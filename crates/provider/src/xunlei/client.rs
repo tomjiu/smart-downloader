@@ -37,7 +37,7 @@ impl Client {
     }
 
     /// 构造 drive API 的三要素请求头。
-    fn auth_headers(state: &AuthState) -> HeaderMap {
+    pub(crate) fn auth_headers(state: &AuthState) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", state.access_token)).unwrap());
         h.insert("x-device-id", HeaderValue::from_str(&state.device_id).unwrap());
@@ -133,6 +133,19 @@ impl Client {
             Err(_) => Err(ClientError::DeviceFlow(format!("poll failed with status {}", status))),
         }
     }
+
+    /// 取直链：调 PLAY API 拿 web_content_link（F2/F3 已验证端点）。
+    /// 返回 (name, web_content_link)。size/expires 由调用方从 URL 参数解析（f=/e=）。
+    pub async fn resolve_link(&self, state: &AuthState, file_id: &str) -> Result<PlayResp, ClientError> {
+        let url = format!("{}/drive/v1/files/{}?space=&usage=PLAY", PAN_BASE, file_id);
+        let resp: PlayResp = self.http
+            .get(url)
+            .headers(Self::auth_headers(state))
+            .send().await?
+            .error_for_status()?
+            .json().await?;
+        Ok(resp)
+    }
 }
 
 /// 设备码响应（request_device_code 的返回）。
@@ -152,6 +165,17 @@ pub struct TokenResp {
     pub access_token: String,
     pub refresh_token: String,
     pub expires_in: u64,
+}
+
+/// PLAY API 响应（files/{id}?usage=PLAY）。
+#[derive(Clone, Debug, Deserialize)]
+pub struct PlayResp {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub web_content_link: String,
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 #[cfg(test)]

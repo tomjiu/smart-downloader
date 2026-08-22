@@ -106,9 +106,22 @@ impl crate::RemoteProvider for XunleiProvider {
         self.tasks.lock().await.get(id).map(|_| ProviderStatus::Ready).ok_or(ProviderError::NotFound)
     }
     async fn resolve(&self, id: &ProviderTaskId) -> Result<Vec<ResolvedRemoteFile>, ProviderError> {
-        // 骨架：真实 PLAY API 取链待端点确认后补
-        let _ = id;
-        Err(ProviderError::Other("resolve not yet implemented (endpoint pending)".into()))
+        let file_id = self.tasks.lock().await.get(id).cloned().ok_or(ProviderError::NotFound)?;
+        let state = self.auth.lock().await.clone().ok_or(ProviderError::Auth)?;
+        let play = self.client.resolve_link(&state, &file_id).await.map_err(|e| ProviderError::Other(e.to_string()))?;
+        let url = play.web_content_link;
+        if url.is_empty() {
+            return Err(ProviderError::Other("web_content_link empty".into()));
+        }
+        let size = play.size.or_else(|| url_query_u64(&url, "f")).unwrap_or(0);
+        let expires_at = url_query_u64(&url, "e");
+        Ok(vec![ResolvedRemoteFile {
+            rel_path: if play.name.is_empty() { file_id } else { play.name },
+            url,
+            size,
+            etag: None,
+            expires_at,
+        }])
     }
     async fn remove(&self, id: &ProviderTaskId) -> Result<(), ProviderError> {
         self.tasks.lock().await.remove(id).ok_or(ProviderError::NotFound)?;
@@ -122,6 +135,22 @@ impl crate::RemoteProvider for XunleiProvider {
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// 从 URL 查询串里取一个 u64 参数（如 f=size, e=expires）。
+fn url_query_u64(url: &str, key: &str) -> Option<u64> {
+    let query = url.split('?').nth(1)?;
+    for pair in query.split('&') {
+        let mut kv = pair.splitn(2, '=');
+        if kv.next() == Some(key) {
+            if let Some(v) = kv.next() {
+                if let Ok(n) = v.parse::<u64>() {
+                    return Some(n);
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -139,5 +168,13 @@ mod tests {
     fn runtime_authenticated_false_when_no_auth() {
         let p = XunleiProvider::new("xunlei", PathBuf::from("nonexistent_test.json"));
         assert!(!p.runtime().authenticated);
+    }
+    #[test]
+    fn url_query_parses_size_and_expires() {
+        let url = "https://vod.xunlei.com/download/?fid=x&f=27471387&e=1787156621&g=abc";
+        assert_eq!(url_query_u64(url, "f"), Some(27471387));
+        assert_eq!(url_query_u64(url, "e"), Some(1787156621));
+        assert_eq!(url_query_u64(url, "g"), None); // g 非数字
+        assert_eq!(url_query_u64(url, "nonexistent"), None);
     }
 }
