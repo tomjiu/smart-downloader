@@ -1488,6 +1488,7 @@ dependencies = [
  "md-5",
  "reqwest",
  "serde",
+ "serde_json",
  "sha1",
  "smart-dl-core",
  "smart-dl-httpdl",

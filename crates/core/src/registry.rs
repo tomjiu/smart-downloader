@@ -75,6 +75,9 @@ impl EngineRegistry {
                 .first_with(Capability::Ftp)
                 .ok_or_else(|| RoutingError::FeatureDisabled("ftp".into())),
             DownloadSource::Ed2k(_) => Err(RoutingError::Unsupported("ed2k".into())),
+            DownloadSource::XunleiShare(_) => self
+                .first_with(Capability::OfflineCache)
+                .ok_or(RoutingError::NoEngineForSource),
         }
     }
 

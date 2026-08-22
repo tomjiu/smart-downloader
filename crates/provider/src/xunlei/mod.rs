@@ -2,6 +2,7 @@
 //! captcha_sign / device_sign（sign.rs）、GCID / CID（hash.rs）。
 //! 纯函数，无 I/O，算法移植自 alist（MIT）与 xunlei-lixian（公开）。
 
+pub mod auth;
 pub mod hash;
 pub mod sign;
 

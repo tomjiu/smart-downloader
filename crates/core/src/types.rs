@@ -20,6 +20,8 @@ pub enum DownloadSource {
         pass: String,
     },
     Thunder(String), // 解码为 Http（§7.1）
+    /// 迅雷网盘分享链接（pan.xunlei.com/s/xxx?pwd=yyy）。
+    XunleiShare(String),
     Ed2k(String),    // v1 不支持 → Failed
 }
 
