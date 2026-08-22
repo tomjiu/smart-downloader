@@ -1,4 +1,6 @@
-//! OAuth 2.0 设备码流程（RFC 8628）状态机。
+//! OAuth 2.0 设备码流程（RFC 8628）状态机 + 编排。
+
+use crate::xunlei::client::{Client, ClientError, DeviceCode};
 
 /// 设备码流程状态。
 #[derive(Clone, Debug, PartialEq)]
@@ -35,6 +37,46 @@ impl DeviceFlowState {
                 }
                 _ => self.clone(),
             },
+        }
+    }
+}
+
+/// 设备码登录编排：请求 device code → 展示二维码 → 轮询 token。
+/// 网络调用委托给 `Client`；本结构只负责把状态机串起来。
+pub struct DeviceAuthFlow {
+    client: Client,
+}
+
+impl DeviceAuthFlow {
+    pub fn new(client: Client) -> Self {
+        DeviceAuthFlow { client }
+    }
+
+    /// 发起设备码登录：请求 device code，返回包含二维码 URL 的 `AwaitingScan` 状态。
+    pub async fn start(&self, scope: &str) -> Result<DeviceFlowState, ClientError> {
+        let code: DeviceCode = self.client.request_device_code(scope).await?;
+        let now = crate::xunlei::client::now_unix();
+        Ok(DeviceFlowState::AwaitingScan {
+            device_code: code.device_code,
+            user_code: code.user_code,
+            verification_uri: code.verification_uri,
+            expires_at: now + code.expires_in,
+        })
+    }
+
+    /// 轮询一次：若成功返回 `Done`（含 token），否则返回更新后的状态。
+    /// 需要当前状态里的 device_code。
+    pub async fn poll_once(&self, state: &DeviceFlowState) -> Result<DeviceFlowState, ClientError> {
+        let device_code = match state {
+            DeviceFlowState::AwaitingScan { device_code, .. } => device_code.clone(),
+            _ => return Ok(state.clone()),
+        };
+        match self.client.poll_device_token(&device_code).await? {
+            Some(token) => Ok(DeviceFlowState::Done {
+                access_token: token.access_token,
+                refresh_token: token.refresh_token,
+            }),
+            None => Ok(state.on_poll(Some("authorization_pending"), crate::xunlei::client::now_unix())),
         }
     }
 }

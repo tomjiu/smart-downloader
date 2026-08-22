@@ -3,6 +3,7 @@
 use crate::types::{ProviderError, ProviderRuntime, ProviderStatus, ProviderTaskId, ResolvedRemoteFile};
 use crate::xunlei::auth::{load as load_auth, save as save_auth, AuthState};
 use crate::xunlei::client::Client;
+use crate::xunlei::device::DeviceAuthFlow;
 use smart_dl_core::types::{Capability, DownloadSource};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -27,6 +28,36 @@ impl XunleiProvider {
             token_path,
             tasks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// 开始设备码登录：返回一个 `DeviceAuthFlow`，上层调用 `start(scope)` 拿二维码，
+    /// 然后 `poll_once(state)` 轮询直到 `Done`（拿到 token）或 `Failed`。
+    pub fn begin_device_login(&self) -> DeviceAuthFlow {
+        DeviceAuthFlow::new(self.client.clone())
+    }
+
+    /// 把设备码登录拿到的 token 写入登录态并持久化。
+    pub async fn store_login(&self, access_token: String, refresh_token: String) -> Result<(), ProviderError> {
+        // 登录后需初始化 captcha_token（匿名可拿）和 device_id。
+        // device_id：若已有则复用，否则生成（这里用固定占位，真实生成待 daemon 层提供）。
+        let device_id = {
+            let guard = self.auth.lock().await;
+            guard.as_ref().map(|s| s.device_id.clone()).unwrap_or_else(|| format!("wdi10.{}", now_unix()))
+        };
+        let mut state = AuthState {
+            access_token,
+            refresh_token,
+            device_id,
+            captcha_token: String::new(),
+            access_token_expires_at: now_unix() + 43200, // 12h，实际以 token 响应为准
+            captcha_token_expires_at: 0,
+        };
+        // 拉取 captcha_token
+        self.client.refresh_captcha(&mut state).await.map_err(|e| ProviderError::Other(e.to_string()))?;
+        let mut guard = self.auth.lock().await;
+        *guard = Some(state.clone());
+        save_auth(&self.token_path, &state).map_err(|e| ProviderError::Other(e.to_string()))?;
+        Ok(())
     }
 }
 

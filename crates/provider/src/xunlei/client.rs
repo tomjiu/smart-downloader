@@ -4,11 +4,14 @@ use crate::xunlei::auth::AuthState;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 
+/// pan 网盘场景的 client_id（取链/captcha/refresh 用）。
 pub const CLIENT_ID: &str = "Xqp0kJBXWhwaTpB6";
+/// 网页登录（设备码流程）的 app_id（扫码登录用）。
+pub const DEVICE_CLIENT_ID: &str = "XW5SkOhLDjnOZP7J";
 pub const XLUSER_BASE: &str = "https://xluser-ssl.xunlei.com";
 pub const PAN_BASE: &str = "https://api-pan.xunlei.com";
 
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
 }
@@ -19,8 +22,11 @@ pub enum ClientError {
     Http(#[from] reqwest::Error),
     #[error("auth missing")]
     NoAuth,
+    #[error("device flow: {0}")]
+    DeviceFlow(String),
 }
 
+#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
 }
@@ -43,8 +49,6 @@ impl Client {
 
     /// refresh_token 换新 access_token（已验证可行）。
     pub async fn refresh(&self, state: &mut AuthState) -> Result<(), ClientError> {
-        #[derive(Deserialize)]
-        struct TokenResp { access_token: String, refresh_token: String, expires_in: u64 }
         let resp: TokenResp = self.http
             .post(format!("{}/v1/auth/token", XLUSER_BASE))
             .json(&serde_json::json!({
@@ -78,6 +82,76 @@ impl Client {
         state.captcha_token_expires_at = now_unix() + resp.expires_in;
         Ok(())
     }
+
+    /// 请求设备码（RFC 8628 设备码流程第一步，已实测端点）。
+    pub async fn request_device_code(&self, scope: &str) -> Result<DeviceCode, ClientError> {
+        #[derive(Deserialize)]
+        struct Resp {
+            device_code: String,
+            user_code: String,
+            #[serde(default)] verification_uri_complete: String,
+            #[serde(default)] verification_url: String,
+            expires_in: u64,
+            #[serde(default)] interval: u64,
+        }
+        let resp: Resp = self.http
+            .post(format!("{}/v1/auth/device/code", XLUSER_BASE))
+            .form(&[("scope", scope), ("client_id", DEVICE_CLIENT_ID)])
+            .send().await?.error_for_status()?.json().await?;
+        Ok(DeviceCode {
+            device_code: resp.device_code,
+            user_code: resp.user_code,
+            verification_uri: if resp.verification_uri_complete.is_empty() { resp.verification_url } else { resp.verification_uri_complete },
+            expires_in: resp.expires_in,
+            interval: resp.interval,
+        })
+    }
+
+    /// 轮询设备码是否已被扫码授权（RFC 8628 第二步，已实测端点）。
+    /// 返回 `Ok(Some(TokenResp))` = 授权成功；`Ok(None)` = 未授权（authorization_pending/slow_down）。
+    pub async fn poll_device_token(&self, device_code: &str) -> Result<Option<TokenResp>, ClientError> {
+        #[derive(Deserialize)]
+        struct ErrResp { error: String }
+        let resp = self.http
+            .post(format!("{}/v1/auth/token", XLUSER_BASE))
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                ("device_code", device_code),
+                ("client_id", DEVICE_CLIENT_ID),
+            ])
+            .send().await?;
+        let status = resp.status();
+        if status.is_success() {
+            let token: TokenResp = resp.json().await?;
+            return Ok(Some(token));
+        }
+        // 非 2xx：解析 error 字段，authorization_pending/slow_down = 未授权（继续等）
+        let body: Result<ErrResp, _> = resp.json().await;
+        match body {
+            Ok(e) if e.error == "authorization_pending" || e.error == "slow_down" => Ok(None),
+            Ok(e) => Err(ClientError::DeviceFlow(e.error)),
+            Err(_) => Err(ClientError::DeviceFlow(format!("poll failed with status {}", status))),
+        }
+    }
+}
+
+/// 设备码响应（request_device_code 的返回）。
+#[derive(Clone, Debug)]
+pub struct DeviceCode {
+    pub device_code: String,
+    pub user_code: String,
+    /// 二维码内容（verification_uri_complete，前端把它转成二维码图片）。
+    pub verification_uri: String,
+    pub expires_in: u64,
+    pub interval: u64,
+}
+
+/// token 端点成功响应（refresh / 设备码轮询成功共用结构）。
+#[derive(Clone, Debug, Deserialize)]
+pub struct TokenResp {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_in: u64,
 }
 
 #[cfg(test)]
