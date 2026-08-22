@@ -15,5 +15,6 @@ download.bin.part
 crates/daemon/download.bin
 scripts/research/captures/
 scripts/research/cloud_delivery/
+scripts/research/_backups/
 __pycache__/
 *.pyc
