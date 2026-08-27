@@ -88,6 +88,49 @@ async fn healthy_mirror1_never_uses_mirror2() {
 }
 
 #[tokio::test]
+async fn weighted_score_prefers_healthy_mirror() {
+    // P1 Mirror 加权评分：首轮 m1 段1 失败被罚后，换源重试轮按分数排序优先 m2。
+    // 64MB → 4 段（0/16M/32M/48M）；m1 对起点 16M 404，其余健康。
+    let size = 64 * MB;
+    let src = patterned(size);
+    let expected = sha256_of(&src);
+    let m1 = HttpTestServer::start(HttpServerConfig {
+        size,
+        fail_ranges: vec![16 * MB],
+        patterned_content: true,
+        ..Default::default()
+    })
+    .await;
+    let m2 = HttpTestServer::start(HttpServerConfig {
+        size,
+        patterned_content: true,
+        ..Default::default()
+    })
+    .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = HttpEngine::new(reqwest::Client::new());
+    let urls = vec![m1.url("/file"), m2.url("/file")];
+    let task = make_http_task_to("score1", &urls[0], dir.path().to_path_buf(), Some("s1.bin"));
+    let tid = engine.add(&task).await.unwrap();
+    engine.update_sources(&tid, urls).await.unwrap();
+    let st = wait_terminal(&engine, &tid).await;
+    assert_eq!(st.state, EngineState::Completed, "应完成: {:?}", st.error);
+    let got = std::fs::read(dir.path().join("s1.bin")).unwrap();
+    assert_eq!(sha256_of(&got), expected);
+
+    // 换源重试轮：m1 已被罚（段1 缩小粒度仍失败）→ 排序优先 m2 → m2 服务全部 4 段起点
+    // （首轮 mirrors 只有 [m1]，m1 的 16M 起点留痕属正常；断言 m2 全量接管即可证明排序生效）
+    let m2_starts = m2.range_starts.lock().unwrap();
+    for want in [0u64, 16 * MB, 32 * MB, 48 * MB] {
+        assert!(
+            m2_starts.contains(&want),
+            "m2 应接管全部段（实际 {m2_starts:?}）缺起点 {want:#x}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn all_mirrors_dead_reports_error() {
     // 32MB → 动态分段 {0,16MB}；两源对第 2 段起点 16MB 都 404
     // （probe 走起点 0，不受影响）→ 段全源失败 → 整体 Error（不做部分成功利用）

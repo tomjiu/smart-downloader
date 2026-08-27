@@ -5,13 +5,21 @@
 use crate::rate::RateLimiter;
 use crate::segment_manager::SegmentManager;
 use crate::static_split::segment_count;
+use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// Mirror 评分 clamp 边界（防单个坏源被无限惩罚/好源无限膨胀）。
+const SCORE_MAX: i64 = 4;
+const SCORE_MIN: i64 = -4;
+
 /// 动态分段下载：worker 数 N=clamp(total/64MB, 2, 8)，段粒度 min_split。
 /// `offset` = 续传起点（跳过 [0, offset)，由调用方续传决策给出）。
 /// 任一段全源失败 → Err（调用方决定重试/报错）。`limiter` 跨段共享（0 = 不限）。
+/// `scores` = 可选 Mirror 加权评分表（None = 不评分，纯按 mirrors 顺序）。
+/// 参数均为同层语义字段，聚合结构体反而增加调用方样板 → 允许 8 参。
+#[allow(clippy::too_many_arguments)]
 pub async fn download_dynamic(
     client: &reqwest::Client,
     part: &Path,
@@ -20,6 +28,7 @@ pub async fn download_dynamic(
     min_split: u64,
     mirrors: &[String],
     limiter: Arc<RateLimiter>,
+    scores: Option<Arc<Mutex<HashMap<String, i64>>>>,
 ) -> Result<(), String> {
     // 预分配 .part（续传场景：旧 .part 保留，只写缺失段；不截断）
     let f = std::fs::OpenOptions::new()
@@ -40,6 +49,7 @@ pub async fn download_dynamic(
         let mirrors = mirrors.to_vec();
         let limiter = limiter.clone();
         let manager = manager.clone();
+        let scores = scores.clone();
         workers.spawn(async move {
             loop {
                 let seg = {
@@ -53,10 +63,18 @@ pub async fn download_dynamic(
                 for url in &mirrors {
                     match download_segment_with_retry(&client, url, &part, seg, &limiter).await {
                         Ok(()) => {
+                            if let Some(sc) = &scores {
+                                update_score(sc, url, 1);
+                            }
                             ok = true;
                             break;
                         }
-                        Err(_) => continue, // 下一 mirror（粒度已缩到最小仍失败）
+                        Err(_) => {
+                            // 该 mirror 对此段失败（粒度已缩到最小仍失败）→ 惩罚
+                            if let Some(sc) = &scores {
+                                update_score(sc, url, -2);
+                            }
+                        }
                     }
                 }
                 if !ok {
@@ -84,6 +102,13 @@ pub async fn download_dynamic(
         }
     }
     Ok(())
+}
+
+/// 更新 mirror 评分（成功 +delta / 失败惩罚，clamp [SCORE_MIN, SCORE_MAX]）。
+fn update_score(scores: &Mutex<HashMap<String, i64>>, url: &str, delta: i64) {
+    let mut m = scores.lock().unwrap();
+    let s = m.entry(url.to_string()).or_insert(0);
+    *s = (*s + delta).clamp(SCORE_MIN, SCORE_MAX);
 }
 
 /// 失败缩小粒度重试的最小粒度（P1）：低于该粒度不再拆分（对齐设计 §3.1 的 1MB 防碎片）。

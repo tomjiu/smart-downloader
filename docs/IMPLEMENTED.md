@@ -194,6 +194,12 @@ enable_upnp = false
 
 **边界**：<16MB 小文件只有 1 段 → 单 worker 下载；`plan_segments`（static_split）仍保留给 FTP 串行路径；`ftp.rs` 未接入动态分段（属另一条线）。
 
+### 12. 失败缩小粒度重试（P1，`b70923e`）
+
+**行为契约**：段全 mirror 失败不再直接整体 Err——`download_segment_with_retry` 按迭代式拆分栈拆半重试（粒度下限 1MB，`MIN_RETRY_GRANULARITY`），左右子段都成功才视为段成功；缩到最小粒度仍失败才报段错误并走整体 Err。子段写入各自区间，与整段写入等价；已成功子段字节不回收（重试覆盖写，语义无害）。
+
+**验证**：新用例 `failed_large_segment_recovers_by_halving`——测试服务器 `fail_ranges_min_len` 模拟"起点 16MB 且长度 ≥ 8MB 的 Range 404"（大段失败、拆半后可下载），32MB 文件拆半收敛完成，文件 SHA256 与源一致；Range 起点留痕（16MB/20MB/24MB）验证拆分过程真实发生。既有 `all_mirrors_dead_reports_error` 语义不变：坏区无法通过拆分修复时仍整体 Error。
+
 ---
 
 ## 主线历史（已完成，详见 git log）

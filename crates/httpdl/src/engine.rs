@@ -46,6 +46,8 @@ struct HttpTask {
 
 struct EngineInner {
     tasks: Mutex<HashMap<EngineTaskId, HttpTask>>,
+    /// Mirror 加权评分（URL → 分数）：跨任务持久，成功 +1 / 失败 -2，clamp [-4, +4]。
+    mirror_scores: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 /// HTTP 引擎：reqwest 传输 + 自研调度层（D29）。
@@ -70,6 +72,7 @@ impl HttpEngine {
             limiter: Arc::new(RateLimiter::new(download_kb_s)),
             inner: Arc::new(EngineInner {
                 tasks: Mutex::new(HashMap::new()),
+                mirror_scores: Arc::new(Mutex::new(HashMap::new())),
             }),
         }
     }
@@ -94,7 +97,7 @@ async fn download_loop(
 ) {
     loop {
         // 快照任务参数（不跨 await 持锁）
-        let (part, offset, mirrors, total, sha256) = {
+        let (part, offset, mirrors_raw, total, sha256) = {
             let tasks = inner.tasks.lock().unwrap();
             let t = match tasks.get(&tid) {
                 Some(t) if t.gen == gen => t,
@@ -109,6 +112,13 @@ async fn download_loop(
             )
         };
 
+        // Mirror 加权评分：按历史分数降序稳定排序（同分保持原序），优先健康源。
+        let mut mirrors = mirrors_raw.clone();
+        {
+            let scores = inner.mirror_scores.lock().unwrap();
+            mirrors.sort_by_key(|u| -scores.get(u).copied().unwrap_or(0));
+        }
+
         match download_dynamic(
             client,
             &part,
@@ -117,6 +127,7 @@ async fn download_loop(
             DEFAULT_MIN_SPLIT,
             &mirrors,
             limiter.clone(),
+            Some(inner.mirror_scores.clone()),
         )
         .await
         {
@@ -213,7 +224,7 @@ async fn download_loop(
                     let tasks = inner.tasks.lock().unwrap();
                     tasks.get(&tid).map(|t| t.mirrors.clone())
                 };
-                if now_mirrors.as_deref() != Some(mirrors.as_slice()) {
+                if now_mirrors.as_deref() != Some(mirrors_raw.as_slice()) {
                     continue; // 换源已生效 → 用新列表重试
                 }
                 finish(&inner, &tid, EngineState::Error, Some(e));
