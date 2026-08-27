@@ -45,6 +45,8 @@ pub struct HttpServerConfig {
     pub retry_429: u32,
     /// 这些 Range 起点 → 404（模拟中途断流/mirror 失效）。
     pub fail_ranges: Vec<u64>,
+    /// 与 fail_ranges 配合：Range 长度 < 该值才放行（模拟"大段失败、拆半后可下载"）。
+    pub fail_ranges_min_len: Option<u64>,
     /// 前 N 次请求返回坏内容（verify "首次错后对" 用）；之后返回正常内容。
     pub bad_first: u32,
     /// 使用确定性模式内容（patterned），否则 0x5A 填充。
@@ -62,6 +64,7 @@ impl Default for HttpServerConfig {
             etag: Some("etag-1"),
             retry_429: 0,
             fail_ranges: vec![],
+            fail_ranges_min_len: None,
             bad_first: 0,
             patterned_content: false,
             content: None,
@@ -141,14 +144,22 @@ async fn handler(State(st): State<ServerState>, headers: HeaderMap) -> Response 
     match range {
         Some(r) if !st.cfg.always_416 => {
             let start = parse_range_start(&r);
+            let total = st.body.len() as u64;
+            let end = parse_range_end(&r).unwrap_or(total - 1).min(total - 1);
             st.range_starts.lock().unwrap().push(start);
-            // 中途断流/mirror 失效：指定起点 → 404
+            // 中途断流/mirror 失效：指定起点 → 404；配 fail_ranges_min_len 时仅对长度 >= 阈值的 Range 生效
             if st.cfg.fail_ranges.contains(&start) {
-                return StatusCode::NOT_FOUND.into_response();
+                let req_len = end - start + 1;
+                let allow_small = st
+                    .cfg
+                    .fail_ranges_min_len
+                    .map(|m| req_len < m)
+                    .unwrap_or(false);
+                if !allow_small {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
             }
             if st.cfg.range {
-                let total = st.body.len() as u64;
-                let end = parse_range_end(&r).unwrap_or(total - 1).min(total - 1);
                 // 坏内容：前 bad_first 次请求返回错字节（其余正常）
                 let payload: Vec<u8> = if (req_no as u32) < st.cfg.bad_first {
                     st.body

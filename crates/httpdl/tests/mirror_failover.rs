@@ -121,3 +121,47 @@ async fn all_mirrors_dead_reports_error() {
     assert_eq!(st.state, EngineState::Error, "全部 mirror 失败 → Error");
     assert!(st.error.is_some());
 }
+
+#[tokio::test]
+async fn failed_large_segment_recovers_by_halving() {
+    // P1 失败缩小粒度重试：mirror 对"起点 16MB 且长度 >= 8MB"的 Range 404（fail_ranges_min_len），
+    // 整段 [16MB,32MB) 失败 → 拆半重试收敛：left2 [16MB,20MB) 放行、right2 [20MB,24MB) 与 right [24MB,32MB) 成功。
+    let size = 32 * MB;
+    let src = patterned(size);
+    let expected = sha256_of(&src);
+    let m1 = HttpTestServer::start(HttpServerConfig {
+        size,
+        fail_ranges: vec![16 * MB],
+        fail_ranges_min_len: Some(8 * MB),
+        patterned_content: true,
+        ..Default::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = HttpEngine::new(reqwest::Client::new());
+    let task = make_http_task_to(
+        "mir4",
+        &m1.url("/file"),
+        dir.path().to_path_buf(),
+        Some("o4.bin"),
+    );
+    let tid = engine.add(&task).await.unwrap();
+    let st = wait_terminal(&engine, &tid).await;
+    assert_eq!(
+        st.state,
+        EngineState::Completed,
+        "缩小粒度重试应完成: {:?}",
+        st.error
+    );
+    let got = std::fs::read(dir.path().join("o4.bin")).unwrap();
+    assert_eq!(sha256_of(&got), expected, "缩小粒度重试后文件必须完整");
+
+    // 拆分过程留痕：整段尝试（16MB）、left 再拆（20MB）、right（24MB）都应出现在 Range 起点里
+    let starts = m1.range_starts.lock().unwrap();
+    for want in [0u64, 16 * MB, 20 * MB, 24 * MB] {
+        assert!(
+            starts.contains(&want),
+            "应观察到 Range 起点 {want:#x}（实际: {starts:?}）"
+        );
+    }
+}

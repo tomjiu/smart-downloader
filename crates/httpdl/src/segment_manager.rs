@@ -17,6 +17,10 @@ impl Segment {
     pub fn len(&self) -> u64 {
         self.end - self.start + 1
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// P0 默认最小段粒度（16MB）。
