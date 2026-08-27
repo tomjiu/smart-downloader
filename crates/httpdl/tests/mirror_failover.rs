@@ -13,14 +13,15 @@ const MB: u64 = 1024 * 1024;
 #[tokio::test]
 async fn mirror1_404_then_mirror2_takes_over() {
     // 核心：段在 mirror1 上 404 → mirror2 补上 → 文件完整
-    let size = MB;
+    // 32MB → 动态分段 {0,16MB} 两段；第 2 段起点 16MB 在 mirror1 404
+    let size = 32 * MB;
     let src = patterned(size);
     let expected = sha256_of(&src);
 
-    // mirror1：第 2 段起点（size/2）404
+    // mirror1：第 2 段起点（16MB）404
     let m1 = HttpTestServer::start(HttpServerConfig {
         size,
-        fail_ranges: vec![size / 2],
+        fail_ranges: vec![16 * MB],
         patterned_content: true,
         ..Default::default()
     })
@@ -88,17 +89,18 @@ async fn healthy_mirror1_never_uses_mirror2() {
 
 #[tokio::test]
 async fn all_mirrors_dead_reports_error() {
-    // 两源对第 2 段都 404（probe 走第 1 段起点 0，不受影响）→ 段全失败 → Error
-    let size = MB;
+    // 32MB → 动态分段 {0,16MB}；两源对第 2 段起点 16MB 都 404
+    // （probe 走起点 0，不受影响）→ 段全源失败 → 整体 Error（不做部分成功利用）
+    let size = 32 * MB;
     let m1 = HttpTestServer::start(HttpServerConfig {
         size,
-        fail_ranges: vec![size / 2],
+        fail_ranges: vec![16 * MB],
         ..Default::default()
     })
     .await;
     let m2 = HttpTestServer::start(HttpServerConfig {
         size,
-        fail_ranges: vec![size / 2],
+        fail_ranges: vec![16 * MB],
         ..Default::default()
     })
     .await;

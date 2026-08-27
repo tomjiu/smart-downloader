@@ -12,7 +12,8 @@ const MB: u64 = 1024 * 1024;
 
 #[tokio::test]
 async fn four_segments_64mb_sha256_matches_source() {
-    // 用户指定用例：4 段并行下载 64MB → 文件 SHA256 与源一致
+    // 用户指定用例：64MB → 16MB 粒度 4 段，由 2 个 worker（clamp(64MB/64MB,2,8)=2）
+    // 经 SegmentManager 动态领取并行下载 → 文件 SHA256 与源一致
     let size = 64 * MB;
     let src = patterned(size);
     let expected = sha256_of(&src);
@@ -69,8 +70,9 @@ async fn part_file_released_after_finalize() {
 
 #[tokio::test]
 async fn segment_requests_cover_file_without_overlap() {
-    // 5MB（公式 2 段）：server 记录的各段 Range 起点必须覆盖 [0, total) 且不重叠
-    let size = 5 * MB;
+    // 64MB 文件，16MB 粒度 → 4 段：动态领取最终必须覆盖全部段起点
+    // （probe 与段0 同起点 0；worker 领取顺序不影响最终集合）
+    let size = 64 * MB;
     let srv = HttpTestServer::start(HttpServerConfig {
         size,
         ..Default::default()
@@ -89,11 +91,11 @@ async fn segment_requests_cover_file_without_overlap() {
 
     let starts: std::collections::HashSet<u64> =
         srv.range_starts.lock().unwrap().iter().copied().collect();
-    // probe(0-0) 与段1 同起点；段起点集合必须恰为 {0, size/2} → 覆盖且不重叠
-    assert_eq!(
-        starts,
-        [0u64, size / 2].into_iter().collect(),
-        "2 段起点必须覆盖全文件且不相交"
+    let expected: std::collections::HashSet<u64> =
+        [0u64, 16 * MB, 32 * MB, 48 * MB].into_iter().collect();
+    assert!(
+        starts.is_superset(&expected),
+        "动态领取必须覆盖全文件各段，实际: {starts:?}"
     );
     assert_eq!(
         std::fs::metadata(dir.path().join("c.bin")).unwrap().len(),

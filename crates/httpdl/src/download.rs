@@ -1,23 +1,27 @@
-//! 多连接段下载器（M4b）：并行下载各段到 .part（seek 定位，段不相交无锁），
-//! 段失败 → 镜像轮换（列表内依次尝试）。限速（RateLimiter）跨段共享。
+//! 动态分段下载器（P0，方案A）：worker 池经 SegmentManager 按 FIFO 动态领取
+//! 段，段内流式写盘（seek+write，段不相交 → 并发写无锁）。
+//! 失败语义：任一段全 mirror 失败 → 整体 Err（不做部分成功利用，P0 约定）。
 
 use crate::rate::RateLimiter;
-use crate::static_split::Segment;
+use crate::segment_manager::SegmentManager;
+use crate::static_split::segment_count;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-/// 并行下载所有段。`mirrors` 为候选源列表：某段在某源失败 → 下一源重试该段。
-/// 全源失败 → Err（调用方决定重试/报错）。`limiter` 为跨段共享限速器（0 = 不限）。
-pub async fn download_segments(
+/// 动态分段下载：worker 数 N=clamp(total/64MB, 2, 8)，段粒度 min_split。
+/// `offset` = 续传起点（跳过 [0, offset)，由调用方续传决策给出）。
+/// 任一段全源失败 → Err（调用方决定重试/报错）。`limiter` 跨段共享（0 = 不限）。
+pub async fn download_dynamic(
     client: &reqwest::Client,
     part: &Path,
-    segments: &[Segment],
-    mirrors: &[String],
     total: u64,
+    offset: u64,
+    min_split: u64,
+    mirrors: &[String],
     limiter: Arc<RateLimiter>,
 ) -> Result<(), String> {
-    // 预分配 .part（含续传场景：旧 .part 保留，只写缺失段；不截断）
+    // 预分配 .part（续传场景：旧 .part 保留，只写缺失段；不截断）
     let f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -27,39 +31,70 @@ pub async fn download_segments(
     f.set_len(total).map_err(|e| e.to_string())?;
     drop(f);
 
-    let mut handles = Vec::new();
-    for seg in segments {
+    let manager = Arc::new(Mutex::new(SegmentManager::new(total, offset, min_split)));
+    let n_workers = segment_count(total);
+    let mut workers = tokio::task::JoinSet::new();
+    for _ in 0..n_workers {
         let client = client.clone();
         let part = part.to_path_buf();
         let mirrors = mirrors.to_vec();
-        let seg = *seg;
         let limiter = limiter.clone();
-        handles.push(tokio::spawn(async move {
-            for m in &mirrors {
-                match download_segment(&client, m, seg, &limiter).await {
-                    Ok(bytes) => {
-                        write_segment(&part, seg, &bytes).map_err(|e| e.to_string())?;
-                        return Ok::<(), String>(());
+        let manager = manager.clone();
+        workers.spawn(async move {
+            loop {
+                let seg = {
+                    let mut m = manager.lock().unwrap();
+                    match m.take_segment() {
+                        Some(s) => s,
+                        None => return Ok::<(), String>(()),
                     }
-                    Err(_) => continue, // 下一 mirror
+                };
+                let mut ok = false;
+                for url in &mirrors {
+                    match download_segment_streaming(&client, url, &part, seg, &limiter).await {
+                        Ok(()) => {
+                            ok = true;
+                            break;
+                        }
+                        Err(_) => continue, // 下一 mirror
+                    }
                 }
+                if !ok {
+                    return Err(format!(
+                        "all mirrors failed for segment [{}, {}]",
+                        seg.start, seg.end
+                    ));
+                }
+                manager.lock().unwrap().complete(seg);
             }
-            Err("all mirrors failed for segment".to_string())
-        }));
+        });
     }
-    for h in handles {
-        h.await.map_err(|e| e.to_string())??;
+    // 任一 worker 失败 → 整体失败，取消其余
+    while let Some(res) = workers.join_next().await {
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                workers.abort_all();
+                return Err(e);
+            }
+            Err(e) => {
+                workers.abort_all();
+                return Err(format!("worker panicked: {e}"));
+            }
+        }
     }
     Ok(())
 }
 
-/// 下载单个段（Range: bytes=start-end），流式读取 + 限速，校验长度。
-async fn download_segment(
+/// 单段流式下载：Range: bytes=start-end，chunk 边收边写 .part
+/// （段内顺序写，seek 一次定位；段不相交 → 与其它 worker 无写冲突）。
+async fn download_segment_streaming(
     client: &reqwest::Client,
     url: &str,
-    seg: Segment,
+    part: &Path,
+    seg: crate::segment_manager::Segment,
     limiter: &RateLimiter,
-) -> Result<Vec<u8>, String> {
+) -> Result<(), String> {
     let mut resp = client
         .get(url)
         .header(
@@ -69,31 +104,29 @@ async fn download_segment(
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    let status = resp.status();
-    if status != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(format!("segment status {status}"));
+    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(format!("segment status {}", resp.status()));
     }
-    let mut buf = Vec::with_capacity(seg.len() as usize);
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(part)
+        .map_err(|e| format!("part open: {e}"))?;
+    f.seek(SeekFrom::Start(seg.start))
+        .map_err(|e| e.to_string())?;
+    let mut written: u64 = 0;
     loop {
         let chunk = resp.chunk().await.map_err(|e| e.to_string())?;
         let Some(chunk) = chunk else { break };
         limiter.wait(chunk.len() as u64).await;
-        buf.extend_from_slice(&chunk);
+        f.write_all(&chunk).map_err(|e| e.to_string())?;
+        written += chunk.len() as u64;
     }
-    if buf.len() as u64 != seg.len() {
+    if written != seg.len() {
         return Err(format!(
             "segment length {} != expected {}",
-            buf.len(),
+            written,
             seg.len()
         ));
     }
-    Ok(buf)
-}
-
-/// 段写入 .part：seek 到段起点（段不相交 → 并发写无锁冲突）。
-fn write_segment(part: &Path, seg: Segment, bytes: &[u8]) -> std::io::Result<()> {
-    let mut f = std::fs::OpenOptions::new().write(true).open(part)?;
-    f.seek(SeekFrom::Start(seg.start))?;
-    f.write_all(bytes)?;
     Ok(())
 }

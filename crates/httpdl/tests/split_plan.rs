@@ -1,7 +1,8 @@
-//! M4a: 静态分块规划（§14 D11/D25）。
-//! N = clamp(file_size/64MB, 2, 8)；段不相交且覆盖全文件。
+//! M4a: 静态分块规划（§14 D11/D25）——段数公式与全文件覆盖。
+//! 说明：P0 起 HTTP 主路径改用动态分段（SegmentManager），
+//! 静态规划仅保留 segment_count（worker 数公式）与 plan_segments（FTP 串行下载用）。
 
-use smart_dl_httpdl::static_split::{plan_segments, plan_segments_from, segment_count};
+use smart_dl_httpdl::static_split::{plan_segments, segment_count};
 
 const MB: u64 = 1024 * 1024;
 
@@ -55,56 +56,4 @@ fn segments_cover_file_exactly() {
 #[test]
 fn zero_size_plan_is_empty() {
     assert!(plan_segments(0).is_empty());
-}
-
-// ---- #4 续传规划：plan_segments_from（只覆盖 [offset, total)）----
-
-#[test]
-fn resume_plan_covers_remaining_span() {
-    // 100MB 文件，40MB 已下 → 段必须覆盖 [40MB, 100MB) 且连续无重叠
-    let offset = 40 * MB;
-    let total = 100 * MB;
-    let segs = plan_segments_from(offset, total);
-    assert!(!segs.is_empty());
-    assert_eq!(segs.first().unwrap().start, offset, "首段从偏移开始");
-    assert_eq!(segs.last().unwrap().end, total - 1, "末段到文件尾");
-    for w in segs.windows(2) {
-        assert_eq!(w[0].end + 1, w[1].start, "续传段必须连续");
-    }
-    // 总覆盖长度 = 剩余字节
-    let covered: u64 = segs.iter().map(|s| s.len()).sum();
-    assert_eq!(covered, total - offset);
-}
-
-#[test]
-fn resume_plan_at_zero_equals_full_plan() {
-    // offset=0 → 与全量规划一致（覆盖 [0, total)）
-    for size in [10 * MB, 100 * MB, 1024 * MB] {
-        assert_eq!(plan_segments_from(0, size), plan_segments(size));
-    }
-}
-
-#[test]
-fn resume_plan_offset_near_end_is_small() {
-    // 偏移接近末尾 → 剩余覆盖正确（无越界）
-    let total = 100 * MB;
-    let offset = total - 10;
-    let segs = plan_segments_from(offset, total);
-    let covered: u64 = segs.iter().map(|s| s.len()).sum();
-    assert_eq!(covered, 10);
-    assert_eq!(segs.first().unwrap().start, offset);
-    assert_eq!(segs.last().unwrap().end, total - 1);
-}
-
-#[test]
-fn resume_plan_offset_at_or_beyond_total_is_empty() {
-    assert!(
-        plan_segments_from(100 * MB, 100 * MB).is_empty(),
-        "偏移==总长 → 无段"
-    );
-    assert!(
-        plan_segments_from(101 * MB, 100 * MB).is_empty(),
-        "偏移>总长 → 无段"
-    );
-    assert!(plan_segments_from(0, 0).is_empty());
 }

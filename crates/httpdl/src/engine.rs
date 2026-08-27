@@ -1,11 +1,11 @@
 //! HttpEngine（§14，impl DownloadEngine）：M4a 骨架 + M4b 多连接并行下载/镜像/换源/校验。
 //! add = 探测 → 规划 → 登记 → 后台下载循环；段失败 → 镜像轮换；校验失败 → 重下 1 次 → 降级接受。
 
-use crate::download::download_segments;
+use crate::download::download_dynamic;
 use crate::range::probe_range;
 use crate::rate::RateLimiter;
 use crate::resume;
-use crate::static_split::{plan_segments, plan_segments_from};
+use crate::segment_manager::DEFAULT_MIN_SPLIT;
 use crate::verify::verify_file;
 use smart_dl_core::identity::ContentIdentity;
 use smart_dl_core::session::output::OutputManager;
@@ -31,7 +31,8 @@ struct HttpTask {
     /// 当前源 ETag（换源对比）。
     etag: Option<String>,
     dest: PathBuf,
-    segments: Vec<crate::static_split::Segment>,
+    /// 续传起点（0 = 全新下载；>0 = 跳过 [0, offset) 动态领取剩余段）。
+    offset: u64,
     state: EngineState,
     done: u64,
     total: u64,
@@ -93,7 +94,7 @@ async fn download_loop(
 ) {
     loop {
         // 快照任务参数（不跨 await 持锁）
-        let (part, segments, mirrors, total, sha256) = {
+        let (part, offset, mirrors, total, sha256) = {
             let tasks = inner.tasks.lock().unwrap();
             let t = match tasks.get(&tid) {
                 Some(t) if t.gen == gen => t,
@@ -101,14 +102,24 @@ async fn download_loop(
             };
             (
                 part_path_of(&t.dest, gen),
-                t.segments.clone(),
+                t.offset,
                 t.mirrors.clone(),
                 t.total,
                 t.sha256.clone(),
             )
         };
 
-        match download_segments(client, &part, &segments, &mirrors, total, limiter.clone()).await {
+        match download_dynamic(
+            client,
+            &part,
+            total,
+            offset,
+            DEFAULT_MIN_SPLIT,
+            &mirrors,
+            limiter.clone(),
+        )
+        .await
+        {
             Ok(()) => {
                 // finalize 前检查代次：换源已发生 → 本循环结果作废（gen1 会重下）
                 let still_current = inner
@@ -187,7 +198,9 @@ async fn download_loop(
                                 let _ = std::fs::remove_file(resume::part_etag_path(&part));
                                 finish(&inner, &tid, EngineState::Completed, None);
                             }
-                            Err(e) => finish(&inner, &tid, EngineState::Error, Some(e)),
+                            Err(e) => {
+                                finish(&inner, &tid, EngineState::Error, Some(e))
+                            }
                         }
                         return;
                     }
@@ -232,7 +245,9 @@ fn finish(inner: &Arc<EngineInner>, tid: &str, state: EngineState, error: Option
 /// .part → 目标落位。换源/重下场景 dest 可能已有旧内容且大小相同
 /// （OutputManager::finalize_to 的幂等短路会直接 Ok 不覆盖）→ 先删 dest 强制落位。
 fn finalize_part(part: &Path, dest: &Path, total: u64) -> Result<(), String> {
-    let _ = std::fs::remove_file(dest);
+    if let Err(e) = std::fs::remove_file(dest) {
+        tracing::warn!("finalize_part: 删除目标文件失败 {dest:?}: {e}");
+    }
     let om = OutputManager::new(PathBuf::from("."));
     om.finalize_to(part, dest, total).map_err(|e| e.to_string())
 }
@@ -302,8 +317,9 @@ impl DownloadEngine for HttpEngine {
         let dest = task.dest_root.join(&rel);
         // 断点续传（#4）：.part 存在 → 探测+决策 → 从偏移续传或作废重下；
         // 探测到的 ETag 持久化到 `<part>.etag` 供下次决策。
+        // P0 动态分段：只记录续传起点 offset，段由 SegmentManager 动态领取。
         let part0 = part_path_of(&dest, 0);
-        let segments = if part0.exists() {
+        let offset = if part0.exists() {
             let part_len = std::fs::metadata(&part0).map(|m| m.len()).unwrap_or(0);
             let part_etag = resume::read_part_etag(&part0);
             match resume::decide_resume(part_len, part_etag.as_deref(), &probe) {
@@ -312,16 +328,16 @@ impl DownloadEngine for HttpEngine {
                         "[httpdl] 断点续传 {}: 从偏移 {off} 继续 (part_len={part_len})",
                         task.id
                     );
-                    plan_segments_from(off, total)
+                    off
                 }
                 resume::ResumeDecision::Restart => {
                     println!("[httpdl] 断点续传 {}: .part 不可信，作废重下", task.id);
                     remove_part(&part0);
-                    plan_segments(total)
+                    0
                 }
             }
         } else {
-            plan_segments(total)
+            0
         };
         resume::write_part_etag(&part0, probe.etag.as_deref());
         let sha256 = match &task.identity {
@@ -339,7 +355,7 @@ impl DownloadEngine for HttpEngine {
                     mirrors: vec![url.clone()],
                     etag: probe.etag.clone(),
                     dest,
-                    segments,
+                    offset,
                     state: EngineState::Downloading,
                     done: 0,
                     total,

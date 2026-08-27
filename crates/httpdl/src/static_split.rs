@@ -33,28 +33,6 @@ pub fn plan_segments(total: u64) -> Vec<Segment> {
     split_n(total, segment_count(total))
 }
 
-/// 续传规划：只覆盖 `[offset, total)`（前半已下载）。offset >= total → 空（无需再下）。
-/// 段数仍按全文件大小公式（多连接并发度与全量一致）。
-pub fn plan_segments_from(offset: u64, total: u64) -> Vec<Segment> {
-    if offset >= total {
-        return vec![];
-    }
-    let n = segment_count(total) as u64;
-    let span = total - offset;
-    let base = span / n;
-    let rem = span % n;
-    (0..n)
-        .map(|i| {
-            let start = offset + i * base + i.min(rem);
-            let len = base + u64::from(i < rem);
-            Segment {
-                start,
-                end: start + len - 1,
-            }
-        })
-        .collect()
-}
-
 /// 等分 n 段：前 `total % n` 段各多 1 字节，段连续覆盖 [0, total)。
 /// M4b 用户用例（4 段并行 64MB）用显式 n 绕过公式段数。
 pub fn split_n(total: u64, n: usize) -> Vec<Segment> {
