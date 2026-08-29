@@ -1,2 +1,4 @@
+research_bin/installers/x-player-guanwang.apk filter=lfs diff=lfs merge=lfs -text
+research_bin/installers/thunder_5.80.7.66659.dmg filter=lfs diff=lfs merge=lfs -text
 'research_bin/installers/x-player-guanwang.apk' filter=lfs diff=lfs merge=lfs -text
 'research_bin/installers/thunder_5.80.7.66659.dmg' filter=lfs diff=lfs merge=lfs -text
