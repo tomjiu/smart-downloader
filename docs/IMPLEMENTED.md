@@ -200,6 +200,20 @@ enable_upnp = false
 
 **验证**：新用例 `failed_large_segment_recovers_by_halving`——测试服务器 `fail_ranges_min_len` 模拟"起点 16MB 且长度 ≥ 8MB 的 Range 404"（大段失败、拆半后可下载），32MB 文件拆半收敛完成，文件 SHA256 与源一致；Range 起点留痕（16MB/20MB/24MB）验证拆分过程真实发生。既有 `all_mirrors_dead_reports_error` 语义不变：坏区无法通过拆分修复时仍整体 Error。
 
+### 13. backup_url/backup_md5 备用源兜底（P1，`963f9dd`）
+
+**背景**：夸克架构（`quark_architecture.md` / `cross_client_comparison.md`）的备用源切换机制——主源失败后切备用源，并以备用源内容校验值确认。
+
+**行为契约**
+- `DownloadSource::Http` 新增 `backup_url: Option<String>`；`ContentIdentity::SingleFile` 新增 `backup_md5: Option<String>`（均 `serde(default)`，旧数据兼容）。
+- 校验优先级：有 `sha256` 用 SHA256；无 sha256 但有 backup_md5 用 MD5（`verify_file_md5`，`md-5 = "0.10"`）；均无 → 跳过校验直接落位。
+- 主源两次校验失败（原降级阈值）后：若配置了 `backup_url` → 清空 sha256、置 md5=backup_md5、offset=0、`backup_used=true`，切换备用源重新下载；备用源也失败 → 仍走降级接受 + md5 告警。
+- 未配置 backup_url → 原 sha256 降级路径不变（回归兼容）。
+
+**验证**：`backup_failover.rs` 6 用例全绿——主源坏备源好（md5 恢复）/ 双坏（降级 md5 告警）/ 仅 backup_url 复用主源 sha256 / 无 backup 回归 / 主源好不触备源 / 无校验不触备源。`cargo test -p smart-dl-httpdl` 全量绿、clippy `--no-deps --all-targets -D warnings` 归零。
+
+**边界**：切换后不递归（`backup_used` 防无限切换）；切换仅发生在「有校验目标」且「校验失败」的场景；无校验目标时不切换（与主源校验缺失语义一致）。
+
 ---
 
 ## 主线历史（已完成，详见 git log）

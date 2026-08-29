@@ -40,7 +40,7 @@
 | ~xunlei-import 端到端测试~ | ~~`POST /tasks/xunlei-import` 代码存在但无 e2e 测试~~ **已完成（2026-08-27）**：新增 `crates/daemon/tests/xunlei_import_api.rs`，覆盖合法样本导入、bad base64、xltd 数量不匹配 |
 | ed2k 协议 | 明确不支持（解码出的 ed2k 链接 → 路由拒绝，报"ed2k 不支持"）——**挪远期**：完整实现 = eMule/eDonkey 客户端协议（数周级），并入"跨协议"远期专项（见 F 段）|
 
-已有（防重复列）：并发队列（BT≤3/HTTP·FTP≤8）、HTTP 多连接并行/镜像/换源、**HTTP 动态分段（SegmentManager 动态领取 + 流式写盘，`109692c`）**、sha256 可选校验、BT 校验/做种停止、事件队列背压、全局代理 + 双引擎限速（启动时生效）。
+已有（防重复列）：并发队列（BT≤3/HTTP·FTP≤8）、HTTP 多连接并行/镜像/换源、**HTTP 动态分段（SegmentManager 动态领取 + 流式写盘，`109692c`）**、**失败缩小粒度重试（`b70923e`）**、**backup_url/backup_md5 备用源兜底（`963f9dd`）**、sha256 可选校验、BT 校验/做种停止、事件队列背压、全局代理 + 双引擎限速（启动时生效）。
 
 ### 手动验证待办（脚本已备，待人工在真实网络执行）
 
