@@ -18,3 +18,25 @@ scripts/research/cloud_delivery/
 scripts/research/_backups/
 __pycache__/
 *.pyc
+
+# 迅雷登录态（活体 token，严禁入库）
+xunlei_auth.json
+**/xunlei_auth.json
+
+xunlei_auth_web.json
+**/xunlei_auth_web.json
+xunlei_fresh_token.txt
+
+# 迅雷凭证与调试产物（严禁入库）
+xunlei_desktop_creds.json
+xunlei_sms_session.json
+scripts/oauth_dump.txt
+scripts/oauth_pass2.txt
+scripts/oauth_pass3.txt
+scripts/oauth_pass4.txt
+speedup_logic.txt
+speedup_logic2.txt
+speedup_mine.txt
+superspeed_hunt.txt
+url_hunt.txt
+docs/research/xunlei/bugc_repro_*.log
