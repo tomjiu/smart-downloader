@@ -136,7 +136,7 @@ enable_upnp = false
 |---|---|---|
 | A | 磁力任务 pause 后引擎队列复活继续下载 | **已修（调度层持续执法）**：`enforce_pauses` 每 500ms 对比 done 增长再压；彻底根治仍需 metadata alert 尊重记录态 |
 | B | 特定生命周期交汇窗口 runtime 全端点挂死（29 线程全 Parked 死锁实锤） | 待专项（干净环境单变量复现→minidump→线程栈定位持锁者） |
-| C | 兜底传输撞上已抢先下完的同名文件时挂起 | 待专项（疑点 FallbackSink→HttpEngine.add 已存在终文件分支；候选短路方案已列） |
+| C | 兜底传输撞上已抢先下完的同名文件时挂起 | **httpdl 侧已收口**：候选②`finalize_to` 幂等短路清理 .part、③`finalize_part` 删 dest 失败升级 warn 均已落地，新增 `dest_preexisting` 回归测试 4 用例全绿（crates/httpdl/tests/dest_preexisting.rs）；候选①`transition_for` 放行 Paused→Seeding 已在 daemon 侧实现（待其线提交） |
 
 ### 7. Provider 自动降级（探活 + 失败冷却）
 
