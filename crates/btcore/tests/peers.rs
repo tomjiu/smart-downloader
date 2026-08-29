@@ -34,6 +34,7 @@ fn rich_peer_fields_during_download() {
     let seeder = seed::TestSeeder::start();
     let ih = c.add_magnet(seeder.magnet(), &[]).expect("add_magnet");
     let (ip, port) = seeder.addr();
+    c.resume(&ih).expect("resume");
     c.add_peer(&ih, &ip, port).expect("add_peer");
     // 限速 100KB/s → 2MB 约 20s：拉长 peer 存活窗口，让 SEED 快照确定可测
     //（顺带覆盖 set_limits 契约）；本地瞬时传输时 peer 可能立刻断开导致快照窗口竞态

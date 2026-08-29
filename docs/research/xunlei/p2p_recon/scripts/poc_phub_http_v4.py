@@ -1,5 +1,5 @@
 """
-PoC v4: 正确的 PHub 包格式 — 前 13 字节不加密 + MD5 派生 AES key
+PoC v4（已废弃）: 基于 v2 假设的 PHub 包格式 — 前 13 字节不加密 + MD5 派生 AES key
 
 反汇编确认:
   - 包数据 [0:4] + [5:9] → MD5 → AES-128 key
@@ -7,6 +7,12 @@ PoC v4: 正确的 PHub 包格式 — 前 13 字节不加密 + MD5 派生 AES key
   - 从 [13:] 开始 AES-ECB 加密
   - cmd_id 可能是 0x22 (从 DoDecode cmp 看出)
   - 另一个命令字 0x1771 (6001) 从调用 8 看出
+
+⚠️  v2 假设已被 v3 证伪：
+  - PHub HTTP 生产包不使用 MD5(seq) 派生 AES key
+  - 正确模型 = RSA-1024 包装随机 16B AES key（每请求 XPF_RandomBytes）
+  - 规范见 `scripts/research/cloud_delivery/v3/PHUB_PROTOCOL_SPEC_V3.md`
+  - XUDT 帧仍用 MD5(8_byte_header)，见 `scripts/research/cloud_delivery/phub_line/XUDT_KEY_DERIVATION_SOLVED.md`
 """
 import struct, hashlib, time, urllib.request, urllib.error, ssl, os, base64
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes

@@ -40,6 +40,12 @@ lt_err lt_apply_network(lt_session* s,
                         const char* proxy_user, const char* proxy_pass,
                         int64_t down_bytes, int64_t up_bytes);
 
+/* —— 发现层开关（DHT / LSD / UPnP）——
+   三个开关独立设置（0=关 1=开）；enable_upnp 同时控制 enable_natpmp
+   （端口映射族同进退，不提供单独 NAT-PMP 开关）。
+   会话默认全关（M0 确定性语义，见 lt_session_new）；本函数后置覆盖。 */
+lt_err lt_apply_discovery(lt_session* s, int enable_dht, int enable_lsd, int enable_upnp);
+
 /* —— 添加/移除（5）—— */
 lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, char* ih_out /*41 字节*/);
 lt_err lt_add_torrent_file(lt_session* s, const uint8_t* meta, size_t len, const char** web_seeds, char* ih_out);
@@ -57,6 +63,7 @@ typedef struct {
     int64_t downloaded, total, down_rate, up_rate;
     int     num_peers, num_seeds;   /* 已连接数（F2） */
     int     metadata_received;      /* F2 三阶段评估前提 */
+    int     paused;                 /* torrent_handle::pause() 后的 paused 标志 */
 } lt_torrent_status;
 
 lt_err lt_status(lt_session* s, const char* ih, lt_torrent_status* out);

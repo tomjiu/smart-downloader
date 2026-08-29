@@ -49,6 +49,7 @@ fn http_routes_to_http() {
             url: "https://example.com/f.bin".into(),
             headers: vec![],
             auth: None,
+            backup_url: None,
         })
         .unwrap(),
         "http"
@@ -114,6 +115,7 @@ fn no_engine_at_all_is_no_engine_error() {
         url: "https://example.com/f.bin".into(),
         headers: vec![],
         auth: None,
+        backup_url: None,
     });
     assert!(matches!(r, Err(RoutingError::NoEngineForSource)));
 }

@@ -17,6 +17,7 @@ fn content_identity_single_file_serde_roundtrip() {
         size: 12345,
         etag: Some("\"abc\"".into()),
         sha256: None,
+        backup_md5: None,
     };
     let json = serde_json::to_string(&ci).unwrap();
     let back: ContentIdentity = serde_json::from_str(&json).unwrap();

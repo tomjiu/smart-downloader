@@ -33,6 +33,7 @@ fn string_copies_survive_following_pops() {
     s.set_alert_mask(0xFFFF).expect("mask");
     let ih = s.add_magnet(seeder.magnet(), &[]).expect("add_magnet");
     let (ip, port) = seeder.addr();
+    s.resume(&ih).expect("resume");
     s.add_peer(&ih, &ip, port).expect("add_peer");
     download_to_complete(&s, &ih);
 
@@ -56,6 +57,7 @@ fn grow_retry_on_take_resume_data() {
     s.set_alert_mask(0xFFFF).expect("mask");
     let ih = s.add_magnet(seeder.magnet(), &[]).expect("add_magnet");
     let (ip, port) = seeder.addr();
+    s.resume(&ih).expect("resume");
     s.add_peer(&ih, &ip, port).expect("add_peer");
     download_to_complete(&s, &ih);
 

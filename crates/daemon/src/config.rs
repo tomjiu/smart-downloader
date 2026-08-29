@@ -10,7 +10,9 @@ pub struct Config {
     pub server: ServerCfg,
     pub download: DownloadCfg,
     pub bt: BtCfg,
+    pub xunlei: XunleiCfg,
     pub provider: ProviderCfg,
+    pub provider_xunlei: ProviderXunleiCfg,
     pub lock: LockCfg,
     pub storage: StorageCfg,
 }
@@ -44,6 +46,25 @@ pub struct BtCfg {
     pub save_path: Option<PathBuf>,
     /// BT 上传限速（KiB/s）；0 = 不限。启动时生效。
     pub max_upload_kb_s: u32,
+    /// 启用 DHT（去中心化 peer 发现）。默认关闭保持确定性；纯磁力无 tracker
+    /// 冷启动可开启。启动时生效。
+    pub enable_dht: bool,
+    /// 启用 LSD（本地网络 peer 发现）。默认关闭保持确定性。启动时生效。
+    pub enable_lsd: bool,
+    /// 启用 UPnP/NAT-PMP 端口映射（两者同进退）。默认关闭保持确定性。启动时生效。
+    pub enable_upnp: bool,
+}
+
+/// 迅雷 SDK 引擎配置（Windows-only）。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct XunleiCfg {
+    /// 启用迅雷 SDK 引擎（需编译时 --features xunlei）。
+    pub enabled: bool,
+    /// 迅雷 SDK 目录（包含 DownloadSDKProxy.dll 等文件）。
+    pub sdk_dir: Option<PathBuf>,
+    /// 落盘目录（须存在；默认与 dest_root 相同）。
+    pub save_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -55,6 +76,17 @@ pub struct ProviderCfg {
     /// 开发/演示用 MockProvider（仅有的现成实现；真实 provider 待迅雷线落地）。
     /// 仅当 `enabled=true` 时生效。
     pub mock: bool,
+}
+
+/// 迅雷云盘 Provider（XunleiProvider）装配配置。
+/// 默认关：需显式 `enabled=true` 才把 XunleiProvider 注入 provider 列表。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ProviderXunleiCfg {
+    pub enabled: bool,
+    /// 登录态 JSON 路径（examples 会写入；daemon 只读加载 + 续期回写）。
+    /// 缺省时 daemon 用 `xunlei_auth.json`。
+    pub token_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -86,11 +118,16 @@ impl Default for Config {
                 enabled: true,
                 save_path: None,
                 max_upload_kb_s: 0,
+                enable_dht: false,
+                enable_lsd: false,
+                enable_upnp: false,
             },
+            xunlei: XunleiCfg::default(),
             provider: ProviderCfg {
                 enabled: false,
                 mock: false,
             },
+            provider_xunlei: ProviderXunleiCfg::default(),
             lock: LockCfg {
                 path: PathBuf::from("./daemon.lock"),
             },
@@ -119,6 +156,14 @@ impl Config {
             .unwrap_or_else(|| self.download.dest_root.clone())
     }
 
+    /// 迅雷实际落盘目录（save_path 或默认 dest_root）。
+    pub fn xunlei_save_path(&self) -> PathBuf {
+        self.xunlei
+            .save_path
+            .clone()
+            .unwrap_or_else(|| self.download.dest_root.clone())
+    }
+
     /// 精简配置快照（`GET /config` 返回；不含敏感项——proxy 可能带凭据故隐藏；
     /// serve 注入 + 热重载共用）。
     pub fn snapshot_json(&self, tasks_path: &std::path::Path) -> serde_json::Value {
@@ -126,12 +171,24 @@ impl Config {
             "dest_root": self.download.dest_root,
             "bt_save_path": self.bt_save_path(),
             "bt_enabled": self.bt.enabled,
+            "bt_enable_dht": self.bt.enable_dht,
+            "bt_enable_lsd": self.bt.enable_lsd,
+            "bt_enable_upnp": self.bt.enable_upnp,
+            "xunlei_enabled": self.xunlei.enabled,
             "listen_addr": self.server.addr,
             "persist_path": tasks_path,
             "max_download_kb_s": self.download.max_download_kb_s,
             "max_upload_kb_s": self.bt.max_upload_kb_s,
             "proxy_enabled": !self.download.proxy.is_empty(),
             "provider_enabled": self.provider.enabled,
+            "provider_xunlei_enabled": self.provider_xunlei.enabled,
+            // 仅暴露「登录态文件是否存在」布尔，不泄露路径字符串本身。
+            "provider_xunlei_token_exists": self
+                .provider_xunlei
+                .token_path
+                .as_ref()
+                .map(|p| p.exists())
+                .unwrap_or(false),
         })
     }
 }
@@ -148,6 +205,53 @@ mod tests {
         assert!(c.bt.enabled);
         assert_eq!(c.lock.path, PathBuf::from("./daemon.lock"));
         assert_eq!(c.bt_save_path(), c.download.dest_root);
+        // 发现层开关默认全关（不改变现有行为）
+        assert!(!c.bt.enable_dht);
+        assert!(!c.bt.enable_lsd);
+        assert!(!c.bt.enable_upnp);
+    }
+
+    #[test]
+    fn bt_discovery_defaults_off_in_snapshot() {
+        // 快照含三键且默认 false
+        let c = Config::default();
+        let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap["bt_enable_dht"], false);
+        assert_eq!(snap["bt_enable_lsd"], false);
+        assert_eq!(snap["bt_enable_upnp"], false);
+    }
+
+    #[test]
+    fn bt_discovery_toml_overrides() {
+        // TOML 开启值解析 + 快照反映开启值
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(
+            &p,
+            r#"
+[bt]
+enable_dht = true
+enable_lsd = true
+enable_upnp = true
+"#,
+        )
+        .unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert!(c.bt.enable_dht);
+        assert!(c.bt.enable_lsd);
+        assert!(c.bt.enable_upnp);
+        let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap["bt_enable_dht"], true);
+        assert_eq!(snap["bt_enable_lsd"], true);
+        assert_eq!(snap["bt_enable_upnp"], true);
+
+        // 部分开启：仅 dht
+        let p2 = dir.path().join("config2.toml");
+        std::fs::write(&p2, "[bt]\nenable_dht = true\n").unwrap();
+        let c2 = Config::load(Some(&p2)).unwrap();
+        assert!(c2.bt.enable_dht);
+        assert!(!c2.bt.enable_lsd);
+        assert!(!c2.bt.enable_upnp);
     }
 
     #[test]
@@ -200,6 +304,61 @@ path = "/tmp/sd.lock"
             !snap.as_object().unwrap().contains_key("proxy"),
             "快照不得含代理 URL"
         );
+    }
+
+    #[test]
+    fn provider_xunlei_default_off() {
+        // 默认关闭、无 token_path，快照不得暴露路径，仅给布尔。
+        let c = Config::default();
+        assert!(!c.provider_xunlei.enabled);
+        assert!(c.provider_xunlei.token_path.is_none());
+        let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap["provider_xunlei_enabled"], false);
+        assert_eq!(snap["provider_xunlei_token_exists"], false);
+        assert!(
+            !snap.as_object().unwrap().contains_key("provider_xunlei_token_path"),
+            "快照不得含 token 路径"
+        );
+    }
+
+    #[test]
+    fn provider_xunlei_enabled_with_token_path() {
+        let dir = tempfile::tempdir().unwrap();
+        // 写一个真实的登录态文件，验证快照能反映其存在性。
+        let auth = dir.path().join("xunlei_auth.json");
+        std::fs::write(&auth, r#"{"access_token":"a","refresh_token":"r","device_id":"d","captcha_token":"c","user_id":"1","access_token_expires_at":0,"captcha_token_expires_at":0}"#).unwrap();
+        let missing = dir.path().join("no_such.json");
+        let p = dir.path().join("config.toml");
+        std::fs::write(
+            &p,
+            format!(
+                "[provider_xunlei]\nenabled = true\ntoken_path = \"{}\"\n",
+                auth.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert!(c.provider_xunlei.enabled);
+        assert_eq!(c.provider_xunlei.token_path, Some(auth.clone()));
+        let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap["provider_xunlei_enabled"], true);
+        assert_eq!(snap["provider_xunlei_token_exists"], true);
+
+        // 不存在的 token_path：enabled 仍 true，但 token_exists 为 false。
+        let p2 = dir.path().join("config2.toml");
+        std::fs::write(
+            &p2,
+            format!(
+                "[provider_xunlei]\nenabled = true\ntoken_path = \"{}\"\n",
+                missing.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        let c2 = Config::load(Some(&p2)).unwrap();
+        assert!(c2.provider_xunlei.enabled);
+        let snap2 = c2.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap2["provider_xunlei_enabled"], true);
+        assert_eq!(snap2["provider_xunlei_token_exists"], false);
     }
 
     #[test]

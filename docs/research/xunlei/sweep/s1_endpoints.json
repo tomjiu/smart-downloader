@@ -1,0 +1,899 @@
+{
+ "rel_paths": {
+  "/api/subsc": {
+   "count": 9,
+   "files": {
+    "m_90.js": 9
+   },
+   "known": []
+  },
+  "/v1/user/provider": {
+   "count": 8,
+   "files": {
+    "m_1182.js": 4,
+    "m_704.js": 4
+   },
+   "known": []
+  },
+  "/v1/auth/signin": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/auth/signin/with/provider": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/auth/signup": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/auth/signup/anonymously": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/auth/token": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/auth/device/code": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/auth/revoke": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/user/provider/bind": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/auth/provider/token": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/auth/provider/uri": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/user/device/authorize": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/user/me": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/user/query": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/user/profile": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/user/trans/by/provider": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/auth/verification": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/auth/verification/verify": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/user/sudo": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/user/contact": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/user/password": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/auth/reset": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/user/authorize": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/user/authorize/info": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/user/authorize/detect": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/v1/auth/signin/token": {
+   "count": 4,
+   "files": {
+    "m_1182.js": 2,
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/models/v1": {
+   "count": 3,
+   "files": {
+    "m_1066.js": 3
+   },
+   "known": []
+  },
+  "/share/manage": {
+   "count": 3,
+   "files": {
+    "m_12.js": 1,
+    "m_81.js": 2
+   },
+   "known": []
+  },
+  "/v1/shield/captcha/init": {
+   "count": 2,
+   "files": {
+    "m_1181.js": 2
+   },
+   "known": []
+  },
+  "/mediahub/v1/events": {
+   "count": 2,
+   "files": {
+    "m_67.js": 2
+   },
+   "known": []
+  },
+  "/v1/auth/token/introspect": {
+   "count": 2,
+   "files": {
+    "m_704.js": 2
+   },
+   "known": []
+  },
+  "/share/mobile": {
+   "count": 2,
+   "files": {
+    "m_81.js": 2
+   },
+   "known": []
+  },
+  "/share/pc": {
+   "count": 2,
+   "files": {
+    "m_81.js": 2
+   },
+   "known": []
+  },
+  "/api/subscribe/list": {
+   "count": 2,
+   "files": {
+    "m_90.js": 2
+   },
+   "known": []
+  },
+  "/xlppc.searcher.api/drive_file_search": {
+   "count": 1,
+   "files": {
+    "m_10.js": 1
+   },
+   "known": []
+  },
+  "/xlppc.pan.note/api/getNoteList": {
+   "count": 1,
+   "files": {
+    "m_100.js": 1
+   },
+   "known": []
+  },
+  "/activity/v1/rewards": {
+   "count": 1,
+   "files": {
+    "m_111.js": 1
+   },
+   "known": []
+  },
+  "/share/man": {
+   "count": 1,
+   "files": {
+    "m_12.js": 1
+   },
+   "known": []
+  },
+  "/mediahub/v1/resources": {
+   "count": 1,
+   "files": {
+    "m_132.js": 1
+   },
+   "known": []
+  },
+  "/mediahub/v1/collections": {
+   "count": 1,
+   "files": {
+    "m_132.js": 1
+   },
+   "known": []
+  },
+  "/decompress/v1/list": {
+   "count": 1,
+   "files": {
+    "m_134.js": 1
+   },
+   "known": []
+  },
+  "/decompress/v1/decompress": {
+   "count": 1,
+   "files": {
+    "m_134.js": 1
+   },
+   "known": []
+  },
+  "/decompress/v1/progress": {
+   "count": 1,
+   "files": {
+    "m_134.js": 1
+   },
+   "known": []
+  },
+  "/chitchat/v1/group/query": {
+   "count": 1,
+   "files": {
+    "m_171.js": 1
+   },
+   "known": []
+  },
+  "/mediahub/v1/event": {
+   "count": 1,
+   "files": {
+    "m_67.js": 1
+   },
+   "known": []
+  },
+  "/api/subscribe/own/info": {
+   "count": 1,
+   "files": {
+    "m_90.js": 1
+   },
+   "known": []
+  },
+  "/api/subscribe/delete": {
+   "count": 1,
+   "files": {
+    "m_90.js": 1
+   },
+   "known": []
+  },
+  "/api/subscribe/info": {
+   "count": 1,
+   "files": {
+    "m_90.js": 1
+   },
+   "known": []
+  },
+  "/api/subscribe/whites": {
+   "count": 1,
+   "files": {
+    "m_90.js": 1
+   },
+   "known": []
+  },
+  "/api/subscribe/search": {
+   "count": 1,
+   "files": {
+    "m_90.js": 1
+   },
+   "known": []
+  },
+  "/user_info/pc_info": {
+   "count": 1,
+   "files": {
+    "m_99.js": 1
+   },
+   "known": []
+  }
+ },
+ "urls": {
+  "http://www.w3.org/2000/svg": {
+   "count": 4,
+   "host": "www.w3.org",
+   "files": {
+    "m_1181.js": 1,
+    "m_1182.js": 1,
+    "m_3.js": 1,
+    "m_456.js": 1
+   },
+   "known": []
+  },
+  "http://www.w3.org/1999/xlink": {
+   "count": 4,
+   "host": "www.w3.org",
+   "files": {
+    "m_1181.js": 1,
+    "m_1182.js": 1,
+    "m_3.js": 1,
+    "m_81.js": 1
+   },
+   "known": []
+  },
+  "https://dev-xluser-ssl.xunlei.com": {
+   "count": 4,
+   "host": "dev-xluser-ssl.xunlei.com",
+   "files": {
+    "m_23.js": 2,
+    "m_999.js": 2
+   },
+   "known": []
+  },
+  "https://xluser-ssl.xunlei.com": {
+   "count": 3,
+   "host": "xluser-ssl.xunlei.com",
+   "files": {
+    "m_23.js": 2,
+    "m_239.js": 1
+   },
+   "known": []
+  },
+  "https://api-shoulei-ssl.xunlei.com": {
+   "count": 2,
+   "host": "api-shoulei-ssl.xunlei.com",
+   "files": {
+    "m_1.js": 2
+   },
+   "known": [
+    "K8"
+   ]
+  },
+  "https://api-shoulei-": {
+   "count": 2,
+   "host": "api-shoulei-",
+   "files": {
+    "m_1.js": 2
+   },
+   "known": [
+    "K8"
+   ]
+  },
+  "https://test-api-gat": {
+   "count": 2,
+   "host": "test-api-gat",
+   "files": {
+    "m_1.js": 2
+   },
+   "known": []
+  },
+  "https://api-gateway-pan.xunlei.com": {
+   "count": 2,
+   "host": "api-gateway-pan.xunlei.com",
+   "files": {
+    "m_1.js": 2
+   },
+   "known": [
+    "K2"
+   ]
+  },
+  "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd": {
+   "count": 2,
+   "host": "www.w3.org",
+   "files": {
+    "m_1181.js": 1,
+    "m_1182.js": 1
+   },
+   "known": []
+  },
+  "https://i.xunlei.com/xluser/validate/enter/modifyphone_enter.html": {
+   "count": 2,
+   "host": "i.xunlei.com",
+   "files": {
+    "m_1431.js": 2
+   },
+   "known": []
+  },
+  "https://web-vod-xdrive.xunlei.com/ts_downloader": {
+   "count": 2,
+   "host": "web-vod-xdrive.xunlei.com",
+   "files": {
+    "m_933.js": 2
+   },
+   "known": []
+  },
+  "https://pan.xunlei.com": {
+   "count": 2,
+   "host": "pan.xunlei.com",
+   "files": {
+    "m_933.js": 2
+   },
+   "known": []
+  },
+  "https://api-xl9-ssl.xunlei.com/sl_dev','testing':'https://api-xl9-ssl.xunlei.com/sl_dev','alpha':_0x568151(0x207)+'i-xl9-ssl.xunlei.com/sl','preview':'https://api-xl9-ssl.xunlei.com/sl','production':'https://api-xl9-ssl.xunlei.com/sl'": {
+   "count": 1,
+   "host": "api-xl9-ssl.xunlei.com",
+   "files": {
+    "m_1.js": 1
+   },
+   "known": []
+  },
+  "https://easy-mock.com/mock/5dfc6f66d1f75'+_0x568151(0x32d)+'7/red-envelope','development':'https://test-api-shoulei-ssl.xunlei.com','testing':'https://test-api-shoulei-ssl.xunlei.com','preview':_0x4b8235[_0x568151(0x303)+'I']": {
+   "count": 1,
+   "host": "easy-mock.com",
+   "files": {
+    "m_1.js": 1
+   },
+   "known": []
+  },
+  "https://api-alpha-dr": {
+   "count": 1,
+   "host": "api-alpha-dr",
+   "files": {
+    "m_1.js": 1
+   },
+   "known": []
+  },
+  "https://api-alpha-drive.office.k8s.xunlei.cn/','testing':_0x568151(0x207)+'i-alpha-drive.office.k8s.xunlei.cn/','preview':_0x568151(0x207)+'i-pan.xunlei.com/','production':'https://api-pan.xunlei.com/'": {
+   "count": 1,
+   "host": "api-alpha-drive.office.k8s.xunlei.cn",
+   "files": {
+    "m_1.js": 1
+   },
+   "known": []
+  },
+  "http://api": {
+   "count": 1,
+   "host": "api",
+   "files": {
+    "m_1.js": 1
+   },
+   "known": []
+  },
+  "https://api-alpha-drive.office.k8s.xunlei.cn": {
+   "count": 1,
+   "host": "api-alpha-drive.office.k8s.xunlei.cn",
+   "files": {
+    "m_1.js": 1
+   },
+   "known": []
+  },
+  "https://conf-m-ssl.xunlei.com/'+_0x386e00(0x368)+'0ac1-9b0d-11ea-a017-0242ac140002'": {
+   "count": 1,
+   "host": "conf-m-ssl.xunlei.com",
+   "files": {
+    "m_100.js": 1
+   },
+   "known": [
+    "K7"
+   ]
+  },
+  "https://test-api-xmo": {
+   "count": 1,
+   "host": "test-api-xmo",
+   "files": {
+    "m_1066.js": 1
+   },
+   "known": []
+  },
+  "https://test-api-xmodels.xunlei.com/models/v1','preview':'https://api-xmodels.'+_0x4ec796(0x139)+'/models/v1','production':'https://api-xmodels.xunlei.com/models/v1'": {
+   "count": 1,
+   "host": "test-api-xmodels.xunlei.com",
+   "files": {
+    "m_1066.js": 1
+   },
+   "known": []
+  },
+  "https://feross.org": {
+   "count": 1,
+   "host": "feross.org",
+   "files": {
+    "m_1196.js": 1
+   },
+   "known": []
+  },
+  "https://a.app.qq.com": {
+   "count": 1,
+   "host": "a.app.qq.com",
+   "files": {
+    "m_12.js": 1
+   },
+   "known": []
+  },
+  "https://a.app.qq.com/o/simple.jsp?pkgnam'+_0x4e745a(0x265)+'ei.downloadprovider&ckey=CK147'+_0x4e745a(0x286),'TASK_CREATE_COUNT_LIMIT':'task_create_count_limit','FILE_SPACE_NOT_ENOUGH':'file_space'+_0x4e745a(0x363)+'h','TASK_SUB_TASK_NUM_LIMIT':'task_sub_task_num_li'+_0x4e745a(0x2a4),'NOTE_GUIDE_TIP_STATUS':_0x4e745a(0x348)+'ipStatus','CREATE_URLTASK_TIP_TIME':'create_urltask_tip_time','SPACE_SIZE_LIMIT':'space_size_limit','RESTORE_FILE_COUNT_LIMIT':'restore_file_count_l'+_0x4e745a(0x24b)": {
+   "count": 1,
+   "host": "a.app.qq.com",
+   "files": {
+    "m_12.js": 1
+   },
+   "known": []
+  },
+  "https://pay.xunlei.com/pages/2020/web-pay-center/','mobile-browser':_0x4e745a(0x30b)+'ges-pay.xunlei.com/pages/2020/android-sl-pay/'": {
+   "count": 1,
+   "host": "pay.xunlei.com",
+   "files": {
+    "m_12.js": 1
+   },
+   "known": []
+  },
+  "https://down.sandai.net/mac/thunder.dmg','win':'https://down.sandai.net/thunder11/XunLeiWebSetup_pan.exe'": {
+   "count": 1,
+   "host": "down.sandai.net",
+   "files": {
+    "m_12.js": 1
+   },
+   "known": []
+  },
+  "https://union-gateway.office.k8s.xunlei.cn/union/v3','testing':'https://union-gateway.office.k8s.xunlei.cn/union/v3','preview':'https://union-gateway-pan.xunlei.com/union/v3','production':'https://union-gateway-pan.xunlei.com/union/v3'": {
+   "count": 1,
+   "host": "union-gateway.office.k8s.xunlei.cn",
+   "files": {
+    "m_1228.js": 1
+   },
+   "known": []
+  },
+  "https://password.office.k8s.xunlei.cn/v1/password','testing':'https://password.office.k8s.xunlei.cn/v1/password','preview':'https://xluser-ssl.xunlei.com/v1/password','production':'https://xluser-ssl.xunlei.com/v1/password'": {
+   "count": 1,
+   "host": "password.office.k8s.xunlei.cn",
+   "files": {
+    "m_1299.js": 1
+   },
+   "known": []
+  },
+  "https://api-alpha-drive.office.k8s.xunlei.cn/drive-reader/v1','testing':'https://api-alpha-drive.office.k8s.xunlei.cn/drive-reader/v1','preview':'https://api-pan.xunlei.com/drive-reader/v1','production':'https://api-pan.xunlei.com/drive-reader/v1'": {
+   "count": 1,
+   "host": "api-alpha-drive.office.k8s.xunlei.cn",
+   "files": {
+    "m_132.js": 1
+   },
+   "known": []
+  },
+  "https://www.baidu.com/": {
+   "count": 1,
+   "host": "www.baidu.com",
+   "files": {
+    "m_1431.js": 1
+   },
+   "known": []
+  },
+  "https://oia-pan-ssl.xunlei.com/?query=')['concat'](encodeURIComponent(_0x140141)),'scheme'!==_0x46d2eb&&_0x8e7d64&&(_0x3bfae9+='&ct='['concat'](_0x8e7d64)),!_0x27d732)": {
+   "count": 1,
+   "host": "oia-pan-ssl.xunlei.com",
+   "files": {
+    "m_167.js": 1
+   },
+   "known": []
+  },
+  "https://i.xunlei.com/center/account/personal/oauth/','scope':'profile": {
+   "count": 1,
+   "host": "i.xunlei.com",
+   "files": {
+    "m_23.js": 1
+   },
+   "known": []
+  },
+  "http://127.0.0.1:28317/yun_fet'+_0x3821f6(0x293),'headers':": {
+   "count": 1,
+   "host": "127.0.0.1:28317",
+   "files": {
+    "m_235.js": 1
+   },
+   "known": []
+  },
+  "https://weixinapi-m-ssl.xunlei.com/wx/sign/js_api?page_url=')['concat'](_0x152fdb": {
+   "count": 1,
+   "host": "weixinapi-m-ssl.xunlei.com",
+   "files": {
+    "m_235.js": 1
+   },
+   "known": []
+  },
+  "https://xluser2-ssl.xunlei.com": {
+   "count": 1,
+   "host": "xluser2-ssl.xunlei.com",
+   "files": {
+    "m_239.js": 1
+   },
+   "known": []
+  },
+  "https://xluser3-ssl": {
+   "count": 1,
+   "host": "xluser3-ssl",
+   "files": {
+    "m_239.js": 1
+   },
+   "known": []
+  },
+  "https://weixinapi-m-ssl.xunlei.com/wx/si'+_0x1ed239(0x257)+'page_url=')['concat'](_0x2b5ea4": {
+   "count": 1,
+   "host": "weixinapi-m-ssl.xunlei.com",
+   "files": {
+    "m_24.js": 1
+   },
+   "known": []
+  },
+  "https://static-xl.a.88cdn.com": {
+   "count": 1,
+   "host": "static-xl.a.88cdn.com",
+   "files": {
+    "m_289.js": 1
+   },
+   "known": []
+  },
+  "http://www.w3.org/1998/Math/MathML": {
+   "count": 1,
+   "host": "www.w3.org",
+   "files": {
+    "m_3.js": 1
+   },
+   "known": []
+  },
+  "https://union-gateway-pan.xunlei.com/uni'+_0xdd297d(0x330)+'rting/user'+_0xdd297d(0x1f1);function": {
+   "count": 1,
+   "host": "union-gateway-pan.xunlei.com",
+   "files": {
+    "m_34.js": 1
+   },
+   "known": []
+  },
+  "https://backstage-img-ssl.a.88cdn.com/05e4f2d4a751f1895746a15da2d391105418a66d','multiple':'https://ba'+_0x1c02f4(0x208)+'g-ssl.a.88cdn.com/2e'+_0x1c02f4(0x2a5)+'5a4a5d79f6056b6bc4fa4b6b87ba','video':_0x1c02f4(0x329)+'ckstage-img-ssl.a.88cdn.com/8e91a81218dd38ba32dccbc91757548851617f79','play':'https://backstage-img-ssl.a.88cdn.com/8e91a81218dd38ba32dccb'+_0x1c02f4(0x268)+'51617f79','image':_0x1c02f4(0x329)+'ckstage-img-ssl.a.88cdn.com/db'+_0x1c02f4(0x31f)+'54761f7fdd6fae3821ff5e7ddc48','text':'https://backstage-img-ssl.a.88cdn.com/a4b04aea8b0273b2159fb98606165a33'+_0x1c02f4(0x2b4),'audio':'https://backstage-img-ssl.a.88cdn.com/29'+_0x1c02f4(0x1bc)+'c2d6190da160ab5aa4d4f9674a14','dir':'https://backstage-img-ssl.a.88'+_0x1c02f4(0x220)+'9fc2a136a2881181e73fea74a4836efc02195d','folder':'https://backstage-img-ssl.a.88'+_0x1c02f4(0x2af)+'de21fd06b9ebdd5092b68652b6fc6118e23c2b','default_folder':'https://backstage-img-ssl.a.88cdn.com/9ee6be8099bac6d6d84377b62623c7db0d55c2c3','pdf':_0x1c02f4(0x329)+'ckstage-img-ssl.a.88cdn.com/d6e3583e2e190a9a5b6de9accbe47f85f636bf4e','bt':_0x1c02f4(0x329)+'ckstage-img-ssl.a.88cdn.com/65d616355857aef8af40b8'+_0x1c02f4(0x26e)+'770cb0ce','m3u8':'https://backstage-img-ssl.a.88cdn.com/48ee83808054456fff30ad0e230394b119026ced','rar':_0x1c02f4(0x329)+'ckstage-img-ssl.a.88cdn.com/3f'+_0x1c02f4(0x237)+'684c52e799277f5cabfc99013a03','zip':'https://backstage-img-ssl.a.88cdn.com/3f04ec375a29684c52e799277f5cabfc'+_0x1c02f4(0x280),'x-7z-compressed':'https://backstage-img-ssl.a.88cdn.com/3f04ec375a29684c52e799277f5cabfc99013a03','x-rar':'https://backstage-img-ssl.a.88cdn.com/3f04ec375a29684c52e799277f5cabfc99013a03','x-gzip':'https://backstage-img-ssl.a.88cdn.com/3f04ec375a29684c52e799277f5cabfc99013a03','epub':'https://backstage-img-ssl.a.88cdn.com/d97ec90ec60291f31ce44af510487622f85f25bc','mobi':'https://backstage-img-ssl.a.88cdn.com/60b29eed812570c1d6becb6f66522439fae189b0','chm':'https://backstage-im'+_0x1c02f4(0x1c0)+'cdn.com/5ed5758625be3980a163c2c312b6a1c5590e6195','pkg':'https://backstage-img-ssl.a.88cdn.com/705bddb43e336b706e25dd0b759e0b1848557b09','xmind':'https://backstage-img-ssl.a.88cdn.com/39c6af224734f6d8ca5438c6acf76e04b6f237e4','x-apple-diskimage':'https://backstage-img-ssl.a.88cdn.com/d3f979eeb1d4'+_0x1c02f4(0x2ba)+'71e791cdf729941ee7','vnd.android.package-archive':'https://backstage-img-ssl.a.88cdn.com/6de03ec1c2801a16c6408dba5ff21c0255613e6f','vnd.openxmlformats-officedocument.wordprocessingml.document':'https://ba'+_0x1c02f4(0x208)+'g-ssl.a.88cdn.com/7217d35f94271d570c9ba0249c1b5109f6e13161','docx':'https://backstage-img-ssl.a.88cdn.com/7217d35f94271d570c9ba0249c1b5109'+_0x1c02f4(0x29b),'vnd.openxmlformats-officedocument.spreadsheetml.sheet':'https://backstage-img-ssl.a.88cdn.com/ca0929e2c294eed13332a5a2120bda0cec13dde1','xlsx':'https://backstage-img-ssl.a.88cdn.com/ca0929e2c294eed13332a5a2120bda0cec13dde1','vnd.openxmlformats-officedocument.presentationml.presentation':'https://backstage-img-ssl.a.88cdn.com/12f012b24eed473fd4ddebfcaea4d12f8e0001ec','pptx':'https://backstage-im'+_0x1c02f4(0x1c0)+'cdn.com/12f012b24eed473fd4ddebfcaea4d12f'+_0x1c02f4(0x313)": {
+   "count": 1,
+   "host": "backstage-img-ssl.a.88cdn.com",
+   "files": {
+    "m_50.js": 1
+   },
+   "known": []
+  },
+  "https://clipboardjs.com/": {
+   "count": 1,
+   "host": "clipboardjs.com",
+   "files": {
+    "m_598.js": 1
+   },
+   "known": []
+  },
+  "http://a.app.qq.com/o/simple.jsp?pkgname=com.xunlei.downloadprovider&ckey=CK1470052035866": {
+   "count": 1,
+   "host": "a.app.qq.com",
+   "files": {
+    "m_600.js": 1
+   },
+   "known": []
+  },
+  "http://127.0.0.1:28317/yun_fetch_back/": {
+   "count": 1,
+   "host": "127.0.0.1:28317",
+   "files": {
+    "m_600.js": 1
+   },
+   "known": []
+  },
+  "https://xluser-ssl.xunlei.com/v1/getuserinfo": {
+   "count": 1,
+   "host": "xluser-ssl.xunlei.com",
+   "files": {
+    "m_600.js": 1
+   },
+   "known": []
+  },
+  "https://pay.xunlei.com/pages/2020/web-pay-center/?default_tab=": {
+   "count": 1,
+   "host": "pay.xunlei.com",
+   "files": {
+    "m_600.js": 1
+   },
+   "known": []
+  },
+  "https://pan.xunlei.com/loading/": {
+   "count": 1,
+   "host": "pan.xunlei.com",
+   "files": {
+    "m_601.js": 1
+   },
+   "known": []
+  },
+  "https://i.xunlei.com/xluser/auth/": {
+   "count": 1,
+   "host": "i.xunlei.com",
+   "files": {
+    "m_602.js": 1
+   },
+   "known": []
+  },
+  "https://m.down.sandai.net/mobile/yunpan_'+_0x1bb0d2(0x135)+'pk','home':'https://m.down.sandai.net/mobile/yunpanh5.apk'": {
+   "count": 1,
+   "host": "m.down.sandai.net",
+   "files": {
+    "m_624.js": 1
+   },
+   "known": []
+  },
+  "https://down.sandai.net/thunder11/XunLeiWebSetup_pan.exe": {
+   "count": 1,
+   "host": "down.sandai.net",
+   "files": {
+    "m_627.js": 1
+   },
+   "known": []
+  },
+  "https://down.sandai.net/mac/thunder.dmg": {
+   "count": 1,
+   "host": "down.sandai.net",
+   "files": {
+    "m_627.js": 1
+   },
+   "known": []
+  },
+  "https://github.com/mathiasbynens/CSS.escape)": {
+   "count": 1,
+   "host": "github.com",
+   "files": {
+    "m_81.js": 1
+   },
+   "known": []
+  },
+  "https://backstage-img-ssl.a.88cdn.com/019fc2a136a2881181e73fea74a4836efc02195d": {
+   "count": 1,
+   "host": "backstage-img-ssl.a.88cdn.com",
+   "files": {
+    "m_81.js": 1
+   },
+   "known": []
+  },
+  "https://github.com/w3c/IntersectionObserver": {
+   "count": 1,
+   "host": "github.com",
+   "files": {
+    "m_81.js": 1
+   },
+   "known": []
+  },
+  "http://10.10.45.67:19099/ts_downloader": {
+   "count": 1,
+   "host": "10.10.45.67:19099",
+   "files": {
+    "m_933.js": 1
+   },
+   "known": []
+  },
+  "https://xluser-ssl.x": {
+   "count": 1,
+   "host": "xluser-ssl.x",
+   "files": {
+    "m_999.js": 1
+   },
+   "known": []
+  },
+  "https://xl": {
+   "count": 1,
+   "host": "xl",
+   "files": {
+    "m_999.js": 1
+   },
+   "known": []
+  }
+ },
+ "websocket": {},
+ "schemes": {
+  "thunderx://": {
+   "count": 2,
+   "files": {
+    "m_627.js": 2
+   }
+  }
+ },
+ "rest_args": {
+  "Content-Length": {
+   "count": 2,
+   "files": {
+    "m_600.js": 2
+   }
+  },
+  "redirect_uri": {
+   "count": 1,
+   "files": {
+    "m_1182.js": 1
+   }
+  },
+  "xlUploadUnfinished": {
+   "count": 1,
+   "files": {
+    "m_1431.js": 1
+   }
+  }
+ }
+}

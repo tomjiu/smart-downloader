@@ -4,10 +4,15 @@
 
 pub mod auth;
 pub mod client;
+pub mod cloud_search;
 pub mod device;
 pub mod hash;
 pub mod provider;
+pub mod share;
 pub mod sign;
+pub mod url_class;
 
-pub use hash::{cid, gcid};
-pub use sign::{captcha_sign, device_sign};
+pub use hash::{bcid, cid, gcid};
+pub use share::{parse_share_link, ResolvedLink, SharedFile, SharedLink, Sharer, ShareError};
+pub use sign::{captcha_sign, device_id_32, device_sign};
+pub use url_class::{classify_url, cdn_hosts_by_region, LinkClass};

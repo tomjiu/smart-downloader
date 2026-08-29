@@ -89,7 +89,8 @@ int main(int argc, char** argv) {
 
         lt::settings_pack sp;
         // 2.x: listen_port removed; use listen_interfaces string
-        sp.set_str(lt::settings_pack::listen_interfaces, "0.0.0.0:" + std::to_string(port));
+        // 本地测试仅需 localhost TCP，避免 VPN/虚拟网卡 + uTP 绑定失败导致 listen_failed_alert 误杀
+        sp.set_str(lt::settings_pack::listen_interfaces, "127.0.0.1:" + std::to_string(port) + "/tcp");
         sp.set_bool(lt::settings_pack::enable_upnp, false);
         sp.set_bool(lt::settings_pack::enable_natpmp, false);
         // 本地确定性 e2e：关闭 LSD/DHT，避免 0.0.0.0 监听被多接口宣告后
@@ -117,8 +118,13 @@ int main(int argc, char** argv) {
             ses.pop_alerts(&als);
             for (const lt::alert* a : als) {
                 if (a->type() == lt::listen_failed_alert::alert_type) {
-                    std::fprintf(stderr, "seed_main listen failed: %s\n", a->message().c_str());
-                    return 1;
+                    auto* fa = static_cast<const lt::listen_failed_alert*>(a);
+                    if (fa->socket_type == lt::socket_type_t::tcp) {
+                        std::fprintf(stderr, "seed_main listen failed: %s\n", a->message().c_str());
+                        return 1;
+                    }
+                    // uTP/其他传输 listen 失败不影响本地 TCP 测试（M0 e2e 仅需 TCP）
+                    std::fprintf(stderr, "seed_main non-tcp listen ignored: %s\n", a->message().c_str());
                 }
                 if (a->type() == lt::listen_succeeded_alert::alert_type) {
                     listening = true;

@@ -14,7 +14,7 @@ use base64::Engine as _;
 
 async fn serve_bt() -> (std::net::SocketAddr, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
-    let bt = smart_dl_daemon::bt::BtEngine::new(dir.path(), None, 0, 0).unwrap();
+    let bt = smart_dl_daemon::bt::BtEngine::new(dir.path(), None, 0, 0, false, false, false).unwrap();
     let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
     let state = Arc::new(DaemonState::new(Arc::new(http), vec![]).with_bt(Arc::new(bt)));
     let app = http::router(state.clone());
@@ -322,14 +322,14 @@ async fn readd_same_magnet_after_restart_ok() {
 
     // 第一次"运行"
     let r1 = {
-        let bt = smart_dl_daemon::bt::BtEngine::new(dir.path(), None, 0, 0).unwrap();
+        let bt = smart_dl_daemon::bt::BtEngine::new(dir.path(), None, 0, 0, false, false, false).unwrap();
         let state = DaemonState::new(Arc::new(http.clone()), vec![]).with_bt(Arc::new(bt));
         state.add_link_task(MAGNET.to_string(), None).await
     };
     assert!(r1.is_ok(), "首次 add 应成功: {:?}", r1.err());
 
     // "重启"：新 session（同 save_path）重新 add
-    let bt2 = smart_dl_daemon::bt::BtEngine::new(dir.path(), None, 0, 0).unwrap();
+    let bt2 = smart_dl_daemon::bt::BtEngine::new(dir.path(), None, 0, 0, false, false, false).unwrap();
     let state2 = DaemonState::new(Arc::new(http), vec![]).with_bt(Arc::new(bt2));
     let r2 = state2.add_link_task(MAGNET.to_string(), None).await;
     assert!(

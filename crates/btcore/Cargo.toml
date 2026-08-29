@@ -8,6 +8,15 @@ build = "build.rs"
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+async-trait = { workspace = true }
+smart-dl-core = { path = "../core" }
+fs2 = { workspace = true }
+
+# Xunlei BT 引擎（Windows-only，免登录匿名模式）。
+xunlei-ffi = { path = "../../crates/xunlei-ffi", optional = true }
 
 [build-dependencies]
 bindgen = "0.71"
+
+[features]
+xunlei = ["dep:xunlei-ffi"]

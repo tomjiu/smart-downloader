@@ -81,6 +81,39 @@ impl CliClient {
                 self.check(resp, json).await?;
                 Ok(())
             }
+            #[cfg(feature = "xunlei-import")]
+            CliCommand::ImportXunlei {
+                torrent,
+                cfg,
+                xltds,
+                dest,
+            } => {
+                use base64::Engine;
+                let mut xltd_b64s = Vec::with_capacity(xltds.len());
+                for xltd in xltds {
+                    let data = std::fs::read(xltd)
+                        .map_err(|e| CliError::Http(format!("读取 xltd 失败: {e}")))?;
+                    xltd_b64s.push(base64::engine::general_purpose::STANDARD.encode(data));
+                }
+                let body = serde_json::json!({
+                    "torrent_b64": base64::engine::general_purpose::STANDARD.encode(std::fs::read(torrent).map_err(|e| CliError::Http(format!("读取 torrent 失败: {e}")))?),
+                    "cfg_b64": base64::engine::general_purpose::STANDARD.encode(std::fs::read(cfg).map_err(|e| CliError::Http(format!("读取 cfg 失败: {e}")))?),
+                    "xltd_b64s": xltd_b64s,
+                    "dest": dest,
+                });
+                let resp = self
+                    .client
+                    .post(format!("{}/tasks/xunlei-import", self.base))
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| CliError::Http(e.to_string()))?;
+                self.check(resp, json).await?;
+                if !json {
+                    println!("迅雷任务已导入（结果见上，或 --json 查看 task_id）");
+                }
+                Ok(())
+            }
         }
     }
 

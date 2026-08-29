@@ -12,9 +12,13 @@ pub mod engine;
 pub mod ffi;
 pub mod resume;
 pub mod xudt;
+#[cfg(feature = "xunlei")]
+pub mod xunlei_engine;
 
 pub use alerts::{Alert, AlertKind, StateSubKind};
 pub use bare::Bare;
 pub use engine::{peer_flags, BtCore, PeerInfo, TorrentStatus};
 pub use ffi::{Error, Result};
 pub use resume::ResumeBytes;
+#[cfg(feature = "xunlei")]
+pub use xunlei_engine::XunleiBtEngine;

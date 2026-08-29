@@ -1,0 +1,2 @@
+[*] WriteFile hooked; capturing (daemon makes API calls after init)
+[*] capture window done; total unique non-id tokens: 0

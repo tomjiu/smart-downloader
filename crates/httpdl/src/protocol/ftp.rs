@@ -1,5 +1,5 @@
 //! FTP 协议子集（M4c，feature=`ftp`，设计 §15）：
-//! 被动模式（PASV）、REST 断点续传（.part）、421 退避重试；
+//! 被动模式（PASV）、REST 断点续传（.part）、421 退避重试、目录下载（LIST 单层）；
 //! 不支持 SFTP/FTPS 隐式/目录递归/FXP。
 
 use crate::retry::Backoff;
@@ -8,7 +8,7 @@ use smart_dl_core::session::output::OutputManager;
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
     Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
-    EngineTaskId, PeerInfo,
+    EngineTaskId, FileProgress, PeerInfo,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -20,17 +20,40 @@ use tokio::net::TcpStream;
 /// 421/连接失败重试次数（连接层退避）。
 const CONNECT_ATTEMPTS: u32 = 4;
 
+/// FTP URL 目标：单文件或目录。
+#[derive(Debug, PartialEq, Eq)]
+enum FtpTarget {
+    /// 远端普通文件（绝对路径，不以 `/` 结尾）。
+    File(String),
+    /// 远端目录（绝对路径，以 `/` 结尾；根目录为 `/`）。
+    Dir(String),
+}
+
+/// 目录任务的单文件条目（远端路径 + 进度/状态）。
+struct FtpFile {
+    /// 文件名（相对目录，即落盘相对路径）。
+    name: String,
+    /// 远端绝对路径（`<目录>/<文件名>`）。
+    path: String,
+    size: u64,
+    done: u64,
+    state: EngineState,
+}
+
 struct FtpTask {
     host: String,
     port: u16,
     user: String,
     pass: String,
     path: String,
+    /// 单文件任务：目标文件路径；目录任务：目标目录路径。
     dest: PathBuf,
     total: u64,
     state: EngineState,
     done: u64,
     error: Option<String>,
+    /// 目录任务的文件级进度（单文件任务为空）。
+    files: Vec<FtpFile>,
 }
 
 struct EngineInner {
@@ -58,6 +81,108 @@ impl FtpEngine {
             }),
         }
     }
+
+    /// 目录分支：LIST 探测（421 → 退避重试）→ 解析文件列表 → 建任务 → spawn 目录循环。
+    /// 落位 `dest_root/<目录名>/<文件名>`；目录名取 URL 路径最后一段非空名称（根目录 → host）。
+    async fn add_directory(
+        &self,
+        task: &DownloadTask,
+        host: String,
+        port: u16,
+        user: String,
+        pass: String,
+        path: String,
+    ) -> Result<EngineTaskId, EngineError> {
+        // LIST 探测：连接 + 登录 + PASV + LIST（421 → 退避重试）
+        let listing = {
+            let mut last = String::new();
+            let mut listing: Option<String> = None;
+            for attempt in 1..=CONNECT_ATTEMPTS {
+                match probe_list(&host, port, &user, &pass, &path).await {
+                    Ok(text) => {
+                        listing = Some(text);
+                        break;
+                    }
+                    Err(e) => {
+                        last = e;
+                        if attempt < CONNECT_ATTEMPTS && !is_terminal(&last) {
+                            tokio::time::sleep(self.backoff.next_delay(attempt)).await;
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+            match listing {
+                Some(t) => t,
+                None => return Err(EngineError::Other(format!("ftp list failed: {last}"))),
+            }
+        };
+        let entries = parse_list_listing(&listing);
+        if entries.is_empty() {
+            return Err(EngineError::Other("ftp directory is empty".to_string()));
+        }
+
+        // 落位目录：dest_root/<目录名>（URL 最后一段非空名称；根目录 → host）
+        let dir_name = dir_name_of(&path, &host);
+        let dest_dir = task.dest_root.join(&dir_name);
+        std::fs::create_dir_all(&dest_dir)
+            .map_err(|e| EngineError::Other(format!("mkdir {}: {e}", dest_dir.display())))?;
+
+        // 文件条目：远端路径 + .part 续传起点（超长作废）
+        let dir_prefix = path.trim_end_matches('/').to_string();
+        let mut files = Vec::new();
+        let mut total = 0u64;
+        let mut done = 0u64;
+        for e in entries {
+            let fpath = format!("{}/{}", dir_prefix, e.name);
+            let dest = dest_dir.join(&e.name);
+            let part = part_path_of(&dest);
+            if let Ok(md) = std::fs::metadata(&part) {
+                if md.len() > e.size {
+                    let _ = std::fs::remove_file(&part);
+                }
+            }
+            let d = part_done(&part);
+            total += e.size;
+            done += d;
+            files.push(FtpFile {
+                name: e.name,
+                path: fpath,
+                size: e.size,
+                done: d,
+                state: EngineState::MetadataPending,
+            });
+        }
+
+        let tid = task.id.clone();
+        {
+            let mut tasks = self.inner.tasks.lock().unwrap();
+            tasks.insert(
+                tid.clone(),
+                FtpTask {
+                    host,
+                    port,
+                    user,
+                    pass,
+                    path,
+                    dest: dest_dir,
+                    total,
+                    state: EngineState::Downloading,
+                    done,
+                    error: None,
+                    files,
+                },
+            );
+        }
+        let inner = self.inner.clone();
+        let backoff = self.backoff;
+        let spawn_tid = tid.clone();
+        tokio::spawn(async move {
+            download_dir_loop(inner, spawn_tid, backoff).await;
+        });
+        Ok(tid)
+    }
 }
 
 impl Default for FtpEngine {
@@ -66,14 +191,15 @@ impl Default for FtpEngine {
     }
 }
 
-/// 解析 `ftp://[user:pass@]host[:port]/path`。目录（空路径或以 / 结尾）→ None。
-fn parse_ftp_url(url: &str) -> Option<(String, u16, String)> {
+/// 解析 `ftp://[user:pass@]host[:port]/path`。
+/// 目录（空路径或以 `/` 结尾）→ `FtpTarget::Dir`；否则 `FtpTarget::File`。
+fn parse_ftp_url(url: &str) -> Option<(String, u16, FtpTarget)> {
     let rest = url.strip_prefix("ftp://")?;
-    let (auth_host, path) = rest.split_once('/')?;
-    let path = format!("/{path}");
-    if path == "/" || path.ends_with('/') {
-        return None; // 目录（v1 不支持）
-    }
+    // 无 `/` → 空路径（根目录）
+    let (auth_host, raw_path) = match rest.split_once('/') {
+        Some((ah, p)) => (ah, p),
+        None => (rest, ""),
+    };
     let host_port = auth_host
         .rsplit_once('@')
         .map(|(_, hp)| hp)
@@ -85,7 +211,87 @@ fn parse_ftp_url(url: &str) -> Option<(String, u16, String)> {
     if host.is_empty() {
         return None;
     }
-    Some((host, port, path))
+    let path = format!("/{raw_path}");
+    let target = if path.ends_with('/') {
+        FtpTarget::Dir(path)
+    } else {
+        FtpTarget::File(path)
+    };
+    Some((host, port, target))
+}
+
+/// 目录条目（LIST 解析结果：普通文件）。
+#[derive(Debug, PartialEq, Eq)]
+struct DirEntry {
+    name: String,
+    size: u64,
+}
+
+/// 解析 UNIX `ls -l` 风格 LIST 响应 → 普通文件列表（独立纯函数，便于单测）。
+/// 容错：`total N` 头、空行、多空格分隔、字段不足/大小非数字的异常行；
+/// 过滤子目录（权限位 `d`）与符号链接等非普通文件行、`.`/`..` 及含路径分隔符的名字（防穿越）。
+fn parse_list_listing(text: &str) -> Vec<DirEntry> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // `total N` 头（部分服务器输出）
+        if fields.first() == Some(&"total") {
+            continue;
+        }
+        // 标准 9 字段：perm links owner group size month day time name...
+        if fields.len() < 9 {
+            continue;
+        }
+        // 只收普通文件（`-` 开头）；目录 `d`/链接 `l`/设备等跳过
+        if !fields[0].starts_with('-') {
+            continue;
+        }
+        let size = match fields[4].parse::<u64>() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // 文件名 = 第 9 字段起（名字可含空格）
+        let name = fields[8..].join(" ");
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+        {
+            continue;
+        }
+        out.push(DirEntry { name, size });
+    }
+    out
+}
+
+/// 落盘名净化：Windows 非法字符替换为 `_`（防穿越/防盘符语义）。
+fn sanitize_name(name: &str) -> String {
+    name.chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            _ => c,
+        })
+        .collect()
+}
+
+/// 目录落位名：URL 路径最后一段非空名称；根目录（无名称）→ host。
+fn dir_name_of(dir_path: &str, host: &str) -> String {
+    let last = dir_path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("");
+    let name = sanitize_name(last);
+    if name.is_empty() || name == "." || name == ".." {
+        sanitize_name(host)
+    } else {
+        name
+    }
 }
 
 /// 控制连接会话（单命令/响应流）。
@@ -224,9 +430,65 @@ async fn download_segment(
     Ok(())
 }
 
-/// 下载循环：串行段下载；连接失败/421 → 退避重试；段终态失败 → Error。
+/// 单文件下载核心（单文件/目录任务共用）：串行段下载 + 退避重试 + .part 落位。
 /// 续传：.part 存在（>0 且 < total）→ 单段 REST 从 part 大小续到文件尾；
-/// 无 .part（或已满）→ 正常分块下载。
+/// 无 .part（或已满）→ 正常分块下载。每段完成经 `on_progress(len)` 上报增量。
+async fn download_file<F: Fn(u64)>(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+    path: &str,
+    dest: &Path,
+    total: u64,
+    backoff: Backoff,
+    on_progress: F,
+) -> Result<(), String> {
+    let part = part_path_of(dest);
+    let part_done = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    let segments = if part_done > 0 && part_done < total {
+        // .part 续传：从偏移续到文件尾（单段）
+        vec![crate::static_split::Segment {
+            start: part_done,
+            end: total - 1,
+        }]
+    } else {
+        plan_segments(total)
+    };
+
+    // 预分配 .part
+    std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&part)
+        .map_err(|e| format!("part open: {e}"))?
+        .set_len(total)
+        .map_err(|e| format!("part open: {e}"))?;
+
+    for seg in segments {
+        for attempt in 1..=CONNECT_ATTEMPTS {
+            match download_segment(host, port, user, pass, path, seg, &part).await {
+                Ok(()) => break,
+                Err(e) => {
+                    // 连接层失败（421/IO）→ 退避重试；550 等终态 → 直接失败
+                    if attempt < CONNECT_ATTEMPTS && !is_terminal(&e) {
+                        tokio::time::sleep(backoff.next_delay(attempt)).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        // 进度：段完成
+        on_progress(seg.len());
+    }
+
+    // 全部段完成 → 落位
+    finalize_part(&part, dest, total)
+}
+
+/// 单文件任务的下载循环：download_file 包装 + 任务状态落定。
 async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Backoff) {
     let (host, port, user, pass, path, dest, total) = {
         let tasks = inner.tasks.lock().unwrap();
@@ -241,69 +503,94 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
             t.total,
         )
     };
-    let part = part_path_of(&dest);
-    let part_done = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-    let segments = if part_done > 0 && part_done < total {
-        // .part 续传：从偏移续到文件尾（单段）
-        vec![crate::static_split::Segment {
-            start: part_done,
-            end: total - 1,
-        }]
-    } else {
-        plan_segments(total)
-    };
-
-    // 预分配 .part
-    if let Err(e) = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&part)
-        .map(|f| f.set_len(total))
-    {
-        finish(
-            &inner,
-            &tid,
-            EngineState::Error,
-            Some(format!("part open: {e}")),
-        );
-        return;
-    }
-
-    for seg in segments {
-        let mut ok = false;
-        for attempt in 1..=CONNECT_ATTEMPTS {
-            match download_segment(&host, port, &user, &pass, &path, seg, &part).await {
-                Ok(()) => {
-                    ok = true;
-                    break;
-                }
-                Err(e) => {
-                    // 连接层失败（421/IO）→ 退避重试；550 等终态 → 直接失败
-                    if attempt < CONNECT_ATTEMPTS && !is_terminal(&e) {
-                        tokio::time::sleep(backoff.next_delay(attempt)).await;
-                        continue;
-                    }
-                    finish(&inner, &tid, EngineState::Error, Some(e));
-                    return;
-                }
-            }
+    let inner2 = inner.clone();
+    let tid2 = tid.clone();
+    let r = download_file(&host, port, &user, &pass, &path, &dest, total, backoff, move |n| {
+        let mut tasks = inner2.tasks.lock().unwrap();
+        if let Some(t) = tasks.get_mut(&tid2) {
+            t.done += n;
         }
-        if !ok {
-            return;
-        }
-        // 进度：段完成
-        let mut tasks = inner.tasks.lock().unwrap();
-        if let Some(t) = tasks.get_mut(&tid) {
-            t.done += seg.len();
-        }
-        drop(tasks);
-    }
-
-    // 全部段完成 → 落位
-    match finalize_part(&part, &dest, total) {
+    })
+    .await;
+    match r {
         Ok(()) => finish(&inner, &tid, EngineState::Completed, None),
         Err(e) => finish(&inner, &tid, EngineState::Error, Some(e)),
+    }
+}
+
+/// 目录任务下载循环：逐文件串行 download_file，落位 `<dest>/<文件名>`；
+/// 任一文件终态失败 → 整任务 Error（错误消息带文件名）。
+async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Backoff) {
+    let (host, port, user, pass, dir_dest, files) = {
+        let tasks = inner.tasks.lock().unwrap();
+        let t = tasks.get(&tid).unwrap();
+        (
+            t.host.clone(),
+            t.port,
+            t.user.clone(),
+            t.pass.clone(),
+            t.dest.clone(),
+            t.files
+                .iter()
+                .map(|f| (f.name.clone(), f.path.clone(), f.size))
+                .collect::<Vec<_>>(),
+        )
+    };
+    // add 时已建目录；此处幂等兜底（目录被外部删除的场景）
+    if let Err(e) = std::fs::create_dir_all(&dir_dest) {
+        finish(&inner, &tid, EngineState::Error, Some(format!("mkdir: {e}")));
+        return;
+    }
+    for (name, fpath, size) in files {
+        let dest = dir_dest.join(&name);
+        set_file_state(&inner, &tid, &name, EngineState::Downloading);
+        let inner2 = inner.clone();
+        let tid2 = tid.clone();
+        let name2 = name.clone();
+        let r = download_file(
+            &host,
+            port,
+            &user,
+            &pass,
+            &fpath,
+            &dest,
+            size,
+            backoff,
+            move |n| {
+                let mut tasks = inner2.tasks.lock().unwrap();
+                if let Some(t) = tasks.get_mut(&tid2) {
+                    t.done += n;
+                    if let Some(f) = t.files.iter_mut().find(|f| f.name == name2) {
+                        f.done += n;
+                    }
+                }
+            },
+        )
+        .await;
+        match r {
+            Ok(()) => set_file_state(&inner, &tid, &name, EngineState::Completed),
+            Err(e) => {
+                set_file_state(&inner, &tid, &name, EngineState::Error);
+                finish(
+                    &inner,
+                    &tid,
+                    EngineState::Error,
+                    Some(format!("{name}: {e}")),
+                );
+                return;
+            }
+        }
+    }
+    finish(&inner, &tid, EngineState::Completed, None);
+}
+
+/// 更新目录任务中某文件的状态。
+fn set_file_state(inner: &Arc<EngineInner>, tid: &str, name: &str, state: EngineState) {
+    let mut tasks = inner.tasks.lock().unwrap();
+    if let Some(t) = tasks.get_mut(tid) {
+        if let Some(f) = t.files.iter_mut().find(|f| f.name == name) {
+            f.state = state;
+        }
     }
 }
 
@@ -330,6 +617,11 @@ fn finish(inner: &Arc<EngineInner>, tid: &str, state: EngineState, error: Option
         t.error = error;
         if state == EngineState::Completed {
             t.done = t.total;
+            // 目录任务：逐文件推进到完成态
+            for f in t.files.iter_mut() {
+                f.done = f.size;
+                f.state = EngineState::Completed;
+            }
         }
     }
 }
@@ -353,76 +645,85 @@ impl DownloadEngine for FtpEngine {
             DownloadSource::Ftp { url, user, pass } => (url.clone(), user.clone(), pass.clone()),
             _ => return Err(EngineError::Other("source is not ftp".to_string())),
         };
-        let (host, port, path) = parse_ftp_url(&url).ok_or_else(|| {
-            EngineError::Other("invalid ftp url or directory (v1 unsupported)".to_string())
-        })?;
+        let (host, port, target) =
+            parse_ftp_url(&url).ok_or_else(|| EngineError::Other("invalid ftp url".to_string()))?;
 
-        // 探测：连接 + 登录 + SIZE（421 → 退避重试）
-        let total = {
-            let mut last = String::new();
-            let mut size: Option<u64> = None;
-            for attempt in 1..=CONNECT_ATTEMPTS {
-                match probe_size(&host, port, &user, &pass, &path).await {
-                    Ok(t) => {
-                        size = Some(t);
-                        break;
-                    }
-                    Err(e) => {
-                        last = e;
-                        if attempt < CONNECT_ATTEMPTS && !is_terminal(&last) {
-                            tokio::time::sleep(self.backoff.next_delay(attempt)).await;
-                            continue;
+        match target {
+            // 目录分支：LIST 探测 → 逐文件条目 → 目录下载循环
+            FtpTarget::Dir(path) => {
+                self.add_directory(task, host, port, user, pass, path)
+                    .await
+            }
+            FtpTarget::File(path) => {
+                // 探测：连接 + 登录 + SIZE（421 → 退避重试）
+                let total = {
+                    let mut last = String::new();
+                    let mut size: Option<u64> = None;
+                    for attempt in 1..=CONNECT_ATTEMPTS {
+                        match probe_size(&host, port, &user, &pass, &path).await {
+                            Ok(t) => {
+                                size = Some(t);
+                                break;
+                            }
+                            Err(e) => {
+                                last = e;
+                                if attempt < CONNECT_ATTEMPTS && !is_terminal(&last) {
+                                    tokio::time::sleep(self.backoff.next_delay(attempt)).await;
+                                    continue;
+                                }
+                                break;
+                            }
                         }
-                        break;
+                    }
+                    match size {
+                        Some(t) => t,
+                        None => return Err(EngineError::Other(format!("ftp probe failed: {last}"))),
+                    }
+                };
+
+                let rel = task
+                    .metadata
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "download.bin".to_string());
+                let dest = task.dest_root.join(&rel);
+                // .part 超长（源变小）→ 作废
+                let part = part_path_of(&dest);
+                if let Ok(md) = std::fs::metadata(&part) {
+                    if md.len() > total {
+                        let _ = std::fs::remove_file(&part);
                     }
                 }
-            }
-            match size {
-                Some(t) => t,
-                None => return Err(EngineError::Other(format!("ftp probe failed: {last}"))),
-            }
-        };
 
-        let rel = task
-            .metadata
-            .name
-            .clone()
-            .unwrap_or_else(|| "download.bin".to_string());
-        let dest = task.dest_root.join(&rel);
-        // .part 超长（源变小）→ 作废
-        let part = part_path_of(&dest);
-        if let Ok(md) = std::fs::metadata(&part) {
-            if md.len() > total {
-                let _ = std::fs::remove_file(&part);
+                let tid = task.id.clone();
+                {
+                    let mut tasks = self.inner.tasks.lock().unwrap();
+                    tasks.insert(
+                        tid.clone(),
+                        FtpTask {
+                            host,
+                            port,
+                            user,
+                            pass,
+                            path,
+                            dest,
+                            total,
+                            state: EngineState::Downloading,
+                            done: part_done(&part),
+                            error: None,
+                            files: vec![],
+                        },
+                    );
+                }
+                let inner = self.inner.clone();
+                let backoff = self.backoff;
+                let spawn_tid = tid.clone();
+                tokio::spawn(async move {
+                    download_loop(inner, spawn_tid, backoff).await;
+                });
+                Ok(tid)
             }
         }
-
-        let tid = task.id.clone();
-        {
-            let mut tasks = self.inner.tasks.lock().unwrap();
-            tasks.insert(
-                tid.clone(),
-                FtpTask {
-                    host,
-                    port,
-                    user,
-                    pass,
-                    path,
-                    dest,
-                    total,
-                    state: EngineState::Downloading,
-                    done: part_done(&part),
-                    error: None,
-                },
-            );
-        }
-        let inner = self.inner.clone();
-        let backoff = self.backoff;
-        let spawn_tid = tid.clone();
-        tokio::spawn(async move {
-            download_loop(inner, spawn_tid, backoff).await;
-        });
-        Ok(tid)
     }
 
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError> {
@@ -442,10 +743,20 @@ impl DownloadEngine for FtpEngine {
     async fn status(&self, id: &EngineTaskId) -> Result<EngineStatus, EngineError> {
         let tasks = self.inner.tasks.lock().unwrap();
         let t = tasks.get(id).ok_or(EngineError::NotFound)?;
+        // 目录任务 → 文件级进度（FileProgress）；单文件任务 → 空（保持既有行为）
+        let files = t
+            .files
+            .iter()
+            .map(|f| FileProgress {
+                rel_path: f.name.clone(),
+                done: f.done,
+                size: f.size,
+            })
+            .collect();
         Ok(EngineStatus {
             state: t.state,
             metadata_received: true,
-            files: vec![],
+            files,
             total_done: t.done,
             total: t.total,
             down_rate: 0,
@@ -505,4 +816,105 @@ async fn probe_size(
 /// 现有 .part 已下载字节数（续传起点）。
 fn part_done(part: &Path) -> u64 {
     std::fs::metadata(part).map(|m| m.len()).unwrap_or(0)
+}
+
+/// 探测目录列表：连接 + 登录 + PASV + LIST → 目录文本（数据连接读到 EOF）。
+async fn probe_list(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+    path: &str,
+) -> Result<String, String> {
+    let mut s = FtpSession::connect(host, port).await?;
+    s.login(user, pass).await?;
+    let data_addr = s.pasv().await?;
+    // LIST 必须是 1xx 中间响应（150/125）；550 等错误直接终态失败
+    let resp = s.cmd(&format!("LIST {path}")).await?;
+    if !resp.starts_with('1') {
+        return Err(resp);
+    }
+    let mut data = TcpStream::connect(data_addr)
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut bytes = Vec::new();
+    data.read_to_end(&mut bytes)
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = read_response(&mut s.reader).await; // 226
+    s.quit().await;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// LIST 解析：两个文件行 + `total` 头 + 子目录被过滤 + 多空格分隔。
+    #[test]
+    fn parse_list_listing_two_files_and_subdir_filtered() {
+        let text = "total 8\r\n\
+                    -rw-r--r--  1 owner  group      1024 Jan 01 12:00 a.bin\r\n\
+                    drwxr-xr-x  2 owner  group      4096 Jan 01 12:00 subdir\r\n\
+                    -rw-r--r--  1 owner    group     4096 Jan 01 12:00 b.bin\r\n";
+        assert_eq!(
+            parse_list_listing(text),
+            vec![
+                DirEntry {
+                    name: "a.bin".to_string(),
+                    size: 1024
+                },
+                DirEntry {
+                    name: "b.bin".to_string(),
+                    size: 4096
+                },
+            ]
+        );
+    }
+
+    /// LIST 解析容错：空行/字段不足/大小非数字/符号链接被跳过；含空格文件名保留。
+    #[test]
+    fn parse_list_listing_tolerates_malformed_lines() {
+        let text = "\r\n\
+                    total 12\r\n\
+                    garbage line\r\n\
+                    -rw-r--r-- 1 owner group abc Jan 01 12:00 badsize.bin\r\n\
+                    lrwxrwxrwx 1 owner group 5 Jan 01 12:00 link.bin\r\n\
+                    -rw-r--r-- 1 owner group 7 Jan 01 12:00 with space.bin\r\n\
+                    -rw-r--r-- 1 owner group 3 Jan 01 12:00 ..\r\n";
+        let files = parse_list_listing(text);
+        assert_eq!(files.len(), 1, "只应保留 1 个普通文件: {files:?}");
+        assert_eq!(files[0].name, "with space.bin");
+        assert_eq!(files[0].size, 7);
+    }
+
+    /// 目录识别：以 `/` 结尾或空路径 → Dir；否则 File；非法 URL → None。
+    #[test]
+    fn parse_ftp_url_distinguishes_file_and_dir() {
+        let (h, p, t) = parse_ftp_url("ftp://u:p@host:2121/pub/dir/").unwrap();
+        assert_eq!((h.as_str(), p), ("host", 2121));
+        assert_eq!(t, FtpTarget::Dir("/pub/dir/".to_string()));
+
+        let (_, _, t) = parse_ftp_url("ftp://host/").unwrap();
+        assert_eq!(t, FtpTarget::Dir("/".to_string()));
+
+        // 无路径（空路径）→ 根目录
+        let (_, _, t) = parse_ftp_url("ftp://host").unwrap();
+        assert_eq!(t, FtpTarget::Dir("/".to_string()));
+
+        let (h, p, t) = parse_ftp_url("ftp://host/file.bin").unwrap();
+        assert_eq!((h.as_str(), p), ("host", 21));
+        assert_eq!(t, FtpTarget::File("/file.bin".to_string()));
+
+        assert!(parse_ftp_url("http://host/x").is_none());
+        assert!(parse_ftp_url("ftp://").is_none());
+    }
+
+    /// 目录落位名：最后一段非空名称；根目录 → host（含端口净化）。
+    #[test]
+    fn dir_name_of_last_segment_or_host() {
+        assert_eq!(dir_name_of("/pub/files/", "h"), "files");
+        assert_eq!(dir_name_of("/", "127.0.0.1:2121"), "127.0.0.1_2121");
+        assert_eq!(dir_name_of("/..", "h"), "h");
+    }
 }

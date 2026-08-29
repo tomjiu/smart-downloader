@@ -7,6 +7,15 @@ edition.workspace = true
 # magnet/.torrent → libtorrent 薄核（smart-dl-btcore）。默认关：CI 基线不链接
 # libtorrent；本机有 LT 链接环境时启用（cargo build -p smart-dl-daemon --features bt）。
 bt = ["dep:smart-dl-btcore"]
+# 迅雷 SDK BT 引擎（Windows-only，免登录匿名模式）。
+xunlei = ["smart-dl-btcore/xunlei"]
+# 迅雷 BT 任务导入（xlbt.cfg + .bt.xltd + .torrent → fastresume）。
+xunlei-import = ["dep:xunlei-convert", "bt"]
+# F5 P2SP：云盘直链 web seed 注入（POST /tasks/:id/webseeds）。e2e 测试门控，
+# 隐含 bt（验收命令 `--features bt webseed` 对空格分隔/测试名过滤两种解析均兼容）。
+webseed = ["bt"]
+# FTP 引擎（D12：并入 httpdl，feature-gated）。
+ftp = ["smart-dl-httpdl/ftp"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -27,6 +36,8 @@ smart-dl-core = { path = "../core" }
 smart-dl-httpdl = { path = "../httpdl" }
 smart-dl-provider = { path = "../provider" }
 smart-dl-btcore = { path = "../btcore", optional = true }
+xunlei-convert = { path = "../xunlei-convert", optional = true }
+anyhow = "1"
 
 [dev-dependencies]
 tempfile = "3"

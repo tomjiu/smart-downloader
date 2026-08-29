@@ -14,6 +14,9 @@ struct MockTask {
     status_calls: u32,
     /// 第几次 submit（1=首次，≥2=resubmit）。
     submit_seq: u32,
+    /// 延迟 Ready 截止时刻（submit 时刻 + ready_delay；None = 旧行为自动推进）。
+    /// Bug B 复现能力：模拟真实云盘「离线下载数分钟」的协调器等待窗。
+    ready_at: Option<std::time::Instant>,
 }
 
 struct MockState {
@@ -34,6 +37,9 @@ struct MockState {
     refreshed: bool,
     /// 下一次 submit 直接 Failed（fail_next_submits 注入）。
     fail_next: bool,
+    /// 延迟 Ready 时长（>0 时 submit 后该时长内 status=Downloading，到期 Ready；
+    /// 0 = 旧行为：status_calls 自动推进）。Bug B 复现能力，缺省 0 不影响既有测试。
+    ready_delay: std::time::Duration,
     next_id: u64,
     tasks: HashMap<ProviderTaskId, MockTask>,
 }
@@ -62,6 +68,7 @@ impl MockProvider {
                 update_urls: None,
                 refreshed: false,
                 fail_next: false,
+                ready_delay: ready_delay_from_env(),
                 next_id: 1,
                 tasks: HashMap::new(),
             })),
@@ -90,6 +97,15 @@ impl MockProvider {
 
     pub fn with_concurrency(self, n: u32) -> Self {
         self.state.lock().unwrap().concurrency_limit = n;
+        self
+    }
+
+    /// 延迟 Ready：submit 后 `secs` 秒内 status=Downloading，到期 Ready。
+    /// 0 = 旧行为（status_calls 自动推进 Queued→Downloading→Ready）。
+    /// Bug B 免配额复现钥匙：用慢速 Mock 拉开协调器 poll_ready 等待窗，
+    /// 等效真实云盘「离线下载数分钟」，不消耗账号配额。
+    pub fn with_ready_delay_secs(self, secs: u64) -> Self {
+        self.state.lock().unwrap().ready_delay = std::time::Duration::from_secs(secs);
         self
     }
 
@@ -187,12 +203,22 @@ impl crate::RemoteProvider for MockProvider {
         } else {
             ProviderStatus::Queued
         };
+        if initial == ProviderStatus::Failed {
+            st.backoff_until = Some(crate::types::now_unix() + 60);
+        }
+        let ready_at = if matches!(initial, ProviderStatus::Failed) {
+            None
+        } else {
+            (st.ready_delay.as_secs() > 0)
+                .then(|| std::time::Instant::now() + st.ready_delay)
+        };
         st.tasks.insert(
             id.clone(),
             MockTask {
                 status: initial,
                 status_calls: 0,
                 submit_seq: seq,
+                ready_at,
             },
         );
         Ok(id)
@@ -206,12 +232,22 @@ impl crate::RemoteProvider for MockProvider {
         if t.status == ProviderStatus::Failed {
             return Ok(ProviderStatus::Failed);
         }
+        // 延迟 Ready 窗：到期前恒 Downloading，到期 Ready（Bug B 复现能力）。
+        // 不走 status_calls 自动推进，保证长等待窗内判定稳定不翻转。
+        if let Some(ra) = t.ready_at {
+            if std::time::Instant::now() < ra {
+                t.status = ProviderStatus::Downloading;
+                return Ok(t.status.clone());
+            }
+            t.status = ProviderStatus::Ready;
+            return Ok(t.status.clone());
+        }
         t.status = match t.status_calls {
             1 => ProviderStatus::Queued,
             2 => ProviderStatus::Downloading,
             _ => ProviderStatus::Ready,
         };
-        Ok(t.status)
+        Ok(t.status.clone())
     }
 
     async fn resolve(&self, id: &ProviderTaskId) -> Result<Vec<ResolvedRemoteFile>, ProviderError> {
@@ -259,4 +295,82 @@ impl crate::RemoteProvider for MockProvider {
 /// 供 coordinator 区分"直链是否失效"的便捷判定（mock 也可用）。
 pub(crate) fn any_expired(files: &[ResolvedRemoteFile], now: u64) -> bool {
     files.iter().any(|f| link_expired(f, now))
+}
+
+/// 解析 `SMARTDL_MOCK_READY_DELAY_SECS`（Bug B 复现环境变量）：非负整数秒；
+/// 缺失/非法 → 0（旧行为：秒级 Ready）。独立纯函数便于单测（避免测试进程
+/// 内改环境变量的并行竞态）。
+pub fn parse_ready_delay_secs(raw: Option<&str>) -> u64 {
+    raw.and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// 从进程环境读取延迟 Ready 秒数（MockProvider::new 装配时调用一次）。
+fn ready_delay_from_env() -> std::time::Duration {
+    let v = std::env::var("SMARTDL_MOCK_READY_DELAY_SECS").ok();
+    std::time::Duration::from_secs(parse_ready_delay_secs(v.as_deref()))
+}
+
+#[cfg(test)]
+mod ready_delay_tests {
+    use super::*;
+    use crate::RemoteProvider;
+
+    #[test]
+    fn parse_ready_delay_env_semantics() {
+        assert_eq!(parse_ready_delay_secs(None), 0, "缺省 = 0 = 旧行为");
+        assert_eq!(parse_ready_delay_secs(Some("")), 0, "空串 = 旧行为");
+        assert_eq!(parse_ready_delay_secs(Some("abc")), 0, "非法 = 旧行为");
+        assert_eq!(parse_ready_delay_secs(Some("-5")), 0, "负数 = 旧行为");
+        assert_eq!(parse_ready_delay_secs(Some("0")), 0, "显式 0 = 旧行为");
+        assert_eq!(parse_ready_delay_secs(Some("240")), 240);
+        assert_eq!(parse_ready_delay_secs(Some(" 30 ")), 30, "容忍空白");
+    }
+
+    #[tokio::test]
+    async fn zero_delay_keeps_legacy_autopromote() {
+        // with_ready_delay_secs(0) 显式等价缺省：status_calls 自动推进不变
+        let mp = crate::mock::MockProvider::new("m").with_ready_delay_secs(0);
+        use crate::types::ProviderStatus;
+        let id = mp
+            .submit(&smart_dl_core::types::DownloadSource::Http {
+                url: "https://example.com/a".into(),
+                headers: vec![],
+                auth: None,
+                backup_url: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(mp.status(&id).await.unwrap(), ProviderStatus::Queued);
+        assert_eq!(mp.status(&id).await.unwrap(), ProviderStatus::Downloading);
+        assert_eq!(mp.status(&id).await.unwrap(), ProviderStatus::Ready);
+    }
+
+    #[tokio::test]
+    async fn delayed_ready_holds_downloading_until_deadline() {
+        let mp = crate::mock::MockProvider::new("m").with_ready_delay_secs(1);
+        use crate::types::ProviderStatus;
+        let id = mp
+            .submit(&smart_dl_core::types::DownloadSource::Http {
+                url: "https://example.com/b".into(),
+                headers: vec![],
+                auth: None,
+                backup_url: None,
+            })
+            .await
+            .unwrap();
+        // 窗内多次判定恒 Downloading（不随调用次数翻转）
+        for _ in 0..3 {
+            assert_eq!(
+                mp.status(&id).await.unwrap(),
+                ProviderStatus::Downloading,
+                "延迟窗内应稳定 Downloading"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        // 到期 → Ready，且 resolve 放行
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        assert_eq!(mp.status(&id).await.unwrap(), ProviderStatus::Ready);
+        assert!(mp.resolve(&id).await.is_ok(), "到期后 resolve 应可用");
+    }
 }

@@ -1,13 +1,34 @@
 # P2P 网络接入进展报告 v3
 
 > **更新**: 2026-08-17
-> **状态**: 仍在逆向,PHub HTTP body 加密格式未完全破解
+> **状态**: PHub HTTP body 加密格式已澄清（v2 MD5 公式仅适用于 XUDT/legacy；PHub 生产路径为 RSA-wrapped random AES key）
+
+---
+
+## 勘误（2026-08-27）
+
+**v2 结论已局部作废**：本报告曾将 PHub HTTP body 加密描述为
+`AES-ECB(MD5(cmd+seq), body)`（13 字节头 + 从包头派生 key）。
+该公式**仅对 XUDT/legacy 路径成立**（见 `scripts/research/cloud_delivery/phub_line/XUDT_KEY_DERIVATION_SOLVED.md`）。
+
+**PHub/SHub 生产路径正确模型**（v3 spec，已用真实样本验证）：
+```
+8 字节头 (cmd_id + flag + seq_no)
++ 4 字节 ekey_size (RSA-1024 = 128)
++ 128 字节 RSA-1024 密文 (包装随机 16B AES key)
++ 4 字节 aes_body_size
++ N 字节 AES-128-ECB 密文 (PKCS7)
+```
+- AES key = `XPF_RandomBytes(16)`，每请求随机
+- RSA 公钥为编译期常量，服务端持私钥解出 AES key
+- 离线密钥派生（MD5/seq）**不可能**；必须 Frida hook `XPF_RandomBytes` 或 `XPF_AESCreateEncryptContext` 才能拿到 key
+- 规范文档：`scripts/research/cloud_delivery/v3/PHUB_PROTOCOL_SPEC_V3.md`
 
 ---
 
 ## 本轮进展
 
-### 已确认 PHub 包格式 (A 级)
+### 已确认 PHub 包格式 (A 级) — v2 头假设，仅 XUDT/legacy 适用
 
 从反汇编 5 处 `call AES_ENCRYPT_FN` (0x180161920) 的调用者,确认:
 
@@ -24,8 +45,9 @@ PHub body ([13:], AES-ECB 加密):
   AES-ECB 原地加密 (XPF_AESEncryptBufferECB)
   PKCS7 padding
 ```
+> ⚠️ **上式不适用于 PHub HTTP 生产包**。生产包见上方「勘误」v3 spec。
 
-### 完整调用链 (A 级)
+### 完整调用链 (A 级) — v2 路径
 
 ```
 ServicePHubQueryEvent:
@@ -83,12 +105,12 @@ hub5p.sandai.net         → 127.0.0.2 (DNS 污染)
 
 ## 未解决的核心阻碍
 
-### PHub HTTP body 加密格式
+### PHub HTTP body 加密格式 — 已澄清（v3 spec）
 
-14 个 PoC 全部被 PHub 拒绝 ("decrypt request failed")。
+v2 的 14 个 PoC 全部失败，原因已定位：**生产路径不使用 MD5(seq) 派生 AES key**。
 
-已尝试:
-1. ✗ AES-ECB(MD5(cmd+seq), body) — 13B 明文头 + AES(body)
+已尝试（v2 假设下）:
+1. ✗ AES-ECB(MD5(cmd+seq), body) — 13B 明文头 + AES(body) — **仅 XUDT/legacy 适用**
 2. ✗ RSA(AES key) + AES(body) — 4 公钥 × 2 padding
 3. ✗ RSA(整个包) — PKCS1v15 / OAEP
 4. ✗ base64 包装所有组合
@@ -103,16 +125,21 @@ hub5p.sandai.net         → 127.0.0.2 (DNS 污染)
 13. ✗ 不带 enc_len (9 字节头)
 14. ✗ 明文 body + header
 
-### 可能原因
+**正确模型（v3 spec）**：
+- 每请求生成 16B 随机 AES key (`XPF_RandomBytes`)
+- AES key 用 RSA-1024 公钥加密后放在包体前部
+- 包体用 AES-128-ECB + PKCS7 加密
+- 规范文档：`scripts/research/cloud_delivery/v3/PHUB_PROTOCOL_SPEC_V3.md`
 
-1. **HTTP 发送函数 (0x1802833e0) 对加密包做了额外包装** — 比如在 body 前加 HTTP header 字符串,或用 chunked transfer
-2. **AES key 不是从包数据派生** — 而是从 PhubPkgRequester 对象的某个**预共享密钥**字段
-3. **UseRSA 标志为 true** — 整个包需要 RSA 加密,但可能用了**自定义 RSA padding** (XPF_RSAEncrypt_PKCS1_EX 不是标准 PKCS1v15)
-4. **PHub 服务器版本不匹配** — 安装包 v25.0.90.1592 的 RSA 公钥可能已过期
+### 剩余开放问题
+
+1. **HTTP 发送函数 (0x1802833e0) 的额外包装** — 即使 key 正确，仍需确认 HTTP body 是否被 chunked / 额外字符串包装
+2. **真实抓包对照** — 需要 Wireshark 抓 Windows 上迅雷的 pr-phub.sandai.net:80 POST body，验证 v3 spec 的每一字段偏移
+3. **XUDT 帧与 PHub HTTP 包的复用代码路径** — 确认 v2 代码路径是否仅用于 XUDT（UDP），PHub HTTP 是否走 `PhubPkgRequester::DoEncode` 的不同分支
 
 ### 下一步
 
-1. **反汇编 HTTP 发送函数 0x1802833e0** — 看它如何把 PhubPkgRequester 的加密包转成 HTTP body
-2. **找 PhubPkgRequester 构造函数** — 看 this->0x48 (RSA context) 怎么创建,以及 this->0x28 怎么设置
-3. **用 Ghidra 反编译** — 需要 Java 21 + GhidraClassLoader,之前因 OOM 失败
+1. **Frida hook XPF_RandomBytes / XPF_AESCreateEncryptContext** — 在 Thunder.exe 发起 PHub 请求时捕获真实 AES key
+2. **反汇编 HTTP 发送函数 0x1802833e0** — 看它如何把 PhubPkgRequester 的加密包转成 HTTP body
+3. **找 PhubPkgRequester 构造函数** — 看 this->0x48 (RSA context) 怎么创建,以及 this->0x28 怎么设置
 4. **用户用 Wireshark 抓真实 PHub 流量** — 在 Windows 上跑迅雷,抓 pr-phub.sandai.net:80 的 HTTP POST body

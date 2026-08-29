@@ -213,6 +213,14 @@ unsafe extern "C" {
     ) -> lt_err;
 }
 unsafe extern "C" {
+    pub fn lt_apply_discovery(
+        s: *mut lt_session,
+        enable_dht: ::std::os::raw::c_int,
+        enable_lsd: ::std::os::raw::c_int,
+        enable_upnp: ::std::os::raw::c_int,
+    ) -> lt_err;
+}
+unsafe extern "C" {
     pub fn lt_add_magnet(
         s: *mut lt_session,
         magnet: *const ::std::os::raw::c_char,
@@ -263,6 +271,7 @@ pub struct lt_torrent_status {
     pub num_peers: ::std::os::raw::c_int,
     pub num_seeds: ::std::os::raw::c_int,
     pub metadata_received: ::std::os::raw::c_int,
+    pub paused: ::std::os::raw::c_int,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -286,6 +295,8 @@ const _: () = {
         [::std::mem::offset_of!(lt_torrent_status, num_seeds) - 44usize];
     ["Offset of field: lt_torrent_status::metadata_received"]
         [::std::mem::offset_of!(lt_torrent_status, metadata_received) - 48usize];
+    ["Offset of field: lt_torrent_status::paused"]
+        [::std::mem::offset_of!(lt_torrent_status, paused) - 52usize];
 };
 unsafe extern "C" {
     pub fn lt_status(

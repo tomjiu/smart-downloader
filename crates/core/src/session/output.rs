@@ -32,16 +32,20 @@ impl OutputManager {
     }
 
     /// 显式路径版（测试与 daemon 注入用）。
+    ///
+    /// Bug C 修复：目标已存在且大小一致时，不再直接 Ok 短路——先清理可能残留的
+    /// `.part` 文件，避免 BT Seeder 锁文件场景下落位不完整。
     pub fn finalize_to(
         &self,
         part: &Path,
         dest: &Path,
         expected_size: u64,
     ) -> Result<(), OutputError> {
-        // 幂等：目标已落位且大小一致 → Ok（完成信号可能重复投递）
+        // 幂等：目标已落位且大小一致 → 清理 .part 后 Ok（完成信号可能重复投递）
         if dest.exists() {
             let dl = fs::metadata(dest).map_err(OutputError::Io)?.len();
             if dl == expected_size {
+                let _ = fs::remove_file(part);
                 return Ok(());
             }
         }

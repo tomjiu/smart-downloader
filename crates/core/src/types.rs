@@ -149,6 +149,20 @@ pub trait DownloadEngine: Send + Sync {
     async fn update_sources(&self, id: &EngineTaskId, urls: Vec<String>)
         -> Result<(), EngineError>;
     async fn add_url_seed(&self, id: &EngineTaskId, url: &str) -> Result<(), EngineError>;
+    async fn add_peer(&self, _id: &EngineTaskId, _peer: std::net::SocketAddr) -> Result<(), EngineError> {
+        Ok(()) // 默认：不支持直连 peer 注入
+    }
     async fn ban_peer(&self, id: &EngineTaskId, peer: SocketAddr) -> Result<(), EngineError>;
     async fn read_piece(&self, id: &EngineTaskId, idx: u32) -> Result<Vec<u8>, EngineError>;
+
+    /// 迅雷任务导入（M9）：接受 xunlei-convert 生成的 fastresume bencode。
+    /// 默认实现返回 `not supported`；BT 引擎（libtorrent）应Override为 `add_torrent_resume`。
+    async fn add_xunlei_resume(
+        &self,
+        _data: Vec<u8>,
+    ) -> Result<EngineTaskId, EngineError> {
+        Err(EngineError::Other(
+            "add_xunlei_resume not supported by this engine".into(),
+        ))
+    }
 }

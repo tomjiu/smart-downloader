@@ -1,0 +1,4 @@
+[*] scanning 38 ranges (deferred)
+[*] progress 10/38
+[*] progress 20/38
+[*] progress 30/38

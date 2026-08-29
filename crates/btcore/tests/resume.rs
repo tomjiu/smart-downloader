@@ -33,6 +33,7 @@ fn save_resume_roundtrip_reproduces_ih() {
     let seeder = seed::TestSeeder::start();
     let ih = c.add_magnet(seeder.magnet(), &[]).expect("add_magnet");
     let (ip, port) = seeder.addr();
+    c.resume(&ih).expect("resume");
     c.add_peer(&ih, &ip, port).expect("add_peer");
     download_to_complete(&c, &ih);
 
@@ -72,6 +73,7 @@ fn take_before_request_is_not_found() {
     let seeder = seed::TestSeeder::start();
     let ih = c.add_magnet(seeder.magnet(), &[]).expect("add_magnet");
     let (ip, port) = seeder.addr();
+    c.resume(&ih).expect("resume");
     c.add_peer(&ih, &ip, port).expect("add_peer");
     download_to_complete(&c, &ih);
 

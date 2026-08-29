@@ -28,6 +28,7 @@ fn mock_task() -> smart_dl_core::task::DownloadTask {
             size: 0,
             etag: None,
             sha256: None,
+            backup_md5: None,
         },
         dest_root: PathBuf::from("."),
         files: vec![],

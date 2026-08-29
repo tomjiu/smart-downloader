@@ -195,6 +195,20 @@ impl Session {
         call(code, || Ok(()))
     }
 
+    /// 发现层开关：DHT / LSD / UPnP（enable_upnp 同时控制 NAT-PMP——端口映射族）。
+    /// 会话默认全关（M0 确定性语义）；本方法显式覆盖。
+    pub fn apply_discovery(&self, enable_dht: bool, enable_lsd: bool, enable_upnp: bool) -> Result<()> {
+        let code = unsafe {
+            lt_apply_discovery(
+                self.raw,
+                enable_dht as c_int,
+                enable_lsd as c_int,
+                enable_upnp as c_int,
+            )
+        };
+        call(code, || Ok(()))
+    }
+
     /// 最近一次错误（内核侧维护的人类可读文本）
     pub fn err_str(&self) -> Result<String> {
         let mut buf = vec![0u8; 1024];
@@ -308,6 +322,7 @@ impl Session {
             num_peers: 0,
             num_seeds: 0,
             metadata_received: 0,
+            paused: 0,
         };
         let code = unsafe { lt_status(self.raw, i.as_ptr(), &mut st) };
         call(code, || Ok(st))

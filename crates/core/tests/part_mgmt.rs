@@ -98,3 +98,20 @@ fn finalize_to_unwritable_dest_reports_io() {
     ));
     assert!(part.exists(), "失败时不得删除源 .part");
 }
+
+#[test]
+fn finalize_idempotent_cleans_residual_part() {
+    // Bug C：BT 已完成并 rename 落位同名文件 → .part 可能残留。
+    // finalize_to 幂等短路时应清理 .part，避免后续落位冲突。
+    let dir = tempfile::tempdir().unwrap();
+    let om = OutputManager::new(dir.path().to_path_buf());
+    let part = om.part_path("seeded.bin");
+    fs::create_dir_all(part.parent().unwrap()).unwrap();
+    fs::write(&part, b"residual-part-data").unwrap();
+    let dest = dir.path().join("seeded.bin");
+    fs::write(&dest, b"seeded-data").unwrap();
+
+    om.finalize("seeded.bin", b"seeded-data".len() as u64).unwrap();
+    assert_eq!(fs::read(&dest).unwrap(), b"seeded-data");
+    assert!(!part.exists(), "幂等短路应清理残留 .part");
+}

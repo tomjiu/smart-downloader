@@ -64,7 +64,7 @@ fn main() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("参数错误: {e}");
-            eprintln!("用法: smart-dl-daemon <add|pause|resume|remove|list|status|logs> [args] [--server URL] [--json]");
+            eprintln!("用法: smart-dl-daemon <add|pause|resume|remove|list|status|logs|import-xunlei> [args] [--server URL] [--json]");
             std::process::exit(2);
         }
     };

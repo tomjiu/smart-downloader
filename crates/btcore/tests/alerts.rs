@@ -32,6 +32,7 @@ fn download_emits_metadata_piece_and_finished_state() {
     let seeder = seed::TestSeeder::start();
     let ih = c.add_magnet(seeder.magnet(), &[]).expect("add_magnet");
     let (ip, port) = seeder.addr();
+    c.resume(&ih).expect("resume");
     c.add_peer(&ih, &ip, port).expect("add_peer");
     download_to_complete(&c, &ih);
 
@@ -108,6 +109,7 @@ fn dropped_counter_counts_unmasked_alerts() {
     let seeder = seed::TestSeeder::start();
     let ih = c.add_magnet(seeder.magnet(), &[]).expect("add_magnet");
     let (ip, port) = seeder.addr();
+    c.resume(&ih).expect("resume");
     c.add_peer(&ih, &ip, port).expect("add_peer");
     download_to_complete(&c, &ih);
 

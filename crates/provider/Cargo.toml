@@ -10,6 +10,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+tracing = { workspace = true } # BUGB-INSTR（诊断插桩；与 daemon 同版本）
 smart-dl-core = { path = "../core" }
 md-5 = "0.10"
 sha1 = { workspace = true }
@@ -18,3 +19,23 @@ sha1 = { workspace = true }
 axum = "0.7"
 tempfile = "3"
 smart-dl-httpdl = { path = "../httpdl" }
+# 终端二维码渲染（xunlei_qr_login 用，迅雷 App 扫码授权）
+qrcode = "0.14"
+
+[[example]]
+name = "xunlei_qr_login"
+
+[[example]]
+name = "xunlei_pwd_login"
+
+[[example]]
+name = "xunlei_resolve_check"
+
+[[example]]
+name = "xunlei_client_probe"
+
+[[example]]
+name = "xunlei_sms_login"
+
+[[example]]
+name = "xunlei_desktop_probe"

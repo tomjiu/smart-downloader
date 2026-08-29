@@ -1,0 +1,53 @@
+08/25 10:09:37.57 INFO  > loadenv from E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\cwdtest
+08/25 10:09:37.61 INFO [error={"Op":"open","Path":"E:\\Code\\ai\\smart-downloader\\scripts\\research\\xunlei_lite\\out\\cwdtest\\envconfig","Err":2}&file=E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\cwdtest\envconfig] > read envconfig failed use default
+08/25 10:09:37.65 INFO [config_path=C:\Users\yezi6\.drive\&device_space=] > use config
+08/25 10:09:37.67 INFO [use_path=C:\Users\yezi6\.drive\plugins&report=true] > getPluginPATH
+08/25 10:09:37.68 INFO  > setDownloadAlias DriveFileMount :map[]
+08/25 10:09:37.68 INFO  > config.init getEnvStrArray DownloadPATH:[] len:0
+08/25 10:09:37.68 INFO  > config.init init succ: &{isInit:true NasIDKey: NasId: NasSubIdKey: NasSubId: DeviceId: WorkDir: BinPath:E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\cwdtest Platform:pcxllite PathSplit:: DownloadPATHs:[] TorrentPath: DriveFileMount:map[] PluginTokenDuration:5h0m0s PluginPATH:C:\Users\yezi6\.drive\plugins AuthTokenPATH: DriveArgs: DrivePlayer: DriveListen:127.0.0.1:5050 DrivePortFile: DriveLogLevel:info DriveLogFile: DriveLogSize:10MB DriveLogFormat: DriveUpdate: DriveConfigPATH: DrivePIDFile: DriveInfoFile: DrivePublicPort:21603 FreePortRange:[] FreePortRangeUDP:[] LauncherLogFile: LauncherLogSize: LauncherPIDFile: LauncherListen:127.0.0.1:5051 RefreshTokenDuration:1h KvCacheDuration:24h0m0s TaskCfgPath: ScrapeCacheDuration:24h0m0s SyncWatchDogDuration:30m0s CachePATH: DeviceSpace: DeviceName: TLSInsecureSkipVerify:true AllowCustomPlatform:false ImportTask:true SingleTaskMaxMB:100 SingleTaskReserveMB:20 OverallShareMaxMB:200 IdleMemoryUsageLimit:419430400 ThirdAuthURL: PanCliEnv: GeneDBShadowFileDuration:24h DebugPrintFileEvents:[] GossipFile:C:\Users\yezi6\.drive\gossip.json PluginWithBash:false Webhook:{Modules:map[] URL:} HostXluser:https://xluser-ssl.xunlei.com HostApiPan:https://api-pan.xunlei.com HostShoulei:https://api-shoulei-ssl.xunlei.com HostHighSpeedFlow:https://api-pan.xunlei.com EnableTaskCfg:true WebhookHealthzToken: XlliteNotifyTaskComplete: EnableDownloadLog:false DisableNfo:false DownloadPipeLimit:0 UploadPipeLimit:0 DriveAuthorizationTokenPath:}
+08/25 10:09:37.68 INFO  > config.init init succ: &{isInit:true NasIDKey: NasId: NasSubIdKey: NasSubId: DeviceId: WorkDir: BinPath:E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\cwdtest Platform:pcxllite PathSplit:: DownloadPATHs:[] TorrentPath: DriveFileMount:map[] PluginTokenDuration:5h0m0s PluginPATH:C:\Users\yezi6\.drive\plugins AuthTokenPATH: DriveArgs: DrivePlayer: DriveListen:127.0.0.1:5050 DrivePortFile: DriveLogLevel:info DriveLogFile: DriveLogSize:10MB DriveLogFormat: DriveUpdate: DriveConfigPATH: DrivePIDFile: DriveInfoFile: DrivePublicPort:21603 FreePortRange:[] FreePortRangeUDP:[] LauncherLogFile: LauncherLogSize: LauncherPIDFile: LauncherListen:127.0.0.1:5051 RefreshTokenDuration:1h KvCacheDuration:24h0m0s TaskCfgPath: ScrapeCacheDuration:24h0m0s SyncWatchDogDuration:30m0s CachePATH: DeviceSpace: DeviceName: TLSInsecureSkipVerify:true AllowCustomPlatform:false ImportTask:true SingleTaskMaxMB:100 SingleTaskReserveMB:20 OverallShareMaxMB:200 IdleMemoryUsageLimit:419430400 ThirdAuthURL: PanCliEnv: GeneDBShadowFileDuration:24h DebugPrintFileEvents:[] GossipFile:C:\Users\yezi6\.drive\gossip.json PluginWithBash:false Webhook:{Modules:map[] URL:} HostXluser:https://xluser-ssl.xunlei.com HostApiPan:https://api-pan.xunlei.com HostShoulei:https://api-shoulei-ssl.xunlei.com HostHighSpeedFlow:https://api-pan.xunlei.com EnableTaskCfg:true WebhookHealthzToken: XlliteNotifyTaskComplete: EnableDownloadLog:false DisableNfo:false DownloadPipeLimit:0 UploadPipeLimit:0 DriveAuthorizationTokenPath:}
+08/25 10:09:37.69 INFO [biz=StorageManager] > TryFixLastDbCrash crashLog not exists, so quit. crashLog:C:\Users\yezi6\.drive\dbcrashlog
+08/25 10:09:37.82 INFO  > start detect platform
+08/25 10:09:37.82 INFO  > Detector.Detect envPlatform:pcxllite
+08/25 10:09:37.82 INFO  > detect platform: pcxllite XW-G4v1H72tgfJym nasid: labels: [withConfigTaskType withLocalControlApi withSetCredential withoutTrySpeed withoutRunnerCountConfig withoutDownloadSpeedConfig driveApiAllowLocalToken disableLauncherAuth withDownloadPathFullAlias withRemoteDevice withXMP withWebhook withoutConfigPathWarnning withoutAutoDetectDownloadPath allowUseConfigPathAsCachePath withRootDiskSelect withoutUniqName withUserResetScrapeResult withoutHome withSubFile withNFOSearch withVFS withFetchFolder withCheckRunnerAccess withoutCheckPrivilege withoutInitDownloadSDK]
+08/25 10:09:37.99 INFO  > VfsFactory.Register type:os label:
+08/25 10:09:37.99 INFO  > VfsFactory.Register type:smb label:
+08/25 10:09:37.99 INFO  > VfsFactory.Register type:alidrive label:withAlidrive
+08/25 10:09:37.99 INFO  > VfsFactory.Register type:webdav label:
+08/25 10:09:37.99 INFO  > VfsFactory.Register type:mount_fs label:
+08/25 10:09:38 INFO  > NewStorageManager req:[rootPath:C:\Users\yezi6\.drive\] mgr:&{storms:map[] deviceSpace: rootPath:C:\Users\yezi6\.drive\ mu:{w:{state:0 sema:0} writerSem:0 readerSem:0 readerCount:0 readerWait:0} encryptKeys:[] coreEncryptKey:eb5aa306672cab6116b3843eea276a71 kvCache:0x14a30ca8}
+08/25 10:09:38 INFO [device_space=&from_startup=9223372036854] > new drive start[]
+08/25 10:09:38 INFO  > sync.GetHTTPClient by empty user
+08/25 10:09:38 INFO [db_name=cc7bb060f8efc7462b6cbbb5f7a21015&trace_id=_HK6a95jj&func_name=openStorm&db_size=131072&report=true&key=d6783a2199df963f40a756d3d5bc9c6b&keys_len=1&pid=4740&filename=C:\Users\yezi6\.drive\cc7bb060f8efc7462b6cbbb5f7a21015&func_st=08/25 10:09:38&key_idx=0&hasDBFile=true] > dbFile EXISTS
+08/25 10:09:38 INFO [filename=C:\Users\yezi6\.drive\cc7bb060f8efc7462b6cbbb5f7a21015&func_st=08/25 10:09:38&db_name=cc7bb060f8efc7462b6cbbb5f7a21015&func_name=openStorm&pid=4740&key=d6783a2199df963f40a756d3d5bc9c6b&trace_id=_HK6a95jj&key_idx=0&db_size=131072&keys_len=1&hasDBFile=true&report=true] > storm.Open start.
+08/25 10:09:38 INFO [func_name=openStorm&key_idx=0&hasDBFile=true&report=true&key=d6783a2199df963f40a756d3d5bc9c6b&filename=C:\Users\yezi6\.drive\cc7bb060f8efc7462b6cbbb5f7a21015&keys_len=1&func_st=08/25 10:09:38&db_size=131072&trace_id=_HK6a95jj&db_name=cc7bb060f8efc7462b6cbbb5f7a21015&pid=4740] > storm.Open succ
+08/25 10:09:38.01 INFO  > init config
+08/25 10:09:38.01 INFO  > configEngine register globalconfig 3
+08/25 10:09:38.01 INFO  > configEngine register envconfig 2
+08/25 10:09:38.01 INFO  > configEngine register platformdetect 0
+08/25 10:09:38.01 INFO [device_space=&from_startup=9223372036854] > new drive finish[] cost:0.01s
+08/25 10:09:38.01 INFO  > configEngine start watch 4
+08/25 10:09:38.01 INFO [filename=C:\Users\yezi6\.drive\6c8497ab1ec13cc128c281abf114f576&func_st=08/25 10:09:38&trace_id=_X40IVUWS&report=true&pid=4740&key_idx=0&key=d6783a2199df963f40a756d3d5bc9c6b&db_name=6c8497ab1ec13cc128c281abf114f576&keys_len=1&db_size=65536&hasDBFile=true&func_name=openStorm] > dbFile EXISTS
+08/25 10:09:38.01 INFO [pid=4740&db_name=6c8497ab1ec13cc128c281abf114f576&key_idx=0&key=d6783a2199df963f40a756d3d5bc9c6b&hasDBFile=true&func_st=08/25 10:09:38&db_size=65536&report=true&func_name=openStorm&keys_len=1&trace_id=_X40IVUWS&filename=C:\Users\yezi6\.drive\6c8497ab1ec13cc128c281abf114f576] > storm.Open start.
+08/25 10:09:38.01 INFO  > configEngine watch self change
+08/25 10:09:38.01 INFO [from_startup=0] > build version:e699a800 loglevel: info
+08/25 10:09:38.01 INFO [filename=C:\Users\yezi6\.drive\6c8497ab1ec13cc128c281abf114f576&func_st=08/25 10:09:38&keys_len=1&trace_id=_X40IVUWS&pid=4740&func_name=openStorm&key_idx=0&key=d6783a2199df963f40a756d3d5bc9c6b&db_name=6c8497ab1ec13cc128c281abf114f576&db_size=65536&report=true&hasDBFile=true] > storm.Open succ
+08/25 10:09:38.01 INFO  > set log level: info
+08/25 10:09:38.01 INFO  pan-cli/main.go:233 [trace_id=app.Before_P3NcHciW&pid=4740&func_name=app.Before&from_startup=2&func_st=08/25 10:09:38] > startService app.Before start
+08/25 10:09:38.01 INFO  pan-cli/main.go:256 [pid=4740&func_name=app.Before&func_st=08/25 10:09:38&trace_id=app.Before_P3NcHciW] > with cookie map[]
+08/25 10:09:38.02 ERROR  pan-cli/main.go:342  > Cannot lock "E:\\Code\\ai\\smart-downloader\\scripts\\research\\xunlei_lite\\out\\cwdtest", reason: rename E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\cwdtest.3083223500 E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\cwdtest: Access is denied. pidfilepath:E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\cwdtest
+08/25 10:09:38.02 INFO  biz/manager.go:747 [report=true&WorkDir=C:\Users\yezi6\.drive\plugins] > NewPluginManager finish
+08/25 10:09:41.02 INFO  pan-cli/main.go:328  > initPidFile cost:3.01s
+panic: rename E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\cwdtest.3083223500 E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\cwdtest: Access is denied.
+
+goroutine 45 [running]:
+main.initPidFile(0x17ea4000)
+	/xunlei-pan-cli/cmd/pan-cli/main.go:344 +0x2a6
+main.startService.func1(0x17ea4000)
+	/xunlei-pan-cli/cmd/pan-cli/main.go:270 +0x564
+github.com/urfave/cli.(*App).Run(0x17e94000, {0x144080e0, 0x2, 0x2})
+	/go/pkg/mod/github.com/urfave/cli@v1.22.5/app.go:264 +0x5d4
+main.startService({0x2a2f380, 0x148e7c20}, 0x14a31320)
+	/xunlei-pan-cli/cmd/pan-cli/main.go:317 +0x847
+created by main.main
+	/xunlei-pan-cli/cmd/pan-cli/main.go:71 +0x350

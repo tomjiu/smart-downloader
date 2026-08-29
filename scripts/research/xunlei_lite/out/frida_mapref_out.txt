@@ -1,0 +1,2 @@
+[*] pointer-to-client_id (0x01c7a282) refs: 0
+[*] done

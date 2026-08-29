@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@400;700;900&family=Noto+Serif+SC:wght@400;700;900&family=Inter:wght@300;400;500;700&family=Noto+Sans+SC:wght@300;400;500;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    @page { size: 794px 1123px; margin: 0; }
+    :root {
+      --c-bg: #0e1a2e;
+      --c-accent: #5BB8E5;
+      --c-accent2: #B9674B;
+      --c-text: #FFFFFF;
+      --c-muted: #8898B0;
+      --c-footer: #5A6E87;
+    }
+    html, body {
+      margin: 0; padding: 0;
+      width: 794px; height: 1123px;
+      background: var(--c-bg);
+      color: var(--c-text);
+      font-family: 'Inter', 'Noto Sans SC', sans-serif;
+    }
+    @media screen {
+      html { height: auto; display: flex; justify-content: center; min-height: 100vh; background: #050a13; }
+      body { transform-origin: top center; scale: min(1, calc(100vw / 794), calc(100vh / 1123)); margin: 0 auto; box-shadow: 0 0 80px rgba(0,0,0,0.6); }
+    }
+    .cover { width: 794px; height: 1123px; position: relative; box-sizing: border-box; }
+
+    /* Layer 1: Background grid */
+    .bg-layer {
+      position: absolute; inset: 0; overflow: hidden; z-index: 1;
+      background-image:
+        linear-gradient(rgba(91,184,229,0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(91,184,229,0.04) 1px, transparent 1px);
+      background-size: 56px 56px;
+    }
+    .glow1 {
+      position: absolute; top: -100px; right: -100px;
+      width: 500px; height: 500px;
+      background: radial-gradient(circle, rgba(91,184,229,0.12) 0%, transparent 60%);
+      border-radius: 50%;
+    }
+    .glow2 {
+      position: absolute; bottom: -150px; left: -100px;
+      width: 400px; height: 400px;
+      background: radial-gradient(circle, rgba(185,103,75,0.08) 0%, transparent 60%);
+      border-radius: 50%;
+    }
+    .watermark {
+      position: absolute;
+      top: 60%; right: -40px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      color: rgba(91,184,229,0.07);
+      transform: rotate(-90deg);
+      transform-origin: right top;
+      letter-spacing: 8px;
+      white-space: nowrap;
+      font-weight: 500;
+    }
+
+    /* Layer 2: Structure */
+    .vline {
+      position: absolute;
+      left: 57px; top: 90px; bottom: 90px;
+      width: 3px; background: var(--c-accent);
+      z-index: 2;
+      box-shadow: 0 0 12px rgba(91,184,229,0.4);
+    }
+
+    /* Layer 3: Content */
+    .content {
+      position: absolute;
+      left: 90px; right: 90px; top: 0; bottom: 0;
+      z-index: 3;
+    }
+    .label {
+      position: absolute;
+      top: 132px;
+      font-size: 10pt;
+      color: var(--c-accent);
+      letter-spacing: 5px;
+      text-transform: uppercase;
+      font-family: 'JetBrains Mono', 'Inter', monospace;
+      font-weight: 500;
+    }
+    .doc-id {
+      position: absolute;
+      top: 132px; right: 0;
+      font-size: 9pt;
+      color: var(--c-footer);
+      letter-spacing: 2px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .title {
+      position: absolute;
+      top: 200px;
+      font-size: 38pt;
+      font-weight: 900;
+      line-height: 1.15;
+      font-family: 'Playfair Display', 'Noto Serif SC', serif;
+      color: var(--c-text);
+      max-width: 600px;
+      letter-spacing: -0.5px;
+    }
+    .title .accent {
+      color: var(--c-accent);
+      font-style: italic;
+      font-weight: 700;
+    }
+    .subtitle {
+      position: absolute;
+      top: 420px;
+      font-size: 16pt;
+      color: var(--c-muted);
+      max-width: 580px;
+      line-height: 1.5;
+      font-weight: 300;
+      letter-spacing: 0.5px;
+    }
+    .summary {
+      position: absolute;
+      top: 520px;
+      font-size: 12pt;
+      line-height: 1.7;
+      color: var(--c-muted);
+      max-width: 580px;
+      opacity: 0.85;
+    }
+    .meta-block {
+      position: absolute;
+      top: 740px;
+      width: 580px;
+    }
+    .meta-row {
+      display: flex;
+      align-items: baseline;
+      margin-bottom: 14px;
+      font-size: 11pt;
+    }
+    .meta-label {
+      width: 130px;
+      color: var(--c-accent);
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 9.5pt;
+      letter-spacing: 1.5px;
+      text-transform: uppercase;
+      font-weight: 500;
+    }
+    .meta-value {
+      flex: 1;
+      color: var(--c-text);
+      font-family: 'Inter', 'Noto Sans SC', sans-serif;
+    }
+    .stats-row {
+      position: absolute;
+      top: 900px;
+      display: flex;
+      gap: 50px;
+      width: 580px;
+    }
+    .stat-item {
+      flex: 1;
+    }
+    .stat-num {
+      font-size: 28pt;
+      font-weight: 900;
+      font-family: 'Playfair Display', serif;
+      color: var(--c-accent);
+      line-height: 1;
+      letter-spacing: -1px;
+    }
+    .stat-label {
+      font-size: 8.5pt;
+      color: var(--c-footer);
+      text-transform: uppercase;
+      letter-spacing: 2px;
+      margin-top: 6px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .footer {
+      position: absolute;
+      bottom: 50px; left: 90px; right: 90px;
+      display: flex; justify-content: space-between;
+      font-size: 9pt;
+      color: var(--c-footer);
+      font-family: 'JetBrains Mono', monospace;
+      letter-spacing: 2px;
+      padding-top: 18px;
+      border-top: 1px solid rgba(91,184,229,0.15);
+    }
+  </style>
+</head>
+<body>
+  <div class="cover">
+    <div class="bg-layer">
+      <div class="glow1"></div>
+      <div class="glow2"></div>
+      <div class="watermark">BITCOMET · 2.21.2 · REVERSE ENGINEERING ANALYSIS</div>
+    </div>
+    <div class="vline"></div>
+    <div class="content">
+      <div class="label">REVERSE ENGINEERING · TECHNICAL REPORT</div>
+      <div class="doc-id">REV-2026-08-25-V1</div>
+      <div class="title">BitComet 2.21<br/><span class="accent">深度逆向分析</span>报告</div>
+      <div class="subtitle">与 qBittorrent 对比及可借鉴设计评估</div>
+      <div class="summary">本报告基于 BitComet 2.21.2 Linux x86_64 deb 包完整逆向，使用 dpkg-deb 解压、nm/c++filt 符号解析、objdump 反汇编、strings 字符串提取等技术手段，对 BitComet 的 109,727 个符号、2,929 个 C++ 命名空间、110 个 REST API 端点进行了系统性挖掘。从架构层、BT 引擎、传输抽象、云服务、多协议任务模型、磁盘缓存、WebUI、API 设计、AntiLeech 等多维度，对比开源 qBittorrent，识别值得移植到自研下载器的独特设计。</div>
+      <div class="meta-block">
+        <div class="meta-row">
+          <span class="meta-label">Author</span>
+          <span class="meta-value">Z.ai · BitComet Reverse Engineering Team</span>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">Sample</span>
+          <span class="meta-value">BitComet-2.21.2-x86_64.deb · 35,426,504 bytes</span>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">Reference</span>
+          <span class="meta-value">qbittorrent/qBittorrent · master branch · 2026-08-25</span>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">Toolchain</span>
+          <span class="meta-value">binutils 2.44 · nm · objdump · strings · c++filt · readelf</span>
+        </div>
+      </div>
+      <div class="stats-row">
+        <div class="stat-item">
+          <div class="stat-num">109K</div>
+          <div class="stat-label">Symbols</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-num">2,929</div>
+          <div class="stat-label">Namespaces</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-num">110</div>
+          <div class="stat-label">API Endpoints</div>
+        </div>
+        <div class="stat-item">
+          <div class="stat-num">18</div>
+          <div class="stat-label">Core Modules</div>
+        </div>
+      </div>
+    </div>
+    <div class="footer">
+      <span>CONFIDENTIAL · FOR INTERNAL R&amp;D USE</span>
+      <span>2026 · 08 · 25</span>
+    </div>
+  </div>
+</body>
+</html>

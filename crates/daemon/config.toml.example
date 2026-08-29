@@ -16,6 +16,10 @@ enabled = true
 # BT 全局落盘目录（v1 单 session：所有 BT 任务落此目录；任务级 dest 仅接受默认
 # 或与之一致——自定义 dest 会被拒绝）。缺省 = download.dest_root；启动时自动创建。
 # save_path = "./downloads/bt"
+# 发现层开关：默认关闭保持确定性，纯磁力无 tracker 冷启动可开启
+enable_dht = false
+enable_lsd = false
+enable_upnp = false
 
 [lock]
 # 单实例锁文件（重复启动 → 直接退出）

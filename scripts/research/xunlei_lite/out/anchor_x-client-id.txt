@@ -1,0 +1,16 @@
+=== anchor: 'x-client-id' ===
+
+--- occurrence #1 @ file_offset=22845344 ---
+4vvideo/x-mngwas deletedwebsocket: windows/386withCPluginwithWebhookwith_hiddenwith_quotasword/footerword/headerword/media/written < 0wsarecvfromwài,zhuàiwàng,mángwàng,wángwèng,yōngwò,òu,wūwù,qià,èwú,wù,yúwú,wù,yǔwú,yú,yáwā,wǎ,wàwēng,wěngwěn,chuàiwěng,yǎngwū,yā,wùwǎng,mǎngwǎng,wàngwǎng,wángwǎng,wāngx-client-idx-device-idx-lml/x-evmx-lml/x-gdbx-lml/x-gpsx-lml/x-lakx-lml/x-lmlx-lml/x-ndbx5fs/FJvs0Cxiàn,chēnxiàn,jiànxiàn,jiǎnxiàn,xiánxiàn,xiǎnxiàn,xuánxiàng,hóuxiào,jiǎoxiào,xiāoxián,jiànxián,jiānxián,jiǎnxián,qiānxián,xiànxián,xuànxiáng,xièxiáo,shǒuxiòng,hùnxiān,jiānxiān,liánxiān,língxiān,qiànxiā
+
+--- occurrence #2 @ file_offset=23944387 ---
+true,"can_show":true},"super.year":{"can_fetch":true,"can_show":true}}},"file_change_task_types":["upload","restore","copy","offline","trash","move","deletefile"],"file_play":{"filter":"{\"matchAny\":[{\"matchAll\":[{\"match\":[\"scene\",\"in\",\"nfo\"]},{\"matchAny\":[{\"desc\":\"h5\",\"match\":[\"x-client-id\",\"in\",\"XoL5lqbDWNW0e7QA\",\"Xp6vsxz_7IYVw2BB\",\"Yd0uSVGrNJhCC2oE\",\"Yd00NFGrNJhCC2oP\",\"Yd0zTVGrNJhCC2oL\",\"Xqp0kJBXWhwaTpB6\",\"Yd0zylGrNJhCC2oN\",\"Yd0yklGrNJhCC2oH\",\"Yd0y91GrNJhCC2oJ\"],\"matchAny\":[{\"match\":[\"platform\",\"in\",\"synology\",\"qnap\",\"terramaster\",\"pcx
+
+--- occurrence #3 @ file_offset=23945809 ---
+tch\":[\"x-client-type\",\"in\",\"tv\"],\"responseOnMatch\":{\"desc\":\"个人影院-tv\",\"data\":\"{\\\"total_count_by_vastype_forshow\\\":{\\\"0\\\":1,\\\"3\\\":10,\\\"5\\\":-1},\\\"total_count_by_vastype_real\\\":{\\\"0\\\":-1,\\\"3\\\":-1,\\\"5\\\":-1}}\"}},{\"desc\":\"pc\",\"matchAll\":[{\"match\":[\"x-client-id\",\"in\",\"X9ibISwpIp8jQ4Ya\",\"XW-G4v1H72tgfJym\"]},{\"matchAny\":[{\"desc\":\"个人影院-套件端-生态版\",\"match\":[\"platform\",\"in\",\"synology\",\"qnap\",\"terramaster\",\"pcxllite\"],\"responseOnMatch\":{\"data\":\"{\\\"total_count_by_vastype_forshow\\\":{\\\"0\\\":1,\\\"3\\\":10,\\\"5\\\":-1
+
+--- occurrence #4 @ file_offset=23946637 ---
+{\\\"total_count_by_vastype_forshow\\\":{\\\"0\\\":-1,\\\"3\\\":-1,\\\"5\\\":-1},\\\"total_count_by_vastype_real\\\":{\\\"0\\\":-1,\\\"3\\\":-1,\\\"5\\\":-1}}\"}}]}]}]}]},{\"matchAll\":[{\"match\":[\"scene\",\"in\",\"download_list\"]},{\"matchAny\":[{\"desc\":\"下载列表-h5\",\"matchAll\":[{\"match\":[\"x-client-id\",\"in\",\"XoL5lqbDWNW0e7QA\",\"Xp6vsxz_7IYVw2BB\",\"Yd0uSVGrNJhCC2oE\",\"Yd00NFGrNJhCC2oP\",\"Yd0zTVGrNJhCC2oL\",\"Xqp0kJBXWhwaTpB6\",\"Yd0zylGrNJhCC2oN\",\"Yd0yklGrNJhCC2oH\",\"Yd0y91GrNJhCC2oJ\",\"Yd00e1GrNJhCC2oR\"]},{\"matchAny\":[{\"desc\":\"下载列表-h5-生态版\",\"match\":[\"platform\",\"
+
+--- occurrence #5 @ file_offset=23947802 ---
+n\",\"synology\",\"qnap\",\"terramaster\",\"pcxllite\"],\"responseOnMatch\":{\"data\":\"{\\\"total_count_by_vastype_forshow\\\":{\\\"0\\\":-1,\\\"3\\\":-1,\\\"5\\\":-1},\\\"total_count_by_vastype_real\\\":{\\\"0\\\":-1,\\\"3\\\":-1,\\\"5\\\":-1}}\"}}]}]},{\"desc\":\"pc\",\"matchAll\":[{\"match\":[\"x-client-id\",\"in\",\"X9ibISwpIp8jQ4Ya\",\"XW-G4v1H72tgfJym\"]},{\"matchAny\":[{\"desc\":\"下载列表-套件端-生态版\",\"match\":[\"platform\",\"in\",\"synology\",\"qnap\",\"terramaster\",\"pcxllite\",\"linux\"],\"responseOnMatch\":{\"data\":\"{\\\"total_count_by_vastype_forshow\\\":{\\\"0\\\":1,\\\"3\\\":10,\\

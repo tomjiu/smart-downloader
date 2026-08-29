@@ -5,8 +5,11 @@ use smart_dl_core::identity::{CanonicalId, CanonicalKind, ContentIdentity};
 use smart_dl_core::source_parse::normalize::{normalize_user_link, NormalizedSource};
 use smart_dl_core::state_machine::TaskState;
 use smart_dl_core::task::{DownloadTask, TaskId, TaskMetadata};
+#[cfg(any(feature = "ftp", feature = "xunlei-import"))]
+use smart_dl_core::task::{FileState, TaskFile};
 use smart_dl_core::types::{
     DownloadEngine, DownloadSource, EngineKind, EngineState, EngineStatus, EngineTaskId,
+    FileProgress,
 };
 use smart_dl_provider::{
     FallbackCoordinator, FallbackOutcome, HttpSink, ProviderError, ProviderRuntime, RemoteProvider,
@@ -71,6 +74,9 @@ pub struct TaskSnapshot {
     pub done: u64,
     pub total: u64,
     pub error: Option<String>,
+    /// 文件级进度（实时读引擎 status().files；单文件/无文件引擎为空数组）。
+    /// FTP 目录任务与 BT 多文件任务在此处行为一致（都从引擎状态链透出）。
+    pub files: Vec<FileProgress>,
 }
 
 /// 列表条目。
@@ -117,10 +123,20 @@ pub enum DaemonError {
     Engine(String),
     #[error("invalid source: {0}")]
     InvalidSource(String),
+    /// 运行态操作与任务引擎种类不匹配（如给非 BT 任务注入 web seed）→ HTTP 409。
+    #[error("不支持的操作: {0}")]
+    UnsupportedOp(String),
     #[error("持久化: {0}")]
     Persist(String),
     #[error("云兜底: {0}")]
     Fallback(String),
+}
+
+#[cfg(feature = "xunlei-import")]
+impl From<anyhow::Error> for DaemonError {
+    fn from(value: anyhow::Error) -> Self {
+        DaemonError::Engine(value.to_string())
+    }
 }
 
 /// 守护进程状态：任务 + 引擎表 + 事件中枢。
@@ -154,6 +170,257 @@ pub fn write_tasks_atomic(path: &Path, tasks: &[PersistedTask]) -> std::io::Resu
     std::fs::write(&tmp, &json)?;
     std::fs::rename(&tmp, path)?;
     Ok(())
+}
+
+/// 单文件 .torrent 元数据（迅雷导入用）。
+#[derive(Debug, Clone)]
+pub struct TorrentMeta {
+    pub info_hash: String,
+    pub piece_length: u32,
+    pub pieces_hash: Vec<[u8; 20]>,
+    pub name: String,
+    /// 单文件大小（仅单文件 torrent 使用）。
+    pub file_size: u64,
+    /// 多文件列表（仅多文件 torrent 使用）。
+    pub files: Vec<FileMeta>,
+}
+
+/// 单文件元数据。
+#[derive(Debug, Clone)]
+pub struct FileMeta {
+    /// 相对路径（多文件）或文件名（单文件）。
+    pub path: String,
+    /// 文件大小（字节）。
+    pub size: u64,
+    /// 该文件在 torrent 中的起始 piece 索引。
+    pub piece_offset: usize,
+    /// 该文件占用的 piece 数量。
+    pub piece_count: usize,
+}
+
+#[cfg(feature = "bt")]
+impl TorrentMeta {
+    /// 从 .torrent 字节解析元数据（单文件/多文件）。
+    pub fn parse(b: &[u8]) -> Result<Self, DaemonError> {
+        use sha1::Digest;
+        let (info_start, info_end) = locate_info(b).ok_or_else(|| {
+            DaemonError::InvalidSource(".torrent 解析失败：无法定位 info dict".into())
+        })?;
+
+        let info_hash = {
+            let digest = sha1::Sha1::digest(&b[info_start..=info_end]);
+            digest
+                .iter()
+                .map(|x| format!("{x:02x}"))
+                .collect::<String>()
+        };
+
+        let mut piece_length = 0u32;
+        let mut pieces_hash = Vec::new();
+        let mut name = String::new();
+        let mut file_size = 0u64;
+        let mut has_length = false;
+        let mut files = Vec::new();
+        let mut has_files = false;
+
+        let mut i = info_start + 1; // skip 'd'
+        let end = info_end;
+        while i < end {
+            let (key, after_key) = be_str(b, i).ok_or_else(|| {
+                DaemonError::InvalidSource(".torrent info dict 解析失败".into())
+            })?;
+            i = after_key;
+
+            match key {
+                b"piece length" => {
+                    piece_length = be_int(b, i).ok_or_else(|| {
+                        DaemonError::InvalidSource("piece length 解析失败".into())
+                    })? as u32;
+                    i = value_skip(b, i).ok_or_else(|| {
+                        DaemonError::InvalidSource(".torrent info dict 解析失败".into())
+                    })?;
+                }
+                b"pieces" => {
+                    let pieces_data = be_str(b, i).ok_or_else(|| {
+                        DaemonError::InvalidSource("pieces 解析失败".into())
+                    })?;
+                    if pieces_data.0.len() % 20 != 0 {
+                        return Err(DaemonError::InvalidSource(
+                            "pieces 长度不是 20 的倍数".into(),
+                        ));
+                    }
+                    pieces_hash = pieces_data
+                        .0
+                        .chunks_exact(20)
+                        .map(|ch| <[u8; 20]>::try_from(ch).unwrap())
+                        .collect();
+                    i = value_skip(b, i).ok_or_else(|| {
+                        DaemonError::InvalidSource(".torrent info dict 解析失败".into())
+                    })?;
+                }
+                b"name" => {
+                    name =
+                        String::from_utf8_lossy(be_str(b, i).ok_or_else(|| {
+                            DaemonError::InvalidSource("name 解析失败".into())
+                        })?.0)
+                            .into_owned();
+                    i = value_skip(b, i).ok_or_else(|| {
+                        DaemonError::InvalidSource(".torrent info dict 解析失败".into())
+                    })?;
+                }
+                b"length" => {
+                    file_size = be_int(b, i).ok_or_else(|| {
+                        DaemonError::InvalidSource("length 解析失败".into())
+                    })? as u64;
+                    has_length = true;
+                    i = value_skip(b, i).ok_or_else(|| {
+                        DaemonError::InvalidSource(".torrent info dict 解析失败".into())
+                    })?;
+                }
+                b"files" => {
+                    has_files = true;
+                    // files value 是 list（l...e）
+                    let list_end = list_skip(b, i).ok_or_else(|| {
+                        DaemonError::InvalidSource("files 解析失败".into())
+                    })?;
+                    files = parse_file_list(&b[i + 1..list_end], piece_length)?;
+                    i = list_end + 1; // 跳过 list 的闭合 'e'
+                }
+                _ => {
+                    i = value_skip(b, i).ok_or_else(|| {
+                        DaemonError::InvalidSource(".torrent info dict 解析失败".into())
+                    })?;
+                }
+            }
+        }
+
+        if piece_length == 0 || pieces_hash.is_empty() {
+            return Err(DaemonError::InvalidSource(
+                ".torrent 缺少必要字段 (piece length/pieces)".into(),
+            ));
+        }
+
+        if has_files {
+            // 多文件 torrent：files 数组已解析
+            Ok(Self {
+                info_hash,
+                piece_length,
+                pieces_hash,
+                name,
+                file_size: 0,
+                files,
+            })
+        } else {
+            // 单文件 torrent
+            if !has_length {
+                return Err(DaemonError::InvalidSource(
+                    ".torrent 缺少 length 字段".into(),
+                ));
+            }
+            Ok(Self {
+                info_hash,
+                piece_length,
+                pieces_hash,
+                name,
+                file_size,
+                files: vec![],
+            })
+        }
+    }
+}
+
+/// 解析多文件 torrent 的 files 列表内容（bencode，`l`/`e` 已剥离）。
+#[cfg(feature = "bt")]
+fn parse_file_list(
+    data: &[u8],
+    piece_length: u32,
+) -> Result<Vec<FileMeta>, DaemonError> {
+    let mut files = Vec::new();
+    let mut pos = 0usize;
+    let plen = piece_length as u64;
+
+    while pos < data.len() {
+        if data.get(pos) != Some(&b'd') {
+            pos = value_skip(data, pos).ok_or_else(|| {
+                DaemonError::InvalidSource("files 列表解析失败".into())
+            })?;
+            continue;
+        }
+        let dict_end = dict_skip(data, pos).ok_or_else(|| {
+            DaemonError::InvalidSource("files dict 解析失败".into())
+        })?;
+        let file_dict = &data[pos..=dict_end];
+
+        let mut path = String::new();
+        let mut length = 0u64;
+        let mut j = 1;
+        while j < file_dict.len() - 1 {
+            let (key, after_key) = be_str(file_dict, j).ok_or_else(|| {
+                DaemonError::InvalidSource("files dict key 解析失败".into())
+            })?;
+            j = after_key;
+            match key {
+                b"length" => {
+                    length = be_int(file_dict, j).ok_or_else(|| {
+                        DaemonError::InvalidSource("files length 解析失败".into())
+                    })? as u64;
+                    j = value_skip(file_dict, j).ok_or_else(|| {
+                        DaemonError::InvalidSource("files dict value 解析失败".into())
+                    })?;
+                }
+                b"path" => {
+                    // path value 是 list（l...e）
+                    let path_list_end = list_skip(file_dict, j).ok_or_else(|| {
+                        DaemonError::InvalidSource("files path list 解析失败".into())
+                    })?;
+                    path = parse_path_list(&file_dict[j + 1..path_list_end])?;
+                    j = path_list_end + 1;
+                }
+                _ => {
+                    j = value_skip(file_dict, j).ok_or_else(|| {
+                        DaemonError::InvalidSource("files dict value 解析失败".into())
+                    })?;
+                }
+            }
+        }
+
+        if length > 0 && !path.is_empty() {
+            // 计算 piece 偏移和数量（按文件在 torrent 中的累计字节偏移）
+            let total_size: u64 = files.iter().map(|f: &FileMeta| f.size).sum();
+            let piece_offset = (total_size / plen) as usize;
+            let piece_count = ((length + plen - 1) / plen) as usize;
+            files.push(FileMeta {
+                path,
+                size: length,
+                piece_offset,
+                piece_count,
+            });
+        }
+
+        pos = dict_end + 1;
+    }
+
+    Ok(files)
+}
+
+/// 解析 path list 内容（bencode，`l`/`e` 已剥离）为路径字符串。
+#[cfg(feature = "bt")]
+fn parse_path_list(data: &[u8]) -> Result<String, DaemonError> {
+    let mut parts = Vec::new();
+    let mut p = 0usize;
+    while p < data.len() {
+        let (seg, after) = be_str(data, p).ok_or_else(|| {
+            DaemonError::InvalidSource("path segment 解析失败".into())
+        })?;
+        parts.push(String::from_utf8_lossy(seg).into_owned());
+        p = after;
+    }
+    if parts.is_empty() {
+        return Err(DaemonError::InvalidSource(
+            "files path 为空".into(),
+        ));
+    }
+    Ok(parts.join(std::path::MAIN_SEPARATOR_STR))
 }
 
 impl DaemonState {
@@ -198,6 +465,14 @@ impl DaemonState {
         self
     }
 
+    /// 追加 FTP 引擎（feature `ftp`；FTP 链接路由到该引擎）。
+    /// 独立占用 `EngineKind::Ftp` 槽位——不覆盖 Http 槽，保证 HTTP 任务仍走 HttpEngine。
+    #[cfg(feature = "ftp")]
+    pub fn with_ftp(mut self, ftp: Arc<dyn DownloadEngine>) -> Self {
+        self.engines.insert(EngineKind::Ftp, ftp);
+        self
+    }
+
     /// 序列化当前任务目录（持久化用）。
     fn persisted_tasks(&self) -> Vec<PersistedTask> {
         self.tasks
@@ -217,10 +492,17 @@ impl DaemonState {
         let Some(path) = self.persist_path.clone() else {
             return;
         };
+        tracing::info!("[bugb] autosave BEGIN path={path:?}"); // BUGB-INSTR（低频：仅状态迁移时）
         let data = self.persisted_tasks();
         if let Err(e) = write_tasks_atomic(&path, &data) {
             tracing::warn!("任务持久化失败 {path:?}: {e}");
         }
+        tracing::info!("[bugb] autosave END"); // BUGB-INSTR
+    }
+
+    /// BUGB-INSTR（临时诊断，修复验证后移除）：OS 线程侧探测 tasks 锁是否被长期持有。
+    pub fn debug_try_lock_tasks(&self) -> bool {
+        self.tasks.try_lock().is_ok()
     }
 
     /// 从持久化文件恢复任务：逐条重新 add 到引擎（保留原 task_id，
@@ -319,6 +601,21 @@ impl DaemonState {
             NormalizedSource::Ed2k(e) => {
                 Err(DaemonError::InvalidSource(format!("ed2k 不支持: {e}")))
             }
+            NormalizedSource::Ftp(u) => {
+                #[cfg(feature = "ftp")]
+                {
+                    return self.add_ftp_task(u, dest_root).await;
+                }
+                #[cfg(not(feature = "ftp"))]
+                {
+                    Err(DaemonError::InvalidSource(format!(
+                        "ftp 需 FTP 引擎（编译时启用 --features ftp）: {u}"
+                    )))
+                }
+            }
+            NormalizedSource::XunleiShare(u) => {
+                Err(DaemonError::InvalidSource(format!("迅雷网盘分享暂不支持直接导入: {u}")))
+            }
             NormalizedSource::Unsupported(orig) => Err(DaemonError::InvalidSource(format!(
                 "无法识别的链接: {orig}"
             ))),
@@ -371,6 +668,7 @@ impl DaemonState {
                 size: 0,
                 etag: None,
                 sha256: None,
+                backup_md5: None,
             },
             dest_root: dest_root.clone(),
             files: vec![],
@@ -432,8 +730,9 @@ impl DaemonState {
                 ".torrent 解析失败：无法定位 info dict".into(),
             ));
         };
-        // B10：单文件 torrent 总大小已知 → 空间预检（多文件 v1 解析不到 → 跳过）
-        if let Some(total) = torrent_total_size(&torrent_bytes) {
+        // B10：torrent 总大小已知 → 空间预检（多文件按 files 各项求和；解析失败
+        // 回退单文件最小解析；均拿不到才跳过）
+        if let Some(total) = torrent_precheck_total(&torrent_bytes) {
             precheck_space(&dest_root, total)?;
         }
         let canonical = CanonicalId {
@@ -466,6 +765,7 @@ impl DaemonState {
                 size: 0,
                 etag: None,
                 sha256: None,
+                backup_md5: None,
             },
             dest_root: dest_root.clone(),
             files: vec![],
@@ -493,6 +793,247 @@ impl DaemonState {
             events: vec![],
         };
         rec.push_event("add", None);
+        self.tasks.lock().unwrap().insert(task_id.clone(), rec);
+        self.autosave();
+        self.hub.publish(SchedulerEvent::TaskCreated {
+            task_id: task_id.clone(),
+        });
+        self.hub.publish(SchedulerEvent::StateChanged {
+            task_id: task_id.clone(),
+            from: TaskState::Queued,
+            to: TaskState::Downloading(EngineKind::Bt),
+        });
+        Ok(task_id)
+    }
+
+    /// 迅雷任务导入（M9）：xlbt.cfg + 一组 .bt.xltd + .torrent → xunlei-convert fastresume
+    /// → btcore.add_xunlei_resume → TaskCreated 事件。
+    ///
+    /// 单文件 torrent：`xltds` 应包含恰好 1 个 `.bt.xltd`（对应唯一文件）。
+    /// 多文件 torrent：`xltds` 按 `meta.files` 顺序，每个文件对应一个 `.bt.xltd`。
+    #[cfg(feature = "xunlei-import")]
+    pub async fn add_xunlei_import_task(
+        &self,
+        torrent: Vec<u8>,
+        cfg: Vec<u8>,
+        xltds: Vec<Vec<u8>>,
+        dest_root: Option<String>,
+    ) -> Result<TaskId, DaemonError> {
+        use xunlei_convert::{build_bitfield_lenient, FastresumeConverter, XlbtCfg};
+
+        // 1. 解析 torrent
+        let meta = TorrentMeta::parse(&torrent)?;
+
+        // 单文件/多文件统一归一化为文件列表
+        let files: Vec<FileMeta> = if meta.files.is_empty() {
+            vec![FileMeta {
+                path: meta.name.clone(),
+                size: meta.file_size,
+                piece_offset: 0,
+                piece_count: meta.pieces_hash.len(),
+            }]
+        } else {
+            meta.files.clone()
+        };
+        let total_size: u64 = files.iter().map(|f| f.size).sum();
+
+        // xltd 数量须与文件数一致
+        if xltds.len() != files.len() {
+            return Err(DaemonError::InvalidSource(format!(
+                "xltd 数量 {} 与 torrent 文件数 {} 不匹配",
+                xltds.len(),
+                files.len()
+            )));
+        }
+
+        // 2. 确保目标目录存在
+        let def = self
+            .default_dest_root
+            .lock()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let dest_root = ensure_dest_root(dest_root.or(Some(def)))?;
+
+        // 3. 空间预检（总大小已知）
+        precheck_space(&dest_root, total_size)?;
+
+        // 4. 查重
+        let canonical = CanonicalId {
+            kind: CanonicalKind::Bt,
+            identity: meta.info_hash.clone(),
+            validator: None,
+            token_sensitive: false,
+        };
+        let task_id = format!("t{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+        {
+            let tasks = self.tasks.lock().unwrap();
+            for (existing, rec) in tasks.iter() {
+                if rec.task.canonical_id == canonical {
+                    self.hub.publish(SchedulerEvent::DuplicateRejected {
+                        task_id: task_id.clone(),
+                        existing: existing.clone(),
+                    });
+                    return Err(DaemonError::Duplicate(existing.clone()));
+                }
+            }
+        }
+
+        // 5. 转换：逐文件分析 xltd，合并全局 bitfield
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_dir = std::env::temp_dir().join(format!("xunlei-import-{}-{}", task_id, unique));
+        std::fs::create_dir_all(&tmp_dir).map_err(|e| {
+            DaemonError::Engine(format!("创建临时目录失败: {e}"))
+        })?;
+        let torrent_path = tmp_dir.join("source.torrent");
+        let cfg_path = tmp_dir.join("source.xlbt.cfg");
+        std::fs::write(&torrent_path, &torrent).map_err(|e| {
+            DaemonError::Engine(format!("写临时 torrent 失败: {e}"))
+        })?;
+        std::fs::write(&cfg_path, &cfg).map_err(|e| {
+            DaemonError::Engine(format!("写临时 cfg 失败: {e}"))
+        })?;
+
+        // 全局完成位图（初始全 0）
+        let mut bitfield = vec![0u8; (meta.pieces_hash.len() + 7) / 8];
+        let mut completed_total = 0usize;
+        let mut partial_infos: Vec<xunlei_convert::PartialPieceInfo> = Vec::new();
+
+        let mut converter = FastresumeConverter::new();
+        for (file_idx, file) in files.iter().enumerate() {
+            let xltd_path = tmp_dir.join(format!("source.{}.bt.xltd", file_idx));
+            std::fs::write(&xltd_path, &xltds[file_idx]).map_err(|e| {
+                DaemonError::Engine(format!("写临时 xltd[{}] 失败: {e}", file_idx))
+            })?;
+
+            // 该文件对应的 pieces 子集（局部索引从 0 起，xltd 是文件镜像）
+            let file_pieces = &meta.pieces_hash
+                [file.piece_offset..file.piece_offset + file.piece_count];
+
+            let report = converter.analyze(
+                &torrent_path,
+                &cfg_path,
+                &xltd_path,
+                meta.piece_length,
+                file_pieces,
+                0, // file_offset：xltd 是文件镜像，局部偏移固定 0
+                file.size,
+            )?;
+
+            // 把局部 partial piece 索引映射回全局索引
+            for &(local_idx, nonzero, total) in &report.xltd.partial_details {
+                let global_idx = file.piece_offset + local_idx;
+                partial_infos.push(xunlei_convert::PartialPieceInfo {
+                    index: global_idx,
+                    nonzero_bytes: nonzero,
+                    total_bytes: total,
+                });
+            }
+            // 累加局部完成数（completed_pieces 是局部索引的前缀计数，这里用位图直接设置更稳妥）
+            // completed_pieces 语义：前 N 个 piece 完成（局部），映射到全局连续区间。
+            completed_total += report.completed_pieces;
+        }
+
+        // 用 lenient 策略构建全局 bitfield（合并所有文件的 partial）
+        bitfield = build_bitfield_lenient(
+            meta.pieces_hash.len(),
+            completed_total,
+            &partial_infos,
+            0.5,
+        );
+
+        // fastresume file_sizes：[[size, pad], ...]，pad = piece 边界填充
+        let file_sizes: Vec<[u64; 2]> = files
+            .iter()
+            .map(|f| {
+                let plen = meta.piece_length as u64;
+                let pad = (plen - (f.size % plen)) % plen;
+                [f.size, pad]
+            })
+            .collect();
+
+        let fr = converter.build_fastresume(
+            &meta.info_hash,
+            &bitfield,
+            &meta.name,
+            dest_root.to_str().unwrap_or("./"),
+            &file_sizes,
+        )?;
+        let fastresume_bytes =
+            xunlei_convert::fastresume::bencode_fastresume(&fr).map_err(|e| {
+                DaemonError::Engine(format!("fastresume bencode 失败: {e}"))
+            })?;
+
+        // 清理临时文件（best-effort）
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // 6. 通过 btcore 导入
+        let engine_tid = self
+            .engine_for(EngineKind::Bt)?
+            .add_xunlei_resume(fastresume_bytes)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+
+        // 7. 创建任务记录
+        let task = DownloadTask {
+            id: task_id.clone(),
+            canonical_id: canonical,
+            source: DownloadSource::TorrentFile(torrent),
+            identity: ContentIdentity::SingleFile {
+                size: total_size,
+                etag: None,
+                sha256: None,
+                backup_md5: None,
+            },
+            dest_root: dest_root.clone(),
+            files: files
+                .iter()
+                .map(|f| TaskFile {
+                    rel_path: f.path.clone(),
+                    size: f.size,
+                    done: 0,
+                    state: FileState::Pending,
+                    source_urls: vec![],
+                    identity: None,
+                    etag: None,
+                    engine: EngineKind::Bt,
+                })
+                .collect(),
+            acquisitions: vec![],
+            aggregate: Default::default(),
+            state: TaskState::Queued,
+            retry: Default::default(),
+            created_at: std::time::Instant::now(),
+            metadata: TaskMetadata {
+                name: Some(meta.name.clone()),
+                added_at_unix: 0,
+            },
+        };
+        let mut rec = TaskRecord {
+            task,
+            engine_tid: Some(engine_tid.clone()),
+            engine_kind: EngineKind::Bt,
+            engine_status: None,
+            events: vec![],
+        };
+        rec.push_event("xunlei-import", None);
+
+        // 8. peer 注入（best-effort）：把 cfg 里的 bt:// 地址注入引擎
+        if let Ok(cfg_obj) = XlbtCfg::parse(&cfg) {
+            let engine = self.engine_for(EngineKind::Bt)?;
+            for peer_str in cfg_obj.peers {
+                if let Some((ip, port)) = parse_bt_peer(&peer_str) {
+                    let addr = format!("{}:{}", ip, port);
+                    if let Ok(addr) = addr.parse::<std::net::SocketAddr>() {
+                        let _ = engine.add_peer(&engine_tid, addr).await;
+                    }
+                }
+            }
+        }
+
         self.tasks.lock().unwrap().insert(task_id.clone(), rec);
         self.autosave();
         self.hub.publish(SchedulerEvent::TaskCreated {
@@ -554,11 +1095,13 @@ impl DaemonState {
                 url: url.clone(),
                 headers: vec![],
                 auth: None,
+                backup_url: None,
             },
             identity: ContentIdentity::SingleFile {
                 size: 0,
                 etag: None,
                 sha256: None,
+                backup_md5: None,
             },
             dest_root: dest_root.clone(),
             files: vec![],
@@ -599,8 +1142,147 @@ impl DaemonState {
         Ok(task_id)
     }
 
+    /// 添加 FTP 任务（feature `ftp`）：校验 `ftp://` 前缀 → ensure_dest_root →
+    /// `parse_ftp_auth` 提取 user/pass → 归一化 URL 作 canonical 查重 → 路由 `EngineKind::Ftp`
+    /// 引擎 → add → TaskCreated/StateChanged 事件与持久化（完全仿照 add_http_task）。
+    ///
+    /// 目录任务（url 以 `/` 结尾）：引擎 `add` 时已同步 LIST 出文件清单，此处做【有限次数的
+    /// files 同步】——轮询 `engine.status(tid)` 数次直到 `files` 非空，按 TaskFile 结构映射写入
+    /// `task.files`；始终为空（目录瞬时无文件/解析延迟）则静默跳过，文件级进度后续经既有轮询
+    /// 链路从 EngineStatus 透出，不做强制阻塞。
+    #[cfg(feature = "ftp")]
+    pub async fn add_ftp_task(
+        &self,
+        url: String,
+        dest_root: Option<String>,
+    ) -> Result<TaskId, DaemonError> {
+        if !url.starts_with("ftp://") {
+            return Err(DaemonError::InvalidSource(url));
+        }
+        // B10：目标目录预检；目录总大小需 LIST 才可知 → 空间预检跳过（同 HTTP 逻辑）
+        let def = self
+            .default_dest_root
+            .lock()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let dest_root = ensure_dest_root(dest_root.or(Some(def)))?;
+        let (user, pass) = smart_dl_core::source_parse::ftp::parse_ftp_auth(&url);
+        // D34 复用 canonical 归一化（url 无 query 时基本原样）：FTP 身份键 = 归一化 URL
+        let canonical = CanonicalId {
+            kind: CanonicalKind::Ftp,
+            identity: canonical_http_url(&url),
+            validator: None,
+            token_sensitive: false,
+        };
+        let task_id = format!("t{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+
+        // 查重（canonical 一致 → DuplicateRejected）
+        {
+            let tasks = self.tasks.lock().unwrap();
+            for (existing, rec) in tasks.iter() {
+                if rec.task.canonical_id == canonical {
+                    self.hub.publish(SchedulerEvent::DuplicateRejected {
+                        task_id: task_id.clone(),
+                        existing: existing.clone(),
+                    });
+                    return Err(DaemonError::Duplicate(existing.clone()));
+                }
+            }
+        }
+
+        let is_dir = url.ends_with('/');
+        // 单文件任务：落盘名取 URL 最后一段（引擎 `add` 用作 dest 相对文件名）；目录任务由引擎自理
+        let name = url
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let task = DownloadTask {
+            id: task_id.clone(),
+            canonical_id: canonical,
+            source: DownloadSource::Ftp {
+                url: url.clone(),
+                user,
+                pass,
+            },
+            identity: ContentIdentity::SingleFile {
+                size: 0,
+                etag: None,
+                sha256: None,
+                backup_md5: None,
+            },
+            dest_root: dest_root.clone(),
+            files: vec![],
+            acquisitions: vec![],
+            aggregate: Default::default(),
+            state: TaskState::Queued,
+            retry: Default::default(),
+            created_at: std::time::Instant::now(),
+            metadata: TaskMetadata {
+                name: if is_dir { None } else { name },
+                added_at_unix: 0,
+            },
+        };
+
+        let engine = self.engine_for(EngineKind::Ftp)?;
+        let engine_tid = engine
+            .add(&task)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        let mut rec = TaskRecord {
+            task,
+            engine_tid: Some(engine_tid.clone()),
+            engine_kind: EngineKind::Ftp,
+            engine_status: None,
+            events: vec![],
+        };
+        rec.push_event("add", None);
+
+        // 目录任务：有限次 files 同步（FtpEngine::add 已同步 LIST，首轮通常即可命中）
+        if is_dir {
+            for _ in 0..8 {
+                if let Ok(st) = engine.status(&engine_tid).await {
+                    if !st.files.is_empty() {
+                        rec.task.files = st
+                            .files
+                            .into_iter()
+                            .map(|f| TaskFile {
+                                rel_path: f.rel_path,
+                                size: f.size,
+                                done: f.done,
+                                state: FileState::Active,
+                                source_urls: vec![url.clone()],
+                                identity: None,
+                                etag: None,
+                                engine: EngineKind::Ftp,
+                            })
+                            .collect();
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+        }
+
+        self.tasks.lock().unwrap().insert(task_id.clone(), rec);
+        self.autosave();
+        self.hub.publish(SchedulerEvent::TaskCreated {
+            task_id: task_id.clone(),
+        });
+        self.hub.publish(SchedulerEvent::StateChanged {
+            task_id: task_id.clone(),
+            from: TaskState::Queued,
+            to: TaskState::Downloading(EngineKind::Ftp),
+        });
+        Ok(task_id)
+    }
+
     /// 任务快照（实时读引擎状态；未完成时引擎可能已移动）。
     pub async fn task_snapshot(&self, id: &str) -> Option<TaskSnapshot> {
+        let t0 = std::time::Instant::now(); // BUGB-INSTR
         let rec = self.tasks.lock().unwrap().get(id).cloned()?;
         let engine = self.engine_for(rec.engine_kind).ok();
         let (engine_name, status) = match (&rec.engine_tid, &engine) {
@@ -610,10 +1292,24 @@ impl DaemonState {
             }
             _ => (None, None),
         };
-        let state = match &status {
-            Some(s) => state_label(&engine_state_to_task(&s.state, rec.engine_kind)),
-            None => state_label(&rec.task.state),
+        { // BUGB-INSTR：快照耗时（>1s 说明引擎调用阻塞）
+            let ms = t0.elapsed().as_millis();
+            if ms > 1000 {
+                tracing::warn!("[bugb] snapshot SLOW id={id} elapsed_ms={ms}");
+            } else if ms > 50 {
+                tracing::info!("[bugb] snapshot id={id} elapsed_ms={ms}");
+            }
+        }
+        // 显示层权威（qB 式）：用户暂停是记录级事实，不被引擎实时态覆盖
+        // （lt 暂停后 status 枚举仍报 downloading，ABI 未透出 paused 位）。
+        let effective_state = match &rec.task.state {
+            TaskState::Paused => rec.task.state.clone(),
+            other => match &status {
+                Some(s) => engine_state_to_task(&s.state, rec.engine_kind),
+                None => other.clone(),
+            },
         };
+        let state = state_label(&effective_state);
         Some(TaskSnapshot {
             task_id: id.to_string(),
             state,
@@ -623,6 +1319,7 @@ impl DaemonState {
             done: status.as_ref().map(|s| s.total_done).unwrap_or(0),
             total: status.as_ref().map(|s| s.total).unwrap_or(0),
             error: status.as_ref().and_then(|s| s.error.clone()),
+            files: status.as_ref().map(|s| s.files.clone()).unwrap_or_default(),
         })
     }
 
@@ -693,6 +1390,44 @@ impl DaemonState {
             to: TaskState::Downloading(rec.engine_kind),
         });
         Ok(())
+    }
+
+    /// F5 P2SP：给运行中的 BT 任务逐条注入 web seed（云盘直链，BEP-19），
+    /// 返回成功注入条数。仅 BT 任务可注入（其余 → UnsupportedOp，HTTP 层映射
+    /// 409）；engine_tid 缺失（尚未入引擎/恢复失败）→ NotFound。
+    /// **URL 必须原样使用**：禁止增删改任何 query 参数——云盘直链带 `at=`
+    /// 防篡改签名，改动即失效；要多条链请重新调用取链 API 取新链（F5 PoC-1b）。
+    pub async fn add_webseeds(&self, id: &str, urls: &[String]) -> Result<usize, DaemonError> {
+        let rec = self
+            .tasks
+            .lock()
+            .unwrap()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        let tid = rec
+            .engine_tid
+            .clone()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        if rec.engine_kind != EngineKind::Bt {
+            return Err(DaemonError::UnsupportedOp(format!(
+                "仅 BT 任务支持注入 web seed（{id} 为 {:?}）",
+                rec.engine_kind
+            )));
+        }
+        let engine = self.engine_for(EngineKind::Bt)?;
+        let mut added = 0usize;
+        for url in urls {
+            engine
+                .add_url_seed(&tid, url)
+                .await
+                .map_err(|e| DaemonError::Engine(e.to_string()))?;
+            added += 1;
+        }
+        if let Some(rec) = self.tasks.lock().unwrap().get_mut(id) {
+            rec.push_event("webseed", Some(format!("+{added}")));
+        }
+        Ok(added)
     }
 
     pub async fn remove(&self, id: &str) -> Result<(), DaemonError> {
@@ -877,11 +1612,13 @@ impl HttpSink for FallbackSink {
                 url: url.to_string(),
                 headers: vec![],
                 auth: None,
+                backup_url: None,
             },
             identity: ContentIdentity::SingleFile {
                 size: 0,
                 etag: None,
                 sha256: None,
+                backup_md5: None,
             },
             dest_root,
             files: vec![],
@@ -900,14 +1637,26 @@ impl HttpSink for FallbackSink {
             .add(&task)
             .await
             .map_err(|e| SinkError::Failed(e.to_string()))?;
-        // 轮询到终态（60s 上限）
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        // 轮询到终态（直链传输上限 600s：免费档聚合 ~1MB/s，须容纳数百 MB 文件）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let started = std::time::Instant::now();
+        let mut last_beat = started;
+        let mut last_done = u64::MAX;
         let result = loop {
             let st = self
                 .http
                 .status(&tid)
                 .await
                 .map_err(|e| SinkError::Failed(e.to_string()))?;
+            if last_done == u64::MAX {
+                last_done = st.total_done;
+            }
+            if st.total_done != last_done {
+                last_done = st.total_done;
+            }
+            if last_beat.elapsed() >= std::time::Duration::from_secs(5) {
+                last_beat = std::time::Instant::now();
+            }
             match st.state {
                 EngineState::Completed => break Ok(()),
                 EngineState::Error => {
@@ -947,6 +1696,17 @@ fn map_provider_err(e: ProviderError) -> DaemonError {
     DaemonError::Fallback(msg)
 }
 
+/// 解析 `bt://ip:port` 为 `(ip, port)`。
+#[cfg(feature = "xunlei-import")]
+fn parse_bt_peer(s: &str) -> Option<(String, u16)> {
+    let s = s.strip_prefix("bt://")?;
+    let mut parts = s.rsplitn(2, ':');
+    let port_str = parts.next()?;
+    let ip = parts.next()?;
+    let port = port_str.parse::<u16>().ok()?;
+    Some((ip.to_string(), port))
+}
+
 /// B10（§12 D36）：dest_root 预检——缺失目录自动创建 + 可写探测（探针文件）。
 /// 空间充足性由 `precheck_space` 在总大小已知时另行检查。
 pub fn ensure_dest_root(dest: Option<String>) -> Result<PathBuf, DaemonError> {
@@ -984,38 +1744,52 @@ impl DaemonState {
     /// 应用一条 BT alert 到匹配任务（engine_tid 大小写不敏感归一化比较）：
     /// 状态迁移（`bt_events::transition_for`）+ 引擎缓存写入；返回效果供广播。
     /// 无匹配任务或无迁移 → `None`（调用方丢弃该 alert）。
+    ///
+    /// Bug B 根因修复：`autosave()` 必须在 tasks 锁【外】调用——autosave →
+    /// persisted_tasks 会再次取同一把非重入 std Mutex，锁内调用 = 同线程重入
+    /// 自死锁（alert 循环线程永久持锁挂死 → 全部端点含 /config 无限 hang）。
+    /// 修复前证据：`aba HIT → autosave BEGIN` 后日志静默 + tasks_free=false 永续。
     #[cfg(feature = "bt")]
     pub fn apply_bt_alert(&self, a: &smart_dl_btcore::Alert) -> Option<BtAlertEffect> {
         let ih_l = a.ih.to_ascii_lowercase();
-        let mut tasks = self.tasks.lock().unwrap();
-        for (id, rec) in tasks.iter_mut() {
-            if rec.engine_kind != EngineKind::Bt {
-                continue;
-            }
-            let Some(tid) = &rec.engine_tid else {
-                continue;
-            };
-            if tid.to_ascii_lowercase() != ih_l {
-                continue;
-            }
-            // 命中任务（每条 alert 至多匹配一个 rec）：无迁移 → 丢弃（`?` 提前返回 None）
-            let now = rec.task.state.clone();
-            let (from, to) = crate::bt_events::transition_for(&now, a)?;
-            rec.task.state = to.clone();
-            if let Some(es) = rec.engine_status.as_mut() {
-                if to == TaskState::Failed {
-                    es.error = Some(a.msg.clone());
+        let effect = {
+            let mut tasks = self.tasks.lock().unwrap();
+            let mut found: Option<BtAlertEffect> = None;
+            for (id, rec) in tasks.iter_mut() {
+                if rec.engine_kind != EngineKind::Bt {
+                    continue;
                 }
+                let Some(tid) = &rec.engine_tid else {
+                    continue;
+                };
+                if tid.to_ascii_lowercase() != ih_l {
+                    continue;
+                }
+                // 命中任务（每条 alert 至多匹配一个 rec）：无迁移 → 丢弃
+                let now = rec.task.state.clone();
+                let Some((from, to)) = crate::bt_events::transition_for(&now, a) else {
+                    break;
+                };
+                rec.task.state = to.clone();
+                if let Some(es) = rec.engine_status.as_mut() {
+                    if to == TaskState::Failed {
+                        es.error = Some(a.msg.clone());
+                    }
+                }
+                found = Some(BtAlertEffect {
+                    task_id: id.clone(),
+                    from,
+                    to,
+                    message: a.msg.clone(),
+                });
+                break;
             }
-            self.autosave(); // 状态迁移落盘
-            return Some(BtAlertEffect {
-                task_id: id.clone(),
-                from,
-                to,
-                message: a.msg.clone(),
-            });
+            found
+        }; // ← tasks 锁在此释放（guard drop）
+        if effect.is_some() {
+            self.autosave(); // 锁外落盘：状态迁移落盘（修复 Bug B 重入自死锁）
         }
-        None
+        effect
     }
 
     /// HTTP 任务状态推进轮询：权威 = 引擎实时状态（v1 HTTP 引擎无 alert 回调，
@@ -1025,31 +1799,38 @@ impl DaemonState {
     ///
     /// 返回本批效果供事件广播；无变化的任务跳过。
     pub async fn poll_http_task_states(&self) -> Vec<HttpPollEffect> {
-        // 先收集候选（锁外做引擎调用；避免长持锁）
-        let candidates: Vec<(String, EngineTaskId)> = {
+        // 先收集候选（锁外做引擎调用；避免长持锁）。HTTP + FTP 引擎任务都走本推进路径
+        //（FTP 引擎无 alert 回调，状态推进依赖轮询——与 HTTP 一致）。
+        let candidates: Vec<(String, EngineTaskId, EngineKind)> = {
             let tasks = self.tasks.lock().unwrap();
             tasks
                 .iter()
-                .filter(|(_, rec)| rec.engine_kind == EngineKind::Http)
+                .filter(|(_, rec)| matches!(rec.engine_kind, EngineKind::Http | EngineKind::Ftp))
                 .filter(|(_, rec)| {
                     matches!(
                         rec.task.state,
                         TaskState::Queued | TaskState::Downloading(_)
                     )
                 })
-                .filter_map(|(id, rec)| rec.engine_tid.clone().map(|t| (id.clone(), t)))
+                .filter_map(|(id, rec)| {
+                    rec.engine_tid
+                        .clone()
+                        .map(|t| (id.clone(), t, rec.engine_kind))
+                })
                 .collect()
         };
         let mut effects = Vec::new();
-        for (id, tid) in candidates {
-            let Ok(engine) = self.engine_for(EngineKind::Http) else {
+        for (id, tid, kind) in candidates {
+            let Ok(engine) = self.engine_for(kind) else {
                 continue;
             };
             // 引擎侧已移除/不可用 → 跳过（任务移除后轮询器自然停）
             let Ok(st) = engine.status(&tid).await else {
                 continue;
             };
-            let (from, to) = {
+            // Bug B 根因修复：autosave 移到锁外（persisted_tasks 重入同一把非重入锁
+            // 会同线程自死锁——与 apply_bt_alert 同源缺陷）。
+            let advanced: Option<TaskState> = {
                 let mut tasks = self.tasks.lock().unwrap();
                 let Some(rec) = tasks.get_mut(&id) else {
                     continue;
@@ -1062,7 +1843,7 @@ impl DaemonState {
                     continue;
                 }
                 let from = rec.task.state.clone();
-                let to = engine_state_to_task(&st.state, EngineKind::Http);
+                let to = engine_state_to_task(&st.state, kind);
                 if to == from {
                     continue; // 已在目标态（活跃→活跃、终态已推等）
                 }
@@ -1072,13 +1853,15 @@ impl DaemonState {
                         es.error = st.error.clone();
                     }
                 }
-                self.autosave(); // 终态/推进落盘
-                (from, to)
-            };
+                Some(from)
+            }; // ← tasks 锁在此释放
+            if advanced.is_some() {
+                self.autosave(); // 锁外落盘：终态/推进落盘（修复 Bug B 重入自死锁）
+            }
             effects.push(HttpPollEffect {
                 task_id: id,
-                from,
-                to,
+                from: advanced.expect("checked above"),
+                to: engine_state_to_task(&st.state, kind),
                 message: st.error.clone().unwrap_or_default(),
             });
         }
@@ -1166,6 +1949,23 @@ pub fn torrent_total_size(b: &[u8]) -> Option<u64> {
     None
 }
 
+/// .torrent 空间预检总大小（B10）：优先 TorrentMeta::parse——多文件取 files 各项
+/// size 求和、单文件取 file_size；parse 失败 → 回退 torrent_total_size（单文件最小
+/// 解析）。两者都拿不到 → None（预检跳过）。
+#[cfg(feature = "bt")]
+pub fn torrent_precheck_total(b: &[u8]) -> Option<u64> {
+    match TorrentMeta::parse(b) {
+        Ok(meta) => {
+            if meta.files.is_empty() {
+                Some(meta.file_size)
+            } else {
+                Some(meta.files.iter().map(|f| f.size).sum())
+            }
+        }
+        Err(_) => torrent_total_size(b),
+    }
+}
+
 /// 定位 info dict：返回 (info 值起始 'd' 下标, info dict 闭合 'e' 下标)。
 #[cfg(feature = "bt")]
 fn locate_info(b: &[u8]) -> Option<(usize, usize)> {
@@ -1196,6 +1996,17 @@ fn be_str(b: &[u8], at: usize) -> Option<(&[u8], usize)> {
     let len: usize = std::str::from_utf8(&b[at..colon]).ok()?.parse().ok()?;
     let start = colon + 1;
     Some((&b[start..start + len], start + len))
+}
+
+/// bencode 整数 `i<digits>e` → 值。
+#[cfg(feature = "bt")]
+fn be_int(b: &[u8], at: usize) -> Option<i64> {
+    if b.get(at) != Some(&b'i') {
+        return None;
+    }
+    let e = b[at..].iter().position(|&c| c == b'e')? + at;
+    let s = std::str::from_utf8(&b[at + 1..e]).ok()?;
+    s.parse().ok()
 }
 
 /// dict 结束下标：从 `start`（'d'）按 键(字符串)→值 结构推进到闭合 'e'。
@@ -1319,6 +2130,7 @@ mod bt_alert_tests {
                     size: 0,
                     etag: None,
                     sha256: None,
+                    backup_md5: None,
                 },
                 dest_root: PathBuf::from("."),
                 files: vec![],
@@ -1406,6 +2218,26 @@ mod bt_alert_tests {
     }
 
     #[test]
+    fn finished_alert_promotes_paused_to_seeding() {
+        // Bug C：BT 在记录态 Paused 下被引擎实际完成（Bug A 复活后跑完），
+        // Finished alert 应允许推进到 Seeding，避免记录态与引擎态错位。
+        let state = make_state_with(bt_rec(TaskState::Paused, "C1"));
+        let alert = Alert {
+            kind: AlertKind::State,
+            ih: "c1".into(),
+            msg: "torrent finished downloading".into(),
+            at: 0,
+            resume_ready: false,
+        };
+        let eff = state.apply_bt_alert(&alert).unwrap();
+        assert_eq!(eff.from, TaskState::Paused);
+        assert_eq!(eff.to, TaskState::Seeding);
+        let rec_lock = state.tasks.lock().unwrap();
+        let rec = rec_lock.get("t1").unwrap();
+        assert_eq!(rec.task.state, TaskState::Seeding, "记录态必须落盘");
+    }
+
+    #[test]
     fn non_bt_task_ignored() {
         // HTTP 任务（engine_kind=Http）不匹配 BT alert
         let mut rec = bt_rec(TaskState::Downloading(EngineKind::Bt), "XT77");
@@ -1446,13 +2278,40 @@ mod bt_alert_tests {
         };
         assert!(state.apply_bt_alert(&alert).is_none());
     }
+
+    /// Bug B 回归（重入自死锁）：storage 启用 + Finished alert 迁移 → autosave。
+    /// 修复前：apply_bt_alert 持 tasks 锁调用 autosave → persisted_tasks 同线程
+    /// 重入同一把非重入 Mutex → 本测试 5s 超时失败（真实事故 = 全端点永久 hang）。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn finished_alert_with_storage_autosave_no_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("tasks.json");
+        let engine = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
+        let state = DaemonState::new(Arc::new(engine), vec![]).with_storage(store.clone());
+        let rec = bt_rec(TaskState::Queued, "BEEF");
+        (*state.tasks.lock().unwrap()).insert(rec.task.id.clone(), rec);
+        let alert = Alert {
+            kind: AlertKind::State,
+            ih: "beef".into(),
+            msg: "torrent finished downloading".into(),
+            at: 0,
+            resume_ready: false,
+        };
+        let work = state.apply_bt_alert(&alert);
+        let eff = tokio::time::timeout(std::time::Duration::from_secs(5), async move { work })
+            .await
+            .expect("apply_bt_alert 死锁（Bug B 重入回归）");
+        assert!(eff.is_some(), "Finished alert 应产生 Seeding 迁移");
+        assert_eq!(eff.unwrap().to, TaskState::Seeding);
+        // 落盘确实发生（autosave 在锁外完成）
+        assert!(store.exists(), "状态迁移应触发持久化落盘");
+    }
 }
 
 /// torrent_infohash（bencode 最小解析）单元测试。
 #[cfg(all(test, feature = "bt"))]
 mod torrent_tests {
-    use super::torrent_infohash;
-    use super::torrent_total_size;
+    use super::*;
 
     /// 最小合法 .torrent：d4:info<infodict>e
     fn sample_torrent() -> Vec<u8> {
@@ -1513,6 +2372,289 @@ mod torrent_tests {
         assert_eq!(torrent_total_size(&t), None);
         let _ = &mut t;
     }
+
+    #[test]
+    fn parse_minimal_single_file_torrent() {
+        // 构造最小单文件 torrent（bencode）
+        let mut torrent = Vec::new();
+        torrent.extend_from_slice(b"d"); // dict
+        torrent.extend_from_slice(b"8:announce14:http://tracker"); // announce
+        torrent.extend_from_slice(b"4:infod"); // info dict
+        torrent.extend_from_slice(b"6:lengthi12345e"); // length
+        torrent.extend_from_slice(b"4:name8:filename"); // name
+        torrent.extend_from_slice(b"12:piece lengthi16384e"); // piece length
+        torrent.extend_from_slice(b"6:pieces"); // pieces key
+        torrent.extend_from_slice(b"20:"); // pieces value 长度前缀
+        torrent.extend_from_slice(&[0u8; 20]); // dummy piece hash
+        torrent.extend_from_slice(b"ee"); // end info dict, end dict
+
+        let meta = TorrentMeta::parse(&torrent).unwrap();
+        assert_eq!(meta.info_hash.len(), 40);
+        assert_eq!(meta.piece_length, 16384);
+        assert_eq!(meta.pieces_hash.len(), 1);
+        assert_eq!(meta.name, "filename");
+        assert_eq!(meta.file_size, 12345);
+    }
+
+    #[test]
+    fn parse_multi_file() {
+        // 多文件 torrent 应被解析（files 列表含 2 个文件）
+        let mut torrent = Vec::new();
+        torrent.extend_from_slice(b"d4:infod"); // 顶层 + info dict
+        torrent.extend_from_slice(b"12:piece lengthi16384e"); // piece length
+        torrent.extend_from_slice(b"6:pieces20:"); // pieces (1 piece)
+        torrent.extend_from_slice(&[0u8; 20]);
+        torrent.extend_from_slice(b"4:name8:multidir"); // name
+        torrent.extend_from_slice(b"5:filesl"); // files list
+        // 文件1: length=10, path=["a"]
+        torrent.extend_from_slice(b"d6:lengthi10e4:pathl1:aee");
+        // 文件2: length=20, path=["b"]
+        torrent.extend_from_slice(b"d6:lengthi20e4:pathl1:bee");
+        torrent.extend_from_slice(b"e"); // end files list
+        torrent.extend_from_slice(b"ee"); // end info dict + top dict
+
+        let meta = TorrentMeta::parse(&torrent).unwrap();
+        assert_eq!(meta.files.len(), 2, "应解析出 2 个文件");
+        assert_eq!(meta.files[0].path, "a");
+        assert_eq!(meta.files[0].size, 10);
+        assert_eq!(meta.files[1].path, "b");
+        assert_eq!(meta.files[1].size, 20);
+    }
+
+    #[test]
+    fn precheck_total_multi_file_sums_files() {
+        // 多文件 torrent：预检总量 = 各文件 size 之和（torrent_total_size 遇 files
+        // 返回 None，此处验证升级后 parse 路径生效）
+        let mut torrent = Vec::new();
+        torrent.extend_from_slice(b"d4:infod");
+        torrent.extend_from_slice(b"12:piece lengthi16384e");
+        torrent.extend_from_slice(b"6:pieces20:");
+        torrent.extend_from_slice(&[0u8; 20]);
+        torrent.extend_from_slice(b"4:name8:multidir");
+        torrent.extend_from_slice(b"5:filesl");
+        torrent.extend_from_slice(b"d6:lengthi10e4:pathl1:aee");
+        torrent.extend_from_slice(b"d6:lengthi20e4:pathl1:bee");
+        torrent.extend_from_slice(b"e");
+        torrent.extend_from_slice(b"ee");
+        assert_eq!(torrent_precheck_total(&torrent), Some(30));
+    }
+
+    #[test]
+    fn precheck_total_single_file_uses_length() {
+        let t = sample_torrent();
+        // length=123（单文件走 file_size）
+        assert_eq!(torrent_precheck_total(&t), Some(123));
+    }
+
+    #[test]
+    fn precheck_total_parse_fail_falls_back() {
+        // TorrentMeta::parse 失败（缺 piece length/pieces）但 info dict 内 length
+        // 可定位 → 回退 torrent_total_size 路径
+        let t = b"d4:infod6:lengthi999e4:name4:testee";
+        assert_eq!(torrent_precheck_total(t), Some(999));
+    }
+
+    /// xunlei 导入测试：add_xunlei_import_task / xunlei_convert 仅在
+    /// xunlei-import feature 下存在，单独门控以免 --features bt 编译失败。
+    #[cfg(all(test, feature = "xunlei-import"))]
+    mod xunlei_import_tests {
+        use super::*;
+        use std::path::PathBuf;
+
+        #[tokio::test]
+        async fn add_xunlei_import_task_e2e() {
+            // 使用 tools/xunlei-migrate/e2e_out 合成样本测试完整导入流程
+            let e2e = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("../../tools/xunlei-migrate/e2e_out");
+            let torrent_path = e2e.join("test.torrent");
+            let cfg_path = e2e.join("test.xlbt.cfg");
+            let xltd_path = e2e.join("test.bt.xltd");
+            if !torrent_path.exists() || !cfg_path.exists() || !xltd_path.exists() {
+                eprintln!("SKIP: e2e files not found at {:?}", e2e);
+                return;
+            }
+
+            let torrent = std::fs::read(&torrent_path).expect("read torrent");
+            let cfg = std::fs::read(&cfg_path).expect("read cfg");
+            let xltd = std::fs::read(&xltd_path).expect("read xltd");
+
+            // 构造 DaemonState（FakeEngine 作为 BT 引擎）
+            let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state = DaemonState::new(fake.clone(), vec![])
+                .with_dest_root(dir.path().to_path_buf());
+
+            let tid = state
+                .add_xunlei_import_task(torrent, cfg, vec![xltd], None)
+                .await
+                .expect("add_xunlei_import_task should succeed");
+
+            // 验证任务已创建
+            let tasks = state.tasks.lock().unwrap();
+            let rec = tasks.get(&tid).expect("task exists");
+            assert_eq!(rec.task.state, TaskState::Queued);
+            assert_eq!(rec.engine_kind, EngineKind::Bt);
+            assert!(rec.engine_tid.is_some());
+            assert_eq!(fake.xunlei_resumes().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn add_xunlei_import_task_requires_matching_xltds() {
+            // 多文件 torrent（2 文件）传入 0 个 xltd → 数量不匹配
+            let mut torrent = Vec::new();
+            torrent.extend_from_slice(b"d4:infod");
+            torrent.extend_from_slice(b"12:piece lengthi16384e");
+            torrent.extend_from_slice(b"6:pieces20:");
+            torrent.extend_from_slice(&[0u8; 20]);
+            torrent.extend_from_slice(b"4:name8:multidir");
+            torrent.extend_from_slice(b"5:filesl");
+            torrent.extend_from_slice(b"d6:lengthi10e4:pathl1:aee");
+            torrent.extend_from_slice(b"d6:lengthi20e4:pathl1:bee");
+            torrent.extend_from_slice(b"e");
+            torrent.extend_from_slice(b"ee");
+
+            let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state = DaemonState::new(fake.clone(), vec![])
+                .with_dest_root(dir.path().to_path_buf());
+
+            let err = state
+                .add_xunlei_import_task(torrent, vec![], vec![], None)
+                .await
+                .expect_err("应拒绝 xltd 数量不匹配");
+            assert!(
+                err.to_string().contains("不匹配"),
+                "错误信息应提示数量不匹配: {err}"
+            );
+            assert_eq!(fake.xunlei_resumes().len(), 0);
+        }
+
+        #[tokio::test]
+        async fn add_xunlei_import_task_rejects_duplicate() {
+            // 使用 e2e 合成样本
+            let e2e = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("../../tools/xunlei-migrate/e2e_out");
+            let torrent_path = e2e.join("test.torrent");
+            let cfg_path = e2e.join("test.xlbt.cfg");
+            let xltd_path = e2e.join("test.bt.xltd");
+            if !torrent_path.exists() || !cfg_path.exists() || !xltd_path.exists() {
+                eprintln!("SKIP: e2e files not found at {:?}", e2e);
+                return;
+            }
+
+            let torrent = std::fs::read(&torrent_path).expect("read torrent");
+            let cfg = std::fs::read(&cfg_path).expect("read cfg");
+            let xltd = std::fs::read(&xltd_path).expect("read xltd");
+
+            let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state = DaemonState::new(fake.clone(), vec![])
+                .with_dest_root(dir.path().to_path_buf());
+
+            // 第一次导入成功
+            let tid1 = state
+                .add_xunlei_import_task(torrent.clone(), cfg.clone(), vec![xltd.clone()], None)
+                .await
+                .expect("first import should succeed");
+
+            // 第二次导入相同 infohash → Duplicate
+            let err = state
+                .add_xunlei_import_task(torrent, cfg, vec![xltd], None)
+                .await
+                .expect_err("应拒绝重复 infohash");
+            assert!(
+                err.to_string().contains("duplicate") || err.to_string().contains("重复"),
+                "错误信息应提示重复: {err}"
+            );
+            // 验证只有第一次任务被创建
+            let tasks = state.tasks.lock().unwrap();
+            assert!(tasks.contains_key(&tid1));
+            assert_eq!(tasks.len(), 1);
+        }
+
+        #[tokio::test]
+        async fn add_xunlei_import_task_rejects_bad_torrent() {
+            let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state = DaemonState::new(fake.clone(), vec![])
+                .with_dest_root(dir.path().to_path_buf());
+
+            let err = state
+                .add_xunlei_import_task(vec![], vec![], vec![], None)
+                .await
+                .expect_err("应拒绝无效 torrent");
+            assert!(
+                err.to_string().contains("解析失败") || err.to_string().contains("无法定位"),
+                "错误信息应提示解析失败: {err}"
+            );
+            assert_eq!(fake.xunlei_resumes().len(), 0);
+        }
+
+        #[tokio::test]
+        async fn add_xunlei_import_task_marks_lenient_partial() {
+            // 读取预生成的 partial_test.torrent（16KB piece, 16 pieces, 256KB 文件）
+            let e2e = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap())
+                .join("../../tools/xunlei-migrate/e2e_out");
+            let torrent_path = e2e.join("partial_test.torrent");
+            if !torrent_path.exists() {
+                eprintln!("SKIP: partial_test.torrent not found");
+                return;
+            }
+            let torrent = std::fs::read(&torrent_path).expect("read torrent");
+            let info_hash = torrent_infohash(&torrent).expect("infohash");
+
+            // 构造 minimal cfg（magic + infohash + 头部观测值）
+            let mut cfg = Vec::new();
+            cfg.extend_from_slice(b"XDLCTX\x00\x00");
+            cfg.extend_from_slice(&[0u8; 16]); // 0x08-0x17 随机区
+            // 0x18-0x37 8 个 u32 观测值（与 e2e 样本一致）
+            cfg.extend_from_slice(&30025u32.to_le_bytes());
+            cfg.extend_from_slice(&7u32.to_le_bytes());
+            cfg.extend_from_slice(&0u32.to_le_bytes());
+            cfg.extend_from_slice(&4u32.to_le_bytes());
+            cfg.extend_from_slice(&0u32.to_le_bytes());
+            cfg.extend_from_slice(&28584u32.to_le_bytes());
+            cfg.extend_from_slice(&4u32.to_le_bytes());
+            cfg.extend_from_slice(&262145u32.to_le_bytes());
+            cfg.extend_from_slice(&40u32.to_le_bytes()); // 0x38 infohash 长度 = 40 (u32)
+            cfg.extend_from_slice(info_hash.as_bytes()); // 0x3C-0x63 ASCII infohash
+
+            // 构造 xltd：piece 5 为 partial（前 8192 字节非零 = 50%）
+            let piece_length = 16384usize;
+            let file_size = 256 * 1024u64;
+            let xltd_size = ((file_size + 4095) / 4096 * 4096) as usize;
+            let mut xltd = vec![0u8; xltd_size];
+            let p5_offset = 5 * piece_length;
+            for i in 0..8192 {
+                xltd[p5_offset + i] = 0xAB;
+            }
+
+            let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+            let dir = tempfile::tempdir().expect("tempdir");
+            let state = DaemonState::new(fake.clone(), vec![])
+                .with_dest_root(dir.path().to_path_buf());
+
+            let tid = state
+                .add_xunlei_import_task(torrent, cfg, vec![xltd], None)
+                .await
+                .expect("add_xunlei_import_task should succeed");
+
+            let tasks = state.tasks.lock().unwrap();
+            let rec = tasks.get(&tid).expect("task exists");
+            assert_eq!(rec.task.state, TaskState::Queued);
+            assert_eq!(rec.engine_kind, EngineKind::Bt);
+            assert!(rec.engine_tid.is_some());
+            assert_eq!(fake.xunlei_resumes().len(), 1);
+
+            // 验证 bitfield：piece 0 和 piece 5 应被标记为完成（lenient 策略）
+            let resumes = fake.xunlei_resumes();
+            let fastresume = resumes.last().unwrap();
+            let bened = xunlei_convert::fastresume::bdecode(fastresume).expect("bdecode fastresume");
+            let pieces = bened.dict_get(b"pieces").expect("pieces").as_bytes().expect("pieces bytes");
+            assert_eq!(pieces.len(), 2); // 16 pieces = 2 bytes
+            assert_eq!(pieces[0], 0x84, "piece 0 and 5 should be set: got 0x{:02X}", pieces[0]);
+        }
+    }
 }
 
 /// B10 预检单元测试（ensure_dest_root / precheck_space）。
@@ -1560,6 +2702,11 @@ pub struct FakeEngine {
     counter: std::sync::atomic::AtomicU64,
     fail_urls: std::sync::Mutex<std::collections::HashSet<String>>,
     added: std::sync::Mutex<Vec<String>>,
+    xunlei: std::sync::Mutex<Vec<Vec<u8>>>,
+    /// 已注入的 web seed（(engine_tid, url)，F5 webseed 注入测试用）。
+    url_seeds: std::sync::Mutex<Vec<(String, String)>>,
+    /// status() 额外透出的文件级进度（目录 files 同步测试用；默认空 = 保持旧行为）。
+    status_files: std::sync::Mutex<Vec<FileProgress>>,
 }
 
 #[cfg(test)]
@@ -1570,6 +2717,9 @@ impl FakeEngine {
             counter: std::sync::atomic::AtomicU64::new(1),
             fail_urls: std::sync::Mutex::new(std::collections::HashSet::new()),
             added: std::sync::Mutex::new(Vec::new()),
+            xunlei: std::sync::Mutex::new(Vec::new()),
+            url_seeds: std::sync::Mutex::new(Vec::new()),
+            status_files: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -1579,6 +2729,20 @@ impl FakeEngine {
 
     pub fn added(&self) -> Vec<String> {
         self.added.lock().unwrap().clone()
+    }
+
+    pub fn xunlei_resumes(&self) -> Vec<Vec<u8>> {
+        self.xunlei.lock().unwrap().clone()
+    }
+
+    /// 读取已记录的 web seed 注入（(engine_tid, url)，F5 webseed 测试断言用）。
+    pub fn url_seeds(&self) -> Vec<(String, String)> {
+        self.url_seeds.lock().unwrap().clone()
+    }
+
+    /// 设置 status() 返回的文件级进度（FTP 目录 files 同步测试注入用）。
+    pub fn set_status_files(&self, files: Vec<FileProgress>) {
+        *self.status_files.lock().unwrap() = files;
     }
 }
 
@@ -1628,7 +2792,9 @@ impl DownloadEngine for FakeEngine {
         &self,
         _id: &EngineTaskId,
     ) -> Result<EngineStatus, smart_dl_core::types::EngineError> {
-        Ok(EngineStatus::default())
+        let mut es = EngineStatus::default();
+        es.files = self.status_files.lock().unwrap().clone();
+        Ok(es)
     }
     async fn remove(
         &self,
@@ -1652,8 +2818,20 @@ impl DownloadEngine for FakeEngine {
     }
     async fn add_url_seed(
         &self,
+        id: &EngineTaskId,
+        url: &str,
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        // 记录（engine_tid, url）供测试断言逐条转发
+        self.url_seeds
+            .lock()
+            .unwrap()
+            .push((id.clone(), url.to_string()));
+        Ok(())
+    }
+    async fn add_peer(
+        &self,
         _id: &EngineTaskId,
-        _url: &str,
+        _peer: std::net::SocketAddr,
     ) -> Result<(), smart_dl_core::types::EngineError> {
         Ok(())
     }
@@ -1670,6 +2848,18 @@ impl DownloadEngine for FakeEngine {
         _idx: u32,
     ) -> Result<Vec<u8>, smart_dl_core::types::EngineError> {
         Ok(vec![])
+    }
+
+    async fn add_xunlei_resume(
+        &self,
+        data: Vec<u8>,
+    ) -> Result<EngineTaskId, smart_dl_core::types::EngineError> {
+        self.xunlei.lock().unwrap().push(data);
+        Ok(format!(
+            "xr{}",
+            self.counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ))
     }
 }
 
@@ -1814,5 +3004,518 @@ mod persist_tests {
             std::path::PathBuf::from("/tmp/custom"),
             "显式 dest 优先于默认"
         );
+    }
+
+    /// Bug B 回归（重入自死锁，HTTP 推进路径）：storage 启用 + 引擎状态推进
+    /// （Queued → Downloading）触发锁内 autosave。修复前：poll_http_task_states
+    /// 持 tasks 锁调 autosave → persisted_tasks 同线程重入 → 5s 超时失败。
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_poll_transition_with_storage_autosave_no_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("tasks.json");
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]).with_storage(store.clone());
+        let _tid = state
+            .add_http_task("https://example.com/wedge.bin".into(), None)
+            .await
+            .unwrap();
+        // FakeEngine::status 默认 MetadataPending → 推进 Queued→Downloading(Http)
+        //（迁移必发生 → 必走 autosave 路径）
+        let work = state.poll_http_task_states();
+        let effects = tokio::time::timeout(std::time::Duration::from_secs(5), work)
+            .await
+            .expect("poll_http_task_states 死锁（Bug B 重入回归）");
+        assert_eq!(effects.len(), 1, "应推进一条任务状态");
+        assert!(store.exists(), "状态推进应触发持久化落盘");
+    }
+}
+
+/// 卡 D：FTP 路由（feature `ftp`）单测——add_ftp_task 前缀校验 / user+pass 提取 /
+/// 路由 Ftp 引擎 / 目录 files 同步；以及端到端（真实 FtpEngine + 最小 mock FTP server）。
+#[cfg(all(test, feature = "ftp"))]
+mod ftp_tests {
+    use super::*;
+
+    // ---- 单元：add_ftp_task 基础路由 ----
+
+    #[tokio::test]
+    async fn non_ftp_url_is_invalid() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Ftp));
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            DaemonState::new(fake.clone(), vec![]).with_dest_root(dir.path().to_path_buf());
+        let err = state
+            .add_ftp_task("https://example.com/f.bin".into(), None)
+            .await
+            .expect_err("非 ftp:// 前缀应拒绝");
+        assert!(
+            matches!(err, DaemonError::InvalidSource(_)),
+            "应返回 InvalidSource: {err}"
+        );
+        assert!(fake.added().is_empty(), "不应路由到引擎");
+    }
+
+    #[tokio::test]
+    async fn extracts_auth_and_routes_to_ftp_engine() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Ftp));
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            DaemonState::new(fake.clone(), vec![]).with_dest_root(dir.path().to_path_buf());
+        let url = "ftp://alice:secret@host/pub/a.bin".to_string();
+        let tid = state.add_ftp_task(url.clone(), None).await.unwrap();
+        let rec = state.tasks.lock().unwrap().get(&tid).cloned().unwrap();
+        assert_eq!(rec.engine_kind, EngineKind::Ftp, "engine_kind 记 Ftp");
+        match &rec.task.source {
+            DownloadSource::Ftp { url: u, user, pass } => {
+                assert_eq!(u, &url);
+                assert_eq!(user, "alice", "parse_ftp_auth 应提取 user");
+                assert_eq!(pass, "secret", "parse_ftp_auth 应提取 pass");
+            }
+            other => panic!("source 应为 DownloadSource::Ftp: {other:?}"),
+        }
+        // FakeEngine.add 对 Ftp 源记录 task.id → 证明路由到 Ftp 引擎
+        assert_eq!(fake.added(), vec![tid], "应路由到 Ftp 引擎 add");
+    }
+
+    #[tokio::test]
+    async fn anonymous_auth_falls_back() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Ftp));
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            DaemonState::new(fake.clone(), vec![]).with_dest_root(dir.path().to_path_buf());
+        let tid = state
+            .add_ftp_task("ftp://host/pub/a.bin".into(), None)
+            .await
+            .unwrap();
+        let rec = state.tasks.lock().unwrap().get(&tid).cloned().unwrap();
+        match &rec.task.source {
+            DownloadSource::Ftp { user, pass, .. } => {
+                assert_eq!(user, "anonymous");
+                assert_eq!(pass, "");
+            }
+            _ => panic!("source 应为 Ftp"),
+        }
+    }
+
+    #[tokio::test]
+    async fn single_file_uses_url_filename_as_metadata_name() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Ftp));
+        fake.set_status_files(vec![FileProgress {
+            rel_path: "x.bin".into(),
+            done: 0,
+            size: 5,
+        }]);
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            DaemonState::new(fake.clone(), vec![]).with_dest_root(dir.path().to_path_buf());
+        let tid = state
+            .add_ftp_task("ftp://host/pub/a.bin".into(), None)
+            .await
+            .unwrap();
+        let rec = state.tasks.lock().unwrap().get(&tid).cloned().unwrap();
+        assert_eq!(
+            rec.task.metadata.name.as_deref(),
+            Some("a.bin"),
+            "单文件任务落盘名取 URL 最后一段"
+        );
+        assert!(
+            rec.task.files.is_empty(),
+            "单文件任务不应触发目录 files 同步"
+        );
+    }
+
+    #[tokio::test]
+    async fn dir_task_syncs_files_from_engine_status() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Ftp));
+        fake.set_status_files(vec![
+            FileProgress {
+                rel_path: "a.bin".into(),
+                done: 0,
+                size: 10,
+            },
+            FileProgress {
+                rel_path: "b.bin".into(),
+                done: 0,
+                size: 20,
+            },
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            DaemonState::new(fake.clone(), vec![]).with_dest_root(dir.path().to_path_buf());
+        let tid = state.add_ftp_task("ftp://host/pub/".into(), None).await.unwrap();
+        let rec = state.tasks.lock().unwrap().get(&tid).cloned().unwrap();
+        assert_eq!(
+            rec.task.files.len(),
+            2,
+            "目录任务 files 应从引擎 status 同步: {:?}",
+            rec.task.files
+        );
+        assert_eq!(rec.task.files[0].rel_path, "a.bin");
+        assert_eq!(rec.task.files[0].size, 10);
+        assert_eq!(rec.task.files[0].done, 0);
+        assert_eq!(rec.task.files[0].engine, EngineKind::Ftp);
+        assert_eq!(rec.task.files[0].source_urls, vec!["ftp://host/pub/".to_string()]);
+        // 序列化往返：task.files（含 EngineKind::Ftp）应可持久化反序列化
+        let json = serde_json::to_vec(&rec.task).expect("task 可序列化");
+        let _restored: DownloadTask = serde_json::from_slice(&json).expect("可反序列化");
+    }
+
+    #[tokio::test]
+    async fn repeated_ftp_dup_is_rejected() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Ftp));
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            DaemonState::new(fake.clone(), vec![]).with_dest_root(dir.path().to_path_buf());
+        let _ = state.add_ftp_task("ftp://host/pub/".into(), None).await.unwrap();
+        let err = state
+            .add_ftp_task("ftp://host/pub/".into(), None)
+            .await
+            .expect_err("重复 canonical 应拒绝");
+        assert!(matches!(err, DaemonError::Duplicate(_)), "应返回 Duplicate: {err}");
+    }
+
+    // ---- 端到端：真实 FtpEngine + 最小 mock FTP server（卡 D 验收点） ----
+
+    /// 最小 mock FTP server：支持目录 LIST（文件清单）/ 文件 RETR（完整内容）、PASSIVE 被动模式。
+    /// `files` = `(远端绝对路径, 内容)`；路径不带 user:pass@。
+    async fn start_mock_ftp(files: Vec<(String, Vec<u8>)>) -> SocketAddr {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let files = SArc::new(files);
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let files = files.clone();
+                tokio::spawn(async move {
+                    handle_mock_ftp(stream, files).await;
+                });
+            }
+        });
+        addr
+    }
+
+    use std::net::SocketAddr;
+    use std::sync::Arc as SArc;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpStream;
+
+    async fn handle_mock_ftp(mut stream: TcpStream, files: SArc<Vec<(String, Vec<u8>)>>) {
+        let mut rest: u64 = 0;
+        let mut data_listener: Option<tokio::net::TcpListener> = None;
+        let _ = stream.write_all(b"220 test ftp ready\r\n").await;
+        let mut reader = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            let cmd = line.trim_end_matches("\r\n").trim_end();
+            let (verb, arg) = match cmd.split_once(' ') {
+                Some((v, a)) => (v, a.trim()),
+                None => (cmd, ""),
+            };
+            let conn = reader.get_mut();
+            match verb {
+                "USER" | "PASS" => {
+                    let _ = conn.write_all(b"230 logged in\r\n").await;
+                }
+                "TYPE" => {
+                    let _ = conn.write_all(b"200 type set\r\n").await;
+                }
+                "PASV" => {
+                    let dl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let da = dl.local_addr().unwrap();
+                    let (p1, p2) = (da.port() / 256, da.port() % 256);
+                    let _ = conn
+                        .write_all(format!("227 Entering Passive Mode (127,0,0,1,{p1},{p2})\r\n").as_bytes())
+                        .await;
+                    data_listener = Some(dl);
+                }
+                "RETR" => {
+                    let data: Option<Vec<u8>> = files
+                        .iter()
+                        .find(|(p, _)| p == arg)
+                        .map(|(_, d)| d.clone());
+                    let Some(body) = data else {
+                        let _ = conn.write_all(b"550 file unavailable\r\n").await;
+                        continue;
+                    };
+                    if rest > body.len() as u64 {
+                        let _ = conn.write_all(b"550 file unavailable\r\n").await;
+                        continue;
+                    }
+                    let _ = conn.write_all(b"150 opening data connection\r\n").await;
+                    if let Some(dl) = data_listener.as_ref() {
+                        if let Ok((mut data_conn, _)) = dl.accept().await {
+                            let _ = data_conn.write_all(&body[rest as usize..]).await;
+                            let _ = data_conn.shutdown().await;
+                        }
+                    }
+                    let _ = conn.write_all(b"226 transfer complete\r\n").await;
+                    rest = 0;
+                    data_listener = None;
+                }
+                "LIST" => {
+                    let dir = arg.trim_end_matches('/');
+                    let prefix = format!("{dir}/");
+                    let mut lines: Vec<String> = Vec::new();
+                    for (p, d) in files.iter() {
+                        if let Some(name) = p.strip_prefix(&prefix) {
+                            if !name.is_empty() && !name.contains('/') {
+                                lines.push(format!(
+                                    "-rw-r--r--  1 owner  group  {:>8} Jan 01 12:00 {name}",
+                                    d.len()
+                                ));
+                            }
+                        }
+                    }
+                    let mut text = format!("total {}\r\n", lines.len());
+                    text.push_str(&lines.join("\r\n"));
+                    text.push_str("\r\n");
+                    let _ = conn.write_all(b"150 opening data connection\r\n").await;
+                    if let Some(dl) = data_listener.as_ref() {
+                        if let Ok((mut data, _)) = dl.accept().await {
+                            let _ = data.write_all(text.as_bytes()).await;
+                            let _ = data.shutdown().await;
+                        }
+                    }
+                    let _ = conn.write_all(b"226 transfer complete\r\n").await;
+                    data_listener = None;
+                }
+                _ => {
+                    let _ = conn.write_all(b"502 unknown\r\n").await;
+                }
+            }
+        }
+    }
+
+    /// 端到端验收（卡 D）：FTP 目录任务（2 文件）→ add 后 task.files 同步 →
+    /// poll_http_task_states 推进 Completed → 快照含文件信息且逐文件 done==size；
+    /// 同时一个 HTTP 任务（独立 Http 槽）不受影响。
+    #[tokio::test]
+    async fn ftp_dir_completes_and_http_unaffected() {
+        let ftp_addr = start_mock_ftp(vec![
+            ("/pub/a.bin".to_string(), vec![0x5Au8; 16]),
+            ("/pub/b.bin".to_string(), vec![0x5Bu8; 24]),
+        ])
+        .await;
+        let ftp_url = format!("ftp://127.0.0.1:{}/pub/", ftp_addr.port());
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().to_str().unwrap().to_string();
+
+        // 同时挂 HTTP 引擎（Fake）与真实 FTP 引擎：验证各占独立槽位
+        let http_fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let ftp_engine: Arc<dyn DownloadEngine> = Arc::new(smart_dl_httpdl::FtpEngine::new());
+        let state = Arc::new(
+            DaemonState::new(http_fake.clone(), vec![])
+                .with_ftp(ftp_engine)
+                .with_dest_root(dir.path().to_path_buf()),
+        );
+
+        // 1) FTP 目录任务
+        let ftp_tid = state
+            .add_link_task(ftp_url.clone(), Some(dest.clone()))
+            .await
+            .expect("FTP 目录任务 add 应成功");
+        let rec = state.tasks.lock().unwrap().get(&ftp_tid).cloned().unwrap();
+        assert_eq!(rec.engine_kind, EngineKind::Ftp);
+        assert_eq!(rec.task.files.len(), 2, "add 后 files 应同步 2 个: {:?}", rec.task.files);
+
+        // 2) HTTP 任务走独立 Http 槽（Fake 引擎记录），不受 FTP 影响
+        let http_tid = state
+            .add_http_task("https://example.com/keep.bin".into(), Some(dest.clone()))
+            .await
+            .unwrap();
+        assert!(
+            http_fake.added().contains(&"https://example.com/keep.bin".to_string()),
+            "HTTP 任务应路由到 Http 引擎: {:?}",
+            http_fake.added()
+        );
+
+        // 3) 轮询推进 FTP 到 Completed（FTP 引擎无 alert，靠 poll 推进——同 HTTP 链路）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let _ = state.poll_http_task_states().await;
+            if let Some(snap) = state.task_snapshot(&ftp_tid).await {
+                if snap.state == "Completed" {
+                    // 快照含文件信息，且逐文件 done==size
+                    assert_eq!(snap.files.len(), 2, "快照应含 2 个文件进度");
+                    for f in &snap.files {
+                        assert_eq!(f.done, f.size, "逐文件 done 应等于 size: {f:?}");
+                    }
+                    // HTTP 任务记录仍存在（未被破坏）
+                    assert!(state.task_snapshot(&http_tid).await.is_some());
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "60s 内 FTP 任务未 Completed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// 卡 I′：F5 P2SP web seed 注入（feature `webseed`，隐含 `bt`）——
+/// 端点语义单测 + 真实 BtCore 本地 HTTP 源端到端（Rust 版 F5 PoC-1）。
+#[cfg(all(test, feature = "webseed"))]
+mod webseed_tests {
+    use super::*;
+
+    /// 最小单文件 .torrent（无 tracker；info: length=123/name=test/piece length/pieces）。
+    fn sample_torrent() -> Vec<u8> {
+        let mut b = b"d4:infod6:lengthi123e4:name4:test12:piece lengthi16384e6:pieces20:".to_vec();
+        b.extend_from_slice(&[0u8; 20]);
+        b.extend_from_slice(b"eee");
+        b
+    }
+
+    #[tokio::test]
+    async fn non_bt_task_rejects_webseed() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            DaemonState::new(fake.clone(), vec![]).with_dest_root(dir.path().to_path_buf());
+        let tid = state
+            .add_http_task("http://example.com/a.bin".into(), Some(dir.path().to_string_lossy().into_owned()))
+            .await
+            .unwrap();
+        let err = state
+            .add_webseeds(&tid, &["http://seed/1".into()])
+            .await
+            .expect_err("非 BT 任务必须拒绝");
+        assert!(matches!(err, DaemonError::UnsupportedOp(_)), "实际: {err:?}");
+        assert!(fake.url_seeds().is_empty());
+    }
+
+    #[tokio::test]
+    async fn bt_task_forwards_urls_to_engine() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            DaemonState::new(fake.clone(), vec![]).with_dest_root(dir.path().to_path_buf());
+        let tid = state
+            .add_torrent_task(sample_torrent(), Some(dir.path().to_string_lossy().into_owned()))
+            .await
+            .expect("add_torrent_task");
+        let n = state
+            .add_webseeds(&tid, &["http://seed/1".into(), "http://seed/2".into()])
+            .await
+            .expect("注入应成功");
+        assert_eq!(n, 2);
+        let rec = state.tasks.lock().unwrap().get(&tid).cloned().unwrap();
+        let engine_tid = rec.engine_tid.expect("engine_tid");
+        assert_eq!(
+            fake.url_seeds(),
+            vec![
+                (engine_tid.clone(), "http://seed/1".into()),
+                (engine_tid, "http://seed/2".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn webseed_missing_task_is_not_found() {
+        let state = DaemonState::new(
+            Arc::new(FakeEngine::new(EngineKind::Bt)),
+            vec![],
+        );
+        let err = state
+            .add_webseeds("t_missing", &["http://seed/1".into()])
+            .await
+            .expect_err("");
+        assert!(matches!(err, DaemonError::NotFound(_)));
+    }
+
+    // ---- 端到端：真实 BtCore + 本地 HTTP 静态源（F5 PoC-1 的 Rust 复刻）----
+
+    /// 极简 HTTP/1.1 静态源：200 全量 / 206 Range 分片，Connection: close。
+    async fn serve_http(mut sock: tokio::net::TcpStream, body: Vec<u8>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = vec![0u8; 8192];
+        let n = sock.read(&mut buf).await.unwrap_or(0);
+        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+        let range = req
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("range:"))
+            .and_then(|l| l.split_once(':').map(|(_, v)| v.trim().to_string()));
+        if let Some(r) = range {
+            let spec = r.trim_start_matches("bytes=");
+            let (a, b) = spec.split_once('-').unwrap_or((spec, ""));
+            let start: u64 = a.parse().unwrap_or(0);
+            let end: u64 = if b.is_empty() {
+                body.len() as u64 - 1
+            } else {
+                b.parse::<u64>().unwrap_or(body.len() as u64 - 1)
+            };
+            let s = (start as usize).min(body.len().saturating_sub(1));
+            let e = (end as usize).min(body.len().saturating_sub(1));
+            let head = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {s}-{e}/{}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len(),
+                e.saturating_sub(s) + 1
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body[s..=e]).await;
+        } else {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
+        }
+        let _ = sock.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn webseed_e2e_downloads_via_local_http_source() {
+        use sha1::{Digest, Sha1};
+        // 单 piece 文件：64KB 内容，pieces = SHA1(全量)
+        let content: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+        let mut h = Sha1::new();
+        h.update(&content);
+        let piece = h.finalize();
+        let mut meta =
+            b"d4:infod6:lengthi65536e4:name8:file.bin12:piece lengthi65536e6:pieces20:".to_vec();
+        meta.extend_from_slice(&piece);
+        meta.extend_from_slice(b"eee");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let c = content.clone();
+                tokio::spawn(async move { serve_http(sock, c).await });
+            }
+        });
+
+        let save = tempfile::tempdir().unwrap();
+        let core = smart_dl_btcore::BtCore::new(save.path(), "webseed-e2e").expect("session init");
+        let ih = core.add_torrent_file(&meta, &[]).expect("add torrent");
+        core.add_url_seed(&ih, &format!("http://{addr}/file.bin"))
+            .expect("add url seed");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let st = core.status(&ih).expect("status");
+            if st.downloaded >= 65536 && st.progress >= 0.999 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "90s 未完成: downloaded={} progress={}",
+                st.downloaded,
+                st.progress
+            );
+        }
     }
 }

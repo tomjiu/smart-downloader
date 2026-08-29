@@ -1,0 +1,28 @@
+[package]
+name = "xunlei-ffi"
+version = "0.1.0"
+edition = "2021"
+authors = ["smart-downloader"]
+description = "Thunder DownloadSDK FFI bindings for Windows-only BT/P2SP acceleration"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/example/smart-downloader"
+
+[features]
+default = ["win32"]
+win32 = []
+
+[dependencies]
+# Workspace dependencies
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true, features = ["derive"], optional = true }
+widestring = "1"
+libloading = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+# Windows-only dependencies are declared here.
+windows-sys = { version = "0.59", features = ["Win32_System_LibraryLoader"] }
+
+[lib]
+name = "xunlei_ffi"
+path = "src/lib.rs"

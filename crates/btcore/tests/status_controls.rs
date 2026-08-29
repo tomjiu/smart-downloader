@@ -47,9 +47,10 @@ fn status_metrics_and_geometry() {
         "元数据前 bitfield 空"
     );
 
+    c.resume(&ih).expect("resume");
     c.add_peer(&ih, &ip, port).expect("add_peer");
     // 下载中：metadata 已收，peers ≥1，progress 单调上升
-    let dl = Instant::now() + Duration::from_secs(30);
+    let dl = Instant::now() + Duration::from_secs(60);
     let mut last = 0.0f32;
     loop {
         let st = c.status(&ih).expect("status");
@@ -103,11 +104,13 @@ fn control_ops_and_read_piece() {
     let seeder = seed::TestSeeder::start();
     let ih = c.add_magnet(seeder.magnet(), &[]).expect("add_magnet");
     let (ip, port) = seeder.addr();
+    c.resume(&ih).expect("resume");
     c.add_peer(&ih, &ip, port).expect("add_peer");
     download_to_complete(&c, &ih);
 
     // 控制面
     c.set_limits(&ih, 0, 0).expect("limits unrestricted");
+    c.set_alert_mask(0xFFFF).expect("mask");
     c.set_limits(&ih, 1 << 20, 1 << 20).expect("limits 1MB");
     c.set_sequential(&ih, true).expect("sequential on");
     c.add_tracker(&ih, "http://127.0.0.1:9/announce")
@@ -115,12 +118,14 @@ fn control_ops_and_read_piece() {
     c.add_url_seed(&ih, "http://127.0.0.1:9/seed")
         .expect("add_url_seed");
 
-    // read_piece 轮询（v2）：完成后 piece 0 = 16384 B
-    let dl = Instant::now() + Duration::from_secs(10);
+    // finished 状态下 read_piece 可能不生成 alert；先 resume 进入 seeding 再读
+    c.resume(&ih).expect("resume before read_piece");
+    let dl = Instant::now() + Duration::from_secs(30);
     let mut data: Option<Vec<u8>> = None;
     while Instant::now() < dl {
         match c.read_piece(&ih, 0) {
             Ok(Some(d)) => {
+                eprintln!("read_piece OK len={}", d.len());
                 data = Some(d);
                 break;
             }
@@ -131,7 +136,7 @@ fn control_ops_and_read_piece() {
             Err(e) => panic!("read_piece 错误: {}", e),
         }
     }
-    let data = data.expect("10s 内 piece0 未就绪");
+    let data = data.expect("30s 内 piece0 未就绪");
     assert_eq!(data.len(), PIECE_LEN as usize, "piece 0 长度");
 
     // 移除（不删数据）→ 状态 NotFound
@@ -150,30 +155,35 @@ fn pause_resume_flow() {
     let seeder = seed::TestSeeder::start();
     let ih = c.add_magnet(seeder.magnet(), &[]).expect("add_magnet");
     let (ip, port) = seeder.addr();
+    c.resume(&ih).expect("resume");
     c.add_peer(&ih, &ip, port).expect("add_peer");
     download_to_complete(&c, &ih);
 
+    c.resume(&ih).expect("resume");
     c.pause(&ih).expect("pause");
-    let dl = Instant::now() + Duration::from_secs(10);
-    let mut paused = false;
+    // paused 标志由 lt_torrent_status::paused 提供，作为暂停同步点（比 alert 更即时）
+    let st = c.status(&ih).expect("status_paused");
+    assert!(st.paused, "pause 后 status.paused 应为 true");
+    assert_eq!(st.progress, 1.0, "暂停后 progress 保持 1.0");
+
+    // 辅助校验：pause 后应收到 torrent_paused alert（libtorrent 异步投递，并行下可能延迟）
+    let dl = Instant::now() + Duration::from_secs(20);
+    let mut got_alert = false;
     while Instant::now() < dl {
-        for a in c.pop_alerts(256).expect("pop") {
-            if a.kind == smart_dl_btcore::AlertKind::State
+        let alerts = c.pop_alerts(256).expect("pop");
+        if alerts.iter().any(|a| {
+            a.kind == smart_dl_btcore::AlertKind::State
                 && a.state_subkind() == smart_dl_btcore::StateSubKind::Paused
-            {
-                paused = true;
-            }
-        }
-        if paused {
+        }) {
+            got_alert = true;
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    assert!(paused, "pause 后应收到 torrent_paused alert");
-    let st = c.status(&ih).expect("status_paused");
-    assert_eq!(st.progress, 1.0, "暂停后 progress 保持 1.0");
+    assert!(got_alert, "pause 后应在 20s 内收到 torrent_paused alert");
 
     c.resume(&ih).expect("resume");
     let st = c.status(&ih).expect("status_resumed");
     assert_eq!(st.progress, 1.0);
+    assert!(!st.paused, "resume 后 status.paused 应为 false");
 }

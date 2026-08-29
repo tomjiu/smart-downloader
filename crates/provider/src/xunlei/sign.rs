@@ -1,4 +1,24 @@
 //! 迅雷云盘签名算法（captcha_sign / device_sign），纯函数。
+//!
+//! ## captcha_sign（Web 端，pan.xunlei.com）
+//!
+//! 算法逆向来源见仓库内文档：
+//! `scripts/research/cloud_delivery/login_reverse/README_captcha_sign.md`
+//!
+//! ```text
+//! base = clientId + version + host + deviceId(32位) + timestamp(毫秒)
+//! s = base
+//! for salt in WEB_SALTS: s = md5(s + salt)   // 共 9 轮
+//! captcha_sign = "1." + s
+//! ```
+//!
+//! 关键配置（来自主应用 config 模块 module 23，`funFile = "code-res"` 走本地盐链路径）：
+//! - clientId  = `Xqp0kJBXWhwaTpB6`
+//! - version   = `1.92.91`（package.json 模块 module 180）
+//! - host      = `pan.xunlei.com`
+//! - algVersion= `1`
+//!
+//! ⚠️ deviceId 必须是 **32 位 hex**（`wdi10.` 前缀的 64 位 device_id 去掉前缀后取前 32 位）。
 
 #![allow(unused_imports)]
 
@@ -14,47 +34,76 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// captcha_sign 的 10 个盐（alist 开源，MIT）。
-const ALGORITHMS: [&str; 10] = [
-    "9uJNVj/wLmdwKrJaVj/omlQ",
-    "Oz64Lp0GigmChHMf/6TNfxx7O9PyopcczMsnf",
-    "Eb+L7Ce+Ej48u",
-    "jKY0",
-    "ASr0zCl6v8W4aidjPK5KHd1Lq3t+vBFf41dqv5+fnOd",
-    "wQlozdg6r1qxh0eRmt3QgNXOvSZO6q/GXK",
-    "gmirk+ciAvIgA/cxUUCema47jr/YToixTT+Q6O",
-    "5IiCoM9B1/788ntB",
-    "P07JH0h6qoM6TSUAK2aL9T5s2QBVeY9JWvalf",
-    "+oK0AN",
+/// Web 端 captcha_sign 的 9 个盐（从 module 51→37→26→17→29→26→39→60→29 链逐层逆向，
+/// 已用真实接口验证）。区别于 App 端（alist 的 10 个盐）。
+const WEB_SALTS: [&str; 9] = [
+    "tkPbM0TLWT+eMvAdV2FbXEEQ/Qx5QrfO895+47hmDDPdRZ98xm",
+    "7EBc6XKuI6YGw19anZHmnE4d8W18zjrJU+F",
+    "stEQvsO6eeP93DdrX7mfYA7G",
+    "edXgGCdIaqdZJZH5k",
+    "J9SB6D864S1B",
+    "xlAs2Oo28sr",
+    "21+f+kgyrbIcwUUo+xaPD4GYHkpRGv5i4wOnyHrkH4ehKti",
+    "08kltU1bp6eV5bEdlgSEU0GpzjD7/j5X3FwbiiraEzar",
+    "hX6tf7kBT/DS",
 ];
 
-const CLIENT_ID: &str = "Xp6vsxz_7IYVw2BB";
-const CLIENT_VERSION: &str = "8.31.0.9726";
-const PACKAGE_NAME: &str = "com.xunlei.downloadprovider";
+/// Web 端 client_id（pan.xunlei.com 场景）。
+const CLIENT_ID: &str = "Xqp0kJBXWhwaTpB6";
+/// Web 端版本（package.json 里的 version）。
+const CLIENT_VERSION: &str = "1.92.91";
+/// host（captcha_sign base 里的 host，pan.xunlei.com 场景固定）。
+const HOST: &str = "pan.xunlei.com";
+/// package_name（captcha/init meta 里用）。
+pub const PACKAGE_NAME: &str = "pan.xunlei.com";
+/// algVersion 前缀。
+const ALG_VERSION: &str = "1";
+
+// App 端（com.xunlei.downloadprovider）参数，device_sign 用。
+const APP_PACKAGE_NAME: &str = "com.xunlei.downloadprovider";
 const APPID: &str = "40";
 const APPKEY: &str = "34a062aaa22f906fca4fefe9fb3a3021";
 
-/// 计算 captcha_sign：
-///   s = ClientID + ClientVersion + PackageName + DeviceID + timestamp
-///   for salt in ALGORITHMS: s = md5(s + salt)
+/// 从完整 device_id（`wdi10.` + 64位hex）提取 captcha_sign 用的 32 位 device_id。
+///
+/// 规则：去掉 `wdi10.` 前缀，取前 32 个 hex 字符。
+/// 已验证：`wdi10.adb1a76709f6584a13b58baaf6e1d871d02650159e5762f2299e41b38b017500`
+///       → `adb1a76709f6584a13b58baaf6e1d871`
+pub fn device_id_32(device_id: &str) -> &str {
+    let s = device_id.strip_prefix("wdi10.").unwrap_or(device_id);
+    &s[..s.len().min(32)]
+}
+
+/// 计算 Web 端 captcha_sign：
+///   s = clientId + version + host + deviceId(32位) + timestamp(毫秒)
+///   9 轮 md5(s + salt)
 ///   返回 "1." + s
-pub fn captcha_sign(device_id: &str, timestamp_millis: &str) -> String {
+pub fn captcha_sign(device_id_32: &str, timestamp_millis: &str) -> String {
     let mut s = format!(
         "{}{}{}{}{}",
-        CLIENT_ID, CLIENT_VERSION, PACKAGE_NAME, device_id, timestamp_millis
+        CLIENT_ID, CLIENT_VERSION, HOST, device_id_32, timestamp_millis
     );
-    for salt in ALGORITHMS {
+    for salt in WEB_SALTS {
         let mut h = Md5::new();
         h.update(s.as_bytes());
         h.update(salt.as_bytes());
         s = to_hex(&h.finalize());
     }
-    format!("1.{}", s)
+    format!("{}.{}", ALG_VERSION, s)
+}
+
+/// 计算 captcha_sign 的完整入参 base（调试/测试用，暴露 base 拼接逻辑）。
+pub fn captcha_sign_base(device_id_32: &str, timestamp_millis: &str) -> String {
+    format!(
+        "{}{}{}{}{}",
+        CLIENT_ID, CLIENT_VERSION, HOST, device_id_32, timestamp_millis
+    )
 }
 
 /// device_sign = "div101." + deviceID + md5_hex(sha1_hex(deviceID+packageName+APPID+APPKey))
+/// （App 端 device-sign 流程用，与 captcha_sign 无关，保留。）
 pub fn device_sign(device_id: &str) -> String {
-    let base = format!("{}{}{}{}", device_id, PACKAGE_NAME, APPID, APPKEY);
+    let base = format!("{}{}{}{}", device_id, APP_PACKAGE_NAME, APPID, APPKEY);
     let sha1_hex = {
         let mut h = Sha1::new();
         h.update(base.as_bytes());
@@ -75,6 +124,27 @@ mod tests {
     #[test]
     fn hex_encodes_correctly() {
         assert_eq!(to_hex(&[0x00, 0xff, 0x0a]), "00ff0a");
+    }
+
+    #[test]
+    fn device_id_32_strips_prefix_and_truncates() {
+        let full = "wdi10.adb1a76709f6584a13b58baaf6e1d871d02650159e5762f2299e41b38b017500";
+        assert_eq!(device_id_32(full), "adb1a76709f6584a13b58baaf6e1d871");
+    }
+
+    #[test]
+    fn device_id_32_handles_no_prefix() {
+        assert_eq!(device_id_32("adb1a76709f6584a13b58baaf6e1d871"), "adb1a76709f6584a13b58baaf6e1d871");
+    }
+
+    #[test]
+    fn captcha_sign_matches_verified_sample() {
+        // 真实捕获样本（2026-01，已验证服务端接受）：
+        //   device_id(32位) = adb1a76709f6584a13b58baaf6e1d871
+        //   timestamp       = 1787409379387
+        //   期望 captcha_sign = 1.2546227cbfbcf07eeba5df575fac2085
+        let sign = captcha_sign("adb1a76709f6584a13b58baaf6e1d871", "1787409379387");
+        assert_eq!(sign, "1.2546227cbfbcf07eeba5df575fac2085");
     }
 
     #[test]

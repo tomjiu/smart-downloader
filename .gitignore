@@ -40,3 +40,7 @@ speedup_mine.txt
 superspeed_hunt.txt
 url_hunt.txt
 docs/research/xunlei/bugc_repro_*.log
+
+# 迅雷提取原始产物（体积大，非 SDK 核心二进制已移至 research_bin/）
+scripts/research/xunlei/extracted_macos/
+scripts/research/xunlei/extracted_android/

@@ -1,0 +1,1 @@
+[frida-err] TypeError: not a function

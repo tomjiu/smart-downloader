@@ -66,17 +66,26 @@ fn map_status(st: &TorrentStatus) -> EngineStatus {
 pub struct BtEngine {
     core: Arc<BtCore>,
     save_path: PathBuf,
+    /// 暂停意图表（engine_tid → 上次采样 done）：lt auto_managed 队列会在
+    /// metadata 到达后反复复活用户暂停的任务，单次压制无效——
+    /// 改为持续执法：alert 循环周期性对比 done 增长，增长即再压（Bug A，调度层）。
+    pause_intents: std::sync::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl BtEngine {
     /// 新建 BT 会话（save_path 为全局落盘目录，须已存在）。
     /// `proxy` = 代理 URL（`http://` / `socks5://` / `socks4://`，可带 `user:pass@`；None = 直连）；
     /// `down_kb_s`/`up_kb_s` = 全局下载/上传限速（KiB/s；0 = 不限）。
+    /// `enable_dht`/`enable_lsd`/`enable_upnp` = 发现层开关（默认语义全关，M0 确定性；
+    /// enable_upnp 同时控制 NAT-PMP——端口映射族）。启动时一次 apply，不参与热重载。
     pub fn new(
         save_path: &Path,
         proxy: Option<&str>,
         down_kb_s: u32,
         up_kb_s: u32,
+        enable_dht: bool,
+        enable_lsd: bool,
+        enable_upnp: bool,
     ) -> Result<Self, String> {
         let core = BtCore::new(save_path, "smart-dl-daemon")
             .map_err(|e| format!("bt session init: {}", core_err(&e)))?;
@@ -92,14 +101,57 @@ impl BtEngine {
         };
         core.apply_network(proxy_cfg.as_ref(), down_kb_s, up_kb_s)
             .map_err(|e| format!("bt apply_network: {e:?}"))?;
+        // 发现层开关（DHT/LSD/UPnP）：无条件显式调用（默认 false 保持 M0 确定性）
+        core.apply_discovery(enable_dht, enable_lsd, enable_upnp)
+            .map_err(|e| format!("bt apply_discovery: {e:?}"))?;
         Ok(BtEngine {
             core: Arc::new(core),
             save_path: save_path.to_path_buf(),
+            pause_intents: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
     pub fn core(&self) -> Arc<BtCore> {
         self.core.clone()
+    }
+
+    /// 暂停意图登记（true=登记并采样当前 done 基线；false=清除）。
+    pub fn set_pause_intent(&self, id: &str, intended: bool) {
+        let mut m = self.pause_intents.lock().unwrap();
+        if intended {
+            let done = self
+                .core
+                .status(id)
+                .map(|s| s.downloaded.max(0) as u64)
+                .unwrap_or(0);
+            m.insert(id.to_string(), done);
+        } else {
+            m.remove(id);
+        }
+    }
+
+    pub fn pause_intended(&self, id: &str) -> bool {
+        self.pause_intents.lock().unwrap().contains_key(id)
+    }
+
+    /// 持续执法：对每个带暂停意图的任务，每轮直接下发 pause。
+    /// 这样无论 lt auto_managed 队列 / checking_files 完成态 / 任何内部复活路径，
+    /// 只要意图仍在，每 500ms 至少重压一次，真正把"保持暂停"从"检测后反应"
+    /// 变成"持续压制"（Bug A 终局修复）。
+    pub fn enforce_pauses(&self) {
+        let ids: Vec<String> = self.pause_intents.lock().unwrap().keys().cloned().collect();
+        for id in ids {
+            let _ = self.core.pause(&id);
+            if let Ok(st) = self.core.status(&id) {
+                self.pause_intents.lock().unwrap().insert(id.clone(), st.downloaded.max(0) as u64);
+            }
+        }
+    }
+
+    /// pop_alerts + 持续执法入口（alert 循环每轮调用）。
+    pub fn pop_alerts_enforcing_pause(&self, cap: usize) -> Vec<smart_dl_btcore::Alert> {
+        self.enforce_pauses();
+        self.core.pop_alerts(cap).unwrap_or_default()
     }
 
     /// .fastresume 文件路径（按 infohash 命名——避开文件名转义问题，且 magnet 无需
@@ -149,9 +201,10 @@ impl BtEngine {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         if saved.is_none() {
-            tracing::warn!("fastresume: {ih} 3s 内未就绪（alerts 见 {seen} 条）");
+            tracing::warn!("fastresume: TIMEOUT ih={ih} alerts_seen={seen}");
             return Ok(None);
         }
+        tracing::debug!("fastresume: ready ih={ih}");
         let r = saved.expect("saved checked");
         let p = self.fastresume_path(ih);
         let tmp = p.with_extension("fastresume.tmp");
@@ -227,10 +280,13 @@ impl DownloadEngine for BtEngine {
             },
             _ => return Err(EngineError::Other("source is not bt".to_string())),
         };
-        ih.map_err(|e| EngineError::Other(core_err(&e)))
+        ih.map_err(|e| EngineError::Other(core_err(&e))).map(|ih| {
+            ih
+        })
     }
 
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError> {
+        self.set_pause_intent(id, true); // Bug A：登记意图，metadata 复活时由 alert 循环压制
         self.core
             .pause(id)
             .map_err(|e| EngineError::Other(core_err(&e)))?;
@@ -240,26 +296,34 @@ impl DownloadEngine for BtEngine {
     }
 
     async fn resume(&self, id: &EngineTaskId) -> Result<(), EngineError> {
+        self.set_pause_intent(id, false);
         self.core
             .resume(id)
             .map_err(|e| EngineError::Other(core_err(&e)))
     }
 
     async fn status(&self, id: &EngineTaskId) -> Result<EngineStatus, EngineError> {
+        let t0 = std::time::Instant::now(); // BUGB-INSTR
         // 会话内未注册的 infohash → NotFound（任务已移除/从未添加）。
-        match self.core.status(id) {
+        let r = match self.core.status(id) {
             Ok(st) => Ok(map_status(&st)),
             Err(_) => Err(EngineError::NotFound),
+        };
+        // BUGB-INSTR：status 正常极快，仅慢调用告警（内核阻塞探针）
+        let ms = t0.elapsed().as_millis();
+        if ms > 200 {
+            tracing::warn!("[bugb] bt::status SLOW ih={id} elapsed_ms={ms}");
         }
+        r
     }
 
     async fn remove(&self, id: &EngineTaskId, delete_data: bool) -> Result<(), EngineError> {
-        // #5：移除前显式保存 fastresume（重启后重新 add 同一 magnet → 回灌续传）。
+        // 移除前显式保存 fastresume（重启后重新 add 同一 magnet → 回灌续传）。
         // 失败不阻断移除（best-effort）。
         let _ = self.save_fastresume(id);
-        self.core
-            .remove(id, delete_data)
-            .map_err(|e| EngineError::Other(core_err(&e)))?;
+        self.set_pause_intent(id, false);
+        let r = self.core.remove(id, delete_data);
+        let _ = r.map_err(|e| EngineError::Other(core_err(&e)))?;
         // 数据删除 → 续传凭据一并清理
         if delete_data {
             self.remove_fastresume(id);
@@ -304,6 +368,12 @@ impl DownloadEngine for BtEngine {
             .map_err(|e| EngineError::Other(core_err(&e)))
     }
 
+    async fn add_peer(&self, id: &EngineTaskId, peer: std::net::SocketAddr) -> Result<(), EngineError> {
+        self.core
+            .add_peer(id, &peer.ip().to_string(), peer.port())
+            .map_err(|e| EngineError::Other(core_err(&e)))
+    }
+
     async fn ban_peer(&self, _id: &EngineTaskId, _peer: SocketAddr) -> Result<(), EngineError> {
         Err(EngineError::Unsupported)
     }
@@ -312,6 +382,12 @@ impl DownloadEngine for BtEngine {
         self.core
             .read_piece(id, idx as i32)
             .map(|o| o.unwrap_or_default())
+            .map_err(|e| EngineError::Other(core_err(&e)))
+    }
+
+    async fn add_xunlei_resume(&self, data: Vec<u8>) -> Result<EngineTaskId, EngineError> {
+        self.core
+            .add_torrent_resume(&data, &[])
             .map_err(|e| EngineError::Other(core_err(&e)))
     }
 }

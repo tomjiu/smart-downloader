@@ -384,6 +384,8 @@ diskreadspeed, diskwritespeed, diskwritespeedmax, diskaverageresponse
 
 **说明**：除 `dphub` 之外的绝大多数主机**接受匿名 peerid 即可访问**——它们是 BT/资源发现服务，不是鉴权服务。`dphub` 涉及设备绑定，但迅雷引擎在 `UserID=0` 时会跳过 DPHub 登录，仅走 PHub 资源发现。
 
+> **PHub 加密说明**：早期逆向（v2）曾假设 PHub HTTP body 用 `AES-ECB(MD5(cmd+seq), body)`，该公式**仅适用于 XUDT/legacy 路径**。PHub/SHub 生产路径实际使用 RSA-wrapped random AES key（每请求 16B 随机数，用编译期 RSA-1024 公钥包装），见 `scripts/research/cloud_delivery/v3/PHUB_PROTOCOL_SPEC_V3.md`。
+
 ---
 
 ## 6. 关键 RTTI 类名（C++ 类层级）
@@ -435,6 +437,12 @@ XUDT_InputChannelSession*  - 接收通道
 XUDT_OutputChannelSession* - 发送通道
 XUDT_ConnectionGetLocalEndPoint / RemoteEndPoint
 ```
+
+**XUDT 加密密钥（2026-08-22 确认，A 级）**：
+- `AES-128 key = MD5(8_byte_header)`，其中 8 字节 = `cmd_constant(4B LE) + counter(4B LE)`
+- 每条 XUDT 消息带独立 counter，全局递增 → key 逐消息变化
+- 7 组历史 key 已用 Python `hashlib.md5` 精确复现（见 `scripts/research/cloud_delivery/phub_line/XUDT_KEY_DERIVATION_SOLVED.md`）
+- ** implication **：XUDT 帧可离线解密，不需要 RSA 私钥或 Frida
 
 ### 6.4 长效种子（XLLiveUDownload.dll）
 

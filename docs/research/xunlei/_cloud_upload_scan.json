@@ -1,0 +1,41 @@
+{
+  "dll": "C:\\Program Files\\Thunder Network\\Thunder\\program\\upload\\cloud_upload.dll",
+  "size": 3132576,
+  "export_count": 1,
+  "exports": [
+    {
+      "name": "InitCloudUpload",
+      "rva": 120432
+    }
+  ],
+  "keyword_counts": {
+    "upload": {
+      "utf8": 84,
+      "utf16le": 0
+    },
+    "url": {
+      "utf8": 16,
+      "utf16le": 0
+    },
+    "task": {
+      "utf8": 39,
+      "utf16le": 0
+    },
+    "token": {
+      "utf8": 22,
+      "utf16le": 0
+    },
+    "gcid": {
+      "utf8": 0,
+      "utf16le": 0
+    },
+    "btih": {
+      "utf8": 0,
+      "utf16le": 0
+    },
+    "signature": {
+      "utf8": 4,
+      "utf16le": 0
+    }
+  }
+}

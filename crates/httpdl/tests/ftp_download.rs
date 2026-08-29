@@ -1,4 +1,5 @@
-//! M4c: FTP 下载（PASV 被动模式小文件 / 目录 URL 失败 / 421 退避重试 / 550 错误）。
+//! M4c: FTP 下载（PASV 被动模式小文件 / 421 退避重试 / 550 错误）。
+//! 目录下载用例见 ftp_directory.rs（任务卡 A）。
 
 #![cfg(feature = "ftp")]
 
@@ -42,17 +43,6 @@ async fn pasv_download_small_file_matches_source() {
         srv.retr_count.load(std::sync::atomic::Ordering::SeqCst) >= 1,
         "至少一次 RETR"
     );
-}
-
-#[tokio::test]
-async fn directory_url_fails() {
-    // 目录 URL（路径以 / 结尾）→ v1 不支持 → add 失败
-    let srv = FtpTestServer::start(FtpServerConfig::default()).await;
-    let dir = tempfile::tempdir().unwrap();
-    let engine = FtpEngine::new();
-    let task = make_ftp_task("f2", &srv.url("/dir/"), dir.path().to_path_buf(), "x.bin");
-    let r = engine.add(&task).await;
-    assert!(r.is_err(), "目录 URL 必须失败（v1 不支持）");
 }
 
 #[tokio::test]

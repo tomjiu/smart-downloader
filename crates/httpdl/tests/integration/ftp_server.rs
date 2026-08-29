@@ -1,5 +1,6 @@
 //! 测试基建：本地最小 FTP server（tokio 手写，FTP 协议子集）。
 //! 支持：USER/PASS 登录、TYPE I 二进制、PASV 被动模式、SIZE、REST 断点、RETR 传输、
+//! LIST 目录列表（UNIX ls -l 风格 + total 头 + 注入子目录行）、
 //! 前 N 次控制连接回 421（退避重试测试）；记录 REST 偏移与连接数。
 
 // 按测试二进制编译，未使用的构造/helper 属正常
@@ -22,6 +23,10 @@ pub struct FtpServerConfig {
     pub reject_421: u32,
     /// RETR 总是回 550（文件不存在）。
     pub retr_550: bool,
+    /// 目录场景：`(远端绝对路径, 内容)`。SIZE/RETR 按路径匹配；LIST 列出直接子文件。
+    pub files: Vec<(String, Vec<u8>)>,
+    /// LIST 响应中额外插入的子目录行名（目录下载过滤测试用）。
+    pub list_subdirs: Vec<String>,
 }
 
 impl Default for FtpServerConfig {
@@ -31,6 +36,8 @@ impl Default for FtpServerConfig {
             content: None,
             reject_421: 0,
             retr_550: false,
+            files: Vec::new(),
+            list_subdirs: Vec::new(),
         }
     }
 }
@@ -130,9 +137,12 @@ async fn handle_control(
                 data_listener = Some(dl);
             }
             "SIZE" => {
-                let _ = conn
-                    .write_all(format!("213 {}\r\n", cfg.size).as_bytes())
-                    .await;
+                // 目录场景：按路径匹配 files；未命中 → 单文件场景（cfg.size）
+                let n = match find_file(&cfg.files, arg) {
+                    Some((_, d)) => d.len() as u64,
+                    None => cfg.size,
+                };
+                let _ = conn.write_all(format!("213 {n}\r\n").as_bytes()).await;
             }
             "REST" => {
                 if let Ok(n) = arg.parse::<u64>() {
@@ -142,6 +152,44 @@ async fn handle_control(
                     let _ = conn.write_all(b"501 bad REST\r\n").await;
                 }
             }
+            "LIST" => {
+                // 目录列表：files 中该目录的直接子文件 + 注入的子目录行（UNIX ls -l 风格）
+                let dir = arg.trim_end_matches('/');
+                let prefix = format!("{dir}/");
+                let mut lines: Vec<String> = Vec::new();
+                for (p, d) in &cfg.files {
+                    if let Some(name) = p.strip_prefix(&prefix) {
+                        if !name.is_empty() && !name.contains('/') {
+                            lines.push(format!(
+                                "-rw-r--r--  1 owner  group  {:>8} Jan 01 12:00 {name}",
+                                d.len()
+                            ));
+                        }
+                    }
+                }
+                for sub in &cfg.list_subdirs {
+                    lines.push(format!(
+                        "drwxr-xr-x  2 owner  group  {:>8} Jan 01 12:00 {sub}",
+                        4096
+                    ));
+                }
+                let mut text = format!("total {}\r\n", lines.len());
+                text.push_str(&lines.join("\r\n"));
+                text.push_str("\r\n");
+                if data_listener.is_none() {
+                    let _ = conn.write_all(b"425 no data connection\r\n").await;
+                    continue;
+                }
+                let _ = conn.write_all(b"150 opening data connection\r\n").await;
+                if let Some(dl) = data_listener.as_ref() {
+                    if let Ok((mut data, _)) = dl.accept().await {
+                        let _ = data.write_all(text.as_bytes()).await;
+                        let _ = data.shutdown().await;
+                    }
+                }
+                let _ = conn.write_all(b"226 transfer complete\r\n").await;
+                data_listener = None;
+            }
             "RETR" => {
                 rest_offsets.lock().unwrap().push(rest);
                 retr_count.fetch_add(1, Ordering::SeqCst);
@@ -149,24 +197,30 @@ async fn handle_control(
                     let _ = conn.write_all(b"550 file unavailable\r\n").await;
                     continue;
                 }
-                if body.is_none() {
-                    body = Some(
-                        cfg.content
-                            .clone()
-                            .unwrap_or_else(|| vec![0x5Au8; cfg.size as usize]),
-                    );
-                }
-                let b = body.as_ref().unwrap();
-                if rest > b.len() as u64 {
+                // 目录场景：按路径匹配 files；未命中 → 单文件场景（懒构建 body）
+                let data: Vec<u8> = match find_file(&cfg.files, arg) {
+                    Some((_, d)) => d.clone(),
+                    None => {
+                        if body.is_none() {
+                            body = Some(
+                                cfg.content
+                                    .clone()
+                                    .unwrap_or_else(|| vec![0x5Au8; cfg.size as usize]),
+                            );
+                        }
+                        body.clone().unwrap()
+                    }
+                };
+                if rest > data.len() as u64 {
                     let _ = conn.write_all(b"550 file unavailable\r\n").await;
                     continue;
                 }
                 let _ = conn.write_all(b"150 opening data connection\r\n").await;
                 if let Some(dl) = data_listener.as_ref() {
-                    if let Ok((mut data, _)) = dl.accept().await {
-                        let chunk = &b[rest as usize..];
-                        let _ = data.write_all(chunk).await;
-                        let _ = data.shutdown().await;
+                    if let Ok((mut data_conn, _)) = dl.accept().await {
+                        let chunk = &data[rest as usize..];
+                        let _ = data_conn.write_all(chunk).await;
+                        let _ = data_conn.shutdown().await;
                     }
                 }
                 let _ = conn.write_all(b"226 transfer complete\r\n").await;
@@ -187,4 +241,9 @@ async fn handle_control(
 /// 便捷：确定性内容（与 http_server 的 patterned 同构）。
 pub fn patterned(size: u64) -> Vec<u8> {
     (0..size).map(|i| (i % 251) as u8).collect()
+}
+
+/// 按远端绝对路径查 files 条目。
+fn find_file<'a>(files: &'a [(String, Vec<u8>)], path: &str) -> Option<&'a (String, Vec<u8>)> {
+    files.iter().find(|(p, _)| p == path)
 }

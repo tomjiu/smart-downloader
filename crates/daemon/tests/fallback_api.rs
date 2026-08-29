@@ -18,7 +18,7 @@ async fn serve(
     dest: std::path::PathBuf,
     providers: Vec<Arc<dyn smart_dl_provider::RemoteProvider>>,
 ) -> (std::net::SocketAddr, Arc<DaemonState>) {
-    let bt = smart_dl_daemon::bt::BtEngine::new(&dest, None, 0, 0).unwrap();
+    let bt = smart_dl_daemon::bt::BtEngine::new(&dest, None, 0, 0, false, false, false).unwrap();
     let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
     let state = Arc::new(
         DaemonState::new(Arc::new(http), providers)
@@ -140,4 +140,142 @@ async fn fallback_without_providers_errors_cleanly() {
         fbody["error"].as_str().unwrap().contains("无可用 provider"),
         "应提示无 provider: {fbody}"
     );
+}
+
+#[tokio::test]
+async fn fallback_skips_disabled_provider_and_uses_next() {
+    let size: u64 = 256 * 1024;
+    let body = patterned(size);
+    let srv = TestServer::start(body.clone()).await;
+
+    // 第一个 provider 禁用（submit 直接失败），第二个正常
+    let disabled = MockProvider::new("disabled").disabled();
+    let ok = MockProvider::new("ok").with_files(vec![ResolvedRemoteFile {
+        rel_path: "out.bin".into(),
+        url: srv.url(),
+        size,
+        etag: None,
+        expires_at: None,
+    }]);
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _state) = serve(dir.path().to_path_buf(), vec![Arc::new(disabled), Arc::new(ok)]).await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let tid = add_magnet(&base, &client).await;
+
+    let pr = client
+        .post(format!("{base}/tasks/{tid}/pause"))
+        .send()
+        .await
+        .unwrap();
+    assert!(pr.status().is_success());
+
+    let fb = client
+        .post(format!("{base}/tasks/{tid}/fallback"))
+        .send()
+        .await
+        .unwrap();
+    let fbs = fb.status();
+    let ftext = fb.text().await.unwrap();
+    assert_eq!(fbs, reqwest::StatusCode::OK, "兜底应成功: {ftext}");
+    let out: serde_json::Value = serde_json::from_str(&ftext).unwrap();
+    assert_eq!(out["status"], "completed");
+    assert_eq!(out["provider"], "ok", "应使用第二个可用 provider");
+    assert_eq!(out["transferred"][0], "out.bin");
+
+    let got = std::fs::read(dir.path().join("out.bin")).unwrap();
+    assert_eq!(got.len() as u64, size);
+    assert_eq!(got, body, "直链传输内容必须与源一致");
+}
+
+#[tokio::test]
+async fn fallback_skips_quota_exhausted_provider_and_uses_next() {
+    let size: u64 = 256 * 1024;
+    let body = patterned(size);
+    let srv = TestServer::start(body.clone()).await;
+
+    // 第一个 provider 配额耗尽（submit 返回 Quota），第二个正常
+    let quota_exhausted = MockProvider::new("quota_exhausted").with_quota(0);
+    let ok = MockProvider::new("ok").with_files(vec![ResolvedRemoteFile {
+        rel_path: "out.bin".into(),
+        url: srv.url(),
+        size,
+        etag: None,
+        expires_at: None,
+    }]);
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _state) = serve(dir.path().to_path_buf(), vec![Arc::new(quota_exhausted), Arc::new(ok)]).await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let tid = add_magnet(&base, &client).await;
+
+    let pr = client
+        .post(format!("{base}/tasks/{tid}/pause"))
+        .send()
+        .await
+        .unwrap();
+    assert!(pr.status().is_success());
+
+    let fb = client
+        .post(format!("{base}/tasks/{tid}/fallback"))
+        .send()
+        .await
+        .unwrap();
+    let fbs = fb.status();
+    let ftext = fb.text().await.unwrap();
+    assert_eq!(fbs, reqwest::StatusCode::OK, "兜底应成功: {ftext}");
+    let out: serde_json::Value = serde_json::from_str(&ftext).unwrap();
+    assert_eq!(out["status"], "completed");
+    assert_eq!(out["provider"], "ok", "配额耗尽后应切换到第二个 provider");
+    assert_eq!(out["transferred"][0], "out.bin");
+
+    let got = std::fs::read(dir.path().join("out.bin")).unwrap();
+    assert_eq!(got.len() as u64, size);
+    assert_eq!(got, body, "直链传输内容必须与源一致");
+}
+
+#[tokio::test]
+async fn fallback_skips_auth_failed_provider_and_uses_next() {
+    let size: u64 = 256 * 1024;
+    let body = patterned(size);
+    let srv = TestServer::start(body.clone()).await;
+
+    // 第一个 provider 未认证（submit 返回 Auth），第二个正常
+    let auth_failed = MockProvider::new("auth_failed").unauthenticated();
+    let ok = MockProvider::new("ok").with_files(vec![ResolvedRemoteFile {
+        rel_path: "out.bin".into(),
+        url: srv.url(),
+        size,
+        etag: None,
+        expires_at: None,
+    }]);
+    let dir = tempfile::tempdir().unwrap();
+    let (addr, _state) = serve(dir.path().to_path_buf(), vec![Arc::new(auth_failed), Arc::new(ok)]).await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let tid = add_magnet(&base, &client).await;
+
+    let pr = client
+        .post(format!("{base}/tasks/{tid}/pause"))
+        .send()
+        .await
+        .unwrap();
+    assert!(pr.status().is_success());
+
+    let fb = client
+        .post(format!("{base}/tasks/{tid}/fallback"))
+        .send()
+        .await
+        .unwrap();
+    let fbs = fb.status();
+    let ftext = fb.text().await.unwrap();
+    assert_eq!(fbs, reqwest::StatusCode::OK, "兜底应成功: {ftext}");
+    let out: serde_json::Value = serde_json::from_str(&ftext).unwrap();
+    assert_eq!(out["status"], "completed");
+    assert_eq!(out["provider"], "ok", "Auth 失败后应切换到第二个 provider");
+    assert_eq!(out["transferred"][0], "out.bin");
+
+    let got = std::fs::read(dir.path().join("out.bin")).unwrap();
+    assert_eq!(got.len() as u64, size);
+    assert_eq!(got, body, "直链传输内容必须与源一致");
 }

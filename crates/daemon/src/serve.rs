@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::http;
 use crate::lockfile::InstanceLock;
 use crate::state::DaemonState;
+use smart_dl_provider::RemoteProvider;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,8 +54,54 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     // 开发/演示占位，真实 provider（迅雷云盘等）落地后按类型构造）
     let mut providers: Vec<Arc<dyn smart_dl_provider::RemoteProvider>> = Vec::new();
     if cfg.provider.enabled && cfg.provider.mock {
-        providers.push(Arc::new(smart_dl_provider::MockProvider::new("mock")));
+        // BUGB-INSTR（临时诊断装配，修复验证后移除）：env SMART_DL_MOCK_URL 注入
+        // mock 直链文件，使兜底链在无真实云端配额时也能走完整传输路径。
+        let mut mp = smart_dl_provider::MockProvider::new("mock");
+        if let Ok(url) = std::env::var("SMART_DL_MOCK_URL") {
+            if !url.is_empty() {
+                let rel = std::env::var("SMART_DL_MOCK_NAME").unwrap_or_else(|_| "mockfile.bin".into());
+                let size = std::env::var("SMART_DL_MOCK_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
+                mp = mp.with_files(vec![smart_dl_provider::ResolvedRemoteFile {
+                    rel_path: rel,
+                    url: url.clone(),
+                    size,
+                    etag: None,
+                    expires_at: None,
+                }]);
+            }
+        }
+        // BUGB-INSTR（临时诊断装配，修复验证后移除）：SMARTDL_MOCK_READY_DELAY_SECS
+        // 延迟 Ready——submit 后 N 秒内 status=Downloading，模拟真实云盘「离线
+        // 数分钟」等待窗（免配额复现 Bug B 协调器状态窗）；缺省 0 = 旧行为。
+        if let Ok(secs) = std::env::var("SMARTDL_MOCK_READY_DELAY_SECS") {
+            let secs = secs.trim().parse::<u64>().unwrap_or(0);
+            if secs > 0 {
+                mp = mp.with_ready_delay_secs(secs);
+            }
+        }
+        providers.push(Arc::new(mp));
         tracing::info!("云兜底已启用（provider=mock，开发占位）");
+    }
+    // 3b+. 迅雷云盘 Provider 装配（XunleiProvider）。
+    // 决策说明：不引入新 feature 门，仅按 `cfg.provider_xunlei.enabled` 注入——
+    // smart-dl-provider 本就是 daemon 的常驻（非 optional）依赖，且现有 MockProvider
+    // 也仅由配置开关控制、无 feature 门；故复用同一最少惊讶原则，避免 xunlei-import
+    // （语义为「BT 任务导入 xlbt.cfg→fastresume」，且会联动拉起 bt + xunlei-convert）
+    // 作为无关门控而误导。
+    if cfg.provider_xunlei.enabled {
+        let tp = cfg
+            .provider_xunlei
+            .token_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("xunlei_auth.json"));
+        let xp = smart_dl_provider::xunlei::provider::XunleiProvider::new("xunlei", tp.clone());
+        let authenticated = xp.runtime().authenticated;
+        providers.push(Arc::new(xp));
+        tracing::info!(
+            "迅雷云盘 Provider 已装配: token_path={:?}, authenticated={}",
+            tp,
+            authenticated
+        );
     }
     #[cfg(feature = "bt")]
     let mut state =
@@ -65,20 +112,26 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
 
     // 4. BT 引擎（先取 core 句柄，供 alert 事件流）
     #[cfg(feature = "bt")]
+    let mut bt_typed: Option<Arc<crate::bt::BtEngine>> = None;
+    #[cfg(feature = "bt")]
     let bt_core = {
         if cfg.bt.enabled {
             let save = cfg.bt_save_path();
             std::fs::create_dir_all(&save)
                 .map_err(|e| ServeError::Engine(format!("BT 落盘目录创建失败 {save:?}: {e}")))?;
-            let bt = crate::bt::BtEngine::new(
+            let bt = Arc::new(crate::bt::BtEngine::new(
                 &save,
                 Some(cfg.download.proxy.as_str()),
                 cfg.download.max_download_kb_s,
                 cfg.bt.max_upload_kb_s,
+                cfg.bt.enable_dht,
+                cfg.bt.enable_lsd,
+                cfg.bt.enable_upnp,
             )
-            .map_err(ServeError::Engine)?;
+            .map_err(ServeError::Engine)?);
             let core = bt.core(); // Arc<BtCore>：alert 轮询句柄（trait 化前保存）
-            let bt_arc: Arc<dyn smart_dl_core::types::DownloadEngine> = Arc::new(bt);
+            bt_typed = Some(bt.clone()); // Bug A：alert 循环的暂停意图压制句柄
+            let bt_arc: Arc<dyn smart_dl_core::types::DownloadEngine> = bt.clone();
             state = state.with_bt(bt_arc);
             tracing::info!("BT 引擎已启用, 落盘: {save:?}");
             Some(core)
@@ -89,6 +142,57 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     #[cfg(not(feature = "bt"))]
     if cfg.bt.enabled {
         tracing::warn!("配置启用了 bt 但编译未带 --features bt，BT 不可用");
+    }
+
+    // 4c. 迅雷 SDK 引擎（Windows-only，免登录匿名 + 可选带身份模式；与 BT 共用 EngineKind::Bt）
+    #[cfg(feature = "xunlei")]
+    if cfg.xunlei.enabled {
+        let save = cfg.xunlei_save_path();
+        std::fs::create_dir_all(&save)
+            .map_err(|e| ServeError::Engine(format!("Xunlei 落盘目录创建失败 {save:?}: {e}")))?;
+        let sdk_dir = cfg.xunlei.sdk_dir.clone().unwrap_or_else(|| {
+            // 默认尝试常见安装路径
+            PathBuf::from(r"C:\Program Files\Thunder Network\ThunderSDK")
+        });
+        // 若同配置启用了 xunlei 云盘 Provider，取 user_id 注入 SDK（带身份模式）。
+        // cert 来源尚未完全澄清（speed.auth.vip.xunlei.com 下发流程未知），暂不注入。
+        let xunlei_user_id = if cfg.provider_xunlei.enabled {
+            let tp = cfg
+                .provider_xunlei
+                .token_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("xunlei_auth.json"));
+            smart_dl_provider::xunlei::auth::load(&tp)
+                .ok()
+                .flatten()
+                .map(|s| s.user_id)
+        } else {
+            None
+        };
+        let mut xl_builder = smart_dl_btcore::XunleiBtEngine::builder(&sdk_dir, &save);
+        if let Some(ref uid) = xunlei_user_id {
+            xl_builder = xl_builder.with_user_id(uid);
+        }
+        let xl = xl_builder
+            .build()
+            .await
+            .map_err(|e| ServeError::Engine(format!("Xunlei 引擎初始化失败: {e}")))?;
+        let xl_arc: Arc<dyn smart_dl_core::types::DownloadEngine> = Arc::new(xl);
+        state = state.with_bt(xl_arc);
+        tracing::info!("Xunlei 引擎已启用, sdk: {sdk_dir:?}, 落盘: {save:?}");
+    }
+    #[cfg(not(feature = "xunlei"))]
+    if cfg.xunlei.enabled {
+        tracing::warn!("配置启用了 xunlei 但编译未带 --features xunlei，Xunlei 不可用");
+    }
+
+    // 4d. FTP 引擎（feature `ftp`；与 HTTP 共用默认 dest_root）
+    #[cfg(feature = "ftp")]
+    {
+        let ftp_engine: Arc<dyn smart_dl_core::types::DownloadEngine> =
+            Arc::new(smart_dl_httpdl::FtpEngine::new());
+        state = state.with_ftp(ftp_engine);
+        tracing::info!("FTP 引擎已启用");
     }
 
     // 4b. 任务持久化 + 启动恢复（须在引擎表就绪后：恢复会重新 add）
@@ -114,7 +218,12 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     let (alert_handle, state_arc) = {
         let state_arc = Arc::new(state);
         let handle = bt_core.map(|core| {
-            crate::bt_events::spawn_alert_loop(state_arc.clone(), core, Duration::from_millis(500))
+            crate::bt_events::spawn_alert_loop(
+                state_arc.clone(),
+                core,
+                Duration::from_millis(500),
+                bt_typed.clone(),
+            )
         });
         (handle, state_arc)
     };
@@ -157,7 +266,7 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     }
 
     // 5. 路由 + 监听
-    let app = http::router(state_arc);
+    let app = http::router(state_arc.clone());
     let listener = tokio::net::TcpListener::bind(&cfg.server.addr)
         .await
         .map_err(|e| ServeError::Bind(cfg.server.addr.clone(), e))?;
@@ -169,6 +278,34 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         let _ = tokio::signal::ctrl_c().await;
         let _ = tx.send(());
     });
+
+    // BUGB-INSTR（临时诊断，修复后移除）：纯 sleep 心跳——若此日志停更，
+    // 说明 tokio runtime 已无可调度 worker（全被同步阻塞调用钉死）。
+    {
+        let t0 = std::time::Instant::now();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                tracing::info!("[bugb] watchdog alive uptime_ms={}", t0.elapsed().as_millis());
+            }
+        });
+    }
+
+    // BUGB-INSTR（临时诊断，修复验证后移除）：OS 线程心跳 + tasks 锁探测——
+    // 与 tokio watchdog 互为对照：os-tick 停更 = 进程级冻结；os-tick 活而
+    // tasks_free=false = tasks Mutex 被长期持有且 tokio worker 全数饿死。
+    {
+        let st2 = state_arc.clone();
+        let t0 = std::time::Instant::now();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(300));
+            tracing::debug!(
+                "[bugb] os-tick alive_ms={} tasks_free={}",
+                t0.elapsed().as_millis(),
+                st2.debug_try_lock_tasks()
+            );
+        });
+    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async {

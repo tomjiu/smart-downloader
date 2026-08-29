@@ -15,7 +15,23 @@ use std::sync::Arc;
 
 async fn serve() -> (std::net::SocketAddr, Arc<DaemonState>) {
     let engine = HttpEngine::new(reqwest::Client::new());
-    let state = Arc::new(DaemonState::new(Arc::new(engine), vec![]));
+    let state = DaemonState::new(Arc::new(engine), vec![]);
+    #[cfg(feature = "bt")]
+    {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bt = smart_dl_daemon::bt::BtEngine::new(
+            tmp.path(),
+            None,
+            0,
+            0,
+            false,
+            false,
+            false,
+        )
+        .expect("bt engine");
+        state = state.with_bt(Arc::new(bt));
+    }
+    let state = Arc::new(state);
     let app = http::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -280,16 +296,27 @@ async fn qqdl_link_decoded_and_added() {
     assert_eq!(resp.0, reqwest::StatusCode::CREATED, "qqdl:// 应解码并 201");
 }
 
+#[cfg(feature = "bt")]
 #[tokio::test]
 async fn magnet_ed2k_unknown_rejected_with_clear_error() {
-    // 归一化分类：magnet→BT(v1 无)；ed2k→不支持；未知→无法识别
+    // 归一化分类：magnet→BT；ed2k→不支持；未知→无法识别
     let (addr, _state) = serve().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
-    let (s, b) = add_task(&client, &base, "magnet:?xt=urn:btih:abc").await;
-    assert_eq!(s, reqwest::StatusCode::BAD_REQUEST);
-    assert!(b["error"].as_str().unwrap().contains("magnet"), "{b}");
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "url": "magnet:?xt=urn:btih:0d2c9c9d5c2d3e8f9a1b2c3d4e5f6a7b8c9d0e1f&dn=test" }))
+        .send()
+        .await
+        .unwrap();
+    let s = resp.status();
+    let b = resp.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null);
+    assert_eq!(s, reqwest::StatusCode::CREATED, "magnet 应创建 BT 任务: {b}");
+    assert!(b["task_id"].as_str().unwrap().starts_with('t'), "{b}");
+    // BT 任务必须落到全局 save_path（v1 约束），再删掉避免污染后续测试
+    let tid = b["task_id"].as_str().unwrap().to_string();
+    let _ = client.post(format!("{base}/tasks/{tid}/remove")).send().await;
 
     let (s, b) = add_task(&client, &base, "ed2k://file|a|1|hash|").await;
     assert_eq!(s, reqwest::StatusCode::BAD_REQUEST);

@@ -6,6 +6,8 @@ members = [
     "crates/httpdl",
     "crates/provider",
     "crates/daemon",
+    "crates/xunlei-ffi",
+    "crates/xunlei-convert",
 ]
 # spike/cxx 是临时对比 spike,独立构建,排除出主 workspace
 exclude = ["spike/cxx"]
@@ -20,7 +22,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 async-trait = "0.1"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", features = ["json", "multipart"] }
 tracing = "0.1"
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }

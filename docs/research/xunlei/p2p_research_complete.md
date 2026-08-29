@@ -1,9 +1,30 @@
 # 迅雷 P2P 网络接入逆向研究 - 完整成果合集
 
 > **生成时间**: 2026-08-17T11:32:24.047832
-> **状态**: PHub body 加密格式未完全破解,16 个 PoC 全部失败
+> **状态**: PHub body 加密格式已澄清（v2 MD5 公式仅适用于 XUDT/legacy；PHub 生产路径为 RSA-wrapped random AES key）
 > **关键阻碍**: AES 密钥来源无法确定 (可能来自 ConfigHub 下发)
 > **最有效突破**: Wireshark 抓 1 个真实 PHub 请求
+
+---
+
+## 勘误（2026-08-27）
+
+**v2 结论已局部作废**：本文件曾将 PHub HTTP body 加密描述为
+`AES-ECB(MD5(cmd_id + seq), body)`（13 字节头 + 从包头派生 key）。
+该公式**仅对 XUDT/legacy 路径成立**（见 `scripts/research/cloud_delivery/phub_line/XUDT_KEY_DERIVATION_SOLVED.md`）。
+
+**PHub/SHub 生产路径正确模型**（v3 spec，已用真实样本验证）：
+```
+8 字节头 (cmd_id + flag + seq_no)
++ 4 字节 ekey_size (RSA-1024 = 128)
++ 128 字节 RSA-1024 密文 (包装随机 16B AES key)
++ 4 字节 aes_body_size
++ N 字节 AES-128-ECB 密文 (PKCS7)
+```
+- AES key = `XPF_RandomBytes(16)`，每请求随机
+- RSA 公钥为编译期常量，服务端持私钥解出 AES key
+- 离线密钥派生（MD5/seq）**不可能**；必须 Frida hook `XPF_RandomBytes` 或 `XPF_AESCreateEncryptContext` 才能拿到 key
+- 规范文档：`scripts/research/cloud_delivery/v3/PHUB_PROTOCOL_SPEC_V3.md`
 
 ---
 
@@ -541,8 +562,7 @@ PHub body ([13:], AES-ECB 加密):
   AES-ECB 原地加密 (XPF_AESEncryptBufferECB)
   PKCS7 padding
 ```
-
-### 完整调用链 (A 级)
+> ⚠️ **v2 公式仅适用于 XUDT/legacy 路径**。PHub HTTP 生产包使用 RSA-wrapped random AES key（见文件顶部「勘误」v3 spec）。
 
 ```
 ServicePHubQueryEvent:

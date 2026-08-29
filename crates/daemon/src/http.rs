@@ -28,19 +28,43 @@ pub struct AddTaskReq {
     pub torrent_b64: Option<String>,
 }
 
-/// 组装 API 路由。
-pub fn router(state: Arc<DaemonState>) -> Router {
-    Router::new()
-        .route("/tasks", get(list_tasks).post(add_task))
-        .route("/tasks/:id", get(task_snapshot).delete(remove_task))
-        .route("/tasks/:id/pause", post(pause_task))
-        .route("/tasks/:id/resume", post(resume_task))
-        .route("/tasks/:id/logs", get(task_logs))
-        .route("/tasks/:id/fallback", post(task_fallback))
-        .route("/config", get(config_endpoint))
-        .route("/providers", get(providers))
-        .route("/ws", get(ws_handler))
-        .with_state(state)
+#[cfg(feature = "xunlei-import")]
+#[derive(Deserialize)]
+pub struct AddXunleiImportReq {
+    /// .torrent 文件内容（标准 base64）。
+    pub torrent_b64: String,
+    /// .xlbt.cfg 文件内容（标准 base64）。
+    pub cfg_b64: String,
+    /// .bt.xltd 文件内容数组（标准 base64）；单文件为 1 项，多文件按 torrent files 顺序。
+    pub xltd_b64s: Vec<String>,
+    #[serde(default)]
+    pub dest: Option<String>,
+}
+
+/// F5 P2SP：给 BT 任务注入云盘直链 web seed（`POST /tasks/:id/webseeds`）。
+/// URL 必须原样（带 `at=` 防篡改签名，禁改 query）。
+#[derive(Deserialize)]
+pub struct WebseedReq {
+    pub urls: Vec<String>,
+}
+
+async fn task_webseeds(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<WebseedReq>,
+) -> impl IntoResponse {
+    match state.add_webseeds(&id, &req.urls).await {
+        Ok(n) => Json(serde_json::json!({ "added": n })).into_response(),
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
 }
 
 /// `GET /tasks/:id/logs`：任务操作日志（快照 + 事件序列）。
@@ -214,6 +238,63 @@ async fn add_task(
     }
 }
 
+#[cfg(feature = "xunlei-import")]
+async fn add_xunlei_import(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<AddXunleiImportReq>,
+) -> impl IntoResponse {
+    let decode = |b64: &str| base64::engine::general_purpose::STANDARD.decode(b64.as_bytes());
+    let torrent = match decode(&req.torrent_b64) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "torrent_b64 不是合法 base64" })),
+            )
+                .into_response();
+        }
+    };
+    let cfg = match decode(&req.cfg_b64) {
+        Ok(b) => b,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "cfg_b64 不是合法 base64" })),
+            )
+                .into_response();
+        }
+    };
+    let mut xltds = Vec::with_capacity(req.xltd_b64s.len());
+    for b64 in &req.xltd_b64s {
+        match decode(b64) {
+            Ok(b) => xltds.push(b),
+            Err(_) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "xltd_b64s 含非法 base64" })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
+    match state
+        .add_xunlei_import_task(torrent, cfg, xltds, req.dest)
+        .await
+    {
+        Ok(task_id) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "task_id": task_id })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 async fn task_snapshot(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -277,4 +358,33 @@ async fn providers(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
         })
         .collect();
     Json(rows)
+}
+
+macro_rules! router_base {
+    ($app:expr) => {
+        $app
+            .route("/tasks", get(list_tasks).post(add_task))
+            .route("/tasks/:id", get(task_snapshot).delete(remove_task))
+            .route("/tasks/:id/pause", post(pause_task))
+            .route("/tasks/:id/resume", post(resume_task))
+            .route("/tasks/:id/logs", get(task_logs))
+            .route("/tasks/:id/fallback", post(task_fallback))
+            .route("/tasks/:id/webseeds", post(task_webseeds))
+            .route("/config", get(config_endpoint))
+            .route("/providers", get(providers))
+            .route("/ws", get(ws_handler))
+    };
+}
+
+#[cfg(feature = "xunlei-import")]
+pub fn router(state: Arc<DaemonState>) -> Router {
+    router_base!(Router::new())
+        .route("/tasks/xunlei-import", post(add_xunlei_import))
+        .with_state(state)
+}
+
+#[cfg(not(feature = "xunlei-import"))]
+pub fn router(state: Arc<DaemonState>) -> Router {
+    router_base!(Router::new())
+        .with_state(state)
 }

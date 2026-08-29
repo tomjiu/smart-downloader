@@ -234,11 +234,32 @@ lt_err lt_apply_network(lt_session* s,
     }
 }
 
+lt_err lt_apply_discovery(lt_session* s, int enable_dht, int enable_lsd, int enable_upnp) {
+    if (!s) return LT_ERR_ARG;
+    try {
+        // 会话默认全关（M0 确定性语义，见 lt_session_new）；此处显式覆盖三项。
+        // enable_upnp 同时控制 enable_natpmp（端口映射族同进退，见 lt.h 契约注释）。
+        lt::settings_pack sp;
+        sp.set_bool(lt::settings_pack::enable_dht, enable_dht != 0);
+        sp.set_bool(lt::settings_pack::enable_lsd, enable_lsd != 0);
+        sp.set_bool(lt::settings_pack::enable_upnp, enable_upnp != 0);
+        sp.set_bool(lt::settings_pack::enable_natpmp, enable_upnp != 0);
+        s->ses.apply_settings(sp);
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
 lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, char* ih_out) {
     if (!s || !magnet || !ih_out) return LT_ERR_ARG;
     try {
         lt::add_torrent_params p = lt::parse_magnet_uri(magnet);
         p.save_path = s->save_path;
+        // Bug A 修复（ABI1 兼容）：新增任务即 paused + 禁 auto_managed，
+        // 从源头阻止 lt 队列在 metadata/checking 完成后自动复活。
+        p.flags &= ~lt::torrent_flags::auto_managed;
+        p.flags |= lt::torrent_flags::paused;
         if (web_seeds) {
             for (const char** ws = web_seeds; *ws != nullptr; ++ws) {
                 p.url_seeds.emplace_back(*ws);
@@ -277,6 +298,9 @@ lt_err lt_pause(lt_session* s, const char* ih) {
     try {
         const lt::torrent_handle h = find_handle(s, ih);
         if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        // qBittorrent 同思路：暂停时摘除 auto_managed，禁用 lt 队列自动复活，
+        // 队列策略由上层（Rust 调度层）全权管理。上游同步时请重放本行。
+        h.unset_flags(lt::torrent_flags::auto_managed);
         h.pause(); // 完成即停；torrent_paused_alert 为同步点（D19/D32）
         return LT_OK;
     } catch (...) {
@@ -292,7 +316,7 @@ lt_err lt_status(lt_session* s, const char* ih, lt_torrent_status* out) {
         if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
         const lt::torrent_status st = h.status();
         out->metadata_received = st.has_metadata ? 1 : 0;
-        // ABI=100 excludes paused bool/flag_paused; paused handled via alert in M1.
+        out->paused = (st.flags & lt::torrent_flags::paused) ? 1 : 0;
         switch (st.state) {
             case lt::torrent_status::downloading_metadata:
                 out->state = 4;
@@ -413,6 +437,8 @@ lt_err lt_add_torrent_file(lt_session* s, const uint8_t* meta, size_t len, const
         lt::add_torrent_params p;
         p.ti = std::move(ti);
         p.save_path = s->save_path;
+        p.flags &= ~lt::torrent_flags::auto_managed;
+        p.flags |= lt::torrent_flags::paused;
         set_web_seeds(p, web_seeds);
         return fill_ih(s, p, web_seeds, ih_out);
     } catch (...) {
@@ -429,6 +455,8 @@ lt_err lt_add_torrent_resume(lt_session* s, const uint8_t* resume_data, size_t l
             lt::span<const char>(reinterpret_cast<const char*>(resume_data), len), ec);
         if (ec) { set_err(s, "resume parse: " + ec.message()); return LT_ERR_IO; }
         p.save_path = s->save_path;
+        p.flags &= ~lt::torrent_flags::auto_managed;
+        p.flags |= lt::torrent_flags::paused;
         set_web_seeds(p, web_seeds);
         return fill_ih(s, p, web_seeds, ih_out);
     } catch (...) {

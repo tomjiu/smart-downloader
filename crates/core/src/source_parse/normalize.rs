@@ -5,6 +5,7 @@
 //! - `qqdl://`  内容 = base64(真实URL)，无 AA/ZZ 壳
 
 use crate::source_parse::thunder::{decode_base64_lenient, decode_thunder};
+use crate::source_parse::xunlei_share::parse_xunlei_share;
 
 /// 归一化后的下载源分类（DaemonState::add_link_task 消费）。
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -13,8 +14,12 @@ pub enum NormalizedSource {
     Http(String),
     /// BT 磁力链接（v1 无 BT 引擎 → 由调用方报 Unsupported）。
     Magnet(String),
+    /// FTP 链接（含可选 user:pass@，匿名 → anonymous）。
+    Ftp(String),
     /// eD2k（本项目不支持）。
     Ed2k(String),
+    /// 迅雷网盘分享链接。
+    XunleiShare(String),
     /// 无法识别/无法解码的输入（保原始串，供报错）。
     Unsupported(String),
 }
@@ -23,10 +28,17 @@ fn is_http(u: &str) -> bool {
     u.starts_with("http://") || u.starts_with("https://")
 }
 
+fn is_ftp(u: &str) -> bool {
+    u.starts_with("ftp://")
+}
+
 /// 归一化用户提交的任意链接 → 下载源分类。
 pub fn normalize_user_link(link: &str) -> NormalizedSource {
     if is_http(link) {
         return NormalizedSource::Http(link.to_string());
+    }
+    if is_ftp(link) {
+        return NormalizedSource::Ftp(link.to_string());
     }
     if let Some(rest) = link.strip_prefix("thunder://") {
         return match decode_thunder(link) {
@@ -55,6 +67,12 @@ pub fn normalize_user_link(link: &str) -> NormalizedSource {
     }
     if link.starts_with("ed2k://") {
         return NormalizedSource::Ed2k(link.to_string());
+    }
+    // 迅雷网盘分享链接（pan.xunlei.com/s/xxx?pwd=yyy）
+    if link.contains("pan.xunlei.com/s/") {
+        if parse_xunlei_share(link).is_ok() {
+            return NormalizedSource::XunleiShare(link.to_string());
+        }
     }
     NormalizedSource::Unsupported(link.to_string())
 }
@@ -130,6 +148,14 @@ mod tests {
         assert_eq!(
             normalize_user_link("magnet:?xt=urn:btih:abc"),
             NormalizedSource::Magnet("magnet:?xt=urn:btih:abc".into())
+        );
+    }
+
+    #[test]
+    fn ftp_classified() {
+        assert_eq!(
+            normalize_user_link("ftp://user:pass@example.com/a.bin"),
+            NormalizedSource::Ftp("ftp://user:pass@example.com/a.bin".into())
         );
     }
 

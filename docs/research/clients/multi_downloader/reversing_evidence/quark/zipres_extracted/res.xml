@@ -1,0 +1,172 @@
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<Window size="562,422" sizebox="0,0,0,0" caption="0,0,0,306" layeredopacity="255" layeredimage="">
+	<Font id="0" name="微软雅黑" size="12" bold="false" italic="false" />
+	<Font id="1" name="微软雅黑" size="12" bold="true" italic="false" />
+	<Font id="2" name="微软雅黑" size="16" bold="false" italic="false" />
+	<Font id="3" name="微软雅黑" size="20" bold="false" italic="false" />
+	<Font id="4" name="微软雅黑" size="22" bold="true" italic="false" />
+	<Font id="5" name="微软雅黑" size="26" bold="false" italic="false" />
+	<Font id="6" name="微软雅黑" size="20" bold="false" italic="false" />
+	<Font id="7" name="微软雅黑" size="18" bold="true" italic="false" />
+	<Font id="8" name="微软雅黑" size="16" bold="true" italic="false" />
+	<Font id="9" name="微软雅黑" size="12" bold="true" italic="false" />
+	<Font id="10" name="微软雅黑" size="14" bold="false" italic="false" />
+    <Font id="11" name="微软雅黑" size="20" bold="false" italic="false" underline="true"/>
+    <Font id="12" name="微软雅黑" size="14" bold="false" italic="false" underline="true"/>
+    <Font id="13" name="微软雅黑" size="24" bold="false" italic="false"/>
+	<VerticalLayout>
+		<TabLayout name="main_tab">
+			<!-- 初始页面 -->
+			<Container>
+				<Label name="background_layer" width="562" height="252" bkcolor="0xfff7f9ff" padding="0,0,0,0" float="true" borderround="250,250" bordersize="1" bordercolor="0x1F060A26">
+				</Label>
+				<VerticalLayout name="normal_layer" childvalign="vcenter" childalign="center">
+					<Container height="250">
+						<!-- 分层1，绘制简易安装界面 -->
+						<!-- logo 层 -->
+						<HorizontalLayout height="252" bkcolor="0x00ff0000" childvalign="top" childalign="center">
+							<HorizontalLayout name="logo_layer" childvalign="top" childalign="center">
+								<Label name="quark_logo_label" width="250" height="250" bkimage="quark_logo.png" padding="0,0,0,1" />
+							</HorizontalLayout>
+						</HorizontalLayout>
+						<!-- 商标层 -->
+						<HorizontalLayout height="250" bkcolor="0x00ff0000" childvalign="vcenter" childalign="left" childpadding="0">
+							<HorizontalLayout name="brand_layer" childvalign="vcenter" childalign="left">
+								<Button enabled="false" name="quark_brand_btn" width="123" height="32" normalimage="file='quark_brand.png' align='vcenter'" padding="56,0,0,0"/>
+							</HorizontalLayout>
+						</HorizontalLayout>
+                        
+						<!-- 安装按钮1（位于层1） -->
+						<VerticalLayout height="250" bkcolor="0x00ff0000" childvalign="vcenter" childalign="right" childpadding="0">
+							<HorizontalLayout name="install_layer1" childvalign="top" childalign="right">
+								<Button name="install_layer1_button" cursor="hand" width="94" height="64" padding="0,94,-75,0" font="4" keyboard="false" borderround="64,64" bkcolor="#FF4D80FF" hotbkcolor="#FF3B73FF" pushedbkcolor="#FF3E66CC" textcolor="#FFFFFFFF" hottextcolor="#FFFFFFFF" pushedtextcolor="#7FFFFFFF" />
+                                <Label text="安装" font="4" width="44" height="30" textcolor="#FFFFFFFF" padding="0,110,4,0" mouse="false" />
+                                <Label width="15" height="15" bkimage="forward.png" padding="0,119,68,0" />
+                                <HorizontalLayout width="1" height="1" bkcolor="0x0000ff00" childvalign="vcenter" childalign="right" />
+							</HorizontalLayout>
+                            <HorizontalLayout height="30" bkcolor="0x00ffff00" childvalign="top" childalign="center">
+						    	<HorizontalLayout name="agreement_layer" childvalign="center" childalign="center" height="16" width="180" padding="0,0,0,0">
+                                    <Label text="安装即同意 " font="0" textcolor="#7F060A26" align="left" width="64" />
+						    		<Button text="用户协议" cursor="hand" name="license_btn" font="1" textcolor="#7F060A26" align="left" width="48" keyboard="true"/>
+						    		<Label text=" 和 " font="0" textcolor="#7F060A26" align="left" width="20" />
+						    		<Button text="隐私政策" cursor="hand" name="privacy_btn" font="1" textcolor="#7F060A26" align="left" width="48" keyboard="true"/>
+						    	</HorizontalLayout>
+						    </HorizontalLayout>
+						</VerticalLayout>
+                        
+						<!-- 分层2，安装进度及轮播 -->
+						<Container name="installing_layer" visible="true" height="250" bkcolor="0x00ff0000" fade="0" mouse="true">
+							<HorizontalLayout height="250" bkcolor="0x00ff0000" childvalign="vcenter" childalign="right">
+								<Container name="install_tips_layer" padding="0,0,68,1" width="120" bkcolor="0x0000ff00" fade="0" childvalign="vcenter">
+									<VerticalLayout padding="0,0,0,0" width="120" height="50" bkcolor="0x0000ff00" childvalign="vcenter">
+										<Label name="install_tips_text" height="28" bkcolor="0x0000ff" text="正在下载" textcolor="#FF424EA2" font="13" align="left" padding="18,2,0,0"/>
+                                        <Label name="install_speed_text" height="16" bkcolor="0x0000ff" text="1.0MB/s" textcolor="#FF7F86B9" font="10" align="left" padding="18,4,0,0"/>
+									</VerticalLayout>
+								</Container>
+							</HorizontalLayout>
+							<HorizontalLayout height="250" bkcolor="0x00ff0000" childvalign="bottom" childalign="center">
+								<HorizontalLayout name="install_progress_layer" width="108" height="24" bkcolor="#FFFFFFFF" borderround="24,24" padding="0,0,0,24" childvalign="vcenter" childalign="center">
+									<Progress name="install_progress_bar" width="56" height="2" value="0" min="0" max="99" bkcolor="#336D77AC" forecolor="#FF6D77AC" />
+									<Label name="install_progress_bar_text" width="16" height="20" text="0" font="9" textcolor="#FF6D78C3" padding="6,0,2,0" />
+									<Label width="8" height="8" bkimage="percentmark.png" />
+								</HorizontalLayout>
+							</HorizontalLayout>
+						</Container>
+					</Container>
+
+					<!-- 底部浮动条（层级1） -->
+                    <VerticalLayout bkcolor="0x000000ff" childvalign="top" childalign="top">
+					    <HorizontalLayout bkcolor="0x0000ff00" childalign="center" inset="0,0,0,0" childvalign="top" height="60">
+					    	<HorizontalLayout name="tool_ctrl_layer" visible="true" bkcolor="0x00ffffff" childalign="center" inset="0,17,0,0" childpadding="8">
+					    		<HorizontalLayout width="296" height="40" childalign="left" bordersize="1" bordercolor="#1F060A26" bkcolor="#FFffffff" borderround="40,40" padding="0,0,0,0" childpadding="0">
+                                    <Label text="安装到" font="1" width="36" height="16" textcolor="#FF060A26" padding="14,12,6,0" />
+                                    <Edit name="choose_dir_edit" bkcolor="0x0000ffff" text="C:\Program Files" textcolor="#7F060A26" font="0" width="175" height="34" endellipsis="true" padding="0,4,0,0"/>
+                                    <Button name="choose_dir" cursor="hand" width="16" height="16" normalimage="file='filesfolder.png' align='hcenter|vcenter'  size='16,16'" padding="0,12,12,0" keyboard="false"/>
+                                    <Option name="option_btn" width="32" height="32" cursor="hand" selected="false" bkcolor="#00ffffff" selectedbkcolor="#0F060A26" borderround="32,32" normalimage="file='more.png' align='hcenter|vcenter'  size='16,16'" hotimage="file='more.png' align='hcenter|vcenter'  size='16,16'" pushedimage="file='more.png' align='hcenter|vcenter'  size='16,16'" selectedimage="file='more.png' align='hcenter|vcenter'  size='16,16'" selectedhotimage="file='more.png' align='hcenter|vcenter'  size='16,16'" selectedpushedimage="file='more.png' align='hcenter|vcenter'  size='16,16'" padding="0,4,0,0"/>
+					    		</HorizontalLayout>
+					    		<Button width="40" name="close_btn" height="40" bordersize="1" cursor="hand" bordercolor="#1F060A26" bkcolor="#FFffffff" borderround="40,40" normalimage="file='close_btn.png' align='hcenter|vcenter'  size='16,16'" keyboard="false"/>
+					    	</HorizontalLayout>
+					    </HorizontalLayout>
+                        <VerticalLayout name="option_layer" width="156" height="92" childalign="top" bordersize="1" bordercolor="#1F060A26" bkcolor="#FFffffff" borderround="24,24" padding="263,2,0,0" childpadding="0" visible="false">
+                            
+                            <HorizontalLayout name="pin_option_ctrl" bkcolor="0x0000ffff" padding="4,4,0,0" childvalign="top" childalign="top" width="148" height="28">
+                                <Container width="148" height="28">
+                                    <HorizontalLayout bkcolor="0x0000ffff" padding="0,0,0,0" childvalign="top" childalign="top" width="148" height="28">
+                                        <Option name="pin_task_bar_option" padding="8,7,0,0" width="16" height="16" normalimage="check_off.png" hotimage="check_off.png" pushedimage="check_off.png" selectedimage="check_on.png" selectedhotimage="check_on.png" selectedpushedimage="check_on.png" cursor="hand" selected="true" />
+                                    </HorizontalLayout>
+                                    <Button name="pin_task_bar_option_btn" cursor="hand" width="148" height="28" padding="0,0,0,0" keyboard="false" borderround="16,16" bkcolor="#00ffffff" hotbkcolor="#0F060A26" pushedbkcolor="#0F060A26" textcolor="#FFFFFFFF" hottextcolor="#FFFFFFFF" pushedtextcolor="#FFFFFFFF" />
+                                    <HorizontalLayout padding="0,0,0,0" childvalign="top" childalign="top" width="148" height="28" mouse="false">
+                                        <Label textcolor="#FF060A26" width="84" height="17" text="添加到任务栏" font="0" align="left" padding="32,6,0,0" keyboard="false" mouse="false"/>
+                                    </HorizontalLayout>
+                                </Container>
+                            </HorizontalLayout>
+
+							 <HorizontalLayout name="default_video_option_ctrl" bkcolor="0x0000ffff" padding="4,0,0,0" childvalign="top" childalign="top" width="148" height="28">
+                                <Container width="148" height="28">
+                                    <HorizontalLayout bkcolor="0x0000ffff" padding="0,0,0,0" childvalign="top" childalign="top" width="148" height="28">
+                                        <Option name="default_video_option" padding="8,7,0,0" width="16" height="16" normalimage="check_off.png" hotimage="check_off.png" pushedimage="check_off.png" selectedimage="check_on.png" selectedhotimage="check_on.png" selectedpushedimage="check_on.png" cursor="hand" selected="false" />
+                                    </HorizontalLayout>
+                                    <Button name="default_video_option_btn" cursor="hand" width="148" height="28" padding="0,0,0,0" keyboard="false" borderround="16,16" bkcolor="#00ffffff" hotbkcolor="#0F060A26" pushedbkcolor="#0F060A26" textcolor="#FFFFFFFF" hottextcolor="#FFFFFFFF" pushedtextcolor="#FFFFFFFF" />
+                                    <HorizontalLayout padding="0,0,0,0" childvalign="top" childalign="top" width="148" height="28" mouse="false">
+                                        <Label textcolor="#FF060A26" width="110" height="17" text="设为默认视频播放器" font="0" align="left" padding="32,6,0,0" keyboard="false" mouse="false"/>
+                                    </HorizontalLayout>
+                                </Container>
+                            </HorizontalLayout>
+                            
+                            <HorizontalLayout name="default_pdf_option_ctrl" bkcolor="0x0000ffff" padding="4,0,0,0" childvalign="top" childalign="top" width="148" height="28">
+                                <Container width="148" height="28">
+                                    <HorizontalLayout bkcolor="0x0000ffff" padding="0,0,0,0" childvalign="top" childalign="top" width="148" height="28">
+                                        <Option name="default_pdf_option" padding="8,7,0,0" width="16" height="16" normalimage="check_off.png" hotimage="check_off.png" pushedimage="check_off.png" selectedimage="check_on.png" selectedhotimage="check_on.png" selectedpushedimage="check_on.png" cursor="hand" selected="false" />
+                                    </HorizontalLayout>
+                                    <Button name="default_pdf_option_btn" cursor="hand" width="148" height="28" padding="0,0,0,0" keyboard="false" borderround="16,16" bkcolor="#00ffffff" hotbkcolor="#0F060A26" pushedbkcolor="#0F060A26" textcolor="#FFFFFFFF" hottextcolor="#FFFFFFFF" pushedtextcolor="#FFFFFFFF" />
+                                    <HorizontalLayout padding="0,0,0,0" childvalign="top" childalign="top" width="148" height="28" mouse="false">
+                                        <Label textcolor="#FF060A26" width="84" height="17" text="关联PDF文档" font="0" align="left" padding="32,6,0,0" keyboard="false" mouse="false"/>
+                                    </HorizontalLayout>
+                                </Container>
+                            </HorizontalLayout>
+
+
+                        </VerticalLayout>
+                    </VerticalLayout>
+                    
+				</VerticalLayout>
+				<!-- 分层4，错误页 -->
+				<Container name="common_error_layer" visible="false" height="250" bkcolor="0x00ff0000" mouse="true">
+					<VerticalLayout childvalign="top" childalign="center">
+                    
+							<HorizontalLayout height="120" childvalign="vcenter" childalign="left" padding="0,65,0,0">
+								<Label name="failed_img" width="96" height="96" padding="60,0,0,0" bkimage="failed.png" />
+								<Label name="common_error_msg_text" width="220" height="100" text="安装失败{\n}请重试" wordbreak="true" padding="10,0,10,0" align="left" textcolor="#FF424EA2" font="6" />
+							    <Button name="common_error_retry_button" cursor="hand" width="84" height="64" padding="0,0,10,0" font="4" text="重试" keyboard="false" borderround="64,64" bkcolor="#FF4D80FF" hotbkcolor="#FF3B73FF" pushedbkcolor="#FF3E66CC" textcolor="#FFFFFFFF" hottextcolor="#FFFFFFFF" pushedtextcolor="#7FFFFFFF"/>
+								<Button width="40" name="common_error_close_btn" height="40" bordersize="1" cursor="hand" bordercolor="#1F060A26" padding="0,0,101,0" bkcolor="#FFffffff" borderround="40,40" normalimage="file='close_btn.png' align='hcenter|vcenter'  size='16,16'" keyboard="false"/>
+                            </HorizontalLayout>
+                            
+                            <HorizontalLayout height="75" childvalign="vcenter" childalign="left">
+                                <Label name="common_error_guide_label" padding="160,0,0,0" width="140" height="75" text="如重试无效，请手动" wordbreak="true" align="left" textcolor="#FF424EA2" font="10" />
+                                <Button name="common_error_guide_btn" padding="-11,0,0,0" width="120" height="75" text="下载离线安装包 >" wordbreak="true" align="left" textcolor="#FF424EA2" font="12" cursor="hand" keyboard="false"/>
+                            </HorizontalLayout>
+                            
+						<HorizontalLayout height="1" bkcolor="0x0000ff00" />
+					</VerticalLayout>
+				</Container>
+                <!-- 分层5，跳转提示 -->
+				<Container name="custom_error_layer" visible="false" height="250" bkcolor="0x00ff0000" mouse="true">
+					<VerticalLayout childvalign="top" childalign="center">
+						
+                        <HorizontalLayout height="120" childvalign="vcenter" childalign="left" padding="0,65,0,0" bkcolor="0x00ff0000">
+							<Label name="failed_img" width="96" height="96" padding="60,0,0,0" bkimage="failed.png" />
+							<Button name="custom_error_msg_btn" width="220" height="100" text="去官网下载" wordbreak="true" padding="10,0,10,0" align="left" textcolor="#FF424EA2" font="11" cursor="hand" keyboard="false"/>
+                            <Button name="custom_error_retry_button" cursor="hand" width="84" height="64" padding="0,0,10,0" font="4" text="重试" keyboard="false" borderround="64,64" bkcolor="#FF4D80FF" hotbkcolor="#FF3B73FF" pushedbkcolor="#FF3E66CC" textcolor="#FFFFFFFF" hottextcolor="#FFFFFFFF" pushedtextcolor="#7FFFFFFF"/>
+                            <Button width="40" name="custom_error_close_btn" height="40" bordersize="1" cursor="hand" bordercolor="#1F060A26" padding="0,0,101,0" bkcolor="#FFffffff" borderround="40,40" normalimage="file='close_btn.png' align='hcenter|vcenter'  size='16,16'" keyboard="false"/>
+						</HorizontalLayout>
+                        
+                        <HorizontalLayout bkcolor="0x00ff0000" height="75" childvalign="vcenter" childalign="left" bkcolor="0x0000ff00">
+                            <Label name="custom_error_detail_msg_text" padding="151,0,0,0" width="260" height="75" text="安装失败：未知错误。" wordbreak="true" align="center" textcolor="#FF424EA2" font="10" />
+                        </HorizontalLayout>
+						<HorizontalLayout height="1" bkcolor="0x0000ff00" />
+					</VerticalLayout>
+				</Container>
+			</Container>
+		</TabLayout>
+	</VerticalLayout>
+</Window>

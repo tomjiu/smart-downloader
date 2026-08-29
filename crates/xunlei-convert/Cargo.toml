@@ -1,0 +1,22 @@
+[package]
+name = "xunlei-convert"
+version = "0.1.0"
+edition = "2021"
+authors = ["smart-downloader"]
+description = "Thunder BT task migration tools (xlbt.cfg + xltd -> libtorrent fastresume) - UNVERIFIED"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "xunlei_convert"
+
+[dependencies]
+xunlei-ffi = { path = "../xunlei-ffi" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha1 = { workspace = true }
+thiserror = { workspace = true }
+anyhow = "1"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"

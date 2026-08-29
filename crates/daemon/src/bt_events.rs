@@ -20,10 +20,14 @@ use crate::state::DaemonState;
 /// 返回 `(from, to)`；无迁移返回 `None`。
 pub fn transition_for(now: &TaskState, a: &Alert) -> Option<(TaskState, TaskState)> {
     match (&a.kind, a.state_subkind()) {
+        // Bug C 修复：BT 任务在记录态 Paused 下若引擎实际完成（Bug A 复活后跑完），
+        // 允许迁移到 Seeding，避免记录态与引擎态永久错位导致 fallback 误判进度。
         (AlertKind::State, StateSubKind::Finished)
             if matches!(
                 now,
-                TaskState::Downloading(EngineKind::Bt) | TaskState::Queued
+                TaskState::Downloading(EngineKind::Bt)
+                    | TaskState::Queued
+                    | TaskState::Paused
             ) =>
         {
             Some((now.clone(), TaskState::Seeding))
@@ -37,20 +41,32 @@ pub fn transition_for(now: &TaskState, a: &Alert) -> Option<(TaskState, TaskStat
 
 /// 启动 BT alert 消费循环：每 `interval` 弹一批（≤128）→ 应用迁移 → 广播事件。
 /// 会话 pop 失败（内核不可用）静默跳过；任务已移除/无迁移的 alert 丢弃。
+///
+/// `guard`（Bug A，调度层压制）：传入 BtEngine 后，Metadata alert 到达且该任务
+/// 带暂停意图时立即二次 pause，对冲 auto_managed 队列的自动恢复。
 pub fn spawn_alert_loop(
     state: Arc<DaemonState>,
     core: Arc<BtCore>,
     interval: Duration,
+    guard: Option<Arc<crate::bt::BtEngine>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        let mut tick_count: u64 = 0; // BUGB-INSTR
         loop {
             tokio::time::sleep(interval).await;
-            let alerts = match core.pop_alerts(128) {
-                Ok(v) => v,
-                Err(_) => continue, // 会话暂时不可用：下轮再试
+            let alerts = match &guard {
+                Some(g) => g.pop_alerts_enforcing_pause(128),
+                None => match core.pop_alerts(128) {
+                    Ok(v) => v,
+                    Err(_) => continue, // 会话暂时不可用：下轮再试
+                },
             };
-            for alert in alerts {
-                let Some(effect) = state.apply_bt_alert(&alert) else {
+            tick_count += 1;
+            if tick_count % 20 == 1 {
+                tracing::info!("[bugb] alert-loop alive ticks={tick_count} batch={}", alerts.len());
+            }
+            for alert in &alerts {
+                let Some(effect) = state.apply_bt_alert(alert) else {
                     continue;
                 };
                 let hub = state.hub();

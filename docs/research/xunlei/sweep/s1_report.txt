@@ -1,0 +1,206 @@
+TOTAL=907 SKIP(vendor)=4 BIZ=67 OTHER=836 (OBF files total=76, OBF in BIZ=31)
+unique_rel_paths=52 unique_urls=57 ws=0 schemes=1 rest_args=3 switch_keys=0
+
+== TOP20 BIZ ==
+m_933.js	33.3KB	score=83	zh=52	eps=3	obf=0	marks=-	local=-
+m_81.js	105.5KB	score=82	zh=116	eps=7	obf=0	marks=K14	local=-
+m_1431.js	204.7KB	score=78	zh=557	eps=2	obf=0	marks=-	local=-
+m_600.js	56.5KB	score=77	zh=31	eps=4	obf=0	marks=-	local=127.0.0.1
+m_1.js	22.5KB	score=71	zh=3	eps=10	obf=1	marks=-	local=-
+m_1182.js	227.7KB	score=67	zh=188	eps=29	obf=0	marks=-	local=-
+m_704.js	207.4KB	score=67	zh=122	eps=27	obf=0	marks=-	local=-
+m_23.js	2.0KB	score=57	zh=0	eps=3	obf=1	marks=K14	local=-
+m_1066.js	1.2KB	score=57	zh=0	eps=3	obf=1	marks=-	local=-
+m_239.js	1.1KB	score=57	zh=0	eps=3	obf=1	marks=-	local=-
+m_12.js	8.7KB	score=50	zh=26	eps=6	obf=1	marks=-	local=-
+m_167.js	6.3KB	score=50	zh=1	eps=1	obf=1	marks=-	local=-
+m_132.js	5.1KB	score=44	zh=5	eps=3	obf=1	marks=-	local=-
+m_134.js	4.0KB	score=37	zh=0	eps=3	obf=1	marks=-	local=-
+m_51.js	5.3KB	score=36	zh=22	eps=0	obf=1	marks=-	local=-
+m_329.js	5.1KB	score=36	zh=22	eps=0	obf=1	marks=-	local=-
+m_9.js	34.8KB	score=35	zh=21	eps=0	obf=1	marks=-	local=-
+m_17.js	6.5KB	score=34	zh=18	eps=0	obf=1	marks=-	local=-
+m_67.js	4.5KB	score=33	zh=0	eps=2	obf=1	marks=-	local=-
+m_1127.js	1.6KB	score=33	zh=16	eps=0	obf=1	marks=-	local=-
+
+== FUNC_MARK / LOCAL HITS ==
+m_23.js	marks=K14	local=-
+m_600.js	marks=-	local=127.0.0.1
+m_81.js	marks=K14	local=-
+
+== REL PATHS 全表(52) ==
+9	/api/subsc	[m_90.js]	-
+8	/v1/user/provider	[m_1182.js,m_704.js]	-
+4	/v1/auth/signin	[m_1182.js,m_704.js]	-
+4	/v1/auth/signin/with/provider	[m_1182.js,m_704.js]	-
+4	/v1/auth/signup	[m_1182.js,m_704.js]	-
+4	/v1/auth/signup/anonymously	[m_1182.js,m_704.js]	-
+4	/v1/auth/token	[m_1182.js,m_704.js]	-
+4	/v1/auth/device/code	[m_1182.js,m_704.js]	-
+4	/v1/auth/revoke	[m_1182.js,m_704.js]	-
+4	/v1/user/provider/bind	[m_1182.js,m_704.js]	-
+4	/v1/auth/provider/token	[m_1182.js,m_704.js]	-
+4	/v1/auth/provider/uri	[m_1182.js,m_704.js]	-
+4	/v1/user/device/authorize	[m_1182.js,m_704.js]	-
+4	/v1/user/me	[m_1182.js,m_704.js]	-
+4	/v1/user/query	[m_1182.js,m_704.js]	-
+4	/v1/user/profile	[m_1182.js,m_704.js]	-
+4	/v1/user/trans/by/provider	[m_1182.js,m_704.js]	-
+4	/v1/auth/verification	[m_1182.js,m_704.js]	-
+4	/v1/auth/verification/verify	[m_1182.js,m_704.js]	-
+4	/v1/user/sudo	[m_1182.js,m_704.js]	-
+4	/v1/user/contact	[m_1182.js,m_704.js]	-
+4	/v1/user/password	[m_1182.js,m_704.js]	-
+4	/v1/auth/reset	[m_1182.js,m_704.js]	-
+4	/v1/user/authorize	[m_1182.js,m_704.js]	-
+4	/v1/user/authorize/info	[m_1182.js,m_704.js]	-
+4	/v1/user/authorize/detect	[m_1182.js,m_704.js]	-
+4	/v1/auth/signin/token	[m_1182.js,m_704.js]	-
+3	/models/v1	[m_1066.js]	-
+3	/share/manage	[m_12.js,m_81.js]	-
+2	/v1/shield/captcha/init	[m_1181.js]	-
+2	/mediahub/v1/events	[m_67.js]	-
+2	/v1/auth/token/introspect	[m_704.js]	-
+2	/share/mobile	[m_81.js]	-
+2	/share/pc	[m_81.js]	-
+2	/api/subscribe/list	[m_90.js]	-
+1	/xlppc.searcher.api/drive_file_search	[m_10.js]	-
+1	/xlppc.pan.note/api/getNoteList	[m_100.js]	-
+1	/activity/v1/rewards	[m_111.js]	-
+1	/share/man	[m_12.js]	-
+1	/mediahub/v1/resources	[m_132.js]	-
+1	/mediahub/v1/collections	[m_132.js]	-
+1	/decompress/v1/list	[m_134.js]	-
+1	/decompress/v1/decompress	[m_134.js]	-
+1	/decompress/v1/progress	[m_134.js]	-
+1	/chitchat/v1/group/query	[m_171.js]	-
+1	/mediahub/v1/event	[m_67.js]	-
+1	/api/subscribe/own/info	[m_90.js]	-
+1	/api/subscribe/delete	[m_90.js]	-
+1	/api/subscribe/info	[m_90.js]	-
+1	/api/subscribe/whites	[m_90.js]	-
+1	/api/subscribe/search	[m_90.js]	-
+1	/user_info/pc_info	[m_99.js]	-
+
+== ABSOLUTE URLS 全表(57) ==
+4	http://www.w3.org/2000/svg	[m_1181.js,m_1182.js,m_3.js,m_456.js]	-
+4	http://www.w3.org/1999/xlink	[m_1181.js,m_1182.js,m_3.js,m_81.js]	-
+4	https://dev-xluser-ssl.xunlei.com	[m_23.js,m_999.js]	-
+3	https://xluser-ssl.xunlei.com	[m_23.js,m_239.js]	-
+2	https://api-shoulei-ssl.xunlei.com	[m_1.js]	K8
+2	https://api-shoulei-	[m_1.js]	K8
+2	https://test-api-gat	[m_1.js]	-
+2	https://api-gateway-pan.xunlei.com	[m_1.js]	K2
+2	http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd	[m_1181.js,m_1182.js]	-
+2	https://i.xunlei.com/xluser/validate/enter/modifyphone_enter.html	[m_1431.js]	-
+2	https://web-vod-xdrive.xunlei.com/ts_downloader	[m_933.js]	-
+2	https://pan.xunlei.com	[m_933.js]	-
+1	https://api-xl9-ssl.xunlei.com/sl_dev','testing':'https://api-xl9-ssl.xunlei.com/sl_dev','alpha':_0x568151(0x207)+'i-xl9-ssl.xunlei.com/sl',	[m_1.js]	-
+1	https://easy-mock.com/mock/5dfc6f66d1f75'+_0x568151(0x32d)+'7/red-envelope','development':'https://test-api-shoulei-ssl.xunlei.com','testing	[m_1.js]	-
+1	https://api-alpha-dr	[m_1.js]	-
+1	https://api-alpha-drive.office.k8s.xunlei.cn/','testing':_0x568151(0x207)+'i-alpha-drive.office.k8s.xunlei.cn/','preview':_0x568151(0x207)+'	[m_1.js]	-
+1	http://api	[m_1.js]	-
+1	https://api-alpha-drive.office.k8s.xunlei.cn	[m_1.js]	-
+1	https://conf-m-ssl.xunlei.com/'+_0x386e00(0x368)+'0ac1-9b0d-11ea-a017-0242ac140002'	[m_100.js]	K7
+1	https://test-api-xmo	[m_1066.js]	-
+1	https://test-api-xmodels.xunlei.com/models/v1','preview':'https://api-xmodels.'+_0x4ec796(0x139)+'/models/v1','production':'https://api-xmod	[m_1066.js]	-
+1	https://feross.org	[m_1196.js]	-
+1	https://a.app.qq.com	[m_12.js]	-
+1	https://a.app.qq.com/o/simple.jsp?pkgnam'+_0x4e745a(0x265)+'ei.downloadprovider&ckey=CK147'+_0x4e745a(0x286),'TASK_CREATE_COUNT_LIMIT':'task	[m_12.js]	-
+1	https://pay.xunlei.com/pages/2020/web-pay-center/','mobile-browser':_0x4e745a(0x30b)+'ges-pay.xunlei.com/pages/2020/android-sl-pay/'	[m_12.js]	-
+1	https://down.sandai.net/mac/thunder.dmg','win':'https://down.sandai.net/thunder11/XunLeiWebSetup_pan.exe'	[m_12.js]	-
+1	https://union-gateway.office.k8s.xunlei.cn/union/v3','testing':'https://union-gateway.office.k8s.xunlei.cn/union/v3','preview':'https://unio	[m_1228.js]	-
+1	https://password.office.k8s.xunlei.cn/v1/password','testing':'https://password.office.k8s.xunlei.cn/v1/password','preview':'https://xluser-s	[m_1299.js]	-
+1	https://api-alpha-drive.office.k8s.xunlei.cn/drive-reader/v1','testing':'https://api-alpha-drive.office.k8s.xunlei.cn/drive-reader/v1','prev	[m_132.js]	-
+1	https://www.baidu.com/	[m_1431.js]	-
+1	https://oia-pan-ssl.xunlei.com/?query=')['concat'](encodeURIComponent(_0x140141)),'scheme'!==_0x46d2eb&&_0x8e7d64&&(_0x3bfae9+='&ct='['conca	[m_167.js]	-
+1	https://i.xunlei.com/center/account/personal/oauth/','scope':'profile	[m_23.js]	-
+1	http://127.0.0.1:28317/yun_fet'+_0x3821f6(0x293),'headers':	[m_235.js]	-
+1	https://weixinapi-m-ssl.xunlei.com/wx/sign/js_api?page_url=')['concat'](_0x152fdb	[m_235.js]	-
+1	https://xluser2-ssl.xunlei.com	[m_239.js]	-
+1	https://xluser3-ssl	[m_239.js]	-
+1	https://weixinapi-m-ssl.xunlei.com/wx/si'+_0x1ed239(0x257)+'page_url=')['concat'](_0x2b5ea4	[m_24.js]	-
+1	https://static-xl.a.88cdn.com	[m_289.js]	-
+1	http://www.w3.org/1998/Math/MathML	[m_3.js]	-
+1	https://union-gateway-pan.xunlei.com/uni'+_0xdd297d(0x330)+'rting/user'+_0xdd297d(0x1f1);function	[m_34.js]	-
+1	https://backstage-img-ssl.a.88cdn.com/05e4f2d4a751f1895746a15da2d391105418a66d','multiple':'https://ba'+_0x1c02f4(0x208)+'g-ssl.a.88cdn.com/	[m_50.js]	-
+1	https://clipboardjs.com/	[m_598.js]	-
+1	http://a.app.qq.com/o/simple.jsp?pkgname=com.xunlei.downloadprovider&ckey=CK1470052035866	[m_600.js]	-
+1	http://127.0.0.1:28317/yun_fetch_back/	[m_600.js]	-
+1	https://xluser-ssl.xunlei.com/v1/getuserinfo	[m_600.js]	-
+1	https://pay.xunlei.com/pages/2020/web-pay-center/?default_tab=	[m_600.js]	-
+1	https://pan.xunlei.com/loading/	[m_601.js]	-
+1	https://i.xunlei.com/xluser/auth/	[m_602.js]	-
+1	https://m.down.sandai.net/mobile/yunpan_'+_0x1bb0d2(0x135)+'pk','home':'https://m.down.sandai.net/mobile/yunpanh5.apk'	[m_624.js]	-
+1	https://down.sandai.net/thunder11/XunLeiWebSetup_pan.exe	[m_627.js]	-
+1	https://down.sandai.net/mac/thunder.dmg	[m_627.js]	-
+1	https://github.com/mathiasbynens/CSS.escape)	[m_81.js]	-
+1	https://backstage-img-ssl.a.88cdn.com/019fc2a136a2881181e73fea74a4836efc02195d	[m_81.js]	-
+1	https://github.com/w3c/IntersectionObserver	[m_81.js]	-
+1	http://10.10.45.67:19099/ts_downloader	[m_933.js]	-
+1	https://xluser-ssl.x	[m_999.js]	-
+1	https://xl	[m_999.js]	-
+
+== WS / SCHEME ==
+SCH	thunderx://	2	m_627.js
+
+== REST ARGS (.get/.post 首参) Top120 / 共3 ==
+2	Content-Length	[m_600.js]
+1	redirect_uri	[m_1182.js]
+1	xlUploadUnfinished	[m_1431.js]
+
+== SWITCH KEYS ==
+
+== TOP35 BIZ 中文样本 ==
+[m_933.js] 无法自动播放，可前往设置： | 设置-此网站设置-自动播放-选择 | 允许全部自动播放 | 播放器视频解析中 | 视频文件加载中 | 播放器初始化中 | 自动播放失败 | 加载完成 | 倍速 | 迅雷 | 端 | 迅雷移动端 | 当前切换到 | 倍 | 速度播放 | 预览两分钟 | 保存后查看完整版 | 重播 | 网页无法支持该视频格式，请下载客户端播放 | 文件解析任务
+[m_81.js] 页面不存在，即将返回首页 | 关闭 | 确定 | 取消 | 全选 | 请输入文字 | 不支持IntersectionObserver，升级浏览器或代 | 码使用polyfill | 客户端用户信息 | 标题 | 这是弹框内容 | 身份 | 超级会员 | 白金会员 | 非会员 | 年费超会 | 云盘会员 | 天 | 限免 | 次
+[m_1431.js] 确定要删除所选任务么？ | 删除未成功，请稍后重试 | 图标 | 刷新 | 删除 | 清除 | 暂无添加记录 | 文件大小超出上传流量限额 | 获取文件信息 | 已暂停 | 排队中 | 已存到云盘 | 了解详情 | 暂停 | 上传 | 打开 | 关闭提示 | 确定要清除所有上传完成的记录吗？ | 正在上传( | 更多操作
+[m_600.js] 不在客户端环境内 | 客户端通信超时 | 分钟 | 小时 | 天 | 强制登录 | 未登录 | 显示登录弹窗 | 登录结果 | 用户取消的登录 | 登录成功 | 去获取用户信息 | 登录失败 | 不强制登录 | 返回默认用户信息 | 用户信息 | 已登录 | 登录弹窗 | 未知错误，请稍后再试 | 点击右上角
+[m_1.js(OBF)] 网络异常，请稍后重试 | 客户端内请求
+[m_1182.js] 密码无效 | 验证码过期 | 该帐号已注册，请更换帐号注册或直接登录 | 服务不可用 | 操作成功 | 操作已取消 | 未知错误 | 无效参数 | 请求超时 | 未找到请求 | 已存在 | 无权限访问 | 资源不足 | 操作被拒绝 | 操作终止 | 该操作超出有效范围 | 不支持该操作 | 内部错误 | 操作当前不可用 | 不可恢复的数据丢失或损坏
+[m_704.js] 操作成功 | 操作已取消 | 未知错误 | 无效参数 | 请求超时 | 未找到请求 | 已存在 | 无权限访问 | 资源不足 | 操作被拒绝 | 操作终止 | 该操作超出有效范围 | 不支持该操作 | 内部错误 | 操作当前不可用 | 不可恢复的数据丢失或损坏 | 未授权 | 请进行安全验证 | 安全验证未通过，请重新验证 | 密码无效
+[m_12.js(OBF)] 全部 | 文件夹 | 视频 | 音频 | 图片 | 压缩包 | 应用 | 其他 | 天 | 周 | 月 | 永久 | 年费超会 | 超级会员 | 白金会员 | 普通会员 | 云盘会员 | 云盘空间不足，请清理 | 今日云添加次数已用完 | 转存文件数超限，请删减文件后重试
+[m_167.js(OBF)] 不在客户端环境内
+[m_132.js(OBF)] 网络异常，请稍后重试 | 获取的文件内容 | 乱码
+[m_51.js(OBF)] 用户无资格申请或使用此特权 | 用户有资格但需要用户主动提交申请 | 用户已提交申请 | 待管理员审核 | 播放视频或音频 | 查看文件 | 创建文件 | 删除文件 | 上传文件 | 等待添加 | 添加失败 | 已存到云盘 | 需要提取码 | 提取码错误 | 来晚了，该文件已超出分享次数 | 来晚了，该文件已过期 | 抱歉，该分享已被作者删除 | 该分享内容可能因为涉及侵权、色情、反动、低俗等信息，无法访问！ | 您访问的链接内容正在审核中 | 请稍后访问，链接即将生效
+[m_329.js(OBF)] 没有符合条件的VIP信息 | 检查VIP图标时出错 | 检查有效期内VIP图标时出错 | 状态检查 | 云盘会员 | 白金会员 | 超会 | 所有VIP图标 | 有效期内VIP图标 | 应用过期会员规则：根 | 选择最晚过期的会员图标 | 比较过期时间 | 选择的最晚过期VIP图标 | 应用特殊组合规则：白金会员 | 组合VIP图标 | 白金 | 云盘 | 应用通用规则：处理所有符合条件的VIP项 | 获取到的VIP图标 | 执行出错
+[m_9.js(OBF)] 未知错误，请稍后再试 | 迅雷口令 | 刚刚存入 | 今天 | 刚刚 | 分钟前 | 小时前 | 昨天 | 星期日 | 星期二 | 星期三 | 星期四 | 星期五 | 星期六 | 年 | 月 | 日 | 天
+[m_17.js(OBF)] 服务器异常 | 参数错误 | 未登录 | 风险账号 | 异常账号 | 无权限做此操作 | 未找到资源 | 已存在 | 超过操作上限 | 您已经投过票了 | 网络异常，暂时无法接 | 未找到该圈子 | 超出字数限制 | 账号异常 | 请重新登录 | 发生未知错误
+[m_1127.js(OBF)] 第 | 一两二三四五六七八九十零百千万 | 章 | 节 | 集 | 卷 | 部 | 篇 | 回) | 楔子 | 前言 | 引子) | 正则匹配 | 首页
+[m_34.js(OBF)] 客户端内用户行为数据上报 | 客户端上报失败 | 网页内用户行为数据上报 | 网络异常，请稍后重试 | 上报 | 从客户端获取guid失败 | 用户行为数据上报成功 | 用户行为数据上报失败
+[m_70.js(OBF)] 分钟前 | 今天 | 昨天 | 天前 | 日 | 一 | 二 | 三 | 四 | 五 | 六
+[m_495.js] 我的云盘 | 全部文件 | 已完成 | 加星 | 文件 | 目录 | 图片 | 视频 | 回收站 | 温馨提示 | 即将进入 | 迅雷 | 打开 | 取消 | 享特权文件 | 是否在享特权 | 根目录 | 是否在享特权文件夹里 | 目录设置，进入的目录 | 目录设置，更新后目录树
+[m_10.js(OBF)] 文件ID | 空间 | 用途 | 文件数量 | 文件IDs
+[m_1364.js(OBF)] 网络异常，请稍后重试 | 请输入关键字 | 全部文件
+[m_60.js(OBF)] 无法在当前环境加载 | 完成但未初始化 | 加载失败 | 超时 | 文件创建失败 | 存在 | 上传文件，创建结果
+[m_705.js(OBF)] 按文件名称 | 按文件大小 | 按创建时间 | 按更新时间 | 按文件 | 按类型
+[m_520.js] 年费超会 | 超级会员 | 白金会员 | 云盘会员 | 升级年费超会 | 升级超级会员 | 升级白金会员 | 开通会员 | 用户资料 | 信息 | 用户会员信息 | 手雷内 | 调用客户端的登录 | 手雷 | 未登录 | 未返回用户信息 | 强制登录 | 重试 | 超出重试次数 | 命中缓存
+[m_942.js] 复制到 | 移动到 | 保存到 | 选择解压文件保存路径 | 上传到 | 云添加到 | 我的云盘 | 当前文件夹为共享文件夹， | 复制 | 移动 | 保存 | 解压 | 上传 | 云添加 | 文件将会生成动态并同步给您的订阅者 | 目录 | 创建成功 | 创建失败， | 请选择文件夹 | 新建文件夹
+[m_823.js(OBF)] 文件 | 位置
+
+== OTHER 抽样(前25个名字+KB, 供复核 vendor 性质) ==
+m_0.js	0.4KB	obf=0
+m_1004.js	0.1KB	obf=0
+m_1005.js	0.2KB	obf=0
+m_1006.js	0.2KB	obf=0
+m_1007.js	0.2KB	obf=0
+m_1008.js	0.2KB	obf=0
+m_1009.js	0.2KB	obf=0
+m_101.js	0.5KB	obf=0
+m_1010.js	0.2KB	obf=0
+m_1011.js	0.2KB	obf=0
+m_1012.js	0.2KB	obf=0
+m_1013.js	0.2KB	obf=0
+m_1014.js	0.2KB	obf=0
+m_1015.js	0.2KB	obf=0
+m_102.js	0.3KB	obf=1
+m_1027.js	6.1KB	obf=1
+m_1028.js	0.5KB	obf=1
+m_103.js	0.0KB	obf=0
+m_1031.js	1.8KB	obf=1
+m_104.js	1.3KB	obf=0
+m_1042.js	0.7KB	obf=1
+m_105.js	0.1KB	obf=0
+m_1055.js	0.0KB	obf=0
+m_1056.js	0.3KB	obf=0
+m_1057.js	7.8KB	obf=0

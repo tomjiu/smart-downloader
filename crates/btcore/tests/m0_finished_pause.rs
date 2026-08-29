@@ -23,6 +23,7 @@ fn torrent_finished_then_pause_ordering() {
         .add_magnet(seeder.magnet(), &[])
         .expect("add_magnet");
     let (ip, port) = seeder.addr();
+    session.resume(&ih).expect("resume");
     session.add_peer(&ih, &ip, port).expect("add_peer");
 
     // 下载直到完成（progress 1.0）

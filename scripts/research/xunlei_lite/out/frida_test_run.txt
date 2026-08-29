@@ -1,0 +1,25 @@
+[err] hook MoveFileExW: TypeError: not a function
+[err] hook MoveFileExA: TypeError: not a function
+[err] hook MoveFileW: TypeError: not a function
+[err] hook MoveFileA: TypeError: not a function
+[err] hook ReplaceFileW: TypeError: not a function
+[*] module xllite.exe base=0x620000 size=52797440
+[*] LIVE addresses:
+{
+ "X9ibISwpIp8jQ4Ya": [],
+ "XW-G4v1H72tgfJym": [],
+ "XVJVzaJv8vKHzVCk": [],
+ "XW5SkOhLDjnOZP7J": [],
+ "YGQTOphnGIuyiAxH": [],
+ "XoL5lqbDWNW0e7QA": [],
+ "Xp6vsxz_7IYVw2BB": [],
+ "Yd0uSVGrNJhCC2oE": [],
+ "Yd00NFGrNJhCC2oP": [],
+ "Yd0zTVGrNJhCC2oL": [],
+ "Yqp0kJBXWhwaTpB6": [],
+ "Yd0zylGrNJhCC2oN": [],
+ "Yd0yklGrNJhCC2oH": [],
+ "Yd0y91GrNJhCC2oJ": [],
+ "Yd00e1GrNJhCC2oR": []
+}
+[*] done

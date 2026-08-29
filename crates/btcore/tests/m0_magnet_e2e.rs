@@ -20,6 +20,7 @@ fn real_magnet_makes_progress_within_60s() {
         .add_magnet(seeder.magnet(), &[])
         .expect("add_magnet");
     let (ip, port) = seeder.addr();
+    session.resume(&ih).expect("resume");
     session.add_peer(&ih, &ip, port).expect("add_peer(seeder)");
 
     let deadline = Instant::now() + Duration::from_secs(60);

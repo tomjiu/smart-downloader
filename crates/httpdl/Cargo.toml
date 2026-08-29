@@ -13,6 +13,7 @@ reqwest = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
+tracing = { workspace = true } # BUGB-INSTR（诊断插桩；与 daemon 同版本）
 sha2 = "0.10"
 md-5 = "0.10"
 smart-dl-core = { path = "../core" }

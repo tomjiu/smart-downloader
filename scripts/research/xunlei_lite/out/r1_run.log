@@ -1,0 +1,24 @@
+[*] reading binary (this may take a moment)...
+[*] read 52488352 bytes
+[*] decoded text length 51774430
+[anchor] 'platformdetect': 40 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_platformdetect.txt
+[anchor] 'GetRawConfig': 2 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_GetRawConfig.txt
+[anchor] 'initNasId': 2 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_initNasId.txt
+[anchor] '2ev3.yaml': 40 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_2ev3.yaml.txt
+[anchor] '2ev2.yaml': 40 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_2ev2.yaml.txt
+[anchor] 'client_secret': 3 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_client_secret.txt
+[anchor] 'client_id': 9 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_client_id.txt
+[anchor] 'client_version': 32 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_client_version.txt
+[anchor] 'device_id': 8 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_device_id.txt
+[anchor] 'x-client-id': 5 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_x-client-id.txt
+[anchor] 'x-device-id': 1 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_x-device-id.txt
+[anchor] 'x-client-version': 0 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_x-client-version.txt
+[anchor] 'PlatformConfig': 27 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_PlatformConfig.txt
+[anchor] 'GetRunnerType': 3 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_GetRunnerType.txt
+[anchor] 'detectFile': 2 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_detectFile.txt
+[anchor] 'yaml:': 40 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_yaml:.txt
+[anchor] 'With(': 40 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_With(.txt
+[anchor] 'func (': 0 occurrences -> E:\Code\ai\smart-downloader\scripts\research\xunlei_lite\out\anchor_func (.txt
+[*] scanning for 16-char candidate client ids/secrets...
+[candidate] 7647 unique candidate constants -> out/candidate_constants.txt
+[done] R1 anchor dumps complete. See scripts/research/xunlei_lite/out/

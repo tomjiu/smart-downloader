@@ -1,0 +1,3 @@
+[err read] Error: can't decode byte 0x93 in position 1
+[ranges count] 39
+[errstr scan hits] []

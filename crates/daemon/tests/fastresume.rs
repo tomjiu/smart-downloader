@@ -29,6 +29,7 @@ fn bt_task(id: &str, magnet: &str) -> DownloadTask {
             size: 0,
             etag: None,
             sha256: None,
+            backup_md5: None,
         },
         dest_root: PathBuf::from("."),
         files: vec![],
@@ -65,9 +66,10 @@ async fn fastresume_saved_on_remove_then_reloaded() {
     let magnet = seeder.magnet().to_string();
 
     // 第一次运行：下载完成
-    let engine = BtEngine::new(save.path(), None, 0, 0).unwrap();
+    let engine = BtEngine::new(save.path(), None, 0, 0, false, false, false).unwrap();
     let ih = engine.add(&bt_task("t1", &magnet)).await.unwrap();
     let (ip, port) = seeder.addr();
+    engine.core().resume(&ih).unwrap();
     engine.core().add_peer(&ih, &ip, port).unwrap();
     wait_complete(&engine.core(), &ih);
 
@@ -80,7 +82,7 @@ async fn fastresume_saved_on_remove_then_reloaded() {
 
     // 模拟重启：新 session 同一 save_path → add 应命中 .fastresume 回灌（ih 一致 + 任务注册）
     drop(seeder); // 停掉种子源——回灌/注册不依赖网络
-    let engine2 = BtEngine::new(save.path(), None, 0, 0).unwrap();
+    let engine2 = BtEngine::new(save.path(), None, 0, 0, false, false, false).unwrap();
     let ih2 = engine2.add(&bt_task("t2", &magnet)).await.unwrap();
     assert_eq!(ih2, ih, "回灌 infohash 必须一致");
     // 任务已注册（status 可查）。注：libtorrent save_resume_data 的 resume 数据不含
@@ -93,10 +95,11 @@ async fn fastresume_saved_on_remove_then_reloaded() {
 async fn pause_saves_fastresume() {
     // pause 时也保存进度凭据（best-effort，含未完成场景）
     let save = seed::TempDir::new().expect("tempdir");
-    let engine = BtEngine::new(save.path(), None, 0, 0).unwrap();
+    let engine = BtEngine::new(save.path(), None, 0, 0, false, false, false).unwrap();
     let seeder = seed::TestSeeder::start();
     let ih = engine.add(&bt_task("t3", seeder.magnet())).await.unwrap();
     let (ip, port) = seeder.addr();
+    engine.core().resume(&ih).unwrap();
     engine.core().add_peer(&ih, &ip, port).unwrap();
     wait_complete(&engine.core(), &ih);
 
@@ -111,10 +114,11 @@ async fn pause_saves_fastresume() {
 async fn delete_data_removes_fastresume() {
     // remove(delete_data=true) → 数据删除 → 续传凭据一并清理
     let save = seed::TempDir::new().expect("tempdir");
-    let engine = BtEngine::new(save.path(), None, 0, 0).unwrap();
+    let engine = BtEngine::new(save.path(), None, 0, 0, false, false, false).unwrap();
     let seeder = seed::TestSeeder::start();
     let ih = engine.add(&bt_task("t4", seeder.magnet())).await.unwrap();
     let (ip, port) = seeder.addr();
+    engine.core().resume(&ih).unwrap();
     engine.core().add_peer(&ih, &ip, port).unwrap();
     wait_complete(&engine.core(), &ih);
 

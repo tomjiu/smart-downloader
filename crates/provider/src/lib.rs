@@ -39,4 +39,9 @@ pub trait RemoteProvider: Send + Sync {
         &self,
         id: &ProviderTaskId,
     ) -> Result<Option<Vec<String>>, ProviderError>;
+
+    /// 轻量级探活（默认假设存活；真实 Provider 按需重载）。
+    async fn probe(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
 }

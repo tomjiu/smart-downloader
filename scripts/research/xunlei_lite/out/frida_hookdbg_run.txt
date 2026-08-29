@@ -1,0 +1,4 @@
+[err] outer: TypeError: not a function | stack: TypeError: not a function
+    at <anonymous> (/script1.js:4)
+    at <eval> (/script1.js:20)
+[*] done

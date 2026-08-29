@@ -1,0 +1,1638 @@
+{
+ "DownloadSDK": {
+  "tag": "DownloadSDK",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\xunlei_full_decompiled\\DownloadSDK_DECOMPILED.c",
+  "size_bytes": 588243,
+  "total_lines": 18862,
+  "num_functions": 127,
+  "clusters": [
+   {
+    "file": "DownloadSDK",
+    "span": "L7-L1695",
+    "n_hits": 64,
+    "anchors": [
+     "gcid",
+     "phub",
+     "x_crypto",
+     "x_host",
+     "x_tracker"
+    ],
+    "functions": [
+     "FUN_1800c8f00@L477-961",
+     "FUN_1802f7aa0@L1626-2043"
+    ],
+    "strings": [
+     [
+      581,
+      "HashCalculator::TryCalcGCID"
+     ],
+     [
+      1131,
+      "Invalid GCID length: "
+     ],
+     [
+      1242,
+      ". GCID length: "
+     ]
+    ]
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L2023-L2317",
+    "n_hits": 67,
+    "anchors": [
+     "accelerate",
+     "dcdn",
+     "report",
+     "resource",
+     "shub",
+     "url",
+     "x_crypto",
+     "x_host",
+     "x_tracker"
+    ],
+    "functions": [
+     "FUN_180012850@L2110-2311",
+     "FUN_1802f7aa0@L1626-2043"
+    ],
+    "strings": [
+     [
+      2130,
+      "Xunlei.DownloadSDK.HUBIndexInfo.Class"
+     ],
+     [
+      2153,
+      "Xunlei.DownloadSDK.HttpPackage.Class"
+     ],
+     [
+      2154,
+      "Xunlei.DownloadSDK.HttpClient.Class"
+     ],
+     [
+      2155,
+      "Xunlei.DownloadSDK.HubServerStat.Class"
+     ],
+     [
+      2179,
+      "Xunlei.DownloadSDK.DLTask.Class"
+     ],
+     [
+      2180,
+      "Xunlei.DownloadSDK.P2SPTask.Class"
+     ],
+     [
+      2193,
+      "Xunlei.DownloadSDK.UrlTaskInfo.Class"
+     ],
+     [
+      2205,
+      "Xunlei.DownloadSDK.Resource.Class"
+     ],
+     [
+      2207,
+      "Xunlei.DownloadSDK.ServerResource.Class"
+     ],
+     [
+      2209,
+      "Xunlei.DownloadSDK.ResourceManager.Class"
+     ],
+     [
+      2221,
+      "Xunlei.XLDL.Channel.Class"
+     ],
+     [
+      2222,
+      "Xunlei.XLDL.CHANNELMANAGER.Class"
+     ],
+     [
+      2226,
+      "Xunlei.XLDL.Http.Channel.Class"
+     ],
+     [
+      2230,
+      "Xunlei.XLDL.Ftp.Channel.Class"
+     ],
+     [
+      2232,
+      "Xunlei.DownloadSDK.TaskDataManager.Class"
+     ],
+     [
+      2233,
+      "Xunlei.DownloadSDK.DataManager.Class"
+     ],
+     [
+      2234,
+      "Xunlei.DownloadSDK.DataBlockWriterBase.Class"
+     ],
+     [
+      2236,
+      "Xunlei.DownloadSDK.DataPiece.Class"
+     ],
+     [
+      2237,
+      "Xunlei.DownloadSDK.RangeListRef.Class"
+     ],
+     [
+      2261,
+      "Xunlei.DownloadSDK.ServiceSHubInsertBCID.Class"
+     ],
+     [
+      2263,
+      "Xunlei.DownloadSDK.ServiceSHubInsertServerRes.Class"
+     ],
+     [
+      2265,
+      "Xunlei.DownloadSDK.ServiceSHubQueryServerRes.Class"
+     ],
+     [
+      2267,
+      "Xunlei.DownloadSDK.ServiceSHubQueryUrlInfo.Class"
+     ],
+     [
+      2269,
+      "Xunlei.DownloadSDK.ServiceSHubReportCorrection.Class"
+     ],
+     [
+      2271,
+      "Xunlei.DownloadSDK.ServiceSHubReportResQuality.Class"
+     ],
+     [
+      2273,
+      "Xunlei.DownloadSDK.ServiceSHubReportURLChange.Class"
+     ],
+     [
+      2275,
+      "Xunlei.DownloadSDK.ServiceSHubVoteURLInfo.Class"
+     ],
+     [
+      2277,
+      "Xunlei.DownloadSDK.ServiceFreeDcdnQueryAccelerate.Class"
+     ],
+     [
+      2290,
+      "Xunlei.XLDL.URLObj.Class"
+     ],
+     [
+      2302,
+      "Xunlei.LimitSpeedQuota.Class"
+     ],
+     [
+      2304,
+      "Xunlei.DownloadSDK.XDLOutputChannel.Class"
+     ],
+     [
+      2305,
+      "Xunlei.DownloadSDK.XDLOutputManager.Class"
+     ]
+    ]
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L3226-L3360",
+    "n_hits": 3,
+    "anchors": [
+     "x_config",
+     "x_tracker"
+    ],
+    "functions": [
+     "FUN_18009dac0@L2323-3397"
+    ],
+    "strings": [
+     [
+      3226,
+      "image/x-portable-graymap"
+     ],
+     [
+      3358,
+      "application/x-bittorrent"
+     ],
+     [
+      3360,
+      ".torrent"
+     ]
+    ]
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L5682-L5683",
+    "n_hits": 4,
+    "anchors": [
+     "cert",
+     "x_crypto"
+    ],
+    "functions": [],
+    "strings": []
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L6232-L6233",
+    "n_hits": 4,
+    "anchors": [
+     "cert",
+     "x_crypto"
+    ],
+    "functions": [],
+    "strings": []
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L6782-L6783",
+    "n_hits": 2,
+    "anchors": [
+     "cert"
+    ],
+    "functions": [],
+    "strings": []
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L7332-L7572",
+    "n_hits": 4,
+    "anchors": [
+     "cert"
+    ],
+    "functions": [
+     "FUN_18000ccc0@L7337-7566"
+    ],
+    "strings": []
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L7963-L7977",
+    "n_hits": 4,
+    "anchors": [
+     "cert",
+     "x_tracker"
+    ],
+    "functions": [
+     "FUN_180005110@L7576-7971"
+    ],
+    "strings": []
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L8526-L8527",
+    "n_hits": 2,
+    "anchors": [
+     "cert"
+    ],
+    "functions": [],
+    "strings": []
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L9076-L9077",
+    "n_hits": 2,
+    "anchors": [
+     "x_crypto"
+    ],
+    "functions": [],
+    "strings": []
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L9993-L10243",
+    "n_hits": 10,
+    "anchors": [
+     "upload",
+     "x_tracker"
+    ],
+    "functions": [
+     "XL_GetSubNetUploader@L10152-10341"
+    ],
+    "strings": [
+     [
+      10243,
+      "XL_GetSubNetUploader"
+     ]
+    ]
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L13128-L13601",
+    "n_hits": 12,
+    "anchors": [
+     "dcdn",
+     "token"
+    ],
+    "functions": [
+     "XL_EnableDcdnWithToken@L13296-13553"
+    ],
+    "strings": []
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L13910-L14528",
+    "n_hits": 27,
+    "anchors": [
+     "accelerate",
+     "cert",
+     "dcdn"
+    ],
+    "functions": [
+     "XL_DisableDcdnWithVipCert@L14517-14591",
+     "XL_EnableDcdnWithVipCert@L14105-14315"
+    ],
+    "strings": []
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L15182-L15470",
+    "n_hits": 6,
+    "anchors": [
+     "resource",
+     "x_tracker"
+    ],
+    "functions": [
+     "XL_CreateBTTask@L15304-15328",
+     "XL_CreateMagnetTask@L15454-15518"
+    ],
+    "strings": []
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L15829-L16047",
+    "n_hits": 9,
+    "anchors": [
+     "upload",
+     "x_tracker"
+    ],
+    "functions": [
+     "XL_BTStopUpload@L15906-15988",
+     "XL_BatchAddBTTracker@L16027-16136"
+    ],
+    "strings": []
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L17548-L17558",
+    "n_hits": 7,
+    "anchors": [
+     "accelerate",
+     "dcdn"
+    ],
+    "functions": [
+     "XL_DisableFreeDcdn@L17552-17561"
+    ],
+    "strings": []
+   },
+   {
+    "file": "DownloadSDK",
+    "span": "L18398-L18771",
+    "n_hits": 14,
+    "anchors": [
+     "accelerate",
+     "equity",
+     "token"
+    ],
+    "functions": [
+     "XL_SetTokenMode@L18762-18781",
+     "XL_SetVideoDataCacheSize@L18579-18604"
+    ],
+    "strings": [
+     [
+      18453,
+      "XL_QueryAccelerateInfo"
+     ],
+     [
+      18474,
+      "XL_QueryAccelerateInfo invalid parameters"
+     ]
+    ]
+   }
+  ],
+  "hits_compact": {
+   "phub": [
+    "7"
+   ],
+   "x_crypto": [
+    "7",
+    "131",
+    "234-251",
+    "275-289",
+    "310-336",
+    "361-381",
+    "404-427",
+    "450-464",
+    "1292-1293",
+    "1354-1360",
+    "1619-1620",
+    "2048-2049",
+    "2317",
+    "5682-5683",
+    "6232-6233",
+    "9076-9077"
+   ],
+   "x_host": [
+    "79",
+    "2065",
+    "2130",
+    "2153-2155",
+    "2179-2238",
+    "2261-2305"
+   ],
+   "gcid": [
+    "581",
+    "749",
+    "863",
+    "966-967",
+    "1131",
+    "1242"
+   ],
+   "x_tracker": [
+    "1681-1695",
+    "2023-2026",
+    "3358-3360",
+    "7963-7968",
+    "9993-9997",
+    "10022",
+    "15450-15470",
+    "16023-16047"
+   ],
+   "report": [
+    "2048-2056",
+    "2269-2273"
+   ],
+   "shub": [
+    "2056",
+    "2261-2275"
+   ],
+   "url": [
+    "2193",
+    "2290"
+   ],
+   "resource": [
+    "2205-2209",
+    "15182-15191"
+   ],
+   "dcdn": [
+    "2277",
+    "13128-13132",
+    "13158",
+    "13292-13296",
+    "13332",
+    "13558-13563",
+    "13601",
+    "13910-13922",
+    "14101-14105",
+    "14137",
+    "14320-14324",
+    "14352",
+    "14513-14528",
+    "17548-17558"
+   ],
+   "accelerate": [
+    "2277",
+    "13952-13956",
+    "13982",
+    "17557",
+    "18398-18402",
+    "18430",
+    "18453",
+    "18474"
+   ],
+   "x_config": [
+    "3226"
+   ],
+   "cert": [
+    "5682-5683",
+    "6232-6233",
+    "6782-6783",
+    "7332-7333",
+    "7571-7572",
+    "7976-7977",
+    "8526-8527",
+    "13952-13956",
+    "13982",
+    "14101-14105",
+    "14137",
+    "14320-14324",
+    "14352",
+    "14513-14528"
+   ],
+   "upload": [
+    "10118-10152",
+    "10195",
+    "10243",
+    "15829-15849",
+    "15902-15924"
+   ],
+   "token": [
+    "13292-13296",
+    "13332",
+    "18609-18613",
+    "18639",
+    "18758-18771"
+   ],
+   "equity": [
+    "18609-18613",
+    "18639"
+   ]
+  }
+ },
+ "P2PFramework": {
+  "tag": "P2PFramework",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\xunlei_full_decompiled\\P2PFramework_DECOMPILED.c",
+  "size_bytes": 239952,
+  "total_lines": 7770,
+  "num_functions": 179,
+  "clusters": [
+   {
+    "file": "P2PFramework",
+    "span": "L7-L285",
+    "n_hits": 22,
+    "anchors": [
+     "gcid",
+     "phub",
+     "report",
+     "x_crypto",
+     "x_host"
+    ],
+    "functions": [],
+    "strings": []
+   },
+   {
+    "file": "P2PFramework",
+    "span": "L620-L4887",
+    "n_hits": 307,
+    "anchors": [
+     "cert",
+     "token",
+     "x_crypto",
+     "x_host",
+     "x_netapi",
+     "x_tracker"
+    ],
+    "functions": [
+     "FUN_1800249a0@L612-651",
+     "XPF_CertificationGetClassName@L2751-2756"
+    ],
+    "strings": [
+     [
+      1222,
+      "XPF_Cert_StateChange_EventManager_Name"
+     ],
+     [
+      1224,
+      "XPF_Cert_StateChange_Event"
+     ],
+     [
+      3296,
+      "XPFCertificationDownloaderStateChangeEvent"
+     ],
+     [
+      3609,
+      "XPFCertManagerEventManager"
+     ]
+    ]
+   },
+   {
+    "file": "P2PFramework",
+    "span": "L5346-L5546",
+    "n_hits": 10,
+    "anchors": [
+     "cert",
+     "x_host",
+     "x_tracker"
+    ],
+    "functions": [
+     "XPF_ConnectionGetRemotePeerId@L5435-5449",
+     "XPF_GetTLSVerificationResultName@L5336-5360"
+    ],
+    "strings": [
+     [
+      5346,
+      "TLS_NoCertificate"
+     ],
+     [
+      5350,
+      "TLS_InvalidCertificate"
+     ],
+     [
+      5352,
+      "TLS_ExpiredCertificate"
+     ]
+    ]
+   },
+   {
+    "file": "P2PFramework",
+    "span": "L6104-L7057",
+    "n_hits": 13,
+    "anchors": [
+     "resource",
+     "x_host",
+     "x_tracker"
+    ],
+    "functions": [
+     "XPF_ConnectionAcceptorEndListen@L6571-6582"
+    ],
+    "strings": []
+   },
+   {
+    "file": "P2PFramework",
+    "span": "L7506-L7704",
+    "n_hits": 2,
+    "anchors": [
+     "x_host"
+    ],
+    "functions": [
+     "XPF_CreateDataBlock@L7499-7514"
+    ],
+    "strings": []
+   }
+  ],
+  "hits_compact": {
+   "phub": [
+    "7"
+   ],
+   "x_crypto": [
+    "7-77",
+    "285",
+    "1125-1151",
+    "1329-1340"
+   ],
+   "gcid": [
+    "55-56"
+   ],
+   "report": [
+    "76-77"
+   ],
+   "x_host": [
+    "219",
+    "646",
+    "924-926",
+    "1215",
+    "1265",
+    "1682",
+    "2233",
+    "2318",
+    "2448",
+    "2520",
+    "2991",
+    "3276",
+    "3452",
+    "3979",
+    "4117",
+    "4325",
+    "4406",
+    "4487",
+    "4671",
+    "4733",
+    "4803",
+    "4887",
+    "5530-5546",
+    "6104-6120",
+    "6663",
+    "6851",
+    "7057",
+    "7506",
+    "7704"
+   ],
+   "x_tracker": [
+    "620",
+    "1406",
+    "1456",
+    "1511",
+    "1579",
+    "1831-1845",
+    "2103",
+    "2131",
+    "2166",
+    "2500",
+    "2920-2929",
+    "3227-3234",
+    "3645-3652",
+    "3692-3699",
+    "3739-3746",
+    "3889",
+    "3915",
+    "3941",
+    "5431-5444",
+    "6371-6382"
+   ],
+   "token": [
+    "892-894",
+    "1492",
+    "1555",
+    "2509-2542",
+    "2568-2575"
+   ],
+   "cert": [
+    "1125-1224",
+    "1257-1339",
+    "1377-1391",
+    "1415-1441",
+    "1493-1494",
+    "1556-1557",
+    "2101",
+    "2732-2775",
+    "2810-3395",
+    "3422-3455",
+    "3511-3525",
+    "3557-3575",
+    "3609-3784",
+    "3829-3984",
+    "4011-4120",
+    "4158-4170",
+    "5346-5352"
+   ],
+   "x_netapi": [
+    "2006-2016"
+   ],
+   "resource": [
+    "6450-6457"
+   ]
+  }
+ },
+ "P2PBase": {
+  "tag": "P2PBase",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\xunlei_full_decompiled\\P2PBase_DECOMPILED.c",
+  "size_bytes": 5580,
+  "total_lines": 233,
+  "num_functions": 9,
+  "clusters": [
+   {
+    "file": "P2PBase",
+    "span": "L48-L222",
+    "n_hits": 4,
+    "anchors": [
+     "x_tracker"
+    ],
+    "functions": [
+     "XPF_CheckBuffer@L40-57",
+     "XPF_DecodeHashValue@L64-141",
+     "XPF_HashValueAddRef@L214-229"
+    ],
+    "strings": []
+   }
+  ],
+  "hits_compact": {
+   "x_tracker": [
+    "48",
+    "152",
+    "196",
+    "222"
+   ]
+  }
+ },
+ "XUdt": {
+  "tag": "XUdt",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\xunlei_full_decompiled\\XUdt_DECOMPILED.c",
+  "size_bytes": 16253,
+  "total_lines": 571,
+  "num_functions": 6,
+  "clusters": [
+   {
+    "file": "XUdt",
+    "span": "L14-L497",
+    "n_hits": 6,
+    "anchors": [
+     "x_host",
+     "x_tracker"
+    ],
+    "functions": [
+     "FUN_180024b70@L176-327",
+     "FUN_180029b10@L6-73",
+     "FUN_1800536b0@L471-567"
+    ],
+    "strings": []
+   }
+  ],
+  "hits_compact": {
+   "x_host": [
+    "14",
+    "497"
+   ],
+   "x_tracker": [
+    "163-166",
+    "311-314"
+   ]
+  }
+ },
+ "dl_encrypt": {
+  "tag": "dl_encrypt",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\downloadsdk_encrypt.c",
+  "size_bytes": 35866,
+  "total_lines": 1174,
+  "num_functions": 9,
+  "clusters": [
+   {
+    "file": "dl_encrypt",
+    "span": "L2-L1161",
+    "n_hits": 39,
+    "anchors": [
+     "accelerate",
+     "cert",
+     "dcdn",
+     "equity",
+     "token"
+    ],
+    "functions": [
+     "XL_EnableDcdnWithVipCert@L398-596",
+     "XL_SetTokenMode@L1153-1170"
+    ],
+    "strings": []
+   }
+  ],
+  "hits_compact": {
+   "token": [
+    "2-4",
+    "40",
+    "1010-1012",
+    "1038",
+    "1151-1161"
+   ],
+   "dcdn": [
+    "2-4",
+    "40",
+    "396-398",
+    "430",
+    "600-602",
+    "630",
+    "778-791"
+   ],
+   "cert": [
+    "255-257",
+    "283",
+    "396-398",
+    "430",
+    "600-602",
+    "630",
+    "778-791"
+   ],
+   "accelerate": [
+    "255-257",
+    "283"
+   ],
+   "equity": [
+    "1010-1012",
+    "1038"
+   ]
+  }
+ },
+ "dl_keyfuncs": {
+  "tag": "dl_keyfuncs",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\downloadsdk_key_funcs.c",
+  "size_bytes": 48475,
+  "total_lines": 1653,
+  "num_functions": 20,
+  "clusters": [
+   {
+    "file": "dl_keyfuncs",
+    "span": "L24-L223",
+    "n_hits": 16,
+    "anchors": [
+     "report",
+     "x_crypto"
+    ],
+    "functions": [
+     "FUN_180161920@L5-38",
+     "FUN_180169c00@L88-270"
+    ],
+    "strings": [
+     [
+      223,
+      "service Error. report rc queryCmd.seg != queryResponseCmd.seg , queryCmd.seg = "
+     ]
+    ]
+   },
+   {
+    "file": "dl_keyfuncs",
+    "span": "L525-L1554",
+    "n_hits": 60,
+    "anchors": [
+     "login",
+     "phub",
+     "report",
+     "shub",
+     "stat",
+     "x_config",
+     "x_crypto",
+     "x_host",
+     "x_netapi"
+    ],
+    "functions": [
+     "FUN_18002ceb0@L867-1138",
+     "FUN_180168660@L278-579",
+     "FUN_18030fe70@L1495-1569"
+    ],
+    "strings": [
+     [
+      525,
+      "Stat"
+     ],
+     [
+      969,
+      "CmdHubGetConfigResp::DecodeBody"
+     ],
+     [
+      1108,
+      "Decrypt failed"
+     ]
+    ]
+   }
+  ],
+  "hits_compact": {
+   "x_crypto": [
+    "24-35",
+    "63-77",
+    "127-141",
+    "564-575",
+    "605-620",
+    "650-661",
+    "687-701",
+    "810-827",
+    "851-854",
+    "1007-1016",
+    "1108-1126"
+   ],
+   "report": [
+    "223",
+    "1306"
+   ],
+   "stat": [
+    "525"
+   ],
+   "x_config": [
+    "969-971",
+    "1054-1056"
+   ],
+   "x_host": [
+    "1238",
+    "1314",
+    "1338",
+    "1362",
+    "1386",
+    "1410",
+    "1434",
+    "1458",
+    "1482"
+   ],
+   "phub": [
+    "1306",
+    "1354",
+    "1378",
+    "1426"
+   ],
+   "shub": [
+    "1330",
+    "1402",
+    "1450",
+    "1474"
+   ],
+   "login": [
+    "1354"
+   ],
+   "x_netapi": [
+    "1548-1554"
+   ]
+  }
+ },
+ "dl_combined": {
+  "tag": "dl_combined",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\downloadsdk_combined.c",
+  "size_bytes": 27440,
+  "total_lines": 959,
+  "num_functions": 14,
+  "clusters": [
+   {
+    "file": "dl_combined",
+    "span": "L107-L860",
+    "n_hits": 39,
+    "anchors": [
+     "login",
+     "phub",
+     "report",
+     "shub",
+     "x_config",
+     "x_crypto",
+     "x_host",
+     "x_netapi"
+    ],
+    "functions": [
+     "FUN_18002ceb0@L5-276",
+     "FUN_180285de0@L439-588",
+     "FUN_18030fe70@L801-875"
+    ],
+    "strings": [
+     [
+      107,
+      "CmdHubGetConfigResp::DecodeBody"
+     ],
+     [
+      246,
+      "Decrypt failed"
+     ]
+    ]
+   }
+  ],
+  "hits_compact": {
+   "x_config": [
+    "107-109",
+    "192-194"
+   ],
+   "x_crypto": [
+    "145-154",
+    "246-264",
+    "382-399",
+    "423-426"
+   ],
+   "x_host": [
+    "531",
+    "620",
+    "644",
+    "668",
+    "692",
+    "716",
+    "740",
+    "764",
+    "788"
+   ],
+   "phub": [
+    "612",
+    "660",
+    "684",
+    "732"
+   ],
+   "report": [
+    "612"
+   ],
+   "shub": [
+    "636",
+    "708",
+    "756",
+    "780"
+   ],
+   "login": [
+    "660"
+   ],
+   "x_netapi": [
+    "854-860"
+   ]
+  }
+ },
+ "p2pbase_crypto": {
+  "tag": "p2pbase_crypto",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\p2pbase_crypto.c",
+  "size_bytes": 14927,
+  "total_lines": 521,
+  "num_functions": 9,
+  "clusters": [
+   {
+    "file": "p2pbase_crypto",
+    "span": "L2-L507",
+    "n_hits": 31,
+    "anchors": [
+     "x_crypto",
+     "x_host"
+    ],
+    "functions": [
+     "XPF_Sha1HashData@L497-517"
+    ],
+    "strings": []
+   }
+  ],
+  "hits_compact": {
+   "x_crypto": [
+    "2-36",
+    "80-97",
+    "134-190",
+    "211",
+    "495-507"
+   ],
+   "x_host": [
+    "320"
+   ]
+  }
+ },
+ "p2pbase_rsa": {
+  "tag": "p2pbase_rsa",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\p2pbase_rsa.c",
+  "size_bytes": 59780,
+  "total_lines": 1514,
+  "num_functions": 7,
+  "clusters": [],
+  "hits_compact": {}
+ },
+ "p2pbase_aes_core": {
+  "tag": "p2pbase_aes_core",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\p2pbase_aes_core.c",
+  "size_bytes": 68946,
+  "total_lines": 2016,
+  "num_functions": 14,
+  "clusters": [],
+  "hits_compact": {}
+ },
+ "p2pf_enc1": {
+  "tag": "p2pf_enc1",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\p2pf_encrypt_funcs.c",
+  "size_bytes": 1078,
+  "total_lines": 42,
+  "num_functions": 2,
+  "clusters": [
+   {
+    "file": "p2pf_enc1",
+    "span": "L16-L35",
+    "n_hits": 12,
+    "anchors": [
+     "cert",
+     "x_crypto"
+    ],
+    "functions": [
+     "XPF_CertificationDecryptData@L32-40",
+     "XPF_CertificationEncryptData@L18-26"
+    ],
+    "strings": []
+   }
+  ],
+  "hits_compact": {
+   "cert": [
+    "16-35"
+   ],
+   "x_crypto": [
+    "16-35"
+   ]
+  }
+ },
+ "p2pf_enc2": {
+  "tag": "p2pf_enc2",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\p2pf_encrypt_funcs2.c",
+  "size_bytes": 24206,
+  "total_lines": 715,
+  "num_functions": 27,
+  "clusters": [
+   {
+    "file": "p2pf_enc2",
+    "span": "L2-L702",
+    "n_hits": 109,
+    "anchors": [
+     "cert",
+     "token",
+     "x_crypto",
+     "x_host",
+     "x_tracker"
+    ],
+    "functions": [
+     "XPF_CertificationCompare@L697-711",
+     "XPF_CertificationRelease@L317-357"
+    ],
+    "strings": [
+     [
+      628,
+      "XPF_Cert_StateChange_Event"
+     ]
+    ]
+   }
+  ],
+  "hits_compact": {
+   "cert": [
+    "2-14",
+    "38-61",
+    "263-327",
+    "361-702"
+   ],
+   "x_tracker": [
+    "29",
+    "76",
+    "545-552"
+   ],
+   "token": [
+    "196-224",
+    "249-254"
+   ],
+   "x_host": [
+    "205",
+    "608"
+   ],
+   "x_crypto": [
+    "361-380",
+    "426"
+   ]
+  }
+ },
+ "aes_callers": {
+  "tag": "aes_callers",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\aes_callers_decompiled.c",
+  "size_bytes": 33395,
+  "total_lines": 1041,
+  "num_functions": 7,
+  "clusters": [
+   {
+    "file": "aes_callers",
+    "span": "L241-L828",
+    "n_hits": 10,
+    "anchors": [
+     "dotnet",
+     "phub",
+     "report",
+     "x_crypto",
+     "x_host"
+    ],
+    "functions": [
+     "FUN_180163890@L128-288",
+     "FUN_1801773d0@L416-572",
+     "FUN_1802ad5e0@L740-962"
+    ],
+    "strings": [
+     [
+      241,
+      "service Error. report rc queryCmd.seg != queryResponseCmd.seg , queryCmd.seg = "
+     ],
+     [
+      471,
+      "ServiceIPv6PhubReportRCList::HandleResponse"
+     ],
+     [
+      525,
+      " report rc queryCmd.seg != queryResponseCmd.seg"
+     ],
+     [
+      667,
+      "dcache-hub.sandai.net"
+     ],
+     [
+      828,
+      "Decrypt Fail"
+     ]
+    ]
+   }
+  ],
+  "hits_compact": {
+   "report": [
+    "241",
+    "471-473",
+    "525"
+   ],
+   "phub": [
+    "471-473"
+   ],
+   "x_host": [
+    "630",
+    "667"
+   ],
+   "dotnet": [
+    "667"
+   ],
+   "x_crypto": [
+    "828"
+   ]
+  }
+ },
+ "fb_region": {
+  "tag": "fb_region",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\fb_region_decompiled.c",
+  "size_bytes": 42896,
+  "total_lines": 1366,
+  "num_functions": 8,
+  "clusters": [
+   {
+    "file": "fb_region",
+    "span": "L22-L513",
+    "n_hits": 9,
+    "anchors": [
+     "report",
+     "shub",
+     "x_host"
+    ],
+    "functions": [
+     "FUN_1800fabe0@L6-217",
+     "FUN_1800fd790@L225-483",
+     "FUN_180100070@L491-822"
+    ],
+    "strings": []
+   },
+   {
+    "file": "fb_region",
+    "span": "L846-L949",
+    "n_hits": 5,
+    "anchors": [
+     "phub",
+     "report",
+     "x_host"
+    ],
+    "functions": [
+     "FUN_180141120@L830-908",
+     "FUN_180160b20@L916-1226"
+    ],
+    "strings": []
+   },
+   {
+    "file": "fb_region",
+    "span": "L1293-L1296",
+    "n_hits": 2,
+    "anchors": [
+     "phub",
+     "x_host"
+    ],
+    "functions": [
+     "FUN_18029fad0@L1277-1364"
+    ],
+    "strings": []
+   }
+  ],
+  "hits_compact": {
+   "x_host": [
+    "22",
+    "244",
+    "510",
+    "846",
+    "946",
+    "1293"
+   ],
+   "shub": [
+    "25",
+    "247",
+    "513"
+   ],
+   "report": [
+    "25",
+    "247",
+    "513",
+    "949"
+   ],
+   "phub": [
+    "849",
+    "949",
+    "1296"
+   ]
+  }
+ },
+ "xudt_proto_stack": {
+  "tag": "xudt_proto_stack",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\xudt_protocol_stack_decompiled.c",
+  "size_bytes": 99,
+  "total_lines": 6,
+  "num_functions": 0,
+  "clusters": [],
+  "hits_compact": {}
+ },
+ "xudt_addr": {
+  "tag": "xudt_addr",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\phub_line\\xudt_addr_decompiled.c",
+  "size_bytes": 21223,
+  "total_lines": 565,
+  "num_functions": 0,
+  "clusters": [
+   {
+    "file": "xudt_addr",
+    "span": "L174-L286",
+    "n_hits": 7,
+    "anchors": [
+     "token"
+    ],
+    "functions": [],
+    "strings": []
+   }
+  ],
+  "hits_compact": {
+   "token": [
+    "174-185",
+    "258",
+    "286"
+   ]
+  }
+ },
+ "Server": {
+  "tag": "Server",
+  "path": "E:\\Code\\ai\\smart-downloader\\scripts\\research\\cloud_delivery\\sdk_login_static\\DownloadSDKServer_DECOMPILED.c",
+  "size_bytes": 478038,
+  "total_lines": 16539,
+  "num_functions": 255,
+  "clusters": [
+   {
+    "file": "Server",
+    "span": "L727-L732",
+    "n_hits": 2,
+    "anchors": [
+     "x_tracker"
+    ],
+    "functions": [
+     "FUN_1400012a0@L203-735"
+    ],
+    "strings": []
+   },
+   {
+    "file": "Server",
+    "span": "L3900-L3987",
+    "n_hits": 4,
+    "anchors": [
+     "upload",
+     "x_tracker"
+    ],
+    "functions": [
+     "FUN_1400068a0@L3861-3919",
+     "FUN_140006e10@L3968-4027"
+    ],
+    "strings": []
+   },
+   {
+    "file": "Server",
+    "span": "L4642-L4810",
+    "n_hits": 8,
+    "anchors": [
+     "cert",
+     "dcdn"
+    ],
+    "functions": [
+     "FUN_14000b080@L4614-4659",
+     "FUN_14000b970@L4692-4737",
+     "FUN_14000bc90@L4796-4815"
+    ],
+    "strings": []
+   },
+   {
+    "file": "Server",
+    "span": "L5206-L5206",
+    "n_hits": 1,
+    "anchors": [
+     "x_tracker"
+    ],
+    "functions": [
+     "FUN_14000df10@L5042-5260"
+    ],
+    "strings": []
+   },
+   {
+    "file": "Server",
+    "span": "L5738-L5858",
+    "n_hits": 7,
+    "anchors": [
+     "accelerate",
+     "cert",
+     "dcdn"
+    ],
+    "functions": [
+     "FUN_14000fbf0@L5715-5755",
+     "FUN_1400104b0@L5789-5809",
+     "FUN_140010610@L5843-5863"
+    ],
+    "strings": []
+   },
+   {
+    "file": "Server",
+    "span": "L6501-L6534",
+    "n_hits": 3,
+    "anchors": [
+     "equity",
+     "token"
+    ],
+    "functions": [
+     "FUN_1400121d0@L6473-6518",
+     "FUN_140012360@L6525-6539"
+    ],
+    "strings": []
+   },
+   {
+    "file": "Server",
+    "span": "L7528-L7528",
+    "n_hits": 1,
+    "anchors": [
+     "stat"
+    ],
+    "functions": [],
+    "strings": []
+   },
+   {
+    "file": "Server",
+    "span": "L8646-L8737",
+    "n_hits": 3,
+    "anchors": [
+     "report",
+     "x_tracker"
+    ],
+    "functions": [
+     "FUN_140014730@L8620-8754"
+    ],
+    "strings": []
+   },
+   {
+    "file": "Server",
+    "span": "L11308-L11432",
+    "n_hits": 3,
+    "anchors": [
+     "x_account",
+     "x_config"
+    ],
+    "functions": [
+     "FUN_140018340@L11286-11334",
+     "FUN_140018424@L11353-11422",
+     "entry@L11429-11435"
+    ],
+    "strings": []
+   },
+   {
+    "file": "Server",
+    "span": "L11738-L11746",
+    "n_hits": 3,
+    "anchors": [
+     "x_account"
+    ],
+    "functions": [
+     "__security_init_cookie@L11746-11774"
+    ],
+    "strings": []
+   },
+   {
+    "file": "Server",
+    "span": "L12285-L12311",
+    "n_hits": 2,
+    "anchors": [
+     "stat"
+    ],
+    "functions": [],
+    "strings": []
+   },
+   {
+    "file": "Server",
+    "span": "L13475-L13491",
+    "n_hits": 4,
+    "anchors": [
+     "stat"
+    ],
+    "functions": [
+     "FUN_140019e18@L13472-13477"
+    ],
+    "strings": []
+   },
+   {
+    "file": "Server",
+    "span": "L14316-L14316",
+    "n_hits": 1,
+    "anchors": [
+     "stat"
+    ],
+    "functions": [],
+    "strings": []
+   },
+   {
+    "file": "Server",
+    "span": "L15016-L15016",
+    "n_hits": 1,
+    "anchors": [
+     "stat"
+    ],
+    "functions": [],
+    "strings": []
+   }
+  ],
+  "hits_compact": {
+   "x_tracker": [
+    "727-732",
+    "3900-3901",
+    "5206",
+    "8647"
+   ],
+   "upload": [
+    "3956",
+    "3987"
+   ],
+   "dcdn": [
+    "4642",
+    "4680",
+    "4720",
+    "4772",
+    "4810",
+    "5777",
+    "5804",
+    "5831",
+    "5858"
+   ],
+   "cert": [
+    "4720",
+    "4772",
+    "4810",
+    "5738"
+   ],
+   "accelerate": [
+    "5738",
+    "5831"
+   ],
+   "token": [
+    "6501",
+    "6534"
+   ],
+   "equity": [
+    "6501"
+   ],
+   "stat": [
+    "7528",
+    "12285",
+    "12311",
+    "13475-13491",
+    "14316",
+    "15016"
+   ],
+   "report": [
+    "8646",
+    "8737"
+   ],
+   "x_config": [
+    "11308-11318"
+   ],
+   "x_account": [
+    "11432",
+    "11738-11746"
+   ]
+  }
+ }
+}

@@ -1,0 +1,67 @@
+{
+  "cache_file": "C:\\Users\\yezi6\\AppData\\Roaming\\thunder\\Cache\\Cache_Data\\data_1",
+  "cache_size": 1056768,
+  "host": "api-gateway-pan.xunlei.com",
+  "host_raw_references": 123,
+  "distinct_full_urls": 6,
+  "total_full_url_occurrences": 123,
+  "distinct_xlppc_paths": 7,
+  "total_xlppc_occurrences": 7,
+  "auth_markers_in_window": [],
+  "url_groups": [
+    [
+      "https://api-gateway-pan.xunlei.com/speed-center/v2/rule",
+      68
+    ],
+    [
+      "https://api-gateway-pan.xunlei.com/speed-center/v1/trial",
+      25
+    ],
+    [
+      "https://api-gateway-pan.xunlei.com/speed-center/v1/rule",
+      23
+    ],
+    [
+      "https://api-gateway-pan.xunlei.com/xlppc.searcher.api/drive_common_search",
+      4
+    ],
+    [
+      "https://api-gateway-pan.xunlei.com/xlppc.searcher.api/drive_file_search",
+      2
+    ],
+    [
+      "https://api-gateway-pan.xunlei.com/report/v1/config",
+      1
+    ]
+  ],
+  "xlppc_groups": [
+    [
+      "/xlppc.searcher.api/drive_common_search?user_id=860599297&limit=20&order_by_fields=created_time%3Adesc",
+      1
+    ],
+    [
+      "/xlppc.searcher.api/drive_common_search?user_id=860599297&keyword=magnet%3A%3Fxt%3Durn%3Abtih%3Aa4a4007d7c7ada22348929cd3440ad52ece04152%26dn%3D%255B%25E7%25BB%25BF%25E8%258C%25B6%25E5%25AD%2597%25E5%25B9%2595%25E7%25BB%2584%255D%2520%25E7%25A2%25A7%25E8%2593%259D%25E4%25B9%258B%25E6%25B5%25B7%2520%25E7%25AC%25AC%25E4%25B8%2589%25E5%25AD%25A3%2520%252F%2520Grand%2520Blue%2520S3%2520%255B02%255D%255BWebRip%255D%255B1080p%255D%255B%25E7%25AE%2580%25E7%25B9%2581%25E6%2597%25A5%25E5%2586%2585%25E5%25B0%2581%255D%26tr%3Dhttp%253A%252F%252Fnyaa.tracker.wf%253A7777%252Fannounce%26tr%3Dudp%253A%252F%252Fopen.stealth.si%253A80%252Fannounce%26tr%3Dudp%253A%252F%252Ftracker.opentrackr.org%253A1337%252Fannounce%26tr%3Dudp%253A%252F%252Fexodus.desync.com%253A6969%252Fannounce%26tr%3Dudp%253A%252F%252Ftracker.torrent.eu.org%253A451%252Fannounce&limit=20&order_by_fields=created_time%3Adesc",
+      1
+    ],
+    [
+      "/xlppc.searcher.api/drive_file_search?user_id=860599297&limit=10&keyword=magnet%3A%3Fxt%3Durn%3Abtih%3Aa4a4007d7c7ada22348929cd3440ad52ece04152%26dn%3D%255B%25E7%25BB%25BF%25E8%258C%25B6%25E5%25AD%2597%25E5%25B9%2595%25E7%25BB%2584%255D%2520%25E7%25A2%25A7%25E8%2593%259D%25E4%25B9%258B%25E6%25B5%25B7%2520%25E7%25AC%25AC%25E4%25B8%2589%25E5%25AD%25A3%2520%252F%2520Grand%2520Blue%2520S3%2520%255B02%255D%255BWebRip%255D%255B1080p%255D%255B%25E7%25AE%2580%25E7%25B9%2581%25E6%2597%25A5%25E5%2586%2585%25E5%25B0%2581%255D%26tr%3Dhttp%253A%252F%252Fnyaa.tracker.wf%253A7777%252Fannounce%26tr%3Dudp%253A%252F%252Fopen.stealth.si%253A80%252Fannounce%26tr%3Dudp%253A%252F%252Ftracker.opentrackr.org%253A1337%252Fannounce%26tr%3Dudp%253A%252F%252Fexodus.desync.com%253A6969%252Fannounce%26tr%3Dudp%253A%252F%252Ftracker.torrent.eu.org%253A451%252Fannounce&space=*",
+      1
+    ],
+    [
+      "/xlppc.searcher.api/drive_common_search?user_id=860599297&keyword=magnet%3A%3Fxt%3Durn%3Abtih%3A11B716F96C0D024E2E498B45A0B2A083AF6F6F0D&limit=20&order_by_fields=created_time%3Adesc",
+      1
+    ],
+    [
+      "/xlppc.searcher.api/drive_file_search?user_id=860599297&limit=10&keyword=magnet%3A%3Fxt%3Durn%3Abtih%3A11B716F96C0D024E2E498B45A0B2A083AF6F6F0D&space=*",
+      1
+    ],
+    [
+      "/xlppc.searcher.api/drive_common_search?user_id=860599297&keyword=https%3A%2F%2Fi.xunlei.com%2Fxluser%2Fhome.html&limit=50&order_by_fields=created_time%3Adesc",
+      1
+    ],
+    [
+      "/xlppc.resinfo.api/v1/queryresinfo?type=url&res=https://backstage-file-static.a.88cdn.com/%E8%BF%85%E9%9B%B7%E9%93%BE%E6%8E%A5%E6%92%AD%EF%BC%9A%E6%97%A0%E9%9C%80%E4%B8%8B%E8%BD%BD%EF%BC%8C%E5%8D%B3%E7%82%B9%E5%8D%B3%E6%92%AD.mp4",
+      1
+    ]
+  ]
+}

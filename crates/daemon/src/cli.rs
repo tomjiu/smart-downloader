@@ -36,6 +36,14 @@ pub enum CliCommand {
     Fallback {
         task_id: String,
     },
+    /// 迅雷任务导入（M9）：xlbt.cfg + 一组 .bt.xltd + .torrent → fastresume。
+    #[cfg(feature = "xunlei-import")]
+    ImportXunlei {
+        torrent: String,
+        cfg: String,
+        xltds: Vec<String>,
+        dest: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -116,6 +124,48 @@ fn parse_command(args: &[String]) -> Result<CliCommand, CliError> {
                 _ => unreachable!(),
             })
         }
+        #[cfg(feature = "xunlei-import")]
+        "import-xunlei" => {
+            let torrent = args
+                .get(1)
+                .ok_or_else(|| CliError::MissingArg("import-xunlei <torrent>".to_string()))?
+                .clone();
+            let cfg = args
+                .get(2)
+                .ok_or_else(|| CliError::MissingArg("import-xunlei <torrent> <cfg>".to_string()))?
+                .clone();
+            // 收集 xltd 路径（至少 1 个），直到遇到 -o
+            let mut xltds = Vec::new();
+            let mut dest = None;
+            let mut i = 3;
+            while i < args.len() {
+                if args[i] == "-o" {
+                    dest = Some(
+                        args.get(i + 1)
+                            .ok_or_else(|| CliError::MissingArg("-o <dir>".to_string()))?
+                            .clone(),
+                    );
+                    break;
+                }
+                xltds.push(args[i].clone());
+                i += 1;
+            }
+            if xltds.is_empty() {
+                return Err(CliError::MissingArg(
+                    "import-xunlei <torrent> <cfg> <xltd> [<xltd2> ...]".to_string(),
+                ));
+            }
+            Ok(CliCommand::ImportXunlei {
+                torrent,
+                cfg,
+                xltds,
+                dest,
+            })
+        }
+        #[cfg(not(feature = "xunlei-import"))]
+        "import-xunlei" => Err(CliError::Unknown(
+            "import-xunlei 需要编译时启用 --features xunlei-import".to_string(),
+        )),
         "list" => Ok(CliCommand::List),
         "config" => Ok(CliCommand::Config),
         other => Err(CliError::Unknown(other.to_string())),

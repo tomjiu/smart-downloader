@@ -1,0 +1,10 @@
+[err] hook MoveFileExW: TypeError: not a function
+[err] hook MoveFileExA: TypeError: not a function
+[err] hook MoveFileW: TypeError: not a function
+[err] hook MoveFileA: TypeError: not a function
+[err] hook ReplaceFileW: TypeError: not a function
+[*] module xllite.exe base=0x620000 size=52797440
+[*] banner 'getEnvs succ' hits: 0 []
+[*] KNOWN hits: {"XW-G4v1H72tgfJym":[],"YGQTOphnGIuyiAxH":[],"X9ibISwpIp8jQ4Ya":[],"Yd0uSVGrNJhCC2oE":[]}
+[*] readable module ranges: 25
+[*] done

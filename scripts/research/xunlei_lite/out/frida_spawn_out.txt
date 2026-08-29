@@ -1,0 +1,8 @@
+[*] bypass MoveFileExW
+[*] bypass MoveFileExA
+[*] bypass MoveFileW
+[*] bypass MoveFileA
+[*] bypass ReplaceFileW
+[*] pcxllite client_id expected @ 0x1c79482
+[*] LEA->client_id hits: 0 []
+[*] scan done

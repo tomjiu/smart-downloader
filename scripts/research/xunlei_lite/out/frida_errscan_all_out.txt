@@ -1,0 +1,5 @@
+[*] total module ranges enumerated: 20
+[*] protections: {"r--":2,"r-x":1,"rw-":17}
+[*] errstr hits: []
+[*] clientid hits: []
+[*] done

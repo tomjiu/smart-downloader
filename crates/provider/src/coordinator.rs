@@ -86,6 +86,10 @@ impl FallbackCoordinator {
 
     /// 兜底编排：决策检查 → 选 provider → submit → Ready → resolve →
     /// 传输（直链过期 → update_sources ≤3 → resubmit ≤2 → 超限 Failed）。
+    ///
+    /// 探活失败自动降级：依次尝试所有可用 provider，单个 provider 在
+    /// submit/poll/resolve/handle_links 任一步失败时自动切换到下一个，
+    /// 不阻塞主下载链路。
     pub async fn begin_fallback(
         &self,
         task: &DownloadTask,
@@ -100,13 +104,40 @@ impl FallbackCoordinator {
             }
             _ => {}
         }
-        let name = self.select_provider().ok_or(ProviderError::NoProvider)?;
-        let provider = self
-            .providers
-            .iter()
-            .find(|p| p.name() == name)
-            .expect("select_provider 返回的 name 必须在列表中");
+        let mut last_err = None;
+        loop {
+            let name = match self.select_provider() {
+                Some(n) => n,
+                None => break,
+            };
+            let provider = self
+                .providers
+                .iter()
+                .find(|p| p.name() == name)
+                .expect("select_provider 返回的 name 必须在列表中");
+            match self
+                .try_provider_fallback(task, bt_paused, sink, provider)
+                .await
+            {
+                Ok(outcome) => return Ok(outcome),
+                Err(e) => {
+                    last_err = Some(e);
+                    // provider 已在 XunleiProvider::mark_failure 中设置 backoff，
+                    // 下一轮 select_provider 会自动跳过，继续尝试下一个可用 provider。
+                }
+            }
+        }
+        Err(last_err.unwrap_or(ProviderError::NoProvider))
+    }
 
+    /// 单 provider 兜底编排（供 begin_fallback 重试循环调用）。
+    async fn try_provider_fallback(
+        &self,
+        task: &DownloadTask,
+        _bt_paused: bool,
+        sink: &dyn HttpSink,
+        provider: &Arc<dyn RemoteProvider>,
+    ) -> Result<FallbackOutcome, ProviderError> {
         let mut ptid = provider.submit(&task.source).await?;
         poll_ready(provider, &mut ptid).await?;
         let files = provider.resolve(&ptid).await?;
@@ -114,7 +145,7 @@ impl FallbackCoordinator {
             .handle_links(task, provider, &mut ptid, files, sink)
             .await?;
         Ok(FallbackOutcome {
-            provider: name,
+            provider: provider.name().to_string(),
             provider_task: ptid,
             transferred,
         })
@@ -150,7 +181,9 @@ impl FallbackCoordinator {
                         )
                         .await
                     {
-                        Ok(()) => transferred.push(f.rel_path.clone()),
+                        Ok(()) => {
+                            transferred.push(f.rel_path.clone())
+                        }
                         // 传输中直链过期 → 进入恢复流
                         Err(SinkError::Expired) => {
                             all_ok = false;
@@ -198,21 +231,43 @@ impl FallbackCoordinator {
 }
 
 /// 轮询 Provider 任务到 Ready（自动推进 Queued→Downloading→Ready）。
+///
+/// 真实云盘离线下载耗时秒级到分钟级：指数退避轮询（0.5s 起步，封顶 5s），
+/// 总上限 10 分钟；MockProvider 秒级 Ready 不受影响。
 async fn poll_ready(
     provider: &Arc<dyn RemoteProvider>,
     ptid: &mut ProviderTaskId,
 ) -> Result<(), ProviderError> {
     use crate::types::ProviderStatus;
-    for _ in 0..20 {
-        match provider.status(ptid).await? {
-            ProviderStatus::Ready => return Ok(()),
-            ProviderStatus::Failed => {
-                return Err(ProviderError::Other("provider task failed".into()))
+    const TOTAL_CAP: std::time::Duration = std::time::Duration::from_secs(600);
+    let started = std::time::Instant::now();
+    let mut interval = std::time::Duration::from_millis(500);
+    let mut next_probe = std::time::Instant::now();
+    let mut last_verdict: Option<std::string::String> = None;
+    while std::time::Instant::now() < started + TOTAL_CAP {
+        if std::time::Instant::now() >= next_probe {
+            match provider.status(ptid).await? {
+                ProviderStatus::Ready => {
+                    return Ok(());
+                }
+                ProviderStatus::Failed => {
+                    return Err(ProviderError::Other("provider task failed".into()))
+                }
+                other => {
+                    let v = format!("{other:?}");
+                    if last_verdict.as_deref() != Some(v.as_str()) {
+                        last_verdict = Some(v);
+                    }
+                }
             }
-            _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            next_probe = std::time::Instant::now() + interval;
+            interval = (interval * 2).min(std::time::Duration::from_secs(5));
         }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    Err(ProviderError::Other("provider task not ready".into()))
+    Err(ProviderError::Other(
+        "provider task not ready (offline download still in progress?)".into(),
+    ))
 }
 
 /// 供测试/外部检查直链有效性的便捷函数。

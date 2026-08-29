@@ -59,6 +59,7 @@ fn http_routes_to_http_engine() {
             url: "https://example.com/f.bin".into(),
             headers: vec![],
             auth: None,
+            backup_url: None,
         },
         0,
         0,

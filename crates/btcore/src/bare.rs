@@ -39,6 +39,10 @@ impl Bare {
         self.sess.pause(ih)
     }
 
+    pub fn resume(&self, ih: &str) -> Result<()> {
+        self.sess.resume(ih)
+    }
+
     /// 诊断辅助（M0 调试用）：(metadata_received, num_peers, num_seeds)
     pub fn status_extra(&self, ih: &str) -> Result<(i32, i32, i32)> {
         let st = self.sess.status(ih)?;

@@ -8,7 +8,7 @@ use crate::ffi::{self, lt_peer, lt_torrent_status, Session};
 use crate::resume::ResumeBytes;
 
 /// torrent 整体状态（state 语义对齐 lt.h：0 下载 1 完成 3 错误 4 元数据获取中；
-/// ABI100 无暂停状态，暂停以 torrent_paused alert 为同步点）
+/// paused 由 lt_torrent_status::paused 提供，替代纯 alert 轮询作为暂停同步点）
 #[derive(Debug, Clone, PartialEq)]
 pub struct TorrentStatus {
     pub state: i32,
@@ -20,6 +20,7 @@ pub struct TorrentStatus {
     pub num_peers: i32,
     pub num_seeds: i32,
     pub metadata_received: bool,
+    pub paused: bool,
 }
 
 impl From<lt_torrent_status> for TorrentStatus {
@@ -34,6 +35,7 @@ impl From<lt_torrent_status> for TorrentStatus {
             num_peers: st.num_peers,
             num_seeds: st.num_seeds,
             metadata_received: st.metadata_received != 0,
+            paused: st.paused != 0,
         }
     }
 }
@@ -129,6 +131,12 @@ impl BtCore {
         self.sess.apply_network(proxy, down_kb_s, up_kb_s)
     }
 
+    /// 发现层开关：DHT / LSD / UPnP（enable_upnp 同时控制 NAT-PMP——端口映射族）。
+    /// 会话默认全关（M0 确定性语义）；本方法显式覆盖。
+    pub fn apply_discovery(&self, enable_dht: bool, enable_lsd: bool, enable_upnp: bool) -> ffi::Result<()> {
+        self.sess.apply_discovery(enable_dht, enable_lsd, enable_upnp)
+    }
+
     // —— 添加 / 移除 ——
 
     pub fn add_magnet(&self, magnet: &str, web_seeds: &[String]) -> ffi::Result<String> {
@@ -146,6 +154,12 @@ impl BtCore {
 
     pub fn add_torrent_resume(&self, data: &[u8], web_seeds: &[String]) -> ffi::Result<String> {
         self.sess.add_torrent_resume(data, web_seeds)
+    }
+
+    /// 迅雷任务导入（M9）：接受 xunlei-convert 生成的 fastresume bencode，
+    /// 语义上等价于 `add_torrent_resume`，但对外表达"从迅雷半成品恢复"的意图。
+    pub fn add_xunlei_resume(&self, data: Vec<u8>) -> ffi::Result<String> {
+        self.sess.add_torrent_resume(&data, &[])
     }
 
     pub fn pause(&self, ih: &str) -> ffi::Result<()> {
@@ -240,5 +254,21 @@ impl BtCore {
 
     pub fn read_piece(&self, ih: &str, idx: i32) -> ffi::Result<Option<Vec<u8>>> {
         self.sess.read_piece(ih, idx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn apply_discovery_smoke_roundtrip() {
+        // FFI 全链路冒烟：真实创建 session 后两态切换均应 Ok（参数封送 +
+        // 内核 apply_settings 不抛异常）。内核 settings 值无读回接口，
+        // 真实 DHT 冷启动拉 peer 属手动验证项。
+        let dir = std::env::temp_dir();
+        let core = BtCore::new(&dir, "test-discovery").expect("session init");
+        core.apply_discovery(true, true, true).expect("全开应 Ok");
+        core.apply_discovery(false, false, false).expect("全关应 Ok");
     }
 }
