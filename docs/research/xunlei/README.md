@@ -127,3 +127,22 @@ python tools/xunlei-migrate/xunlei_to_libtorrent_converter.py `
 - **研究线程已关闭**:所有在当前环境可达的结论与实验均已完成(下称"在当前条件下完成")。
 - **唯一剩余动作在用户侧**:提供真实样本后 1 小时内可完成全部 C/D 级升级验证。
 - 真实样本验证**不阻塞** M0-M7 主线(路径 A 完全独立)。
+
+## 研究二进制资产（GitHub Release）
+
+因 GitHub 仓库对单文件 100MB 硬限制，`thunder_5.80.7.66659.dmg`（108.77MB）已发布为 Release 附件：
+
+- **Release 页面**: https://github.com/tomjiu/smart-downloader/releases/tag/v0.1.0-assets
+- **附件名**: `thunder_5.80.7.66659.dmg`
+- **用途**: macOS DownloadKit.framework / MacXLSDKs / DownloadService.xpc 提取源
+- **校验**: 仓库内 `research_bin/installers/` 仅保留 Android `x-player-guanwang.apk`（77MB，通过 Git LFS 存储）；DMG 需从 Release 单独下载
+
+仓库内已包含的分析二进制（无需 Release）：
+- `research_bin/windows/`: `DownloadSDKProxy.dll` / `DownloadSDK.dll` / `DownloadSDKServer.exe`
+- `research_bin/macos/`: `DownloadKit` / `DownloadKit_arm64.bin` / `xlcommon` / `MacXLSDKs` / `DownloadService`
+- `research_bin/android/`: `libxl_thunder_sdk.so`
+
+云分析工作区建议：
+1. 从 Release 下载 `thunder_5.80.7.66659.dmg`
+2. 挂载/解包后提取 `DownloadKit.framework`、`xlcommon.framework`、`MacXLSDKs.framework`、`DownloadService.xpc`
+3. 对照 `docs/research/xunlei/macos_abi_reverse.md` 继续逆向后 4 个未完成结构体
