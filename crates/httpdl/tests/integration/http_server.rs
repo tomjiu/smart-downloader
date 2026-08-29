@@ -12,7 +12,8 @@ use axum::{
     routing::get,
     Router,
 };
-use sha2::{Digest, Sha256};
+use md5::{Digest as Md5Digest, Md5};
+use sha2::Sha256;
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -28,6 +29,14 @@ pub fn patterned(size: u64) -> Vec<u8> {
 #[allow(dead_code)]
 pub fn sha256_of(bytes: &[u8]) -> String {
     let mut h = Sha256::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+/// 备用源校验用 MD5（夸克 backup_md5 语义）。
+#[allow(dead_code)]
+pub fn md5_of(bytes: &[u8]) -> String {
+    let mut h = Md5::new();
     h.update(bytes);
     format!("{:x}", h.finalize())
 }

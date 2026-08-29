@@ -33,11 +33,13 @@ pub fn make_http_task_to(
             url: url.to_string(),
             headers: vec![],
             auth: None,
+            backup_url: None,
         },
         identity: ContentIdentity::SingleFile {
             size: 0,
             etag: None,
             sha256: None,
+            backup_md5: None,
         },
         dest_root,
         files: vec![],
@@ -66,6 +68,33 @@ pub fn make_http_task_sha256(
         size: 0,
         etag: None,
         sha256: Some(sha256.to_string()),
+        backup_md5: None,
+    };
+    t
+}
+
+/// 带主源 sha256 + 备用源 url/md5 的任务（backup_failover 用例）。
+pub fn make_http_task_backup(
+    id: &str,
+    url: &str,
+    backup_url: &str,
+    backup_md5: &str,
+    dest_root: PathBuf,
+    name: &str,
+    sha256: &str,
+) -> DownloadTask {
+    let mut t = make_http_task_to(id, url, dest_root, Some(name));
+    t.source = DownloadSource::Http {
+        url: url.to_string(),
+        headers: vec![],
+        auth: None,
+        backup_url: Some(backup_url.to_string()),
+    };
+    t.identity = ContentIdentity::SingleFile {
+        size: 0,
+        etag: None,
+        sha256: Some(sha256.to_string()),
+        backup_md5: Some(backup_md5.to_string()),
     };
     t
 }
@@ -90,6 +119,7 @@ pub fn make_ftp_task(id: &str, url: &str, dest_root: PathBuf, name: &str) -> Dow
             size: 0,
             etag: None,
             sha256: None,
+            backup_md5: None,
         },
         dest_root,
         files: vec![],

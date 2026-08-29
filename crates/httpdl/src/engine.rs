@@ -6,7 +6,7 @@ use crate::range::probe_range;
 use crate::rate::RateLimiter;
 use crate::resume;
 use crate::segment_manager::DEFAULT_MIN_SPLIT;
-use crate::verify::verify_file;
+use crate::verify::{verify_file, verify_file_md5};
 use smart_dl_core::identity::ContentIdentity;
 use smart_dl_core::session::output::OutputManager;
 use smart_dl_core::task::DownloadTask;
@@ -38,7 +38,15 @@ struct HttpTask {
     total: u64,
     error: Option<String>,
     sha256: Option<String>,
+    /// 备用源内容 MD5 校验目标（切备用源后生效；主源阶段 None）。
+    md5: Option<String>,
     verify_attempts: u32,
+    /// 备用源 URL（主源两次校验失败后切换）。
+    backup_url: Option<String>,
+    /// 备用源内容 MD5（夸克 backup_md5 机制）。
+    backup_md5: Option<String>,
+    /// 备用源是否已使用（避免无限切换）。
+    backup_used: bool,
     /// 换源代次：etag 变化 → gen+1 → 旧下载循环退出、新循环启动。
     /// .part 路径随 gen 隔离（`dest.<gen>.part`），避免新旧循环并发写同一文件。
     gen: u64,
@@ -97,7 +105,7 @@ async fn download_loop(
 ) {
     loop {
         // 快照任务参数（不跨 await 持锁）
-        let (part, offset, mirrors_raw, total, sha256) = {
+        let (part, offset, mirrors_raw, total, sha256, md5) = {
             let tasks = inner.tasks.lock().unwrap();
             let t = match tasks.get(&tid) {
                 Some(t) if t.gen == gen => t,
@@ -109,6 +117,7 @@ async fn download_loop(
                 t.mirrors.clone(),
                 t.total,
                 t.sha256.clone(),
+                t.md5.clone(),
             )
         };
 
@@ -143,76 +152,88 @@ async fn download_loop(
                 if !still_current {
                     return;
                 }
-                // 段全部落位 → 校验（可选 sha256）
+                // 段全部落位 → 校验（sha256 或备用源 md5；均未提供 → 不校验直接落位）
                 let dest = dest_of(&inner, &tid);
-                match &sha256 {
-                    Some(expected) => match verify_file(&part, expected) {
-                        Ok(true) => {
-                            // 校验通过 → 落位
-                            match finalize_part(&part, &dest, total) {
-                                Ok(()) => {
-                                    cleanup_old_parts(&dest, gen);
-                                    // 落位完成 → 清理续传凭据（.part 已移动，etag 副文件删除）
-                                    let _ = std::fs::remove_file(resume::part_etag_path(&part));
-                                    finish(&inner, &tid, EngineState::Completed, None);
-                                }
-                                Err(e) => finish(&inner, &tid, EngineState::Error, Some(e)),
-                            }
-                            return;
-                        }
-                        Ok(false) => {
-                            let attempts = {
-                                let mut tasks = inner.tasks.lock().unwrap();
-                                let t = tasks.get_mut(&tid).unwrap();
-                                t.verify_attempts += 1;
-                                t.verify_attempts
-                            };
-                            if attempts <= 1 {
-                                // 重下 1 次：作废 .part（含 etag 副文件）
-                                remove_part(&part);
-                                continue;
-                            }
-                            // 降级接受 + 告警（Q-B5）
-                            match finalize_part(&part, &dest, total) {
-                                Ok(()) => {
-                                    cleanup_old_parts(&dest, gen);
-                                    // 落位完成 → 清理续传凭据（.part 已移动，etag 副文件删除）
-                                    let _ = std::fs::remove_file(resume::part_etag_path(&part));
-                                    finish(
-                                        &inner,
-                                        &tid,
-                                        EngineState::Completed,
-                                        Some("sha256 mismatch, accepted downgrade".to_string()),
-                                    );
-                                    return;
-                                }
-                                Err(e) => {
-                                    finish(&inner, &tid, EngineState::Error, Some(e));
-                                    return;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            finish(
-                                &inner,
-                                &tid,
-                                EngineState::Error,
-                                Some(format!("verify io: {e}")),
-                            );
-                            return;
-                        }
-                    },
-                    None => {
+                let verify_result = match (&sha256, &md5) {
+                    (Some(expected), _) => verify_file(&part, expected),
+                    (None, Some(expected)) => verify_file_md5(&part, expected),
+                    (None, None) => Ok(true),
+                };
+                match verify_result {
+                    Ok(true) => {
+                        // 校验通过 → 落位
                         match finalize_part(&part, &dest, total) {
                             Ok(()) => {
                                 cleanup_old_parts(&dest, gen);
+                                // 落位完成 → 清理续传凭据（.part 已移动，etag 副文件删除）
                                 let _ = std::fs::remove_file(resume::part_etag_path(&part));
                                 finish(&inner, &tid, EngineState::Completed, None);
                             }
+                            Err(e) => finish(&inner, &tid, EngineState::Error, Some(e)),
+                        }
+                        return;
+                    }
+                    Ok(false) => {
+                        let attempts = {
+                            let mut tasks = inner.tasks.lock().unwrap();
+                            let t = tasks.get_mut(&tid).unwrap();
+                            t.verify_attempts += 1;
+                            t.verify_attempts
+                        };
+                        if attempts <= 1 {
+                            // 重下 1 次：作废 .part（含 etag 副文件）
+                            remove_part(&part);
+                            continue;
+                        }
+                        // 主源两次校验失败 → 切备用源（夸克 backup_url/backup_md5 机制）
+                        let (backup_url, backup_md5, backup_used) = {
+                            let tasks = inner.tasks.lock().unwrap();
+                            let t = tasks.get(&tid).unwrap();
+                            (t.backup_url.clone(), t.backup_md5.clone(), t.backup_used)
+                        };
+                        if let (Some(bu), false) = (&backup_url, backup_used) {
+                            let mut tasks = inner.tasks.lock().unwrap();
+                            let t = tasks.get_mut(&tid).unwrap();
+                            t.backup_used = true;
+                            t.mirrors = vec![bu.clone()];
+                            t.offset = 0; // 备用源可能是不同文件 → 全量重下
+                            t.sha256 = None;
+                            t.md5 = backup_md5.clone();
+                            t.verify_attempts = 0;
+                            t.error = None;
+                            t.state = EngineState::Downloading;
+                            drop(tasks);
+                            println!("[httpdl] {}: 主源校验失败，切换备用源", tid);
+                            remove_part(&part);
+                            continue;
+                        }
+                        // 备用源也失败（或未配置）→ 降级接受 + 告警（Q-B5）
+                        let warn = if md5.is_some() {
+                            "md5 mismatch, accepted downgrade".to_string()
+                        } else {
+                            "sha256 mismatch, accepted downgrade".to_string()
+                        };
+                        match finalize_part(&part, &dest, total) {
+                            Ok(()) => {
+                                cleanup_old_parts(&dest, gen);
+                                // 落位完成 → 清理续传凭据（.part 已移动，etag 副文件删除）
+                                let _ = std::fs::remove_file(resume::part_etag_path(&part));
+                                finish(&inner, &tid, EngineState::Completed, Some(warn));
+                                return;
+                            }
                             Err(e) => {
-                                finish(&inner, &tid, EngineState::Error, Some(e))
+                                finish(&inner, &tid, EngineState::Error, Some(e));
+                                return;
                             }
                         }
+                    }
+                    Err(e) => {
+                        finish(
+                            &inner,
+                            &tid,
+                            EngineState::Error,
+                            Some(format!("verify io: {e}")),
+                        );
                         return;
                     }
                 }
@@ -313,8 +334,13 @@ impl DownloadEngine for HttpEngine {
     }
 
     async fn add(&self, task: &DownloadTask) -> Result<EngineTaskId, EngineError> {
-        let (url, headers) = match &task.source {
-            DownloadSource::Http { url, headers, .. } => (url.clone(), headers.clone()),
+        let (url, headers, backup_url) = match &task.source {
+            DownloadSource::Http {
+                url,
+                headers,
+                backup_url,
+                ..
+            } => (url.clone(), headers.clone(), backup_url.clone()),
             _ => return Err(EngineError::Other("source is not http".to_string())),
         };
         let probe = probe_range(&self.client, &url, &headers).await?;
@@ -351,9 +377,13 @@ impl DownloadEngine for HttpEngine {
             0
         };
         resume::write_part_etag(&part0, probe.etag.as_deref());
-        let sha256 = match &task.identity {
-            ContentIdentity::SingleFile { sha256, .. } => sha256.clone(),
-            _ => None,
+        let (sha256, backup_md5) = match &task.identity {
+            ContentIdentity::SingleFile {
+                sha256,
+                backup_md5,
+                ..
+            } => (sha256.clone(), backup_md5.clone()),
+            _ => (None, None),
         };
 
         let tid = task.id.clone();
@@ -372,7 +402,11 @@ impl DownloadEngine for HttpEngine {
                     total,
                     error: None,
                     sha256,
+                    md5: None,
                     verify_attempts: 0,
+                    backup_url,
+                    backup_md5,
+                    backup_used: false,
                     gen: 0,
                 },
             );

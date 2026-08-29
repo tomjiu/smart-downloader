@@ -13,6 +13,9 @@ pub enum DownloadSource {
         url: String,
         headers: Vec<(String, String)>,
         auth: Option<Auth>,
+        /// 备用源 URL（夸克 backup_url 机制：主源失败后切换；None = 无备用源）。
+        #[serde(default)]
+        backup_url: Option<String>,
     },
     Ftp {
         url: String,

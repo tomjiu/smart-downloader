@@ -41,5 +41,8 @@ pub enum ContentIdentity {
         size: u64,
         etag: Option<String>,
         sha256: Option<String>,
+        /// 备用源内容 MD5（夸克 backup_md5 机制：切换备用源后以其校验）。
+        #[serde(default)]
+        backup_md5: Option<String>,
     },
 }
