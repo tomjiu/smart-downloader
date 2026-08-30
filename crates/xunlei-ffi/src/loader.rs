@@ -64,7 +64,29 @@ static SYMBOLS: OnceLock<Symbols> = OnceLock::new();
 ///
 /// `sdk_dir` 应包含 DownloadSDKProxy.dll 等全套文件。
 /// 调用前应确保 sdk_dir 存在且包含必需文件。
+///
+/// 平台门控（2026-08-30 Task 5-a）：非 Windows 上直接返回可读错误短路，
+/// 不触碰任何 FFI（本 crate 全平台可编译，但 SDK 运行时仅 Windows 提供）。
 pub fn ensure_dlls_loaded(sdk_dir: &Path) -> Result<()> {
+    #[cfg(not(windows))]
+    {
+        let _ = sdk_dir; // 非 Windows 不消费路径
+        return Err(XunleiError::Other(
+            "xunlei-ffi 仅支持 Windows（需要 DownloadSDKProxy.dll + DownloadSDKServer.exe）；\
+             当前平台仅提供类型/解析能力，SDK 运行时不可用"
+                .into(),
+        ));
+    }
+
+    #[cfg(windows)]
+    {
+        ensure_dlls_loaded_windows(sdk_dir)
+    }
+}
+
+/// Windows 真实实现（DLL 搜索路径 + libloading 解析全部 XL_* 符号）。
+#[cfg(windows)]
+fn ensure_dlls_loaded_windows(sdk_dir: &Path) -> Result<()> {
     // 只初始化一次
     if let Some(dir) = LOADED_SDK_DIR.get() {
         if dir == sdk_dir {
@@ -180,6 +202,17 @@ mod tests {
         let fake_dir = PathBuf::from("/nonexistent/xunlei-sdk");
         let result = ensure_dlls_loaded(&fake_dir);
         assert!(result.is_err());
+        // 非 Windows：入口短路，返回「仅支持 Windows」错误（Task 5-a 跨平台门控）
+        #[cfg(not(windows))]
+        match &result.unwrap_err() {
+            XunleiError::Other(msg) => assert!(
+                msg.contains("仅支持 Windows"),
+                "非 Windows 应返回可读平台错误，msg={msg}"
+            ),
+            other => panic!("expected Other(仅支持 Windows), got {other:?}"),
+        }
+        // Windows：真实逻辑 —— 必需文件缺失 → DllLoad
+        #[cfg(windows)]
         assert!(matches!(result.unwrap_err(), XunleiError::DllLoad(_)));
     }
 }

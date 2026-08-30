@@ -220,3 +220,41 @@ enable_upnp = false
 
 - 迅雷/QQDL 链接容错解码（`a989bb8`）、HTTP 断点续传 `.part`+etag（`0252c4f`）、BT fastresume 显式保存（`4f33cd1`）、任务持久化+恢复（`3ce222a`）、TOML 热重载（`784a269`）、HTTP 任务状态推进轮询（`9dea1a0`）、CLI 执行层（`3dfb8dd`）、端点补齐（`df82dfb`）等。
 - **迅雷云盘线（F2/F2.1/F3…）外包专用会话，状态见 `BACKLOG.md` A 段。**
+---
+
+## 2026-08-30 批次（Phase 2：登录原生 UX / 能力吸收 / 主线增强）
+
+### 14. 迅雷原生登录三模式（用户需求 Q1）
+
+**行为契约**：
+- `smart-dl-daemon xunlei-login`（默认 `--page`）：本地 `127.0.0.1:<随机端口>` 起登录页服务，页面复刻迅雷 App 登录视觉（深蓝渐变+白卡片+品牌标志+扫码/密码/短信三 Tab），扫码二维码由**本地模板**构造（`pan.xunlei.com/yc/?client_id=Xqp0…&user_code=…`，不依赖服务端 verification_uri）。
+- `--browser`：系统浏览器直接跳转官方授权页完成设备码授权；本地保留备用登录页（同一会话）。
+- `--qr`：终端 unicode 二维码 + 轮询状态行。
+- `--token <path>`（默认 `./xunlei_auth.json`，POSIX 0600）；成功后打印 user_id，不回显 token。
+- 登录态与 `XunleiProvider::new(_, token_path)` 完全互通（也兼容网页版 localStorage 凭证形状）。
+- **DEVICE_CLIENT_ID 对齐**：`XW5SkOhLDjnOZP7J`（已知失败值）→ `Xqp0kJBXWhwaTpB6`（2026-08-25 实测通过值），常量注释留档变更依据；新增防回归单测。
+- `Client` 支持 `with_bases()` 注入 mock 地址（测试可离线全链）。
+- 密码/短信登录：`/v1/auth/signin`（captcha/init 全套签名 meta）与 `/v1/auth/verification{,/verify}` 编排进 `login_flow`；user_id 兜底从 JWT `sub` 解析。
+- 离线下载 API 已有实现（offline_submit/offline_tasks/torrent_upload，Phase 1 交付）继续可用。
+
+**验证**：`cargo test -p smart-dl-provider --lib` 102 全绿，含 `login_page_e2e_device_flow`（mock 上游 start→pending→authorized→落盘→读回）与 `login_page_password_flow`（captcha+signin→JWT 解 user_id→落盘）两个集成测试；`cargo check --examples -p smart-dl-provider` 全过；示例 `xunlei_qr_login.rs` 已切换本地 QR 构造。
+**文档**：`docs/research/xunlei/NATIVE_LOGIN_GUIDE.md`（三模式使用说明/流程时序/复刻清单/合规声明）。
+
+### 15. 能力吸收落地（用户需求 Q3）
+
+**行为契约**：
+- 协议嗅探引擎 `core/src/sniffer.rs`（FileCentipede 4 层规则移植）：scheme 直判（thunder/qqdl/fs2you/magnet/ed2k/ftp/http）、文本正则提取多链接、协议推断（.torrent 后缀、pan.xunlei.com/s/、pan.quark.cn/s/ 分享识别）、规则表可配置。
+- BitComet 策略建议器 `core/src/strategy.rs` + `btcore::strategy` 门面：`DiskCacheAdvice`（自适应缓存+4 优先级桶，来源 r1 §4.3 + r2 disk_cache_priority）与 `AntiLeechAdvice`（分级反吸血→libtorrent settings_pack 建议值，来源 r1 §4.7）；纯函数，接入点注释标明。
+- 夸克网盘 Provider `provider/src/quark/`：QuarkClient（stoken→detail→save→task→download 全链）、QuarkProvider 实现 `RemoteProvider`、Cookie 登录态持久化、错误分类（NotLogin/ShareExpired/QuotaExhausted）+ 失败冷却（同 xunlei 模式）。端点形状待真机验证（注释标注）。
+- ed2k 链接解析 `core/src/source_parse/ed2k.rs`：解析 name/size/md4，路由层给出"已识别但暂不支持下载"的明确错误（完整引擎仍列远期）。
+
+**验证**：sniffer 13 测 + strategy 7 测 + quark 10 测（axum mock）全绿；`cargo test --workspace --exclude smart-dl-btcore` 全绿。
+**文档**：`docs/CAPABILITY_ABSORBED.md`（吸收能力总清单：✅/🔶/📋/🚫 四档逐项标注 + 不吸收决策清单 + 接入路线图）。
+
+### 16. 跨平台通解文档（用户需求 Q2）
+
+**产出**：`docs/research/xunlei/CROSS_PLATFORM_UNIVERSAL_SOLUTION.md`——分层通解判定（L0/L1 纯 Rust 全平台真通解 ✅ / L2 分平台等效通解 / L3 私有加速永不通解 ❌）+ 能力抽取矩阵（✅24 / 🔶11 / ❌7 项，逐项带仓库证据行号）+ 用户视角三平台通解矩阵 + macOS/Android 路线图 + 合规声明。
+
+### 17. Linux/CI 编译修复
+
+**行为契约**：`xunlei-ffi` Windows-only 代码全部 cfg 门控（非 Windows 编译为安全 stub）；`btcore/build.rs` 在无 libclang 环境自动回退到仓库内已提交 bindings.rs（剥离平台相关布局断言写入 OUT_DIR，`rustc-cfg=lt_bindings_fallback` 切换 include），`cargo check --workspace` 在 Linux 全绿。

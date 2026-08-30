@@ -11,6 +11,7 @@ pub mod bare;
 pub mod engine;
 pub mod ffi;
 pub mod resume;
+pub mod strategy;
 pub mod xudt;
 #[cfg(feature = "xunlei")]
 pub mod xunlei_engine;

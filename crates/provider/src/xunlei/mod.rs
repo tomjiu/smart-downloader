@@ -7,10 +7,15 @@ pub mod client;
 pub mod cloud_search;
 pub mod device;
 pub mod hash;
+pub mod login_flow;
+pub mod login_page;
 pub mod provider;
 pub mod share;
 pub mod sign;
 pub mod url_class;
+
+pub use client::{device_code_qr_url, DEVICE_CLIENT_ID};
+pub use login_flow::{LoginMode, DeviceSession};
 
 pub use hash::{bcid, cid, gcid};
 pub use share::{parse_share_link, ResolvedLink, SharedFile, SharedLink, Sharer, ShareError};

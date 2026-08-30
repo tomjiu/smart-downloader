@@ -232,6 +232,11 @@ impl XunleiHandle {
 ///
 /// 2026-08-27 反汇编铁证：BT_TASK_PARAM_V2 的 torrent_path/save_path 是 UTF-16
 /// 宽字符串（`wcslen` 校验，`cmp word ptr [r+*2]`）。Windows 路径用宽字符。
+///
+/// 平台门控（2026-08-30 Task 5-a）：Windows 用 `OsStr::encode_wide`（保留非 UTF-8
+/// 路径字节）；非 Windows 用 `to_string_lossy` 兜底（仅保证可编译，运行时该 crate
+/// 在非 Windows 由 loader 层短路返回 Err，不会真正走到这里）。
+#[cfg(windows)]
 fn path_to_wide(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     let wide: Vec<u16> = path.as_os_str().encode_wide().collect();
@@ -239,6 +244,12 @@ fn path_to_wide(path: &Path) -> Vec<u16> {
     let mut out = wide;
     out.push(0);
     out
+}
+
+/// 非 Windows 编译兜底：路径按 UTF-8 lossy 转 UTF-16（保持类型/签名不变）。
+#[cfg(not(windows))]
+fn path_to_wide(path: &Path) -> Vec<u16> {
+    str_to_wide(&path.to_string_lossy())
 }
 
 /// 字符串转 UTF-16 宽字符串（`Vec<u16>`，带 NUL 结尾）。

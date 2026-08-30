@@ -230,13 +230,6 @@ pub struct XLP2spSubTaskIndex {
     pub reserved: [c_uint; 100],
 }
 
-// 非 Windows 平台提供空实现（防止编译错误）
-#[cfg(not(windows))]
-mod ffi {
-    use super::*;
-    pub struct LtHandle {}
-}
-
 // ========== 函数指针类型别名（供 libloading 使用） ==========
 
 // NOTE(2026-08-27 真机反汇编铁证): XL_Init 是 2 参数（server_path + param），
@@ -278,7 +271,36 @@ pub type XLBatchDiscardPeerFn = unsafe extern "system" fn(task_id: c_uint, peer_
 pub type XLEnableFreeDcdnFn = unsafe extern "system" fn(task_id: c_uint, enable: c_int) -> LtErr;
 pub type XLDisableFreeDcdnFn = unsafe extern "system" fn(task_id: c_uint) -> LtErr;
 pub type XLAddServerFn = unsafe extern "system" fn(task_id: c_uint, param2: c_uint, server: *const XLServerInfo) -> LtErr;
-pub type XLQueryTaskFlowFn = unsafe extern "system" fn(task_id: c_uint, flow: *mut XLTaskFlow) -> LtErr;
+// NOTE(2026-08-30 Task 5-a 签名补全，来源 docs/research/xunlei/):
+// 1) NEXT_ACTION.md:579 ——「下载速度不在 XLTaskInfo，需 XL_QueryTaskFlow 单独查询，
+//    且该函数是 3 参数非 2 参数」（推翻旧 2 参绑定 fn(task_id, flow)）。
+// 2) xunlei_research_complete.md「XL_QueryTaskFlow」prologue 反汇编（RVA 0x178f0）：
+//      mov esi, ecx   → 参数1 = 32 位（task_id: u32，符合 NEXT_ACTION 核心规律#2）
+//      mov edi, edx   → 参数2 = 32 位（flow_type: u32，语义待真机验证）
+//      mov rbx, r8    → 参数3 = 64 位指针（out：流量输出指针）
+//    且无 handle 参数（核心规律#1：handle 是 SDK 全局状态）。
+// 3) sdk_export_inventory.md:212 —— Windows DownloadSDK.dll 确有该导出。
+// ⚠️ 待真机验证：flow_type 取值语义（假设 0=下载流量 / 1=上传流量）与
+//    out 指针指向布局（暂按 versioned XLTaskFlow，size=0x18）。另注：导出表同时有
+//    XL_FreeTaskFlow，若 out 为 SDK 分配缓冲则需配对释放（未确认，先按调用方缓冲实现）。
+pub type XLQueryTaskFlowFn = unsafe extern "system" fn(
+    task_id: c_uint,
+    flow_type: c_uint,
+    out_flow: *mut XLTaskFlow,
+) -> LtErr;
+
+// NOTE(2026-08-30 Task 5-a): XLGetGlobalDownloadSpeed 是 **macOS DownloadKit** 的 C API
+// （macos_abi_reverse.md:111-119 还原签名）：
+//   i32 XLGetGlobalDownloadSpeed(XLDownloadLib lib, u64 task_id, u64* out_speed)
+// Windows DownloadSDK.dll 导出表**无此符号**（sdk_export_inventory.md 全表核对），
+// 故不加入 loader::Symbols 的急切解析（会导致 Windows 加载失败），仅在此保留
+// 类型定义供未来 xunlei-ffi-macos crate 复用；Windows 侧速度查询走 XL_QueryTaskFlow。
+#[allow(dead_code)]
+pub type XLGetGlobalDownloadSpeedFn = unsafe extern "C" fn(
+    lib: *mut c_void,
+    task_id: c_ulonglong,
+    out_speed: *mut c_ulonglong,
+) -> c_int;
 pub type XLSetTaskUserAgentFn = unsafe extern "system" fn(task_id: c_uint, ua: *const c_char) -> LtErr;
 pub type XLAddHttpHeaderFieldFn = unsafe extern "system" fn(task_id: c_uint, name: *const c_char, value: *const c_char) -> LtErr;
 pub type XLSetTaskDownloadSpeedLimitFn = unsafe extern "system" fn(task_id: c_uint, limit: c_uint) -> LtErr;

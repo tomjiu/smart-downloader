@@ -7,7 +7,14 @@ use std::os::raw::{c_char, c_int};
 use std::path::Path;
 use std::ptr;
 
-include!("../bindings.rs"); // bindgen 产物（build.rs 在 ffi/lt.h 变更时重新生成）
+// bindgen 产物（build.rs 在 ffi/lt.h 变更时重新生成）。
+// 无 libclang 平台（如 Linux CI/云环境）：build.rs 回退使用仓库内已提交的
+// bindings.rs 的净化版（写入 OUT_DIR，剥离平台相关布局断言），经
+// rustc-cfg=lt_bindings_fallback 切换到该副本。
+#[cfg(lt_bindings_fallback)]
+include!(concat!(env!("OUT_DIR"), "/bindings_fallback.rs"));
+#[cfg(not(lt_bindings_fallback))]
+include!("../bindings.rs");
 
 #[derive(Debug, thiserror::Error, PartialEq)]
 pub enum Error {

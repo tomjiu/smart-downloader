@@ -38,7 +38,7 @@
 | FTP 目录下载 | ~~无（仅单文件）~~ **已完成（2026-08-25）**：httpdl 引擎目录递归展开 + daemon `add_ftp_task` 路由打通（`POST /tasks` 可达 `ftp://` 目录 URL），目录任务按多文件下发 |
 | ~快照 files 字段透出~ | ~~多文件任务快照只见总量不见明细~~ **已完成（2026-08-25）**：`TaskSnapshot.files` 透出每个子文件的路径/大小/进度 |
 | ~xunlei-import 端到端测试~ | ~~`POST /tasks/xunlei-import` 代码存在但无 e2e 测试~~ **已完成（2026-08-27）**：新增 `crates/daemon/tests/xunlei_import_api.rs`，覆盖合法样本导入、bad base64、xltd 数量不匹配 |
-| ed2k 协议 | 明确不支持（解码出的 ed2k 链接 → 路由拒绝，报"ed2k 不支持"）——**挪远期**：完整实现 = eMule/eDonkey 客户端协议（数周级），并入"跨协议"远期专项（见 F 段）|
+| ed2k 协议 | ~~明确不支持~~ **链接解析已完成（2026-08-30，`core/src/source_parse/ed2k.rs`：name/size/md4 结构化 + 明确错误分类）**；完整 eMule/eDonkey 客户端协议仍列远期（数周级），并入"跨协议"远期专项（见 F 段）|
 
 已有（防重复列）：并发队列（BT≤3/HTTP·FTP≤8）、HTTP 多连接并行/镜像/换源、**HTTP 动态分段（SegmentManager 动态领取 + 流式写盘，`109692c`）**、**失败缩小粒度重试（`b70923e`）**、**backup_url/backup_md5 备用源兜底（`963f9dd`）**、sha256 可选校验、BT 校验/做种停止、事件队列背压、全局代理 + 双引擎限速（启动时生效）。
 

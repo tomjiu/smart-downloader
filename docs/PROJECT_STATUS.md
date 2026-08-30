@@ -110,14 +110,18 @@
 | `crates/provider/src/xunlei/device.rs` | ✅ `DeviceAuthFlow` 状态机（start → poll_once → Done/Failed） |
 | `crates/provider/src/xunlei/client.rs` | ✅ `request_device_code` / `poll_device_token` / `refresh_captcha` / `resolve_link` / `list_files` |
 | `crates/provider/src/xunlei/provider.rs` | ✅ `store_login`（token + 自动 refresh captcha_token） |
+| `crates/provider/src/xunlei/login_flow.rs` | ✅ 2026-08-30 三模式编排（browser/page/qr）+ 本地 QR URL 构造 |
+| `crates/provider/src/xunlei/login_page.rs` + `login_page.html` | ✅ 2026-08-30 本地 App 同款登录页（axum，127.0.0.1，扫码/密码/短信三 Tab） |
+| `crates/daemon/src/xunlei_login.rs` + cli.rs | ✅ 2026-08-30 `smart-dl-daemon xunlei-login [--browser|--page|--qr] [--token] [--port]` |
+| `docs/research/xunlei/NATIVE_LOGIN_GUIDE.md` | ✅ 2026-08-30 用户手册（三模式/时序/复刻清单/合规） |
 
 ### 待对齐（重要）
 
-| 问题 | 当前值 | 应改值 |
-|------|--------|--------|
-| `DEVICE_CLIENT_ID` | `"XW5SkOhLDjnOZP7J"`（**已知失败**） | `"Xqp0kJBXWhwaTpB6"`（白名单内，已验证） |
-| QR 构造 | 用服务端 `verification_uri` | 改成本地 `pan.xunlei.com/yc/` 模板构造 |
-| examples | 文档提到但目录下未见 | 需补 `xunlei_qr_login.rs` 等最小示例 |
+| 问题 | 状态（2026-08-30 收口） |
+|------|--------------------------|
+| `DEVICE_CLIENT_ID` | ✅ 已对齐 `Xqp0kJBXWhwaTpB6`（client.rs 常量注释留档 + 防回归单测） |
+| QR 构造 | ✅ 本地 `pan.xunlei.com/yc/?client_id=…&user_code=…` 模板构造（`device_code_qr_url`） |
+| examples | ✅ 6 个示例在库，`xunlei_qr_login.rs` 已切本地 QR 构造；`cargo check --examples` 全过 |
 
 ### 凭证存储（安全约定）
 
@@ -165,6 +169,10 @@
 | ☁️ 待派 | **FlashGet** | 多线程/镜像发现 |
 | ☁️ 待派 | **文件蜈蚣** | 协议嗅探（C 档，最后） |
 | ✅ 本地已覆盖 | **迅雷本体** | 登录/云盘/加速/配额已完成 |
+
+### 能力吸收总清单（2026-08-30 新增）
+
+**全部竞品分析材料已盘点建档 → `docs/CAPABILITY_ABSORBED.md`**（✅ 已落地 / 🔶 原型待接 / 📋 计划 / 🚫 明确不吸收，逐项标注）。本轮净新增落地：FileCentipede 嗅探引擎（`core/src/sniffer.rs`）、BitComet 策略建议器（`core/src/strategy.rs`）、夸克网盘 Provider（`provider/src/quark/`，RemoteProvider 全链）。
 
 ### 可操作结论
 
@@ -223,11 +231,11 @@ Release 页面：https://github.com/tomjiu/smart-downloader/releases/tag/v0.1.0-
 
 ## 六、最高优先级 TODO（接手后建议先做）
 
-1. **Windows 登录对齐**：`DEVICE_CLIENT_ID` 从 `XW5SkOhLDjnOZP7J` 改为 `Xqp0kJBXWhwaTpB6`，补 QR 本地构造
-2. **macOS `TAG_XL_TASK_INFO_EX`**：写 C 测试程序 hex dump，或 Ghidra 高级反编译
-3. **BitComet 云解析结果审计**：若拿到结果，按 CAPABILITY_MAP 四题审查单验收
-4. **主线 F3.1 验收**：BT 引擎 matured + Bug B/C 关闭，解锁 CAPABILITY_MAP 第一波
-5. **Rust 编译检查**：当前大量文件已改但未验证 `cargo check --workspace` 是否通过
+1. ~~Windows 登录对齐~~ **✅ 2026-08-30 完成**（client_id 对齐 + QR 本地构造 + 三种登录模式，见 `NATIVE_LOGIN_GUIDE.md`）
+2. **macOS `TAG_XL_TASK_INFO_EX`**：写 C 测试程序 hex dump，或 Ghidra 高级反编译（未变，路线图见 `CROSS_PLATFORM_UNIVERSAL_SOLUTION.md`）
+3. ~~BitComet/竞品解析结果审计~~ **✅ 2026-08-30 完成**（`CAPABILITY_ABSORBED.md` 全量建档，高 ROI 项已落地）
+4. **主线 F3.1 验收**：BT 引擎 matured + Bug B/C 关闭，解锁 CAPABILITY_MAP 第一波（未变）
+5. ~~Rust 编译检查~~ **✅ 2026-08-30 完成**：`cargo check --workspace` Linux 全绿（xunlei-ffi cfg 门控 + btcore bindgen 回退）；`cargo test --workspace --exclude smart-dl-btcore` 全绿
 
 ---
 

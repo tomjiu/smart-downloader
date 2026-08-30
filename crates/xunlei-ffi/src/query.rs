@@ -1,10 +1,10 @@
-//! 状态查询（QueryTaskInfo）。
+//! 状态查询（QueryTaskInfo / QueryTaskFlow）。
 //!
-//! 将 C 结构体（XLTaskInfo）转换为 Rust 结构体（TaskInfo）。
+//! 将 C 结构体（XLTaskInfo / XLTaskFlow）转换为 Rust 结构体（TaskInfo / TaskFlow）。
 
 use tokio::task;
 
-use crate::bindings::XLTaskInfo;
+use crate::bindings::{XLTaskFlow, XLTaskInfo};
 use crate::error::{XunleiError, Result};
 use crate::handle::XunleiHandle;
 use crate::task::TaskId;
@@ -99,4 +99,85 @@ impl XunleiHandle {
         .await
         .map_err(|e| XunleiError::Other(format!("spawn_blocking failed: {}", e)))?
     }
+
+    /// 查询任务流量/速度（XL_QueryTaskFlow，3 参数签名）。
+    ///
+    /// 来源（Task 5-a 签名补全，见 bindings.rs::XLQueryTaskFlowFn 注释）：
+    /// - NEXT_ACTION.md:579：3 参数非 2 参数；
+    /// - xunlei_research_complete.md RVA 0x178f0 prologue：`(u32 task_id, u32 flow_type, ptr out)`；
+    /// - 速度字段**不在** XLTaskInfo，down_rate 需本接口单独查询。
+    ///
+    /// `flow_type` 语义待真机验证（假设 0=下载 / 1=上传，调用方可用常量
+    /// [`TASK_FLOW_DOWNLOAD`] / [`TASK_FLOW_UPLOAD`]）。
+    pub async fn query_task_flow(&self, task_id: &TaskId, flow_type: u32) -> Result<TaskFlow> {
+        let inner = self.inner.clone();
+        let tid = task_id.0 as u32;
+        task::spawn_blocking(move || {
+            let mut flow = XLTaskFlow {
+                size: 0x18, // versioned struct；真实 size 待真机 dump 确认
+                download_bytes: 0,
+                upload_bytes: 0,
+                _pad: 0,
+            };
+
+            unsafe {
+                let r = (inner.symbols.XL_QueryTaskFlow)(tid, flow_type, &mut flow);
+                if r != 0 {
+                    return Err(XunleiError::with_context(
+                        r,
+                        "XL_QueryTaskFlow failed",
+                    ));
+                }
+            }
+
+            Ok(TaskFlow {
+                download_bytes: flow.download_bytes,
+                upload_bytes: flow.upload_bytes,
+            })
+        })
+        .await
+        .map_err(|e| XunleiError::Other(format!("spawn_blocking failed: {}", e)))?
+    }
+
+    /// 查询任务下载速度（字节/秒）。
+    ///
+    /// 便捷封装：按假设 flow_type=0（下载）调 `query_task_flow`。
+    /// ⚠️ 待真机验证：速度语义（瞬时 vs 累计流量）取决于 XLTaskFlow 布局 dump 结果。
+    pub async fn query_download_speed(&self, task_id: &TaskId) -> Result<u64> {
+        self.query_task_flow(task_id, TASK_FLOW_DOWNLOAD)
+            .await
+            .map(|f| f.download_bytes)
+    }
+
+    /// 查询全局下载速度（XLGetGlobalDownloadSpeed）。
+    ///
+    /// ⚠️ 该符号是 **macOS DownloadKit** 的 C API（macos_abi_reverse.md:111-119），
+    /// Windows DownloadSDK.dll **无此导出**（sdk_export_inventory.md 全表核对），
+    /// 故本方法在所有平台都返回明确错误：
+    /// - Windows 侧全局速度：待逆向 `XL_QueryGlobalStat`（out size=0x1c，字段未还原）；
+    /// - macOS 侧：待未来 `xunlei-ffi-macos` crate 落地（类型已预留
+    ///   `bindings::XLGetGlobalDownloadSpeedFn`）。
+    pub async fn global_download_speed(&self) -> Result<u64> {
+        let _ = self.inner.symbols; // 保持与真实查询一致的调用面
+        Err(XunleiError::Other(
+            "XLGetGlobalDownloadSpeed 仅 macOS DownloadKit 提供（Windows 导出表无此符号）；\
+             Windows 全局速度待 XL_QueryGlobalStat 布局逆向，任务级速度用 query_task_flow"
+                .into(),
+        ))
+    }
 }
+
+/// 任务级速度/流量（XL_QueryTaskFlow 输出的 Rust 视图）。
+///
+/// ⚠️ 字段语义待真机验证：XLTaskFlow 布局（size=0x18 假设）未 dump 确认，
+/// download/upload 字节含义（瞬时速率 or 累计流量）以真机 dump 为准。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TaskFlow {
+    pub download_bytes: u64,
+    pub upload_bytes: u64,
+}
+
+/// XL_QueryTaskFlow.flow_type 假设值：下载流量（待真机验证）。
+pub const TASK_FLOW_DOWNLOAD: u32 = 0;
+/// XL_QueryTaskFlow.flow_type 假设值：上传流量（待真机验证）。
+pub const TASK_FLOW_UPLOAD: u32 = 1;
