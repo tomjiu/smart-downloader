@@ -111,11 +111,17 @@ impl XunleiHandle {
                 XunleiError::DllLoad("XL_EnableDcdnWithToken not resolved (DLL missing export)".into())
             })?;
             let token_c = cstring_or_err(&token, "token")?;
+            // CString 必须绑定存活到 FFI 调用点（临时值 .as_ptr() 会在语句末析构 → 悬垂 UB）
             let extra_c = match &extra {
-                Some(s) => cstring_or_err(s, "extra")?.as_ptr(),
-                None => std::ptr::null(),
+                Some(s) => Some(cstring_or_err(s, "extra")?),
+                None => None,
             };
-            let r = sym(channel, flags, token_c.as_ptr(), extra_c);
+            let r = sym(
+                channel,
+                flags,
+                token_c.as_ptr(),
+                extra_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+            );
             if r != 0 {
                 return Err(XunleiError::with_context(r, "XL_EnableDcdnWithToken failed"));
             }
@@ -148,15 +154,22 @@ impl XunleiHandle {
                 )
             })?;
             let session_c = cstring_or_err(&session, "session")?;
+            // 同上：k1/k2 的 CString 绑定存活到调用点，避免临时值悬垂
             let k1_c = match &k1 {
-                Some(s) => cstring_or_err(s, "k1")?.as_ptr(),
-                None => std::ptr::null(),
+                Some(s) => Some(cstring_or_err(s, "k1")?),
+                None => None,
             };
             let k2_c = match &k2 {
-                Some(s) => cstring_or_err(s, "k2")?.as_ptr(),
-                None => std::ptr::null(),
+                Some(s) => Some(cstring_or_err(s, "k2")?),
+                None => None,
             };
-            let r = sym(channel, flags, session_c.as_ptr(), k1_c, k2_c);
+            let r = sym(
+                channel,
+                flags,
+                session_c.as_ptr(),
+                k1_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+                k2_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
+            );
             if r != 0 {
                 return Err(XunleiError::with_context(r, "XL_EnableDcdnWithSession failed"));
             }

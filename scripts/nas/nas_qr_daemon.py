@@ -4,18 +4,26 @@
 - 到手 token → 落盘预置路径 + 取证归档 → 退出
 - 未授权过期 → 自动发下一个码，状态写 qr_state.json（含最新短链）
 用法：nohup python3 nas_qr_daemon.py &
+路径均可被环境变量覆盖（SD_QR_STATE / SD_QR_HOME / SD_QR_ARCHIVE），
+client_id/secret 同理（SD_XL_CLIENT_ID / SD_XL_CLIENT_SECRET，便于轮换）。
 """
 import json, os, sys, time, urllib.request, urllib.parse
 
-CLIENT_ID = "X9ibISwpIp8jQ4Ya"
-CLIENT_SECRET = "BlPF2z7HEeutzH4t6zyjLw"
+# 常量区：引擎内嵌 OAuth 客户端（已随附录 E.2.3 公开；环境变量可覆盖以便轮换）
+CLIENT_ID = os.environ.get("SD_XL_CLIENT_ID", "X9ibISwpIp8jQ4Ya")
+CLIENT_SECRET = os.environ.get("SD_XL_CLIENT_SECRET", "BlPF2z7HEeutzH4t6zyjLw")
 SCOPE = "pan user profile sso offline pan/xunlei/share/create"
 CODE_URL = "https://xluser-ssl.xunlei.com/v1/auth/device/code"
 TOKEN_URL = "https://xluser-ssl.xunlei.com/v1/auth/token"
-STATE = os.path.expanduser("~/my-project/scripts/research/xunlei/qr_state.json")
-HOME = os.path.expanduser("~/.nas-engine-test/data/.drive")
-ARCH = os.path.expanduser(
-    "~/my-project/repo-smart-downloader/scripts/research/xunlei/extracted/cross-platform/xllite_token_20260830.json")
+# 路径区：默认相对脚本自身定位（任意机器/任意克隆位置均可跑），env 可覆盖
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE = os.environ.get("SD_QR_STATE",
+                       os.path.join(SCRIPT_DIR, "qr_state.json"))
+HOME = os.environ.get("SD_QR_HOME",
+                      os.path.expanduser("~/.nas-engine-test/data/.drive"))
+ARCH = os.environ.get("SD_QR_ARCHIVE", os.path.normpath(os.path.join(
+    SCRIPT_DIR, "..", "research", "xunlei", "extracted", "cross-platform",
+    "xllite_token.json")))
 MAX_RUN = 2 * 60 * 60
 
 def http_json(url, data=None):

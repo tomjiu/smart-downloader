@@ -59,10 +59,9 @@ impl NasRemoteEngine {
 }
 
 fn mgr_status_listen(mgr: &NasManager) -> String {
-    // 与 NasConfig 默认一致；管理器构造后 listen 不变，取 status 不必要——
-    // 直接读默认（跨配置请在 NasConfig::default 改）。
-    let _ = mgr;
-    "127.0.0.1:5050".to_string()
+    // 与 NasConfig 同源（SD_NAS_DRIVE_LISTEN 环境变量可覆盖默认 127.0.0.1:5050），
+    // 自定义端口部署不再探活错位。
+    mgr.drive_listen().to_string()
 }
 
 #[async_trait::async_trait]

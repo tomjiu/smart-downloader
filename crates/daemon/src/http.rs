@@ -444,7 +444,8 @@ async fn nas_install(
             "engine": info.engine,
         }))
         .into_response(),
-        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e)) => (
+        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e))
+        | Err(NasError::Token(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": e })),
         )
@@ -457,7 +458,8 @@ async fn nas_start(State(_): State<Arc<DaemonState>>) -> Response {
     use nas::NasError;
     match nas::manager().start().await {
         Ok(pid) => Json(serde_json::json!({ "ok": true, "pid": pid })).into_response(),
-        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e)) => (
+        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e))
+        | Err(NasError::Token(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": e })),
         )
@@ -491,7 +493,8 @@ async fn nas_token(
     use nas::NasError;
     match nas::put_auth_token(nas::manager(), &req.token_json).await {
         Ok(p) => Json(serde_json::json!({ "ok": true, "path": p })).into_response(),
-        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e)) => (
+        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e))
+        | Err(NasError::Token(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": e })),
         )

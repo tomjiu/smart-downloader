@@ -81,6 +81,12 @@ impl NasManager {
         Self { cfg, child: Arc::new(Mutex::new(None)) }
     }
 
+    /// DriveListen 地址（host:port）：探活/反代/远程引擎适配器共用同一来源，
+    /// 避免硬编码默认端口在自定义部署下探活错位。
+    pub fn drive_listen(&self) -> &str {
+        &self.cfg.drive_listen
+    }
+
     pub fn work_dir(&self) -> &Path {
         &self.cfg.work_dir
     }
@@ -281,6 +287,9 @@ pub enum NasError {
     Install(String),
     #[error("启动失败: {0}")]
     Start(String),
+    /// token 形状/桥接类失败（假设区 #8）：与安装/启动错误可编程区分。
+    #[error("token 桥接失败: {0}")]
+    Token(String),
 }
 
 /// `/nas/*` → `http://DriveListen/*` 透明反代（axum wildcard 兜底）。
@@ -309,7 +318,7 @@ pub async fn nas_proxy(State(_state): State<Arc<DaemonState>>, req: Request) -> 
 
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
         .unwrap_or(reqwest::Method::GET);
-    let url = format!("http://127.0.0.1:5050{rest}");
+    let url = format!("http://{}{rest}", manager().drive_listen());
     let mut out = client.request(method, &url);
     for (k, v) in parts.headers.iter() {
         if k == axum::http::header::HOST || k == axum::http::header::CONNECTION {
@@ -395,30 +404,54 @@ pub async fn sync_l1_token(l1_token_path: &Path) -> Result<PathBuf, NasError> {
         .await
         .map_err(|e| NasError::Io(format!("读 L1 token {}: {e}", l1_token_path.display())))?;
     let v: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| NasError::Install(format!("L1 token JSON 解析失败: {e}")))?;
+        .map_err(|e| NasError::Token(format!("JSON 解析失败（{}）: {e}", l1_token_path.display())))?;
+    // 诊断信息：实际存在的字段集（格式漂移时一眼定位，避免盲目猜）
+    let keys = v
+        .as_object()
+        .map(|o| o.keys().cloned().collect::<Vec<_>>().join(","))
+        .unwrap_or_default();
     let access = v
         .get("access_token")
         .and_then(|x| x.as_str())
-        .ok_or_else(|| NasError::Install("L1 token 缺 access_token".into()))?
-        .to_string();
+        .map(str::to_string)
+        .ok_or_else(|| {
+            NasError::Token(format!(
+                "缺 access_token 字段（keys=[{keys}]；若 L1 格式变更请对假设区 #8 校准本桥）"
+            ))
+        })?;
+    if access.is_empty() {
+        return Err(NasError::Token(format!("access_token 为空串（未登录？keys=[{keys}]）")));
+    }
+    // refresh_token 宽容处理：缺省不阻断桥接（登录门是否能静默续期以 A2 实测为准，
+    // 引擎若要求非空 refresh 会在登录门显形——那时再回补硬校验）。
     let refresh = v
         .get("refresh_token")
         .and_then(|x| x.as_str())
         .unwrap_or_default()
         .to_string();
-    if access.is_empty() || refresh.is_empty() {
-        return Err(NasError::Install("L1 token 缺 access/refresh_token（未登录？）".into()));
+    if refresh.is_empty() {
+        tracing::warn!("L1 token 缺 refresh_token（keys=[{keys}]）——桥接继续，续期能力以 A2 实测为准");
     }
-    // expires_at（unix 秒）→ expires_in（剩余秒）；缺省 1h
+    // expires_at（unix 秒；兼容数字字符串形）→ expires_in（剩余秒）；缺省/异常 1h
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let expires_at = v
-        .get("access_token_expires_at")
+    let expires_raw = v.get("access_token_expires_at");
+    let expires_at = expires_raw
         .and_then(|x| x.as_u64())
-        .unwrap_or(now + 3600);
-    let expires_in = expires_at.saturating_sub(now).max(60);
+        .or_else(|| expires_raw.and_then(|x| x.as_str()).and_then(|s| s.parse::<u64>().ok()));
+    let expires_in = match expires_at {
+        Some(t) if t > now => t.saturating_sub(now).max(60),
+        Some(_) => {
+            tracing::warn!("L1 token access_token_expires_at 已过期——按剩余 1h 处理（keys=[{keys}]）");
+            3600
+        }
+        None => {
+            tracing::warn!("L1 token access_token_expires_at 缺失/非 unix 秒——按剩余 1h 处理（keys=[{keys}]）");
+            3600
+        }
+    };
     let bridged = serde_json::json!({
         "access_token": access,
         "refresh_token": refresh,
