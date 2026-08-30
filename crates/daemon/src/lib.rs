@@ -13,6 +13,9 @@ pub mod health;
 pub mod http;
 pub mod http_events;
 pub mod lockfile;
+/// NAS 版迅雷引擎托管（xllite/pan-cli，Linux-only）。附录 E-2026-08-30。
+#[cfg(feature = "nas")]
+pub mod nas;
 pub mod serve;
 pub mod state;
 pub mod ws;

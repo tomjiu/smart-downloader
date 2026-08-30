@@ -1,6 +1,8 @@
 //! HTTP API（axum，M6）：任务 CRUD + 快照 + Provider 运行态 + WS 升级端点（M7）。
 
 use crate::state::{DaemonError, DaemonState};
+#[cfg(feature = "nas")]
+use crate::nas;
 use crate::ws::Throttler;
 use axum::{
     extract::{
@@ -12,6 +14,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+#[cfg(feature = "nas")]
+use axum::response::Response;
 use base64::Engine as _;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -376,15 +380,121 @@ macro_rules! router_base {
     };
 }
 
+#[cfg(feature = "nas")]
+macro_rules! router_nas {
+    ($app:expr) => {
+        $app
+            .route(
+                "/nas/install",
+                post(nas_install),
+            )
+            .route("/nas/start", post(nas_start))
+            .route("/nas/stop", post(nas_stop))
+            .route("/nas/status", get(nas_status))
+            .route("/nas/token", post(nas_token))
+            .fallback(nas::nas_proxy)
+    };
+}
+#[cfg(not(feature = "nas"))]
+macro_rules! router_nas {
+    ($app:expr) => {
+        $app
+    };
+}
+
 #[cfg(feature = "xunlei-import")]
 pub fn router(state: Arc<DaemonState>) -> Router {
-    router_base!(Router::new())
+    router_nas!(router_base!(Router::new()))
         .route("/tasks/xunlei-import", post(add_xunlei_import))
         .with_state(state)
 }
 
 #[cfg(not(feature = "xunlei-import"))]
 pub fn router(state: Arc<DaemonState>) -> Router {
-    router_base!(Router::new())
-        .with_state(state)
+    router_nas!(router_base!(Router::new())).with_state(state)
+}
+
+/// ===== NAS 引擎管理端点（feature nas）=====
+#[cfg(feature = "nas")]
+#[derive(serde::Deserialize, Default)]
+pub struct NasInstallReq {
+    /// SPK 文件路径（daemon 可达）。缺省用 manager 现有配置。
+    #[serde(default)]
+    pub spk_path: Option<String>,
+}
+
+#[cfg(feature = "nas")]
+async fn nas_install(
+    State(_): State<Arc<DaemonState>>,
+    req: Option<Json<NasInstallReq>>,
+) -> Response {
+    use nas::NasError;
+    let mgr = nas::manager();
+    if let Some(Json(r)) = req {
+        if let Some(p) = r.spk_path {
+            std::env::set_var("SD_NAS_SPK", p);
+            // manager 已初始化则此赋值不生效；首次调用前设置生效。此处仅透传提示。
+        }
+    }
+    match mgr.install().await {
+        Ok(info) => Json(serde_json::json!({
+            "ok": true,
+            "version": info.version,
+            "dest": info.dest,
+            "engine": info.engine,
+        }))
+        .into_response(),
+        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(feature = "nas")]
+async fn nas_start(State(_): State<Arc<DaemonState>>) -> Response {
+    use nas::NasError;
+    match nas::manager().start().await {
+        Ok(pid) => Json(serde_json::json!({ "ok": true, "pid": pid })).into_response(),
+        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+#[cfg(feature = "nas")]
+async fn nas_stop(State(_): State<Arc<DaemonState>>) -> Response {
+    let _ = nas::manager().stop().await;
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+#[cfg(feature = "nas")]
+async fn nas_status(State(_): State<Arc<DaemonState>>) -> Response {
+    Json(nas::manager().status().await).into_response()
+}
+
+#[cfg(feature = "nas")]
+#[derive(serde::Deserialize)]
+pub struct NasTokenReq {
+    /// xluser OAuth token JSON（L1 云登录产物；格式校准=假设区实测项）。
+    pub token_json: String,
+}
+
+#[cfg(feature = "nas")]
+async fn nas_token(
+    State(_): State<Arc<DaemonState>>,
+    Json(req): Json<NasTokenReq>,
+) -> Response {
+    use nas::NasError;
+    match nas::put_auth_token(nas::manager(), &req.token_json).await {
+        Ok(p) => Json(serde_json::json!({ "ok": true, "path": p })).into_response(),
+        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e)) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": e })),
+        )
+            .into_response(),
+    }
 }

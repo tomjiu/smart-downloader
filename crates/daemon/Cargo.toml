@@ -14,6 +14,8 @@ xunlei-import = ["dep:xunlei-convert", "bt"]
 # F5 P2SP：云盘直链 web seed 注入（POST /tasks/:id/webseeds）。e2e 测试门控，
 # 隐含 bt（验收命令 `--features bt webseed` 对空格分隔/测试名过滤两种解析均兼容）。
 webseed = ["bt"]
+# NAS 版迅雷引擎托管（xllite/pan-cli，Linux-only；附录 E-2026-08-30）。
+nas = []
 # FTP 引擎（D12：并入 httpdl，feature-gated）。
 ftp = ["smart-dl-httpdl/ftp"]
 
