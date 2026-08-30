@@ -14,6 +14,8 @@ pub mod task;
 pub mod types;
 pub mod bencode;
 pub mod xltd;
+pub mod sniffer;
+pub mod strategy;
 
 pub use dedup::{DedupIndex, DedupOutcome};
 pub use heat::{heat_level, heat_score, HeatEvaluator, HeatLevel};
@@ -21,6 +23,7 @@ pub use identity::{CanonicalId, CanonicalKind, ContentIdentity, Validator};
 pub use ownership::{FallbackDecision, FallbackPolicy, KeepLarger, MetadataAction};
 pub use registry::{EngineRegistry, QueueOutcome, RegistryError, RoutingError, TaskQueue};
 pub use router::{RouteDecision, Router};
+pub use source_parse::ed2k::{parse_ed2k, Ed2kError, Ed2kLink};
 pub use state_machine::{EvalPhase, InvalidTransition, StateMachine, TaskState, TransitionCtx};
 pub use task::{DownloadTask, FileState, TaskFile, TaskId, TaskMetadata};
 pub use types::{

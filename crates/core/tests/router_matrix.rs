@@ -104,8 +104,21 @@ fn ftp_routes_to_feature_disabled_when_missing() {
 #[test]
 fn ed2k_routes_to_failed() {
     let reg = registry_with(MockEngine::bt(), MockEngine::http(), None);
-    let r = reg.select(&DownloadSource::Ed2k("ed2k://|file|x|1|h=abc|/".into()));
-    assert!(matches!(r, Err(RoutingError::Unsupported(ref s)) if s == "ed2k"));
+    // 合法 ed2k（Task 5-a T3）：已识别 → 暂不支持下载，携带元数据
+    let r = reg.select(&DownloadSource::Ed2k(
+        "ed2k://|file|x|1|0123456789abcdef0123456789abcdef|/".into(),
+    ));
+    match r {
+        Err(RoutingError::Ed2kNotSupported { name, size, md4 }) => {
+            assert_eq!(name, "x");
+            assert_eq!(size, 1);
+            assert_eq!(md4, "0123456789abcdef0123456789abcdef");
+        }
+        other => panic!("expected Ed2kNotSupported, got {other:?}"),
+    }
+    // 非法 ed2k（md4 槽位缺失）→ Unsupported（报错可读）
+    let bad = reg.select(&DownloadSource::Ed2k("ed2k://|file|x|1|h=abc|/".into()));
+    assert!(matches!(&bad, Err(RoutingError::Unsupported(s)) if s.contains("ed2k")));
 }
 
 #[test]

@@ -4,6 +4,7 @@
 //! - `thunder://` 内容 = base64("AA" + 真实URL + "ZZ")（§7.1 D36）
 //! - `qqdl://`  内容 = base64(真实URL)，无 AA/ZZ 壳
 
+use crate::source_parse::ed2k::parse_ed2k;
 use crate::source_parse::thunder::{decode_base64_lenient, decode_thunder};
 use crate::source_parse::xunlei_share::parse_xunlei_share;
 
@@ -65,8 +66,18 @@ pub fn normalize_user_link(link: &str) -> NormalizedSource {
     if link.starts_with("magnet:") {
         return NormalizedSource::Magnet(link.to_string());
     }
-    if link.starts_with("ed2k://") {
-        return NormalizedSource::Ed2k(link.to_string());
+    if link
+        .get(..7)
+        .map(|p| p.eq_ignore_ascii_case("ed2k://"))
+        .unwrap_or(false)
+    {
+        // ed2k（Task 5-a T3）：结构化解析（名称/大小/MD4）。
+        // 完整引擎在远期（BACKLOG C 段）：合法链接分类为 Ed2k（路由层给出
+        // 携带 md4/size 元数据的明确错误）；非法链接 → Unsupported（报错可读）。
+        return match parse_ed2k(link) {
+            Ok(_) => NormalizedSource::Ed2k(link.to_string()),
+            Err(e) => NormalizedSource::Unsupported(format!("ed2k 链接解析失败: {e}")),
+        };
     }
     // 迅雷网盘分享链接（pan.xunlei.com/s/xxx?pwd=yyy）
     if link.contains("pan.xunlei.com/s/") {
@@ -161,10 +172,31 @@ mod tests {
 
     #[test]
     fn ed2k_classified() {
+        // Task 5-a T3：合法 ed2k → Ed2k 分类（结构化解析见 ed2k.rs）
         assert_eq!(
-            normalize_user_link("ed2k://file|a|1|hash|"),
-            NormalizedSource::Ed2k("ed2k://file|a|1|hash|".into())
+            normalize_user_link("ed2k://|file|a.bin|1|0123456789abcdef0123456789abcdef|/"),
+            NormalizedSource::Ed2k("ed2k://|file|a.bin|1|0123456789abcdef0123456789abcdef|/".into())
         );
+    }
+
+    #[test]
+    fn ed2k_case_insensitive_scheme_classified() {
+        assert!(matches!(
+            normalize_user_link("ED2K://|file|a.bin|1|0123456789abcdef0123456789abcdef|/"),
+            NormalizedSource::Ed2k(_)
+        ));
+    }
+
+    #[test]
+    fn ed2k_bad_md4_is_unsupported() {
+        // 非法 ed2k（md4 槽位不是 32 位十六进制）→ Unsupported（报错可读）
+        match normalize_user_link("ed2k://file|a|1|hash|") {
+            NormalizedSource::Unsupported(msg) => {
+                assert!(msg.contains("ed2k 链接解析失败"), "msg={msg}");
+                assert!(msg.contains("MD4"), "msg={msg}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 
     #[test]
