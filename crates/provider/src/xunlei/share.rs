@@ -1,11 +1,19 @@
 //! 迅雷云盘「分享链接解析」库模块。
 //!
 //! 移植自 `scripts/research/cloud_delivery/share_dl/` 下的一手实测脚本。
-//! 注意：本模块实现的是「匿名（免登录）」取链链路，而**实测结论是这条链路无法完整跑通**
-//! （详见各端点注释里的「失败结论」），故所有网络方法均为「可调用但未经验证可用」，
-//! 仅 `parse_share_link` 是纯函数且已充分单测。
+//! 本模块含两条链路：
+//!
+//! 1. **匿名链路**（`list`/`resolve`）：**实测结论是这条链路无法完整跑通**
+//!    （`share/detail` 返回 `400 no client info found`，见各端点注释里的「失败结论」），
+//!    保留作对照与调试基线。
+//! 2. **登录态链路**（`list_with_auth`/`resolve_with_auth`，2026-08-30 新增）：
+//!    与 `client.rs` 的 `list_files`/`resolve_link`（实测验证过的同族端点）共用
+//!    三要素登录态头（Bearer + x-device-id + x-captcha-token），仅在 pass_code_token
+//!    的获取端点上按 B 级证据推断（`POST /drive/v1/share/verify`）。【B级待验】：
+//!    端点形状按一手实测脚本还原，网络验证待登录态会话。
 
-use crate::xunlei::client::{CLIENT_ID, CLIENT_VERSION, PAN_BASE, XLUSER_BASE};
+use crate::xunlei::auth::AuthState;
+use crate::xunlei::client::{Client, CLIENT_ID, CLIENT_VERSION, PAN_BASE, XLUSER_BASE};
 use crate::xunlei::sign::{captcha_sign, device_id_32, PACKAGE_NAME};
 use md5::{Digest as Md5Digest, Md5};
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
@@ -255,6 +263,124 @@ impl Sharer {
         Ok(body.captcha_token)
     }
 
+    /// 提取码校验（登录态版）：pwd → pass_code_token。【B级待验】
+    ///
+    /// 与匿名版同端点（`POST /drive/v1/share/verify`），差异仅在鉴权头：
+    /// 登录态下带 `Client::auth_headers`（Bearer + 会话 device_id + 会话 captcha_token），
+    /// 这与桌面 App 登录态打开带提取码分享的行为一致（web 前端在登录态下走同一 drive API）。
+    async fn verify_pass_code_authed(
+        &self,
+        link: &SharedLink,
+        state: &AuthState,
+    ) -> Result<String, ShareError> {
+        #[derive(Deserialize)]
+        struct VerifyResp {
+            #[serde(default)]
+            pass_code_token: String,
+            #[serde(default)]
+            data: serde_json::Value,
+        }
+
+        let resp = self
+            .http
+            .post(format!("{}/drive/v1/share/verify", PAN_BASE))
+            .headers(authed_share_headers(state))
+            .json(&serde_json::json!({
+                "share_id": link.share_id,
+                "pass_code": link.pass_code.clone().unwrap_or_default(),
+            }))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let (s, b) = status_body(resp).await;
+            return Err(ShareError::PassCodeVerify { status: s, body: b });
+        }
+        let body: VerifyResp = resp.json().await?;
+        let token = if !body.pass_code_token.is_empty() {
+            body.pass_code_token
+        } else if let Some(t) = body.data.get("pass_code_token").and_then(|v| v.as_str()) {
+            t.to_string()
+        } else {
+            return Err(ShareError::MissingPassCodeToken);
+        };
+        Ok(token)
+    }
+
+    /// 登录态全流程：会话三要素头 → 分享详情 →（需要时）提码校验 → 文件列表。
+    ///
+    /// 【B级待验】与 `client.rs::list_files`（实测验证过的同族 drive API）同一套登录态头；
+    /// 与匿名版 `list` 的差异：
+    /// 1. 鉴权头换成 `authed_share_headers(state)`（Bearer + 会话 device_id + 会话 captcha_token）——
+    ///    匿名链路实测死于 `400 no client info found`（api-pan 认登录态不认匿名 xluser token），
+    ///    登录态正是该错误的对症解；
+    /// 2. device_id 用会话的（`device_id_32(&state.device_id)`），与 captcha/init 口径一致；
+    /// 3. 提取码校验走 `verify_pass_code_authed`（带登录态重试同端点）。
+    /// 网络验证待登录态会话（同 VIP 通道 UNTESTED 模式）。
+    pub async fn list_with_auth(
+        &self,
+        link: &SharedLink,
+        state: &AuthState,
+    ) -> Result<Vec<SharedFile>, ShareError> {
+        // 若带提取码，先校验拿到 pass_code_token 并缓存（list→resolve 复用）。
+        if link.pass_code.is_some() {
+            let token = self.verify_pass_code_authed(link, state).await?;
+            *self.pass_token.lock().unwrap() = Some(token);
+        }
+        let pass_token = self.pass_token.lock().unwrap().clone();
+
+        let url = build_share_detail_url(&link.share_id, pass_token.as_deref());
+        let resp = self
+            .http
+            .get(&url)
+            .headers(authed_share_headers(state))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let (s, b) = status_body(resp).await;
+            return Err(ShareError::ShareDetail { status: s, body: b });
+        }
+        let detail: Detail = resp.json().await?;
+        Ok(detail
+            .files
+            .into_iter()
+            .map(|f| SharedFile {
+                id: f.id,
+                name: f.name,
+                size: parse_size(&f.size),
+                is_folder: f.kind.ends_with("folder"),
+            })
+            .collect())
+    }
+
+    /// 登录态对单个分享文件取直链。【B级待验】同 `list_with_auth`。
+    ///
+    /// 直链 URL 形状沿用匿名版实测的最可能路径（一手实测 line 325，A 级形状）：
+    /// `GET /drive/v1/files/{fid}?space=&usage=PLAY&share_id=..&pass_code_token=..`，
+    /// 差异仅在鉴权头换登录态三件套（`files` API 实测需有效 Bearer，见
+    /// CAPTCHA_APP_RESULT 步骤 2 的 401——登录态正是 401 的对症解）。
+    pub async fn resolve_with_auth(
+        &self,
+        link: &SharedLink,
+        file_id: &str,
+        state: &AuthState,
+    ) -> Result<ResolvedLink, ShareError> {
+        let pass_token = self.pass_token.lock().unwrap().clone();
+        let url = build_share_play_url(file_id, &link.share_id, pass_token.as_deref());
+
+        let resp = self
+            .http
+            .get(&url)
+            .headers(authed_share_headers(state))
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let (s, b) = status_body(resp).await;
+            return Err(ShareError::ResolvePlay { status: s, body: b });
+        }
+        let body_text = resp.text().await.unwrap_or_default();
+        parse_play_body(body_text)
+    }
+
     /// 提取码校验：pwd → pass_code_token。
     ///
     /// **【B级 · 推断】** 来源 `verify_share_nologin.py` step_4 的候选端点之一
@@ -324,36 +450,11 @@ impl Sharer {
         // **【失败结论 · 一手实测】** `SHARE_NOLOGIN_RESULT.md` 2.1 记录：
         // - 不带任何 token → `400 captcha_token is empty`
         // - 带 xluser-ssl 的 captcha_token → `400 no client info found`（api-pan 不认 xluser 的 token）
-        // 即 `share/detail` 在匿名链路下**实测必然失败**。此处仍按形态实现，错误体会透传给调用方。
+        // 即 `share/detail` 在匿名链路下**实测必然失败**。此处仍按形态实现，错误体会透传给调用方；
+        // 登录态对症版本见 `list_with_auth`。
         let pass_token = self.pass_token.lock().unwrap().clone();
 
-        #[derive(Deserialize)]
-        struct Detail {
-            #[serde(default)]
-            files: Vec<RawFile>,
-        }
-        #[derive(Deserialize)]
-        struct RawFile {
-            #[serde(default)]
-            id: String,
-            #[serde(default)]
-            name: String,
-            /// `drive#folder` / `drive#file`
-            #[serde(default, rename = "kind")]
-            kind: String,
-            /// size 实测为字符串（与 list_files 一致），也兼容数字。
-            #[serde(default)]
-            size: serde_json::Value,
-        }
-
-        let mut url = format!(
-            "{}/drive/v1/share/detail?share_id={}&parent_id=&usage=CONSUME&limit=100",
-            PAN_BASE,
-            urlencode(&link.share_id)
-        );
-        if let Some(t) = &pass_token {
-            url.push_str(&format!("&pass_code_token={}", urlencode(t)));
-        }
+        let url = build_share_detail_url(&link.share_id, pass_token.as_deref());
 
         let resp = self
             .http
@@ -399,15 +500,7 @@ impl Sharer {
         let device_id = device_id_32(&full_dev);
         let pass_token = self.pass_token.lock().unwrap().clone();
 
-        let mut url = format!(
-            "{}/drive/v1/files/{}?space=&usage=PLAY&share_id={}",
-            PAN_BASE,
-            urlencode(file_id),
-            urlencode(&link.share_id)
-        );
-        if let Some(t) = &pass_token {
-            url.push_str(&format!("&pass_code_token={}", urlencode(t)));
-        }
+        let url = build_share_play_url(file_id, &link.share_id, pass_token.as_deref());
 
         let resp = self
             .http
@@ -420,29 +513,100 @@ impl Sharer {
             return Err(ShareError::ResolvePlay { status: s, body: b });
         }
         let body_text = resp.text().await.unwrap_or_default();
-        #[derive(Deserialize)]
-        struct Play {
-            #[serde(default)]
-            web_content_link: String,
-            #[serde(default)]
-            size: Option<u64>,
-        }
-        let play: Play = serde_json::from_str(&body_text)
-            .map_err(|_| ShareError::NoLink { body: body_text.clone() })?;
-        if play.web_content_link.is_empty() {
-            return Err(ShareError::NoLink { body: body_text });
-        }
-        let size = play
-            .size
-            .or_else(|| url_query_u64(&play.web_content_link, "f"))
-            .unwrap_or(0);
-        let expires_at = url_query_u64(&play.web_content_link, "e");
-        Ok(ResolvedLink {
-            url: play.web_content_link,
-            size,
-            expires_at,
-        })
+        parse_play_body(body_text)
     }
+}
+
+/// 纯函数：分享详情 URL（匿名/登录态共用，B 级形状还原自 verify_share_nologin.py line 24）。
+pub(crate) fn build_share_detail_url(share_id: &str, pass_code_token: Option<&str>) -> String {
+    let mut url = format!(
+        "{}/drive/v1/share/detail?share_id={}&parent_id=&usage=CONSUME&limit=100",
+        PAN_BASE,
+        urlencode(share_id)
+    );
+    if let Some(t) = pass_code_token {
+        url.push_str(&format!("&pass_code_token={}", urlencode(t)));
+    }
+    url
+}
+
+/// 纯函数：分享取直链 URL（匿名/登录态共用，A 级形状还原自 verify_share_nologin.py line 325）。
+pub(crate) fn build_share_play_url(file_id: &str, share_id: &str, pass_code_token: Option<&str>) -> String {
+    let mut url = format!(
+        "{}/drive/v1/files/{}?space=&usage=PLAY&share_id={}",
+        PAN_BASE,
+        urlencode(file_id),
+        urlencode(share_id)
+    );
+    if let Some(t) = pass_code_token {
+        url.push_str(&format!("&pass_code_token={}", urlencode(t)));
+    }
+    url
+}
+
+/// 登录态 share 请求头：`client.rs::auth_headers`（实测验证过的三要素）+ web 分享页 Referer/Origin。
+///
+/// 三要素口径与 `list_files`/`resolve_link` 完全一致（Bearer + device_id_32(会话设备号) +
+/// 会话 captcha_token），Referer/Origin 沿用匿名版 `share_headers` 的 web 形状。
+pub(crate) fn authed_share_headers(state: &AuthState) -> reqwest::header::HeaderMap {
+    let mut h = Client::auth_headers(state);
+    h.insert(
+        reqwest::header::REFERER,
+        reqwest::header::HeaderValue::from_static("https://pan.xunlei.com/"),
+    );
+    h.insert(
+        reqwest::header::ORIGIN,
+        reqwest::header::HeaderValue::from_static("https://pan.xunlei.com"),
+    );
+    h
+}
+
+/// share/detail 响应的文件条目（匿名/登录态共用）。
+#[derive(Deserialize)]
+struct RawFile {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    name: String,
+    /// `drive#folder` / `drive#file`
+    #[serde(default, rename = "kind")]
+    kind: String,
+    /// size 实测为字符串（与 list_files 一致），也兼容数字。
+    #[serde(default)]
+    size: serde_json::Value,
+}
+
+/// share/detail 响应体（匿名/登录态共用）。
+#[derive(Deserialize)]
+struct Detail {
+    #[serde(default)]
+    files: Vec<RawFile>,
+}
+
+/// 解析 `files/{id}?usage=PLAY` 响应体 → 直链（匿名/登录态共用）。
+fn parse_play_body(body_text: String) -> Result<ResolvedLink, ShareError> {
+    #[derive(Deserialize)]
+    struct Play {
+        #[serde(default)]
+        web_content_link: String,
+        #[serde(default)]
+        size: Option<u64>,
+    }
+    let play: Play = serde_json::from_str(&body_text)
+        .map_err(|_| ShareError::NoLink { body: body_text.clone() })?;
+    if play.web_content_link.is_empty() {
+        return Err(ShareError::NoLink { body: body_text });
+    }
+    let size = play
+        .size
+        .or_else(|| url_query_u64(&play.web_content_link, "f"))
+        .unwrap_or(0);
+    let expires_at = url_query_u64(&play.web_content_link, "e");
+    Ok(ResolvedLink {
+        url: play.web_content_link,
+        size,
+        expires_at,
+    })
 }
 
 impl Default for Sharer {
@@ -669,5 +833,91 @@ mod tests {
         assert_eq!(parse_size(&serde_json::json!(678)), 678);
         assert_eq!(parse_size(&serde_json::json!("notnum")), 0);
         assert_eq!(parse_size(&serde_json::json!(null)), 0);
+    }
+
+    // ============ 登录态链路（list_with_auth / resolve_with_auth）纯函数测试 ============
+    // 网络方法 UNTESTED（待登录态会话），此处先锁定 URL 与请求头的还原形状。
+
+    fn test_auth_state() -> AuthState {
+        AuthState {
+            access_token: "at.x".into(),
+            refresh_token: "rt.x".into(),
+            device_id: "wdi10.0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .into(),
+            captcha_token: "ck0.t".into(),
+            user_id: "860599297".into(),
+            access_token_expires_at: u64::MAX,
+            captcha_token_expires_at: u64::MAX,
+        }
+    }
+
+    #[test]
+    fn share_detail_url_shape_with_and_without_pass_token() {
+        let u0 = build_share_detail_url("VP-cAuy04PiKRmKkFAvDLJgqA1", None);
+        assert!(u0.starts_with(
+            "https://api-pan.xunlei.com/drive/v1/share/detail?share_id=VP-cAuy04PiKRmKkFAvDLJgqA1&parent_id=&usage=CONSUME&limit=100"
+        ));
+        assert!(!u0.contains("pass_code_token"));
+
+        let u1 = build_share_detail_url("VP-cAuy04PiKRmKkFAvDLJgqA1", Some("pct.abc"));
+        assert!(u1.contains("&pass_code_token=pct.abc"));
+    }
+
+    #[test]
+    fn share_play_url_shape_matches_field_evidence() {
+        // A 级形状（verify_share_nologin.py line 325）：
+        // /drive/v1/files/{fid}?space=&usage=PLAY&share_id=..&pass_code_token=..
+        let u = build_share_play_url("file-1", "share-1", Some("tok"));
+        assert!(u.starts_with(
+            "https://api-pan.xunlei.com/drive/v1/files/file-1?space=&usage=PLAY&share_id=share-1"
+        ));
+        assert!(u.ends_with("&pass_code_token=tok"));
+        // 无提码 token 时不得出现空参
+        let u0 = build_share_play_url("file-1", "share-1", None);
+        assert!(!u0.contains("pass_code_token"));
+    }
+
+    #[test]
+    fn authed_share_headers_match_client_three_elements_plus_web() {
+        let state = test_auth_state();
+        let h = authed_share_headers(&state);
+        assert_eq!(
+            h.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer at.x")
+        );
+        let expected_device: String = device_id_32(&state.device_id).to_string();
+        assert_eq!(
+            h.get("x-device-id").and_then(|v| v.to_str().ok()),
+            Some(expected_device.as_str())
+        );
+        assert_eq!(
+            h.get("x-captcha-token").and_then(|v| v.to_str().ok()),
+            Some("ck0.t")
+        );
+        assert_eq!(
+            h.get("referer").and_then(|v| v.to_str().ok()),
+            Some("https://pan.xunlei.com/")
+        );
+        assert_eq!(
+            h.get("origin").and_then(|v| v.to_str().ok()),
+            Some("https://pan.xunlei.com")
+        );
+    }
+
+    #[test]
+    fn parse_play_body_resolves_size_and_expiry() {
+        let body = r#"{"web_content_link":"https://dl.xunlei.com/f?e=1700000000&f=12345"}"#.to_string();
+        let r = parse_play_body(body).expect("应解析出直链");
+        assert_eq!(r.size, 12345);
+        assert_eq!(r.expires_at, Some(1700000000));
+        assert!(r.url.contains("dl.xunlei.com"));
+    }
+
+    #[test]
+    fn parse_play_body_missing_link_is_no_link_error() {
+        let r = parse_play_body(r#"{"error":"nothing"}"#.to_string());
+        assert!(matches!(r, Err(ShareError::NoLink { .. })));
+        let r2 = parse_play_body("not json".to_string());
+        assert!(matches!(r2, Err(ShareError::NoLink { .. })));
     }
 }
