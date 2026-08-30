@@ -15,9 +15,10 @@ use std::sync::Arc;
 
 async fn serve() -> (std::net::SocketAddr, Arc<DaemonState>) {
     let engine = HttpEngine::new(reqwest::Client::new());
-    let state = DaemonState::new(Arc::new(engine), vec![]);
+    // bt 构建下注入 BtEngine；非 bt 构建纯 HTTP（双态声明，两个 cfg 均零警告）
     #[cfg(feature = "bt")]
-    {
+    let state = {
+        let base = DaemonState::new(Arc::new(engine), vec![]);
         let tmp = tempfile::tempdir().expect("tempdir");
         let bt = smart_dl_daemon::bt::BtEngine::new(
             tmp.path(),
@@ -29,8 +30,10 @@ async fn serve() -> (std::net::SocketAddr, Arc<DaemonState>) {
             false,
         )
         .expect("bt engine");
-        state = state.with_bt(Arc::new(bt));
-    }
+        base.with_bt(Arc::new(bt))
+    };
+    #[cfg(not(feature = "bt"))]
+    let state = DaemonState::new(Arc::new(engine), vec![]);
     let state = Arc::new(state);
     let app = http::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

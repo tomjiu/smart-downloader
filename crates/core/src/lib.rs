@@ -11,6 +11,7 @@ pub mod session;
 pub mod source_parse;
 pub mod state_machine;
 pub mod task;
+pub mod torrent_meta;
 pub mod types;
 pub mod bencode;
 pub mod xltd;
@@ -24,6 +25,8 @@ pub use ownership::{FallbackDecision, FallbackPolicy, KeepLarger, MetadataAction
 pub use registry::{EngineRegistry, QueueOutcome, RegistryError, RoutingError, TaskQueue};
 pub use router::{RouteDecision, Router};
 pub use source_parse::ed2k::{parse_ed2k, Ed2kError, Ed2kLink};
+pub use source_parse::magnet::{parse_magnet, MagnetError, MagnetInfo};
+pub use torrent_meta::{parse_torrent, TorrentFileMeta, TorrentSummary};
 pub use state_machine::{EvalPhase, InvalidTransition, StateMachine, TaskState, TransitionCtx};
 pub use task::{DownloadTask, FileState, TaskFile, TaskId, TaskMetadata};
 pub use types::{

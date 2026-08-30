@@ -112,6 +112,173 @@ async fn task_fallback(
     }
 }
 
+/// `POST /bt/metadata`（B-1）：magnet → .torrent 元数据抓取（预览/预取 sidecar，
+/// 不建任务、不进 registry）。单并发（进行中 → 409）。
+#[derive(Deserialize)]
+pub struct MagnetMetaReq {
+    pub magnet: String,
+    /// 抓取总超时（秒）；缺省 60，clamp 5..=600。
+    #[serde(default)]
+    pub timeout_s: Option<u64>,
+    /// DHT 开关；缺省 true（内网/直连场景可关）。
+    #[serde(default)]
+    pub dht: Option<bool>,
+    /// 追加 tracker（magnet 自带 tr 之外）。
+    #[serde(default)]
+    pub trackers: Vec<String>,
+    /// 已知 peer 引导（`ip:port`；本地 seeder / 手动注入）。
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// 可选：成功后将 .torrent 落盘到该路径（父目录须存在）。
+    #[serde(default)]
+    pub save_to: Option<String>,
+}
+
+#[cfg(feature = "bt")]
+async fn bt_magnet_metadata(
+    State(_state): State<Arc<DaemonState>>,
+    Json(req): Json<MagnetMetaReq>,
+) -> impl IntoResponse {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static BUSY: AtomicBool = AtomicBool::new(false);
+
+    // 参数面校验（同步、快）：magnet / peers / timeout
+    let peers: Vec<std::net::SocketAddr> = match req
+        .peers
+        .iter()
+        .map(|s| s.parse::<std::net::SocketAddr>())
+        .collect()
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": format!("peers 解析失败: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let timeout = std::time::Duration::from_secs(req.timeout_s.unwrap_or(60).clamp(5, 600));
+    let opts = smart_dl_btcore::magnet::FetchOpts {
+        timeout,
+        extra_trackers: req.trackers.clone(),
+        bootstrap_peers: peers,
+        enable_dht: req.dht.unwrap_or(true),
+        ..Default::default()
+    };
+    let magnet = req.magnet.clone();
+    let save_to = req.save_to.clone();
+
+    if BUSY
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "已有 metadata 抓取进行中（单并发）" })),
+        )
+            .into_response();
+    }
+    let result = run_magnet_fetch(&magnet, &opts, save_to.as_deref()).await;
+    BUSY.store(false, Ordering::SeqCst);
+
+    match result {
+        Ok(body) => Json(body).into_response(),
+        Err((code, msg)) => (code, Json(serde_json::json!({ "error": msg }))).into_response(),
+    }
+}
+
+/// 抓取执行体（spawn_blocking 包装阻塞流程 + 临时 scratch 目录管理）。
+#[cfg(feature = "bt")]
+async fn run_magnet_fetch(
+    magnet: &str,
+    opts: &smart_dl_btcore::magnet::FetchOpts,
+    save_to: Option<&str>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    use smart_dl_btcore::magnet::{fetch_metadata, FetchError};
+
+    let scratch = std::env::temp_dir().join(format!(
+        "smart-dl-magnet-fetch-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0)
+    ));
+    if let Err(e) = std::fs::create_dir_all(&scratch) {
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("scratch 目录创建失败: {e}"),
+        ));
+    }
+
+    let m = magnet.to_string();
+    let o = opts.clone();
+    let scratch_for_task = scratch.clone();
+    let res = tokio::task::spawn_blocking(move || fetch_metadata(&m, &scratch_for_task, &o))
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("抓取任务 join 失败: {e}")))
+        .and_then(|r| {
+            r.map_err(|e| match e {
+                FetchError::Magnet(_) | FetchError::Summary(_) => {
+                    (StatusCode::BAD_REQUEST, e.to_string())
+                }
+                FetchError::Timeout { .. } => (StatusCode::REQUEST_TIMEOUT, e.to_string()),
+                FetchError::Ffi(_) | FetchError::Other(_) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+                }
+            })
+        });
+
+    // scratch 目录 best-effort 清理（含抓取中途的部分文件）
+    let _ = std::fs::remove_dir_all(&scratch);
+    let fetched = res?;
+
+    // 可选落盘（父目录须存在；写失败 → 500）
+    let mut saved_to: Option<String> = None;
+    if let Some(dest) = save_to {
+        std::fs::write(dest, &fetched.torrent).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(".torrent 落盘失败 {dest}: {e}"),
+            )
+        })?;
+        saved_to = Some(dest.to_string());
+    }
+
+    let s = &fetched.summary;
+    Ok(serde_json::json!({
+        "infohash": fetched.infohash,
+        "name": s.name,
+        "total_size": s.total_size,
+        "piece_len": s.piece_len,
+        "num_pieces": s.num_pieces,
+        "files": s.files.iter().map(|f| serde_json::json!({
+            "path": f.path,
+            "size": f.size,
+        })).collect::<Vec<_>>(),
+        "trackers": s.trackers,
+        "web_seeds": s.web_seeds,
+        "comment": s.comment,
+        "created_by": s.created_by,
+        "torrent_b64": base64::engine::general_purpose::STANDARD.encode(&fetched.torrent),
+        "saved_to": saved_to,
+    }))
+}
+
+#[cfg(not(feature = "bt"))]
+async fn bt_magnet_metadata(
+    State(_state): State<Arc<DaemonState>>,
+    Json(req): Json<MagnetMetaReq>,
+) -> impl IntoResponse {
+    let _ = req; // 参数不校验：无 BT 引擎的构建里该端点恒不可用
+    (
+        StatusCode::BAD_REQUEST,
+        Json(serde_json::json!({ "error": "metadata 抓取需 BT 引擎（编译时启用 --features daemon/bt）" })),
+    )
+}
+
 /// `GET /config`：生效配置快照（serve 注入；未注入时提示）。
 async fn config_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     Json(state.config_snapshot())
@@ -374,6 +541,7 @@ macro_rules! router_base {
             .route("/tasks/:id/logs", get(task_logs))
             .route("/tasks/:id/fallback", post(task_fallback))
             .route("/tasks/:id/webseeds", post(task_webseeds))
+            .route("/bt/metadata", post(bt_magnet_metadata))
             .route("/config", get(config_endpoint))
             .route("/providers", get(providers))
             .route("/ws", get(ws_handler))

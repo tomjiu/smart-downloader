@@ -134,6 +134,13 @@ lt_err lt_set_limits(lt_session* s, const char* ih, int64_t down_limit, int64_t 
 /* —— 块读取（v2；async read_piece → 轮询取数）—— */
 lt_err lt_read_piece(lt_session* s, const char* ih, int idx, uint8_t* buf, size_t buflen, size_t* out_len);
 
+/* —— torrent 元数据导出（B-1：magnet → .torrent）——
+   须已收到 metadata（magnet 场景等 status.metadata_received）；
+   未就绪/任务不存在 → LT_ERR_NOT_FOUND（err_str 区分）；
+   cap 不足 → LT_ERR_BUFFER_TOO_SMALL（out_len=实际长度，Rust 扩容重试）。
+   产物 = 标准 .torrent bencode（info dict + announce 族；由 create_torrent(ti).generate() 生成）。 */
+lt_err lt_metadata(lt_session* s, const char* ih, uint8_t* buf, size_t cap, size_t* out_len);
+
 #ifdef __cplusplus
 }
 #endif

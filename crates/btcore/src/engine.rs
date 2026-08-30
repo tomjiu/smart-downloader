@@ -255,6 +255,14 @@ impl BtCore {
     pub fn read_piece(&self, ih: &str, idx: i32) -> ffi::Result<Option<Vec<u8>>> {
         self.sess.read_piece(ih, idx)
     }
+
+    // —— 元数据导出（B-1：magnet → .torrent） ——
+
+    /// 已收 metadata 的任务 → 标准 .torrent bencode；
+    /// 未就绪 → Ok(None)（magnet 场景调用方先轮询 status.metadata_received）。
+    pub fn metadata(&self, ih: &str) -> ffi::Result<Option<Vec<u8>>> {
+        self.sess.metadata(ih)
+    }
 }
 
 #[cfg(test)]

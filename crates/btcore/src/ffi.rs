@@ -536,6 +536,34 @@ impl Session {
             }
         }
     }
+
+    /// torrent 元数据导出（B-1：magnet → .torrent）。
+    /// Ok(None) = metadata 未就绪（调用方先轮询 status.metadata_received）；
+    /// Ok(Some(bytes)) = 标准 .torrent bencode。
+    pub fn metadata(&self, ih: &str) -> Result<Option<Vec<u8>>> {
+        let i = self.ih(ih)?;
+        // 初始 64 KiB：绝大多数 .torrent 在此以内（超限自动扩容一次到位）
+        let mut cap = 64 * 1024usize;
+        loop {
+            let mut buf = vec![0u8; cap];
+            let mut n: usize = 0;
+            let code = unsafe {
+                lt_metadata(self.raw, i.as_ptr(), buf.as_mut_ptr(), buf.len(), &mut n)
+            };
+            match code {
+                lt_err_LT_OK => {
+                    buf.truncate(n);
+                    return Ok(Some(buf));
+                }
+                lt_err_LT_ERR_NOT_FOUND => return Ok(None),
+                lt_err_LT_ERR_BUFFER_TOO_SMALL => {
+                    cap = n.max(cap * 2);
+                    continue;
+                }
+                c => return Err(Error::from(c)),
+            }
+        }
+    }
 }
 
 fn ih_str(ih: &[c_char; 41]) -> String {

@@ -494,6 +494,17 @@ unsafe extern "C" {
         out_len: *mut usize,
     ) -> lt_err;
 }
+unsafe extern "C" {
+    /// B-1：torrent 元数据导出（metadata 未就绪 → LT_ERR_NOT_FOUND；
+    /// cap 不足 → LT_ERR_BUFFER_TOO_SMALL + out_len=实际长度）。与 lt.h 同步。
+    pub fn lt_metadata(
+        s: *mut lt_session,
+        ih: *const ::std::os::raw::c_char,
+        buf: *mut u8,
+        cap: usize,
+        out_len: *mut usize,
+    ) -> lt_err;
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct __crt_locale_data {

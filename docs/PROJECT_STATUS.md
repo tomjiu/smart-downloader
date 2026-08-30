@@ -15,6 +15,7 @@
 | HTTP/HTTPS 下载 | ✅ | `crates/httpdl`，多连接、Range、backup_url/backup_md5 备用源 |
 | FTP 下载 | ✅ | `crates/httpdl/src/protocol/ftp.rs`，含目录遍历 |
 | BT 引擎（libtorrent 基座） | ✅ | `crates/btcore`，M0  matured，支持 magnet/torrent/resume |
+| magnet → .torrent 元数据抓取 | ✅ | `btcore::magnet::fetch_metadata` + `POST /bt/metadata`（B-1，见 §一·未完成表历史） |
 | 任务生命周期 | ✅ | add/pause/resume/remove/list/status，daemon HTTP API |
 | 迅雷链接解码 | ✅ | `thunder://` / `qqdl://` 解码为 HTTP URL |
 | 迅雷网盘分享解析 | ✅ | `pan.xunlei.com/s/xxx?pwd=yyy` 解析 |
@@ -26,10 +27,10 @@
 
 | 能力 | 状态 | 说明 |
 |------|------|------|
-| Magnet 直链解析 | 🔶 部分 | 有 `bencode_info_hash`，但缺少完整 magnet → torrent 抓取 |
-| BT 子文件选择 | 🔶 deferred | `XL_BtSelectSubTask` 在 Windows 绑定已暴露，但上层 UI 未接线 |
+| ~~Magnet 直链解析~~ | ✅ 完成（2026-08-30） | B-1：`core/source_parse/magnet.rs`（URI 解析）+ `core/torrent_meta.rs`（摘要+infohash）+ `btcore::magnet::fetch_metadata`（DHT/tracker/bootstrap-peer 抓取）+ FFI `lt_metadata` + daemon `POST /bt/metadata`；e2e 走本地 seeder（btcore/tests/magnet_metadata.rs） |
+| BT 子文件选择 | 🔶 deferred | `XL_BtSelectSubTask` 在 Windows 绑定已暴露，但上层 UI 未接线（libtorrent 侧 file_priorities 可作降级路径） |
 | 速度精确查询 | 🔶 deferred | `XL_QueryTaskFlow` 字段 + `XLGetGlobalDownloadSpeed` 签名待补 |
-| 断点续传校验 | 🔶 partial | fastresume 有，但跨引擎统一续传协议待定 |
+| 断点续传校验 | 🔶 partial | fastresume 有，但跨引擎统一续传协议待定（B 线下一项） |
 | 多源调度可视化 | 🔶 backlog | Provider fallback 有骨架，无 UI |
 
 ### 关键文件

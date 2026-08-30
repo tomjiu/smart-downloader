@@ -21,6 +21,7 @@
 #include <libtorrent/write_resume_data.hpp>
 #include <libtorrent/alert.hpp>
 #include <libtorrent/alert_types.hpp>
+#include <libtorrent/create_torrent.hpp>
 #include <libtorrent/entry.hpp>
 #include <libtorrent/bencode.hpp>
 #include <libtorrent/bdecode.hpp>
@@ -31,7 +32,9 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <iterator>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -726,6 +729,31 @@ lt_err lt_read_piece(lt_session* s, const char* ih, int idx, uint8_t* buf, size_
         }
         return LT_OK;
     } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+lt_err lt_metadata(lt_session* s, const char* ih, uint8_t* buf, size_t cap, size_t* out_len) {
+    if (!s || !ih || !out_len) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        // B-1：metadata 未就绪（magnet 尚未从 peer/DHT 拿到 info dict）→ NOT_FOUND
+        const std::shared_ptr<const lt::torrent_info> ti = h.torrent_file();
+        if (!ti) { set_err(s, "metadata not received"); return LT_ERR_NOT_FOUND; }
+        // create_torrent(ti) → generate → bencode：由 torrent_info 重建标准 .torrent
+        // 字节（info dict 原样 + announce 族回填；v1 torrent 为无损往返）。
+        lt::create_torrent ct(*ti);
+        const lt::entry e = ct.generate();
+        std::vector<char> data;
+        lt::bencode(std::back_inserter(data), e);
+        const size_t sz = data.size();
+        if (!buf || cap < sz) { *out_len = sz; return LT_ERR_BUFFER_TOO_SMALL; }
+        std::memcpy(buf, data.data(), sz);
+        *out_len = sz;
+        return LT_OK;
+    } catch (...) {
+        set_err(s, "engine error");
         return LT_ERR_ENGINE;
     }
 }

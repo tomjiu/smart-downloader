@@ -272,3 +272,33 @@ enable_upnp = false
 **验证**：`cargo check --workspace` 全绿；core 100 / ffi 21 / convert 17 / provider 110(+ex 6) / daemon 44 / httpdl 10 全绿 —— 本批次新增 23 测。
 
 **状态声明**：fs2you = ✅ 可用；VIP 通道与 B 级 FFI = 代码就位·UNTESTED（等用户试用/VIP 票据的真机会话校准，届时一次会话打通 get_info→apply→cert→FFI 注入全链）；cid_store = 假设解析器·待真实样本（`%APPDATA%\Thunder Network\cid_store.dat`，隐私口径见 sample_collection_guide）。
+
+### 19. B-1 magnet → .torrent 元数据抓取（B 线第 1 项，2026-08-30）
+
+**背景**：主线缺口盘点（§一·未完成表）第 1 项，用户批准 B 线开工首选。magnet 建任务后只能盲等
+libtorrent 抓 metadata；缺「先抓元数据预览（文件清单/大小/tracker），再决定建不建任务」的入口。
+
+**四层交付**：
+- **core（纯 Rust，Linux 可测）**：`source_parse/magnet.rs` —— magnet URI 解析（v1 40 hex 强制、
+  hybrid magnet v1 优先、v2-only 显式拒绝、percent-decode 含 UTF-8/dn 的 `+`→空格宽容、tr/ws 去重保序、
+  非法输入零静默）15 测；`torrent_meta.rs` —— .torrent 字节 → 摘要（name/total/piece/files/trackers/
+  url-list/comment/created_by + SHA1(info dict 原始字节) infohash，嵌套 span 定位自带实现）9 测。
+- **FFI 一函数**：`lt_metadata(s, ih, buf, cap, out_len)`（lt.h + lt_kernel.cpp）——
+  `create_torrent(ti).generate()` → bencode；内存契约同 resume/read_piece（Rust 预分配 + cap 不足
+  BUFFER_TOO_SMALL + out_len）；metadata 未就绪 → NOT_FOUND（err_str 区分「任务不存在/未收到」）。
+- **btcore**：`ffi::Session::metadata`（NOT_FOUND→Ok(None)，64 KiB 起步自动扩容）→ `BtCore::metadata`
+  → `magnet.rs::fetch_metadata(magnet, scratch, opts)` —— 专用临时 session（与下载 session 隔离）
+  → resume → bootstrap peers/追加 tracker 注入 → 轮询 metadata_received（timeout/ERROR 语义清晰）
+  → 导出 → 摘要解析 + **infohash 引擎 vs 摘要交叉校验** → remove(delete_data) 清理。
+  FetchOpts：timeout/extra_trackers/bootstrap_peers/enable_dht/poll_interval。
+- **daemon**：`POST /bt/metadata`（feature bt 双态：无 bt 恒 400 提示编译开关；bt 下单并发 409）
+  —— 入参 magnet/timeout_s(5..600)/dht/trackers/peers/save_to；出参 JSON 摘要 + torrent_b64 +
+  saved_to；错误映射 400 坏 magnet / 408 超时 / 500 引擎。
+
+**测试**：core 24 新测（magnet 15 + torrent_meta 9）；btcore e2e `magnet_metadata.rs`（本地 seeder
+直连，双测：fetch_metadata 全链 + BtCore::metadata API 轮询语义，Windows LT 门禁跑）；
+daemon `bt_metadata_api.rs`（无 bt：恒 400；有 bt：坏 magnet 400 / 坏 peer 400 / 不可达 infohash 408）。
+顺带修 `http_api.rs` bt 构建 E0384（存量：cfg(bt) 分支重赋值不可变绑定）。
+
+**验证**：core 124 / provider 115 全绿；daemon 四 feature 组合（默认 / bt / nas,ftp,xunlei-import /
+webseed）编译零新增警告；非 bt daemon 测试 17 全绿。
