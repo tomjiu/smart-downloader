@@ -394,11 +394,21 @@ pub async fn put_auth_token(mgr: &NasManager, token_json: &str) -> Result<PathBu
 
 /// 统一身份层（B-3）：L1 云登录 token → xllite 引擎预置桥。
 ///
-/// L1 侧（xunlei_auth.json）：`{access_token, refresh_token, device_id,
-/// access_token_expires_at, user_id?}`；xllite 侧为 xluser OAuth 响应形
-/// `{access_token, refresh_token, token_type, expires_in}`（RFC 8628 兑换产物）。
-/// 字段映射为**格式假设**（假设区 #8）：引擎实际读取的字段集与文件名，以扫码
-/// 实测拿到的原生 token 文件为准校准；本桥保证 L1 已登录时引擎可免扫码复用。
+/// L1 侧（xunlei_auth.json，AuthState）：`{access_token, refresh_token,
+/// device_id, access_token_expires_at, user_id?}`；xllite 侧原生 token 形
+/// 已由 2026-08-30 扫码实测定案（假设区 #8 校准完毕）：
+/// `{token_type, access_token, refresh_token, id_token, expires_in, scope,
+/// sub, user_group, user_id}`——引擎按原生形读取预置文件，实测登录门通过。
+///
+/// 桥接策略（以原生形为准）：
+/// - 原生字段尽力透传：L1 文件若本就是原生形（如 device-code 产物直接复用），
+///   token_type/id_token/scope/sub/user_group/user_id 原样保留、expires_in
+///   直取——桥接幂等；
+/// - L1 专有字段映射：access_token_expires_at → expires_in（剩余秒，下限 60s；
+///   缺省/异常按 1h 兜底）；
+/// - AuthState 形缺原生字段（id_token/scope/sub/user_group）不伪造——引擎
+///   登录门对缺字段的宽容度以 A2 engine 步实测为准，不行则设备码重登兜底；
+/// - 诊断字段（src/src_file）不再写入文件（保持与原生形一致），改记日志。
 pub async fn sync_l1_token(l1_token_path: &Path) -> Result<PathBuf, NasError> {
     let raw = tokio::fs::read_to_string(l1_token_path)
         .await
@@ -432,36 +442,55 @@ pub async fn sync_l1_token(l1_token_path: &Path) -> Result<PathBuf, NasError> {
     if refresh.is_empty() {
         tracing::warn!("L1 token 缺 refresh_token（keys=[{keys}]）——桥接继续，续期能力以 A2 实测为准");
     }
-    // expires_at（unix 秒；兼容数字字符串形）→ expires_in（剩余秒）；缺省/异常 1h
+    // expires_in：原生形直取；L1 形由 access_token_expires_at（unix 秒；兼容数字
+    // 字符串形）折算剩余秒；缺省/异常按 1h 兜底
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let expires_raw = v.get("access_token_expires_at");
-    let expires_at = expires_raw
-        .and_then(|x| x.as_u64())
-        .or_else(|| expires_raw.and_then(|x| x.as_str()).and_then(|s| s.parse::<u64>().ok()));
-    let expires_in = match expires_at {
-        Some(t) if t > now => t.saturating_sub(now).max(60),
-        Some(_) => {
-            tracing::warn!("L1 token access_token_expires_at 已过期——按剩余 1h 处理（keys=[{keys}]）");
-            3600
-        }
-        None => {
-            tracing::warn!("L1 token access_token_expires_at 缺失/非 unix 秒——按剩余 1h 处理（keys=[{keys}]）");
-            3600
+    let expires_in = match v.get("expires_in").and_then(|x| x.as_u64()) {
+        Some(n) if n > 0 => n, // 原生形：直取，桥接幂等
+        _ => {
+            let expires_raw = v.get("access_token_expires_at");
+            let expires_at = expires_raw
+                .and_then(|x| x.as_u64())
+                .or_else(|| expires_raw.and_then(|x| x.as_str()).and_then(|s| s.parse::<u64>().ok()));
+            match expires_at {
+                Some(t) if t > now => t.saturating_sub(now).max(60),
+                Some(_) => {
+                    tracing::warn!("L1 token access_token_expires_at 已过期——按剩余 1h 处理（keys=[{keys}]）");
+                    3600
+                }
+                None => {
+                    tracing::warn!("L1 token access_token_expires_at 缺失/非 unix 秒——按剩余 1h 处理（keys=[{keys}]）");
+                    3600
+                }
+            }
         }
     };
-    let bridged = serde_json::json!({
-        "access_token": access,
-        "refresh_token": refresh,
-        "token_type": "Bearer",
-        "expires_in": expires_in,
-        "src": "l1-bridge",
-        "src_file": l1_token_path.to_string_lossy(),
-    });
+    // 原生形组装（#8 定案，2026-08-30 扫码实测）：可选字段透传不伪造；
+    // 诊断信息（原 src/src_file）改记日志，文件保持与引擎原生形一致
+    let mut bridged = serde_json::Map::new();
+    bridged.insert(
+        "token_type".into(),
+        v.get("token_type")
+            .cloned()
+            .unwrap_or_else(|| serde_json::Value::String("Bearer".into())),
+    );
+    bridged.insert("access_token".into(), serde_json::Value::String(access));
+    bridged.insert("refresh_token".into(), serde_json::Value::String(refresh));
+    for k in ["id_token", "scope", "sub", "user_group", "user_id"] {
+        if let Some(x) = v.get(k) {
+            bridged.insert(k.into(), x.clone());
+        }
+    }
+    bridged.insert("expires_in".into(), serde_json::Value::from(expires_in));
+    tracing::info!(
+        src_file = %l1_token_path.display(),
+        "L1 token 已桥接为引擎原生形（假设区 #8，2026-08-30 实测定案）"
+    );
     let mgr = manager();
-    put_auth_token(mgr, &bridged.to_string()).await
+    put_auth_token(mgr, &serde_json::Value::Object(bridged).to_string()).await
 }
 
 /// 自检：当前平台是否支持（Linux only）。

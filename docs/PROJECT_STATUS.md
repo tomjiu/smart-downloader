@@ -96,7 +96,7 @@
 |------|------|------|
 | B-1 FTP 引擎 | ✅ 早已交付 | `httpdl::FtpEngine`（`--features ftp`），15 测试全绿 |
 | B-2 NasRemoteEngine | 🔶 骨架 | `daemon/nas_remote.rs`：`DownloadEngine` 适配器，`DriveListen` TCP 探活+能力声明；端点表按假设区 #9 占位（UNTESTED） |
-| B-3 L1→xllite 身份桥 | 🔶 代码就位 | `nas.rs::sync_l1_token` + `serve.rs` 4e 启动自动同步（`SD_L1_TOKEN`）；文件格式校准=假设区 #8（UNTESTED） |
+| B-3 L1→xllite 身份桥 | 🔶 代码就位 | `nas.rs::sync_l1_token` + `serve.rs` 4e 启动自动同步（`SD_L1_TOKEN`）；文件格式已定案（2026-08-30 扫码实测：原生 9 字段形、引擎登录门通过），桥已对齐原生形；缺字段宽容度待 A2 engine 步 |
 | B-4 Android Termux 部署 | ✅ 脚本就位 | `scripts/nas/android-termux-setup.sh`：proot-distro Debian + arm64 SPK 引擎 |
 | A 档扫码守护 | ✅ 就绪待扫 | `scripts/nas/nas_qr_daemon.py`：RFC 8628 设备码 120s 自动续发，token 到手自动预置引擎路径 |
 | core 引擎枚举 | ✅ | `EngineKind::XunleiNas`（core/types.rs） |
