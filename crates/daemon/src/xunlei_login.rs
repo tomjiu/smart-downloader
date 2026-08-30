@@ -7,6 +7,10 @@
 //!   （pan.xunlei.com/yc/?client_id=…&user_code=…），命令行轮询状态；
 //! - Qr：终端直接渲染二维码（qrcode unicode），手机迅雷 App 扫码。
 //!
+//! 设备码服务端固定 120s 有效（expires_in）；Qr/Browser 模式轮询遇过期
+//! 自动换新码重打链接/二维码（与 scripts/nas/nas_qr_daemon.py 循环续发同款），
+//! 不再失败退出——实测最高频失败即「打开链接时码已过期」。
+//!
 //! 三种模式成功后登录态都写入 token_path（默认 ./xunlei_auth.json，0600），
 //! 后续 `XunleiProvider::new(_, token_path)` / daemon 直接复用。
 
@@ -15,6 +19,7 @@ use qrcode::QrCode;
 use smart_dl_provider::xunlei::client::Client;
 use smart_dl_provider::xunlei::login_flow::{
     open_in_browser, poll_device_session, start_device_session, store_auth_state,
+    DEVICE_SCOPE,
 };
 use smart_dl_provider::xunlei::login_page::{serve_login_page, LoginSession};
 
@@ -41,8 +46,9 @@ async fn run_qr(token_path: &std::path::Path) -> Result<(), String> {
     println!("手机迅雷 App → 右上角「扫一扫」扫描下方二维码：");
     println!("  授权页: {}", session.qr_url);
     println!("  授权码: {}（页面要求手动输入时使用）", session.user_code);
+    println!("  （设备码 120s 有效；过期会自动换新并重打二维码，旧码作废）");
     print_qr_terminal(&session.qr_url)?;
-    wait_loop(&client, &session, token_path).await
+    wait_loop(&client, &session, token_path, true, false).await
 }
 
 /// 浏览器跳转官方页模式。
@@ -76,7 +82,8 @@ async fn run_browser(token_path: &std::path::Path, port: u16) -> Result<(), Stri
         println!("  备用本地页: http://{addr}（浏览器被拦截时使用）");
     }
     println!("  授权码: {}", session.user_code);
-    wait_loop(&client, &session, token_path).await
+    println!("  （设备码 120s 有效；过期会自动换新并重开浏览器，旧码作废）");
+    wait_loop(&client, &session, token_path, false, true).await
 }
 
 /// 本地登录页模式（默认）。
@@ -100,11 +107,26 @@ async fn run_page(token_path: &std::path::Path, port: u16) -> Result<(), String>
     }
 }
 
+/// 判断轮询错误是否为设备码过期（本地 expires_at 检查或服务端 expired_token）。
+fn is_device_code_expired(msg: &str) -> bool {
+    let lower = msg.to_lowercase();
+    msg.contains("过期")
+        || lower.contains("expired")
+        || lower.contains("gone")
+        || lower.contains("410")
+}
+
 /// Browser/Qr 模式的轮询等待循环。
+///
+/// `show_qr`：换新码时是否重打终端二维码（Qr 模式）；`reopen_browser`：
+/// 换新码时是否重开系统浏览器跳新授权页（Browser 模式）。旧登录进度不会丢：
+/// SSO 登录态在浏览器侧，新码打开后直接进确认步。
 async fn wait_loop(
     client: &Client,
     session: &smart_dl_provider::xunlei::login_flow::DeviceSession,
     token_path: &std::path::Path,
+    show_qr: bool,
+    reopen_browser: bool,
 ) -> Result<(), String> {
     let mut current = session.clone();
     loop {
@@ -124,9 +146,27 @@ async fn wait_loop(
                 use std::io::Write as _;
                 let _ = std::io::stdout().flush();
             }
-            Err(e) => return Err(format!("登录失败: {e}")),
+            Err(e) => {
+                if !is_device_code_expired(&e.to_string()) {
+                    return Err(format!("登录失败: {e}"));
+                }
+                // 过期 → 换新码继续轮询（与 nas_qr_daemon.py 同款循环续发）。
+                println!();
+                println!("⏳ 设备码已过期（120s 有效），自动换新码，旧链接/二维码作废：");
+                let s = start_device_session(client, DEVICE_SCOPE)
+                    .await
+                    .map_err(|se| format!("换新设备码失败: {se}"))?;
+                println!("  授权页: {}", s.web_auth_url);
+                println!("  授权码: {}", s.user_code);
+                if show_qr {
+                    print_qr_terminal(&s.qr_url)?;
+                }
+                if reopen_browser && open_in_browser(&s.web_auth_url).is_err() {
+                    println!("  ⚠ 自动打开浏览器失败，请手动复制上方授权页链接");
+                }
+                current = s;
+            }
         }
-        let _ = &mut current; // 当前实现 poll 以 device_code 定位，状态无迁移
     }
 }
 
@@ -153,5 +193,16 @@ mod tests {
         // 渲染不 panic 且输出包含二维码字符块。
         let r = print_qr_terminal("https://pan.xunlei.com/yc/?client_id=x&user_code=Y");
         assert!(r.is_ok());
+    }
+
+    #[test]
+    fn device_expired_detection() {
+        assert!(is_device_code_expired("device code 已过期"));
+        assert!(is_device_code_expired(
+            "token endpoint returned expired_token"
+        ));
+        assert!(is_device_code_expired("HTTP Error 410: Gone"));
+        assert!(!is_device_code_expired("HTTP Error 400: Bad Request"));
+        assert!(!is_device_code_expired("登录失败: connection refused"));
     }
 }
