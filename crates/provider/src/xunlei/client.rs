@@ -33,6 +33,16 @@ pub fn device_code_qr_url(user_code: &str) -> String {
         .replace("{user_code}", user_code)
 }
 
+/// /yc/ 统一授权页 URL（scope 显式透传）。
+///
+/// 与 `scripts/nas/nas_qr_daemon.py::web_auth_url` 同构：页面 JS 从 URL 参数
+/// 读取 client_id/user_code/scope 组装 `deviceAuthorize`（Task 22 实证），
+/// 显式带 scope 避免依赖页面内置默认值随版本漂移。scope 仅含字母/空格/斜杠，
+/// 空格按 query 规范转 `%20`。
+pub fn web_auth_url(user_code: &str, scope: &str) -> String {
+    device_code_qr_url(user_code) + "&scope=" + &scope.replace(' ', "%20")
+}
+
 pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()

@@ -13,7 +13,7 @@
 
 use crate::xunlei::auth::AuthState;
 use crate::xunlei::client::{
-    device_code_qr_url, now_unix, Client, ClientError,
+    device_code_qr_url, now_unix, web_auth_url, Client, ClientError,
 };
 
 /// 与研究脚本 get_device_code_link.py 实测一致的 scope。
@@ -49,7 +49,11 @@ pub struct DeviceSession {
     pub device_code: String,
     pub user_code: String,
     /// 本地构造的扫码授权页 URL（官方页面形状，实测 2026-08-25 可用）。
+    /// App「扫一扫」扫的即该 URL。
     pub qr_url: String,
+    /// /yc/ 统一授权页完整链接（带 scope；任意浏览器直接打开，官方页内含
+    /// 账密/短信/扫码/微信/QQ/微博全方式，Task 22/23 实证）。
+    pub web_auth_url: String,
     pub expires_at: u64,
     /// 服务端建议轮询间隔（秒，缺省 3）。
     pub interval: u64,
@@ -60,10 +64,12 @@ pub struct DeviceSession {
 pub async fn start_device_session(client: &Client, scope: &str) -> Result<DeviceSession, ClientError> {
     let code = client.request_device_code(scope).await?;
     let qr_url = device_code_qr_url(&code.user_code);
+    let web_url = web_auth_url(&code.user_code, scope);
     Ok(DeviceSession {
         device_code: code.device_code,
         user_code: code.user_code,
         qr_url,
+        web_auth_url: web_url,
         expires_at: now_unix() + code.expires_in,
         interval: if code.interval == 0 { 3 } else { code.interval },
     })
@@ -213,10 +219,15 @@ mod tests {
             device_code: "dc".into(),
             user_code: "UC1234".into(),
             qr_url: device_code_qr_url("UC1234"),
+            web_auth_url: web_auth_url("UC1234", DEVICE_SCOPE),
             expires_at: now_unix() + 300,
             interval: 3,
         };
         assert!(s.qr_url.starts_with("https://pan.xunlei.com/yc/?client_id="));
         assert!(s.qr_url.contains("user_code=UC1234"));
+        // web_auth_url 必须显式带 scope（空格转 %20），与 Python daemon 同构。
+        assert!(s.web_auth_url.starts_with("https://pan.xunlei.com/yc/?client_id="));
+        assert!(s.web_auth_url.contains("user_code=UC1234"));
+        assert!(s.web_auth_url.contains("&scope=profile%20offline%20pan%20sso%20user"));
     }
 }

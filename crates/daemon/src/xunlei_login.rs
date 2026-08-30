@@ -62,9 +62,15 @@ async fn run_browser(token_path: &std::path::Path, port: u16) -> Result<(), Stri
     let addr = serve_login_page(sess_state, port)
         .await
         .map_err(|e| format!("本地登录页启动失败: {e}"))?;
+    // 打开带 scope 的 /yc/ 统一授权页（与本地页第三方 Tab 同源，Task 22/25）。
+    let web_url = if session.web_auth_url.is_empty() {
+        session.qr_url.clone()
+    } else {
+        session.web_auth_url.clone()
+    };
     println!("正在打开系统浏览器跳转迅雷官方授权页…");
-    println!("  官方页: {}", session.qr_url);
-    if open_in_browser(&session.qr_url).is_err() {
+    println!("  官方页: {web_url}");
+    if open_in_browser(&web_url).is_err() {
         println!("  ⚠ 系统浏览器打开失败，请手动复制上方链接，或打开本地备用页: http://{addr}");
     } else {
         println!("  备用本地页: http://{addr}（浏览器被拦截时使用）");
@@ -85,6 +91,7 @@ async fn run_page(token_path: &std::path::Path, port: u16) -> Result<(), String>
     println!("  · 扫码 Tab：手机迅雷 App 扫描页内二维码（跳转官方授权页确认）");
     println!("  · 密码 Tab：手机号/邮箱/用户名 + 密码（HTTPS 直连迅雷）");
     println!("  · 短信 Tab：手机号 + 验证码");
+    println!("  · 第三方 Tab：微信/QQ/微博（打开官方授权页登录确认，自动取证）");
     println!("登录态保存: {}（仅本机，权限 0600）", token_path.display());
     println!("按 Ctrl+C 退出。");
     // 页面服务由 serve_login_page 的 spawned task 承载；此处挂起等待用户操作。
