@@ -56,6 +56,12 @@ pub struct Symbols {
     pub XL_SetDownloadWindow: XLSetDownloadWindowFn,
     pub XL_SetGlobalConnectionLimit: XLSetGlobalConnectionLimitFn,
     pub XL_AddServer: XLAddServerFn,
+    /// B 级 DCDN/VIP 凭证注入（附录 A #4，UNTESTED）：Option 解析，
+    /// 旧版本 DLL 缺失导出时为 None，不影响其余符号加载。
+    pub XL_EnableDcdnWithToken: Option<XLEnableDcdnWithTokenFn>,
+    pub XL_EnableDcdnWithSession: Option<XLEnableDcdnWithSessionFn>,
+    pub XL_EnableDcdnWithVipCert: Option<XLEnableDcdnWithVipCertFn>,
+    pub XL_SetTaskEquityToken: Option<XLSetTaskEquityTokenFn>,
 }
 
 static SYMBOLS: OnceLock<Symbols> = OnceLock::new();
@@ -168,6 +174,10 @@ fn ensure_dlls_loaded_windows(sdk_dir: &Path) -> Result<()> {
             XL_SetDownloadWindow: *lib.get(b"XL_SetDownloadWindow\0").map_err(|e| XunleiError::DllLoad(format!("XL_SetDownloadWindow not found: {}", e)))?,
             XL_SetGlobalConnectionLimit: *lib.get(b"XL_SetGlobalConnectionLimit\0").map_err(|e| XunleiError::DllLoad(format!("XL_SetGlobalConnectionLimit not found: {}", e)))?,
             XL_AddServer: *lib.get(b"XL_AddServer\0").map_err(|e| XunleiError::DllLoad(format!("XL_AddServer not found: {}", e)))?,
+            XL_EnableDcdnWithToken: lib.get(b"XL_EnableDcdnWithToken\0").ok().map(|f| *f),
+            XL_EnableDcdnWithSession: lib.get(b"XL_EnableDcdnWithSession\0").ok().map(|f| *f),
+            XL_EnableDcdnWithVipCert: lib.get(b"XL_EnableDcdnWithVipCert\0").ok().map(|f| *f),
+            XL_SetTaskEquityToken: lib.get(b"XL_SetTaskEquityToken\0").ok().map(|f| *f),
         }
     };
 

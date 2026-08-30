@@ -1,0 +1,53 @@
+XunLei 25.0.90.1592 (stub MD5 a2def5a6d92660f086277e4de0c27109)
+payload r203 = OnlineResource (57 files) | payload r204 = Download SDK (34 modules)
+payload MD5s == repo resource_1288_1296/1304.bin (byte-identical, already analyzed)
+================================================================================
+
+### SDK CORE (payload/r204)
+module                                        size  FileVersion / Description
+AssistantTools.dll                          443040  2.86.202.127 / 迅雷下载引擎
+DownloadSDK.dll                            4697248  2.86.202.127 / 迅雷下载引擎
+DownloadSDKProxy.dll                        311968  2.86.202.127 / 迅雷下载引擎
+DownloadSDKServer.exe                       428192  2.86.202.127 / 迅雷下载引擎
+Ftp.dll                                     343200  0.1.202.1754 / Ftp
+Http.dll                                    432800  0.1.202.1754 / Http
+Microsoft.VC90.CRT.manifest                   1859  (non-PE)
+P2PBase.dll                                1798304  0.1.202.1754 / P2PBase
+P2PCommonObjects.dll                        333472  0.1.202.1754 / P2PCommonObjects
+P2PFramework.dll                            668320  0.1.202.1754 / P2PFramework
+P2PIO.dll                                   319648  0.1.202.1754 / P2PIO
+P2PStat.dll                                 443040  0.1.202.1754 / P2PStat
+P2PTarget.dll                               303776  0.1.202.1754 / P2PTarget
+ProxyVerifier.dll                           177824  2.86.202.127 / 迅雷下载引擎
+TcpImpl.dll                                4619936  0.1.202.1754 / TcpImpl
+XLBugHandler.dll                            718496  4.2.1.6 / XLBugHandle
+XLBugReport.exe                            1233056  4.2.1.6 / 迅雷错误报告
+XLFileAssistant.exe                         289440  0.1.0.0 / 迅雷快速申请磁盘空间助手
+XLLiveUDownload.dll                         167072  2.86.202.127 / 迅雷下载引擎
+XLReImport.dll                              511136  2.86.202.127 / 迅雷下载引擎
+XLTaskUpgrade.dll                           492192  2.86.202.127 / 迅雷下载引擎
+XUdt.dll                                    842400  0.1.202.1754 / XUdt
+libcurl.dll                                 884896  7.61.1 / libcurl Shared Library
+libeay32.dll                               2288128  1.0.2v-dev / OpenSSL Shared Library
+minizip.dll                                 163488  ? / ?
+msvcp90.dll                                 853312  9.00.30729.4148 / Microsoft® C++ Runtime Library
+msvcr90.dll                                 624448  9.00.30729.4148 / Microsoft® C Runtime Library
+ssleay32.dll                                461312  1.0.2v-dev / OpenSSL Shared Library
+statXml.xml                                   1495  (non-PE)
+upnp.exe                                    172704  1.0.2.4 / upnp_del_port
+xl_thunder_sdk.dll                         5099168  12.0408.960.1 / Downloadlib SDK(64 bit)
+zlib1.dll                                   509600  ? / ?
+
+### INSTALLER UI (payload/r203/OnlineResource)
+module                                        size  FileVersion / Description
+InstallEntry.dll                           2402304  12.1.8.8889 / 安装迅雷X 开始极速下载！
+MainWnd.xml                                  16849  (non-PE)
+MsgBox.xml                                    2518  (non-PE)
+cacert.pem                                  254472  (non-PE)
+libcrypto-3-x64.dll                        6915504  3.1.8 / OpenSSL library
+libcurl.dll                                1509296  8.12.1-DEV / libcurl Shared Library
+libexpat.dll                                289832  2.6.2.0 / ?
+libssl-3-x64.dll                           1436592  3.1.8 / OpenSSL library
+thunder_stat.xml                              1973  (non-PE)
+xlstat4.dll                                1500200  2.0.0.13 / xlstat4
+zlib1.dll                                   564776  2.0.0.1 / zlib1.dll

@@ -317,6 +317,26 @@ pub type XLSetCacheSizeFn = unsafe extern "system" fn(size_mb: c_uint) -> LtErr;
 pub type XLSetDownloadWindowFn = unsafe extern "system" fn(window: c_uint) -> LtErr;
 pub type XLSetGlobalConnectionLimitFn = unsafe extern "system" fn(limit: c_uint) -> LtErr;
 
+// ========== B 级 DCDN/VIP 凭证注入（附录 A #4，未测试，2026-08-30）==========
+//
+// 反编译证据（docs/research/xunlei/sdk_export_inventory.md §2.5）：
+//   XL_EnableDcdnWithToken(int, int, char*, char*)          param_3/4 = 窄字符串（strlen + XPF_String）
+//   XL_EnableDcdnWithSession(int, int, char*, char*, char*) param_3/4/5 = 窄字符串
+//   XL_EnableDcdnWithVipCert(int, int, char*)               param_3 = 窄字符串
+// 两个 c_int 参数语义未确认（推测：通道类型 / flags）。这些是「凭证消费」接口：
+// 调用方（crates/provider VIP 通道）必须先从云侧取得 token/session/cert。
+// ⚠️ 状态：UNTESTED —— 绑定形状来自反编译推断，首次真机调用前必须 dump 校准；
+//    loader 以 Option 解析（版本缺失导出不会中断 SDK 加载）。
+pub type XLEnableDcdnWithTokenFn =
+    unsafe extern "system" fn(c_int, c_int, *const c_char, *const c_char) -> LtErr;
+pub type XLEnableDcdnWithSessionFn =
+    unsafe extern "system" fn(c_int, c_int, *const c_char, *const c_char, *const c_char) -> LtErr;
+pub type XLEnableDcdnWithVipCertFn =
+    unsafe extern "system" fn(c_int, c_int, *const c_char) -> LtErr;
+/// ⚠️ 无反编译签名样本，(task_id, token*) 为最高风险假设形状（比 DCDN 三兄弟更弱）。
+pub type XLSetTaskEquityTokenFn =
+    unsafe extern "system" fn(task_id: c_uint, token: *const c_char) -> LtErr;
+
 #[cfg(test)]
 mod tests {
     use super::*;

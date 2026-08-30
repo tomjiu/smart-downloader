@@ -258,3 +258,17 @@ enable_upnp = false
 ### 17. Linux/CI 编译修复
 
 **行为契约**：`xunlei-ffi` Windows-only 代码全部 cfg 门控（非 Windows 编译为安全 stub）；`btcore/build.rs` 在无 libclang 环境自动回退到仓库内已提交 bindings.rs（剥离平台相关布局断言写入 OUT_DIR，`rustc-cfg=lt_bindings_fallback` 切换 include），`cargo check --workspace` 在 Linux 全绿。
+
+### 18. 缺口解锁批次：fs2you 解码 / VIP 通道未测试代码 / cid_store 假设解析器（2026-08-30）
+
+**背景**：用户追问「永不可做 7 项能做吗」→ 附录 A 重审（APP_COVERAGE_GAP_2026-08-30.md）后用户指示：「能做到的可以做了；#3/#4 无会员账号，先落未测试代码未来做完整」。
+
+**行为契约**：
+- **fs2you:// 解码（缺口 #1 ✅ 完成）**：`core/src/source_parse/fs2you.rs` —— base64 → `cachefile://host/path|size|md5` 三段解析（容忍 `cachefile://` 前缀缺失、scheme 大小写、宽松 b64 补齐），产出直链 + size + md5 元数据；normalize 路由 → Http 直链主流。10 个单测 + 2 个 normalize 集成测。
+- **VIP 加速通道客户端（附录 A #3/#4 代码就位·UNTESTED）**：`provider/src/xunlei/vip_speedup.rs` —— `VipSpeedupClient`：`check_status`（✅ 响应形状已实测验证 SPEEDUP_SYSTEM §三，含 data 包裹双兼容）+ `try_speed_get_info/apply`（🔶 形状假设：官方桌面 inner-api 路由，trial_left_times/trial_key 等 Go json tag 同构）+ `speed_cert_res_status`（🔶 形状假设，产出 → `identity.set_accelerate_certification` A 级已封装）。三基址可注入，Bearer 票由调用方注入（登录态解耦）；风控拒绝原样透传不重试。8 个 axum mock 测试。
+- **B 级 DCDN/VIP 凭证注入 FFI（附录 A #4 封装完成·UNTESTED）**：`xunlei-ffi` bindings/loader/identity 追加 `XL_EnableDcdnWithToken/Session/VipCert`、`XL_SetTaskEquityToken` 四导出 —— 形状来自反编译（§2.5），loader 以 **Option** 解析（版本缺失导出不中断 SDK 加载），封装层缺符号返回可读 DllLoad 错误；CString 封装纯函数单测。**首次真机调用前必须 dump 校准两个 c_int**。
+- **cid_store.dat 假设解析器（附录 A #7 解封·HYPOTHESIS）**：`xunlei-convert/src/cid_store.rs` —— 三形态自适应探测（JSON / XDLCTX 同族 TLV / 裸二进制启发式：不可打印随机块{16,20,32}B × 相邻路径串 ASCII/UTF-16LE 配对，最小 gap 贪心消解 tag 对齐歧义）；`scripts/research/xunlei/cidstore_scan.py` 结构扫描器（隐私脱敏报告，样本到达后校准 Rust 侧）。4 个单测（含垃圾输入零 panic）。
+
+**验证**：`cargo check --workspace` 全绿；core 100 / ffi 21 / convert 17 / provider 110(+ex 6) / daemon 44 / httpdl 10 全绿 —— 本批次新增 23 测。
+
+**状态声明**：fs2you = ✅ 可用；VIP 通道与 B 级 FFI = 代码就位·UNTESTED（等用户试用/VIP 票据的真机会话校准，届时一次会话打通 get_info→apply→cert→FFI 注入全链）；cid_store = 假设解析器·待真实样本（`%APPDATA%\Thunder Network\cid_store.dat`，隐私口径见 sample_collection_guide）。
