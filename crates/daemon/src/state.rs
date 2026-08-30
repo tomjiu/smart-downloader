@@ -2971,9 +2971,11 @@ mod persist_tests {
     #[tokio::test]
     async fn dest_none_uses_default_dest_root() {
         // with_dest_root 注入默认目录后，dest 未指定 → 任务落默认目录（而非 daemon cwd）
+        // Task 5-a：用临时目录替代硬编码 /data/default-dl（沙盒无 /data 写权限 → Permission denied）
+        let tmp = tempfile::tempdir().unwrap();
         let fake = Arc::new(FakeEngine::new(EngineKind::Http));
         let state = DaemonState::new(fake.clone(), vec![])
-            .with_dest_root(std::path::PathBuf::from("/data/default-dl"));
+            .with_dest_root(tmp.path().to_path_buf());
         let tid = state
             .add_http_task("https://example.com/dest.bin".into(), None)
             .await
@@ -2981,16 +2983,18 @@ mod persist_tests {
         let rec = state.tasks.lock().unwrap().get(&tid).cloned().unwrap();
         assert_eq!(
             rec.task.dest_root,
-            std::path::PathBuf::from("/data/default-dl"),
+            tmp.path().to_path_buf(),
             "dest 未指定应落到默认 dest_root"
         );
     }
 
     #[tokio::test]
     async fn explicit_dest_overrides_default() {
+        // Task 5-a：默认 dest_root 同样改为临时目录（保持沙盒可跑）
+        let tmp = tempfile::tempdir().unwrap();
         let fake = Arc::new(FakeEngine::new(EngineKind::Http));
         let state = DaemonState::new(fake.clone(), vec![])
-            .with_dest_root(std::path::PathBuf::from("/data/default-dl"));
+            .with_dest_root(tmp.path().to_path_buf());
         let tid = state
             .add_http_task(
                 "https://example.com/override.bin".into(),

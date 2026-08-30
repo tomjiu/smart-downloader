@@ -64,10 +64,20 @@ fn main() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("参数错误: {e}");
-            eprintln!("用法: smart-dl-daemon <add|pause|resume|remove|list|status|logs|import-xunlei> [args] [--server URL] [--json]");
+            eprintln!("用法: smart-dl-daemon <add|pause|resume|remove|list|status|logs|fallback|xunlei-login|import-xunlei> [args] [--server URL] [--json]");
             std::process::exit(2);
         }
     };
+
+    // —— xunlei-login：本地执行（无需 daemon 进程），分发前拦截 ——
+    if let smart_dl_daemon::cli::CliCommand::XunleiLogin { mode, token_path, port } = &cli.command {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime 创建失败");
+        if let Err(e) = rt.block_on(smart_dl_daemon::xunlei_login::run(*mode, token_path.clone(), *port)) {
+            eprintln!("xunlei-login 失败: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime 创建失败");
     let client = smart_dl_daemon::client::CliClient::new(&server);

@@ -16,6 +16,7 @@ pub mod lockfile;
 pub mod serve;
 pub mod state;
 pub mod ws;
+pub mod xunlei_login;
 
 pub use cli::{Cli, CliCommand, CliError};
 pub use events::SchedulerEvent;

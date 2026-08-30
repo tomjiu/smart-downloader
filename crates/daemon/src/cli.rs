@@ -36,6 +36,13 @@ pub enum CliCommand {
     Fallback {
         task_id: String,
     },
+    /// 迅雷原生登录（Task 5-b）：--page 本地 App 同款登录页（默认）/ --browser
+    /// 跳转官方授权页 / --qr 终端二维码。本地执行，不需要 daemon 在跑。
+    XunleiLogin {
+        mode: XunleiLoginMode,
+        token_path: Option<String>,
+        port: u16,
+    },
     /// 迅雷任务导入（M9）：xlbt.cfg + 一组 .bt.xltd + .torrent → fastresume。
     #[cfg(feature = "xunlei-import")]
     ImportXunlei {
@@ -44,6 +51,17 @@ pub enum CliCommand {
         xltds: Vec<String>,
         dest: Option<String>,
     },
+}
+
+/// 迅雷登录模式（Task 5-b）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum XunleiLoginMode {
+    /// 本地渲染 App 同款登录页（默认）。
+    Page,
+    /// 系统浏览器跳转官方授权页。
+    Browser,
+    /// 终端二维码。
+    Qr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -168,6 +186,39 @@ fn parse_command(args: &[String]) -> Result<CliCommand, CliError> {
         )),
         "list" => Ok(CliCommand::List),
         "config" => Ok(CliCommand::Config),
+        "xunlei-login" => {
+            let mut mode = XunleiLoginMode::Page;
+            let mut token_path = None;
+            let mut port = 0u16;
+            let mut i = 1;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--browser" => mode = XunleiLoginMode::Browser,
+                    "--page" => mode = XunleiLoginMode::Page,
+                    "--qr" => mode = XunleiLoginMode::Qr,
+                    "--token" => {
+                        token_path = Some(
+                            args.get(i + 1)
+                                .ok_or_else(|| CliError::MissingArg("--token <path>".to_string()))?
+                                .clone(),
+                        );
+                        i += 1;
+                    }
+                    "--port" => {
+                        let v = args
+                            .get(i + 1)
+                            .ok_or_else(|| CliError::MissingArg("--port <n>".to_string()))?;
+                        port = v.parse().map_err(|_| {
+                            CliError::Unknown(format!("--port 非法端口号: {v}"))
+                        })?;
+                        i += 1;
+                    }
+                    other => return Err(CliError::Unknown(format!("xunlei-login {other}"))),
+                }
+                i += 1;
+            }
+            Ok(CliCommand::XunleiLogin { mode, token_path, port })
+        }
         other => Err(CliError::Unknown(other.to_string())),
     }
 }

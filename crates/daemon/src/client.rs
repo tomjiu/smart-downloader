@@ -114,6 +114,12 @@ impl CliClient {
                 }
                 Ok(())
             }
+            // xunlei-login 在 main.rs 分发前本地拦截执行，理论上不会到这里；
+            // 保留防御分支保证穷尽性（提示用户直接运行命令而非经 --server 转发）。
+            CliCommand::XunleiLogin { .. } => Err(CliError::Unknown(
+                "xunlei-login 为本地命令，不经过 daemon：请直接运行 smart-dl-daemon xunlei-login"
+                    .to_string(),
+            )),
         }
     }
 
