@@ -5,6 +5,7 @@
 //! - `qqdl://`  内容 = base64(真实URL)，无 AA/ZZ 壳
 
 use crate::source_parse::ed2k::parse_ed2k;
+use crate::source_parse::fs2you::parse_fs2you;
 use crate::source_parse::thunder::{decode_base64_lenient, decode_thunder};
 use crate::source_parse::xunlei_share::parse_xunlei_share;
 
@@ -77,6 +78,19 @@ pub fn normalize_user_link(link: &str) -> NormalizedSource {
         return match parse_ed2k(link) {
             Ok(_) => NormalizedSource::Ed2k(link.to_string()),
             Err(e) => NormalizedSource::Unsupported(format!("ed2k 链接解析失败: {e}")),
+        };
+    }
+    if link
+        .get(..9)
+        .map(|p| p.eq_ignore_ascii_case("fs2you://"))
+        .unwrap_or(false)
+    {
+        // fs2you（RaySource 族，2026-08-30 缺口 #1 落地）：解码为
+        // cachefile://host/path|size|md5 → 直链 HTTP（size/md5 元数据由
+        // parse_fs2you 直接调用方获取；路由层只取 url 进主流）。
+        return match parse_fs2you(link) {
+            Ok(f) => NormalizedSource::Http(f.url),
+            Err(e) => NormalizedSource::Unsupported(format!("fs2you 链接解析失败: {e}")),
         };
     }
     // 迅雷网盘分享链接（pan.xunlei.com/s/xxx?pwd=yyy）
@@ -205,5 +219,26 @@ mod tests {
             normalize_user_link("sqla://whatever"),
             NormalizedSource::Unsupported("sqla://whatever".into())
         );
+    }
+
+    #[test]
+    fn fs2you_decodes_to_http() {
+        // 2026-08-30 缺口 #1：fs2you → 直链 HTTP
+        let inner = "cachefile://cache13.zhowta.com/file/a.rar|1048576|d41d8cd98f00b204e9800998ecf8427e";
+        let link = format!("fs2you://{}", B64.encode(inner.as_bytes()));
+        assert_eq!(
+            normalize_user_link(&link),
+            NormalizedSource::Http("http://cache13.zhowta.com/file/a.rar".into())
+        );
+    }
+
+    #[test]
+    fn fs2you_bad_payload_is_unsupported() {
+        match normalize_user_link("fs2you://!!!junk!!!") {
+            NormalizedSource::Unsupported(msg) => {
+                assert!(msg.contains("fs2you 链接解析失败"), "msg={msg}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
     }
 }
