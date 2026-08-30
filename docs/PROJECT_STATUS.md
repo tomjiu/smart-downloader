@@ -216,8 +216,11 @@ smart-downloader/
 | Android libxl | `research_bin/android/libxl_thunder_sdk.so` | 8.5MB |
 | Android APK | Git LFS 仓库内 | 77MB |
 | macOS DMG | **Release 附件**（108MB，超 GitHub 100MB 限制） | — |
+| 跨平台取证包（SPK 引擎 + APK 解包 + cnk3x） | **Release 附件**（181MB） | — |
 
-Release 页面：https://github.com/tomjiu/smart-downloader/releases/tag/v0.1.0-assets
+Release 页面：
+- `v0.1.0-assets`：macOS DMG — https://github.com/tomjiu/smart-downloader/releases/tag/v0.1.0-assets
+- `v0.1.0-cross-platform`：跨平台取证原材料 — https://github.com/tomjiu/smart-downloader/releases/tag/v0.1.0-cross-platform
 
 ### 云分析推荐工作流
 

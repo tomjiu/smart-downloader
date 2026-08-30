@@ -146,3 +146,17 @@ python tools/xunlei-migrate/xunlei_to_libtorrent_converter.py `
 1. 从 Release 下载 `thunder_5.80.7.66659.dmg`
 2. 挂载/解包后提取 `DownloadKit.framework`、`xlcommon.framework`、`MacXLSDKs.framework`、`DownloadService.xpc`
 3. 对照 `docs/research/xunlei/macos_abi_reverse.md` 继续逆向后 4 个未完成结构体
+
+## 跨平台取证原材料（GitHub Release）
+
+Phase 3 四端可行性定案的原始证据（APK 解包 + NAS 引擎 + cnk3x 源码），因体积较大（181MB）单独归档：
+
+- **Release 页面**: https://github.com/tomjiu/smart-downloader/releases/tag/v0.1.0-cross-platform
+- **附件名**: `cross-platform-evidence.zip`
+- **MD5**: `0fa3103e9234b8d95dd67716bdc54a26`
+- **用途**: 
+  - `spk-x64/payload/bin/bin/xunlei-pan-cli.3.23.5.amd64` — Linux x86_64 官方引擎（xllite）
+  - `spk-arm/payload/bin/bin/xunlei-pan-cli.3.1.10.arm64` — Linux ARM64 官方引擎
+  - `apk-unpacked/` — hezi APK 解包（确认无引擎，为管理端）
+  - `cnk3x/` — 群晖模拟最小集参考实现（MIT）
+- **文档**: `docs/research/xunlei/CROSS_PLATFORM_FOUR_OS_2026-08-30.md`（附录 E）
