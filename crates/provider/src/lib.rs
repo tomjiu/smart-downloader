@@ -6,11 +6,14 @@
 
 pub mod coordinator;
 pub mod mock;
+pub mod quark;
 pub mod types;
 pub mod xunlei;
 
 pub use coordinator::{FallbackCoordinator, FallbackOutcome, HttpSink, SinkError};
 pub use mock::MockProvider;
+// Task 5-d/T2：夸克网盘 Provider（分享链接 → 转存 → 直链）
+pub use quark::{parse_share_link, QuarkProvider};
 pub use types::{
     ProviderError, ProviderRuntime, ProviderStatus, ProviderTaskId, ResolvedRemoteFile,
 };

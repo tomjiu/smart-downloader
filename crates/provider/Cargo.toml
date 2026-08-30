@@ -14,13 +14,14 @@ tracing = { workspace = true } # BUGB-INSTR（诊断插桩；与 daemon 同版�
 smart-dl-core = { path = "../core" }
 md-5 = "0.10"
 sha1 = { workspace = true }
+# 本地登录页服务（Task 5-b：与迅雷 App 一致的原生登录页）
+axum = "0.7"
+# 二维码渲染（终端 unicode / 页面 SVG，扫码登录用）
+qrcode = "0.14"
 
 [dev-dependencies]
-axum = "0.7"
 tempfile = "3"
 smart-dl-httpdl = { path = "../httpdl" }
-# 终端二维码渲染（xunlei_qr_login 用，迅雷 App 扫码授权）
-qrcode = "0.14"
 
 [[example]]
 name = "xunlei_qr_login"

@@ -6,14 +6,32 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use sha1::Digest as _;
 
-/// pan 网盘场景的 client_id（取链/captcha/refresh 用）。
+/// pan 网盘场景的 client_id（取链/captcha/refresh/登录用）。
 pub const CLIENT_ID: &str = "Xqp0kJBXWhwaTpB6";
-/// 网页登录（设备码流程）的 app_id（扫码登录用）。
-pub const DEVICE_CLIENT_ID: &str = "XW5SkOhLDjnOZP7J";
+/// 设备码流程 client_id。
+///
+/// 【2026-08-30 修正】原值 `XW5SkOhLDjnOZP7J`（web 登录 device-code 旧 app_id）
+/// 在设备码流程实测失败（PROJECT_STATUS §三「待对齐」）。2026-08-25 端到端实测
+/// 通过的是 web 端 `Xqp0kJBXWhwaTpB6`（二维码页面
+/// `pan.xunlei.com/yc/?client_id=Xqp0…&user_code=…`，同日 App 扫码授权成功），
+/// 故统一改用白名单内已验证值。旧值仅留档注释。
+/// 依据：docs/PROJECT_STATUS.md、docs/research/2026-08-22-xunlei-login-reverse-status.md。
+pub const DEVICE_CLIENT_ID: &str = "Xqp0kJBXWhwaTpB6";
 pub const XLUSER_BASE: &str = "https://xluser-ssl.xunlei.com";
 pub const PAN_BASE: &str = "https://api-pan.xunlei.com";
 /// Web 端 client_version（captcha/init meta 用）。
 pub const CLIENT_VERSION: &str = "1.92.91";
+/// 本地构造扫码授权页模板（不依赖服务端 verification_uri；PROJECT_STATUS
+/// 「QR 构造」对齐项：实测 2026-08-25 端到端验证的就是该形状）。
+pub const QR_AUTHORIZE_URL_TEMPLATE: &str =
+    "https://pan.xunlei.com/yc/?client_id={client_id}&user_code={user_code}";
+
+/// 本地构造扫码授权页 URL（与官方 App 扫码页一致形状，实测可用）。
+pub fn device_code_qr_url(user_code: &str) -> String {
+    QR_AUTHORIZE_URL_TEMPLATE
+        .replace("{client_id}", CLIENT_ID)
+        .replace("{user_code}", user_code)
+}
 
 pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
@@ -174,6 +192,10 @@ pub enum ClientError {
 #[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
+    /// 账号/登录服务基地址（生产 = XLUSER_BASE；mock 测试注入本地地址）。
+    xluser_base: String,
+    /// 网盘 drive 服务基地址（生产 = PAN_BASE；mock 测试注入本地地址）。
+    pan_base: String,
 }
 
 impl Default for Client {
@@ -182,7 +204,20 @@ impl Default for Client {
 
 impl Client {
     pub fn new() -> Self {
-        Client { http: reqwest::Client::new() }
+        Client {
+            http: reqwest::Client::new(),
+            xluser_base: XLUSER_BASE.to_string(),
+            pan_base: PAN_BASE.to_string(),
+        }
+    }
+
+    /// 测试用：注入本地 mock 服务基地址（登录页 mock 测试需要）。
+    pub fn with_bases(xluser_base: impl Into<String>, pan_base: impl Into<String>) -> Self {
+        Client {
+            http: reqwest::Client::new(),
+            xluser_base: xluser_base.into(),
+            pan_base: pan_base.into(),
+        }
     }
 
     /// 构造 drive API 的三要素请求头。
@@ -200,7 +235,7 @@ impl Client {
     /// refresh_token 换新 access_token（已验证可行）。
     pub async fn refresh(&self, state: &mut AuthState) -> Result<(), ClientError> {
         let resp: TokenResp = self.http
-            .post(format!("{}/v1/auth/token", XLUSER_BASE))
+            .post(format!("{}/v1/auth/token", self.xluser_base))
             .json(&serde_json::json!({
                 "grant_type": "refresh_token",
                 "refresh_token": state.refresh_token,
@@ -258,7 +293,7 @@ impl Client {
             #[serde(default)] captcha_token: String,
         }
         let cap_resp = self.http
-            .post(format!("{}/v1/shield/captcha/init", XLUSER_BASE))
+            .post(format!("{}/v1/shield/captcha/init", self.xluser_base))
             .json(&serde_json::json!({
                 "action": action,
                 "captcha_token": "",
@@ -300,7 +335,7 @@ impl Client {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         let resp = self.http
-            .post(format!("{}/v1/auth/signin", XLUSER_BASE))
+            .post(format!("{}/v1/auth/signin", self.xluser_base))
             .headers(headers)
             .json(&serde_json::json!({
                 "username": username,
@@ -322,7 +357,7 @@ impl Client {
             user_id = resp.sub;
         }
         let now = now_unix();
-        Ok(AuthState {
+        let mut state = AuthState {
             access_token: resp.access_token,
             refresh_token: resp.refresh_token,
             device_id: device_id.to_string(),
@@ -330,7 +365,13 @@ impl Client {
             user_id,
             access_token_expires_at: now + resp.expires_in,
             captcha_token_expires_at: now + 300,
-        })
+        };
+        // 兜底：响应体未带 user_id/sub 时从 access_token JWT 的 sub 声明解析
+        //（web SDK 实测响应形状以 JWT 为准，见 2026-08-22 研究文档 §三）。
+        if state.user_id.is_empty() {
+            state.fill_user_id_from_token();
+        }
+        Ok(state)
     }
 
     /// 匿名获取/刷新 captcha_token。
@@ -347,7 +388,7 @@ impl Client {
         let sign = captcha_sign(did32, &timestamp);
 
         let resp: CaptchaResp = self.http
-            .post(format!("{}/v1/shield/captcha/init", XLUSER_BASE))
+            .post(format!("{}/v1/shield/captcha/init", self.xluser_base))
             .json(&serde_json::json!({
                 "action": "POST:/drive/v1/files",
                 "captcha_token": "",
@@ -380,7 +421,7 @@ impl Client {
             #[serde(default)] interval: u64,
         }
         let resp: Resp = self.http
-            .post(format!("{}/v1/auth/device/code", XLUSER_BASE))
+            .post(format!("{}/v1/auth/device/code", self.xluser_base))
             .form(&[("scope", scope), ("client_id", DEVICE_CLIENT_ID)])
             .send().await?.error_for_status()?.json().await?;
         Ok(DeviceCode {
@@ -398,7 +439,7 @@ impl Client {
         #[derive(Deserialize)]
         struct ErrResp { error: String }
         let resp = self.http
-            .post(format!("{}/v1/auth/token", XLUSER_BASE))
+            .post(format!("{}/v1/auth/token", self.xluser_base))
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", device_code),
@@ -422,7 +463,7 @@ impl Client {
     /// 取直链：调 PLAY API 拿 web_content_link（F2/F3 已验证端点）。
     /// 返回 (name, web_content_link)。size/expires 由调用方从 URL 参数解析（f=/e=）。
     pub async fn resolve_link(&self, state: &AuthState, file_id: &str) -> Result<PlayResp, ClientError> {
-        let url = format!("{}/drive/v1/files/{}?space=&usage=PLAY", PAN_BASE, file_id);
+        let url = format!("{}/drive/v1/files/{}?space=&usage=PLAY", self.pan_base, file_id);
         let resp: PlayResp = self.http
             .get(url)
             .headers(Self::auth_headers(state))
@@ -450,7 +491,7 @@ impl Client {
             #[serde(default)] size: String,
             #[serde(default, rename = "mime_type")] mime_type: String,
         }
-        let url = format!("{PAN_BASE}/drive/v1/files?parent_id={parent_id}&usage=DISPLAY&with_audit=true&limit=100");
+        let url = format!("{}/drive/v1/files?parent_id={parent_id}&usage=DISPLAY&with_audit=true&limit=100", self.pan_base);
         let resp = self.http
             .get(&url)
             .headers(Self::auth_headers(state))
@@ -509,7 +550,7 @@ impl Client {
             #[serde(default)] captcha_token: String,
         }
         let cap_resp = self.http
-            .post(format!("{}/v1/shield/captcha/init", XLUSER_BASE))
+            .post(format!("{}/v1/shield/captcha/init", self.xluser_base))
             .json(&serde_json::json!({
                 "action": "POST:/v1/auth/verification",
                 "captcha_token": "",
@@ -548,7 +589,7 @@ impl Client {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         let resp = self.http
-            .post(format!("{}/v1/auth/verification", XLUSER_BASE))
+            .post(format!("{}/v1/auth/verification", self.xluser_base))
             .headers(headers)
             .json(&serde_json::json!({
                 "phone_number": phone,
@@ -612,7 +653,7 @@ impl Client {
 
         // 1) 校验验证码。
         let verify = self.http
-            .post(format!("{}/v1/auth/verification/verify", XLUSER_BASE))
+            .post(format!("{}/v1/auth/verification/verify", self.xluser_base))
             .json(&serde_json::json!({
                 "client_id": CLIENT_ID,
                 "phone_number": phone,
@@ -673,7 +714,7 @@ impl Client {
             #[serde(default)] captcha_token: String,
         }
         let cap2_resp = self.http
-            .post(format!("{}/v1/shield/captcha/init", XLUSER_BASE))
+            .post(format!("{}/v1/shield/captcha/init", self.xluser_base))
             .json(&serde_json::json!({
                 "action": "POST:/v1/auth/signin",
                 "captcha_token": "",
@@ -712,7 +753,7 @@ impl Client {
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         let resp = self.http
-            .post(format!("{}/v1/auth/signin", XLUSER_BASE))
+            .post(format!("{}/v1/auth/signin", self.xluser_base))
             .headers(headers)
             .json(&serde_json::json!({
                 "username": phone,
@@ -804,7 +845,7 @@ impl Client {
             "url": { "url": url },
         });
         let resp = self.http
-            .post(format!("{PAN_BASE}/drive/v1/files"))
+            .post(format!("{}/drive/v1/files", self.pan_base))
             .headers(Self::auth_headers(state))
             .json(&body)
             .send().await?;
@@ -839,7 +880,7 @@ impl Client {
             #[serde(default)] file_id: String,
         }
         let resp = self.http
-            .get(format!("{PAN_BASE}/drive/v1/tasks?type=offline&limit=50"))
+            .get(format!("{}/drive/v1/tasks?type=offline&limit=50", self.pan_base))
             .headers(Self::auth_headers(state))
             .send().await?;
         let status = resp.status();
@@ -949,7 +990,7 @@ impl Client {
             .unwrap_or_else(|_| reqwest::multipart::Part::bytes(torrent.to_vec()));
         let form = reqwest::multipart::Form::new().part("file", part);
         let resp = self.http
-            .post(format!("{PAN_BASE}/drive/v1/files"))
+            .post(format!("{}/drive/v1/files", self.pan_base))
             .headers(Self::auth_headers(state))
             .multipart(form)
             .send().await?;

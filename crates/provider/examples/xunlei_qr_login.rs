@@ -20,6 +20,7 @@
 //! 打开链接即等价于扫码（见 docs/research/2026-08-22-xunlei-login-reverse-status.md）。
 
 use qrcode::{QrCode, render::unicode};
+use smart_dl_provider::xunlei::client::device_code_qr_url;
 use smart_dl_provider::xunlei::device::DeviceFlowState;
 use smart_dl_provider::xunlei::provider::XunleiProvider;
 
@@ -48,14 +49,18 @@ async fn main() {
     let DeviceFlowState::AwaitingScan { user_code, verification_uri, expires_at, .. } = &state else {
         unreachable!("start 只返回 AwaitingScan");
     };
+    // 本地构造官方授权页 URL（PROJECT_STATUS「QR 构造」对齐项：
+    // pan.xunlei.com/yc/?client_id=…&user_code=…，2026-08-25 实测可用）。
+    // 服务端 verification_uri 仅作回退展示。
+    let qr_url = device_code_qr_url(user_code);
 
     // 2. 终端渲染二维码（用手机【迅雷 App】扫一扫）+ 备用浏览器打开
     println!();
     println!("=== 迅雷设备码登录 ===");
     println!("请打开手机迅雷 App → 右上角扫一扫 → 扫描下方二维码：");
-    println!("  链接: {verification_uri}");
+    println!("  链接: {qr_url}");
     println!("  授权码: {user_code}（若页面要求手动输入）");
-    let code = match QrCode::new(verification_uri.as_bytes()) {
+    let code = match QrCode::new(qr_url.as_bytes()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("二维码生成失败: {e}（可直接在 App 输入上方链接）");

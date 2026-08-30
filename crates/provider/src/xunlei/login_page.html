@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>迅雷登录 — smart-dl</title>
+<style>
+  /* 迅雷 App 登录页视觉复刻：深蓝渐变背景 + 白色圆角卡片 + 品牌蓝按钮 */
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: "PingFang SC", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+    background: linear-gradient(135deg, #0b1c3f 0%, #16345f 45%, #1d4a7a 100%);
+    color: #2b2f36;
+    display: flex; align-items: center; justify-content: center;
+    min-height: 100vh;
+  }
+  .card {
+    width: 380px; max-width: 92vw;
+    background: #ffffff; border-radius: 16px;
+    padding: 34px 34px 26px;
+    box-shadow: 0 18px 60px rgba(0, 20, 60, .45);
+  }
+  .logo { display: flex; align-items: center; justify-content: center; gap: 10px; margin-bottom: 6px; }
+  .logo .mark {
+    width: 40px; height: 40px; border-radius: 10px;
+    background: linear-gradient(135deg, #2468f2, #12b7f5);
+    position: relative; flex: none;
+  }
+  .logo .mark::after {
+    content: ""; position: absolute; left: 12px; top: 11px;
+    border-left: 16px solid #fff; border-top: 9px solid transparent; border-bottom: 9px solid transparent;
+  }
+  .logo .name { font-size: 26px; font-weight: 700; color: #2468f2; letter-spacing: 2px; }
+  .sub { text-align: center; color: #9aa3b2; font-size: 12px; margin-bottom: 22px; }
+  .tabs { display: flex; margin-bottom: 20px; border-bottom: 1px solid #eef1f6; }
+  .tab {
+    flex: 1; text-align: center; padding: 10px 0; font-size: 15px;
+    color: #6b7280; cursor: pointer; border-bottom: 2px solid transparent;
+    user-select: none;
+  }
+  .tab.active { color: #2468f2; border-bottom-color: #2468f2; font-weight: 600; }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  .qr-box { display: flex; flex-direction: column; align-items: center; padding: 6px 0 2px; }
+  .qr-frame { border: 1px solid #e6eaf2; border-radius: 12px; padding: 10px; background: #fff; }
+  .qr-frame img { width: 196px; height: 196px; display: block; }
+  .qr-tip { margin-top: 12px; font-size: 13px; color: #6b7280; }
+  .qr-tip b { color: #2468f2; }
+  .qr-state { margin-top: 8px; font-size: 13px; min-height: 18px; }
+  .qr-state.ok { color: #10b981; }
+  .qr-state.err { color: #ef4444; }
+  .field { position: relative; margin-bottom: 14px; }
+  .field input {
+    width: 100%; padding: 12px 14px; font-size: 14px;
+    border: 1px solid #e3e8f0; border-radius: 10px; outline: none;
+    background: #f8fafc;
+  }
+  .field input:focus { border-color: #2468f2; background: #fff; }
+  .field .suffix {
+    position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+    font-size: 13px; color: #2468f2; cursor: pointer; user-select: none;
+  }
+  .btn {
+    width: 100%; padding: 12px 0; margin-top: 4px;
+    background: linear-gradient(90deg, #2468f2, #3b82f6);
+    color: #fff; font-size: 15px; font-weight: 600;
+    border: none; border-radius: 10px; cursor: pointer;
+  }
+  .btn:disabled { opacity: .55; cursor: not-allowed; }
+  .msg { margin-top: 10px; font-size: 13px; min-height: 18px; text-align: center; }
+  .msg.ok { color: #10b981; } .msg.err { color: #ef4444; }
+  .foot { margin-top: 18px; text-align: center; color: #b6bdca; font-size: 11px; line-height: 1.7; }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo"><div class="mark"></div><div class="name">迅雷</div></div>
+  <div class="sub">smart-dl 原生登录 · 授权后凭证仅保存在本机</div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="qr">扫码登录</div>
+    <div class="tab" data-tab="pwd">密码登录</div>
+    <div class="tab" data-tab="sms">短信登录</div>
+  </div>
+
+  <!-- 扫码登录 -->
+  <div class="panel active" id="panel-qr">
+    <div class="qr-box">
+      <div class="qr-frame"><img id="qr-img" src="/api/qr.svg" alt="二维码"></div>
+      <div class="qr-tip">打开手机 <b>迅雷 App</b> → 右上角「扫一扫」</div>
+      <div class="qr-state" id="qr-state">正在生成二维码…</div>
+      <button class="btn hidden" id="qr-retry">重新生成二维码</button>
+    </div>
+  </div>
+
+  <!-- 密码登录 -->
+  <div class="panel" id="panel-pwd">
+    <div class="field"><input id="pwd-user" placeholder="手机号 / 邮箱 / 用户名" autocomplete="username"></div>
+    <div class="field"><input id="pwd-pass" type="password" placeholder="密码" autocomplete="current-password"></div>
+    <button class="btn" id="pwd-btn">登 录</button>
+    <div class="msg" id="pwd-msg"></div>
+  </div>
+
+  <!-- 短信登录 -->
+  <div class="panel" id="panel-sms">
+    <div class="field">
+      <input id="sms-phone" placeholder="手机号" autocomplete="tel">
+      <span class="suffix" id="sms-send">获取验证码</span>
+    </div>
+    <div class="field"><input id="sms-code" placeholder="验证码" inputmode="numeric"></div>
+    <button class="btn" id="sms-btn">登 录</button>
+    <div class="msg" id="sms-msg"></div>
+  </div>
+
+  <div class="foot">
+    本页面为 smart-dl 本地渲染的登录入口（127.0.0.1，不对外监听）。<br>
+    扫码跳转迅雷官方授权页完成确认；密码/短信经 HTTPS 直连迅雷服务端。
+  </div>
+</div>
+
+<script>
+// Tab 切换
+document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => {
+  document.querySelectorAll('.tab').forEach(x => x.classList.remove('active'));
+  document.querySelectorAll('.panel').forEach(x => x.classList.remove('active'));
+  t.classList.add('active');
+  document.getElementById('panel-' + t.dataset.tab).classList.add('active');
+}));
+
+const $ = id => document.getElementById(id);
+let started = false;
+
+// —— 扫码流程：start → 轮询 status ——
+async function startDeviceFlow() {
+  $('qr-state').className = 'qr-state';
+  $('qr-state').textContent = '正在生成二维码…';
+  $('qr-retry').classList.add('hidden');
+  $('qr-img').src = '/api/qr.svg?ts=' + Date.now();
+  const r = await fetch('/api/start', { method: 'POST' });
+  if (!r.ok) {
+    $('qr-state').className = 'qr-state err';
+    $('qr-state').textContent = '设备码获取失败（' + r.status + '）';
+    $('qr-retry').classList.remove('hidden');
+    return;
+  }
+  started = true;
+  poll();
+}
+
+async function poll() {
+  while (true) {
+    if (!started) return;
+    let st;
+    try { st = await (await fetch('/api/status')).json(); }
+    catch (e) { await sleep(1500); continue; }
+    if (st.state === 'pending') {
+      $('qr-state').className = 'qr-state';
+      $('qr-state').textContent = '等待扫码确认…（授权码 ' + (st.user_code || '') + '）';
+    } else if (st.state === 'authorized') {
+      $('qr-state').className = 'qr-state ok';
+      $('qr-state').textContent = '✓ 授权成功，登录态已保存（user_id: ' + (st.user_id || '-') + '）';
+      $('qr-img').classList.add('hidden');
+      started = false;
+      return;
+    } else if (st.state === 'expired') {
+      $('qr-state').className = 'qr-state err';
+      $('qr-state').textContent = '二维码已过期';
+      $('qr-retry').classList.remove('hidden');
+      started = false;
+      return;
+    } else {
+      $('qr-state').className = 'qr-state err';
+      $('qr-state').textContent = st.message || '登录失败';
+      $('qr-retry').classList.remove('hidden');
+      started = false;
+      return;
+    }
+    await sleep(1500);
+  }
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+$('qr-retry').addEventListener('click', startDeviceFlow);
+
+// —— 密码登录 ——
+$('pwd-btn').addEventListener('click', async () => {
+  const u = $('pwd-user').value.trim(), p = $('pwd-pass').value;
+  const m = $('pwd-msg'); m.className = 'msg'; m.textContent = '';
+  if (!u || !p) { m.className = 'msg err'; m.textContent = '请输入账号与密码'; return; }
+  $('pwd-btn').disabled = true;
+  try {
+    const r = await fetch('/api/login/pwd', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: u, password: p })
+    });
+    const j = await r.json();
+    if (r.ok && j.ok) { m.className = 'msg ok'; m.textContent = '✓ 登录成功（user_id: ' + (j.user_id || '-') + '）'; }
+    else { m.className = 'msg err'; m.textContent = j.message || ('失败（' + r.status + '）'); }
+  } catch (e) { m.className = 'msg err'; m.textContent = '网络错误：' + e; }
+  $('pwd-btn').disabled = false;
+});
+
+// —— 短信登录 ——
+let smsCountdown = 0;
+$('sms-send').addEventListener('click', async () => {
+  const phone = $('sms-phone').value.trim();
+  const m = $('sms-msg');
+  if (!phone || smsCountdown > 0) return;
+  try {
+    const r = await fetch('/api/login/sms/send', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone })
+    });
+    const j = await r.json();
+    if (r.ok && j.ok) {
+      smsCountdown = 60;
+      const timer = setInterval(() => {
+        smsCountdown--;
+        $('sms-send').textContent = smsCountdown + 's 后重发';
+        if (smsCountdown <= 0) { clearInterval(timer); $('sms-send').textContent = '获取验证码'; }
+      }, 1000);
+      m.className = 'msg ok'; m.textContent = '验证码已发送';
+    } else { m.className = 'msg err'; m.textContent = j.message || '发送失败'; }
+  } catch (e) { m.className = 'msg err'; m.textContent = '网络错误：' + e; }
+});
+$('sms-btn').addEventListener('click', async () => {
+  const phone = $('sms-phone').value.trim(), code = $('sms-code').value.trim();
+  const m = $('sms-msg');
+  if (!phone || !code) { m.className = 'msg err'; m.textContent = '请输入手机号与验证码'; return; }
+  try {
+    const r = await fetch('/api/login/sms/verify', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ phone, code })
+    });
+    const j = await r.json();
+    if (r.ok && j.ok) { m.className = 'msg ok'; m.textContent = '✓ 登录成功（user_id: ' + (j.user_id || '-') + '）'; }
+    else { m.className = 'msg err'; m.textContent = j.message || '验证失败'; }
+  } catch (e) { m.className = 'msg err'; m.textContent = '网络错误：' + e; }
+});
+
+startDeviceFlow();
+</script>
+</body>
+</html>

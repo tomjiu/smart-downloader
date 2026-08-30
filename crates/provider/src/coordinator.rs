@@ -9,6 +9,7 @@ use crate::types::{link_expired, now_unix, ProviderError, ProviderTaskId, Resolv
 use crate::RemoteProvider;
 use smart_dl_core::ownership::{decide_auto_fallback, FallbackDecision, FallbackPolicy};
 use smart_dl_core::task::DownloadTask;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -105,11 +106,15 @@ impl FallbackCoordinator {
             _ => {}
         }
         let mut last_err = None;
+        let mut tried: HashSet<String> = HashSet::new();
         loop {
             let name = match self.select_provider() {
                 Some(n) => n,
                 None => break,
             };
+            if tried.contains(&name) {
+                break;
+            }
             let provider = self
                 .providers
                 .iter()
@@ -122,8 +127,9 @@ impl FallbackCoordinator {
                 Ok(outcome) => return Ok(outcome),
                 Err(e) => {
                     last_err = Some(e);
-                    // provider 已在 XunleiProvider::mark_failure 中设置 backoff，
-                    // 下一轮 select_provider 会自动跳过，继续尝试下一个可用 provider。
+                    tried.insert(name);
+                    // 已尝试过的 provider 不再重入，避免 MockProvider 等未设置 backoff 的
+                    // 实现导致同一 provider 死循环。
                 }
             }
         }
