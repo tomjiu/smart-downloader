@@ -3,11 +3,25 @@
 - 每个码发起后立即开始轮询 token（interval=2s）
 - 到手 token → 落盘预置路径 + 取证归档 → 退出
 - 未授权过期 → 自动发下一个码，状态写 qr_state.json（含最新短链）
-用法：nohup python3 nas_qr_daemon.py &
+
+扫码姿势（实测 2026-08-30，重要）：
+  1. 手机迅雷 App → 右上角「扫一扫」→ 扫本脚本打出的终端二维码
+  2. App 内点「确认授权」→ 本脚本 2s 内自动收 token 落盘退出
+  ⚠ 不要把链接粘到浏览器打开：授权页（__/auth/device/）只给 App 原生消费，
+    浏览器（含手机浏览器/App webview UA）访问一律 nginx 404 —— 非过期问题。
+  ⚠ 必须用目标迅雷账号（有云盘权益/VIP 的那个）扫码确认；
+    微信/QQ/微博入口仅当已绑定该迅雷账号时才会登到同一账号。
+
 路径均可被环境变量覆盖（SD_QR_STATE / SD_QR_HOME / SD_QR_ARCHIVE），
 client_id/secret 同理（SD_XL_CLIENT_ID / SD_XL_CLIENT_SECRET，便于轮换）。
+可选依赖：pip install qrcode（终端出二维码；未装则提示安装）。
 """
 import json, os, sys, time, urllib.request, urllib.parse
+
+try:
+    import qrcode
+except ImportError:  # 可选依赖：缺省时仅打印链接 + 安装提示
+    qrcode = None
 
 # 常量区：引擎内嵌 OAuth 客户端（已随附录 E.2.3 公开；环境变量可覆盖以便轮换）
 CLIENT_ID = os.environ.get("SD_XL_CLIENT_ID", "X9ibISwpIp8jQ4Ya")
@@ -42,7 +56,25 @@ def write_state(d):
     with open(STATE, "w") as f:
         json.dump(d, f, ensure_ascii=False, indent=2)
 
+def render_qr(url):
+    """终端渲染当前轮短链二维码；qrcode 未安装时给出一行安装提示。"""
+    if not url:
+        return
+    if qrcode is None:
+        print("  [!] pip install qrcode 后重跑本脚本可在终端直接出二维码", flush=True)
+        return
+    qr = qrcode.QRCode(border=1)
+    qr.add_data(url)
+    qr.make()
+    qr.print_ascii(invert=True)
+
+
 def main():
+    print("=" * 54)
+    print(" 迅雷 App 扫码授权：App → 右上角扫一扫 → 扫下方二维码")
+    print(" 确认授权后 token 自动落盘；每 120s 自动换码，扫最新一轮")
+    print(" ⚠ 链接别粘浏览器打开——授权页只给 App 用，浏览器必 404")
+    print("=" * 54, flush=True)
     deadline = time.time() + MAX_RUN
     n = 0
     while time.time() < deadline:
@@ -55,6 +87,7 @@ def main():
                      "user_code": code.get("user_code"), "issued_at": int(time.time()),
                      "expires_in": code.get("expires_in", 120), "status": "waiting_scan"})
         print(f"[round {n}] short={short} (expires {code.get('expires_in',120)}s)", flush=True)
+        render_qr(short)
         # 轮询当前码直至授权/过期
         t_end = time.time() + code.get("expires_in", 120)
         while time.time() < t_end:
