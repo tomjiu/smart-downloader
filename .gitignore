@@ -44,3 +44,6 @@ docs/research/xunlei/bugc_repro_*.log
 # 迅雷提取原始产物（体积大，非 SDK 核心二进制已移至 research_bin/）
 scripts/research/xunlei/extracted_macos/
 scripts/research/xunlei/extracted_android/
+
+# 超大安装包（已放 GitHub Release，仓库内仅保留 Git LFS 的 APK）
+research_bin/installers/thunder_5.80.7.66659.dmg
