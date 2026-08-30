@@ -2,16 +2,22 @@
 """xllite 扫码授权守护：循环续发设备码（120s/码），最长运行 30 分钟。
 - 每个码发起后立即开始轮询 token（interval=2s）
 - 到手 token → 落盘预置路径 + 取证归档 → 退出
-- 未授权过期 → 自动发下一个码，状态写 qr_state.json（含最新短链）
+- 未授权过期 → 自动发下一个码，状态写 qr_state.json（含最新链接）
 
-扫码姿势（实测 2026-08-30，重要）：
-  1. 手机迅雷 App 先登录目标账号（App 自身登录页支持微信/QQ/微博/验证码，
-     第三方须已绑定该迅雷账号：App → 设置 → 账号与安全 → 第三方账号绑定）
-  2. App → 右上角「扫一扫」→ 扫本脚本打出的终端二维码 → App 内点「确认授权」
-     → 2s 内自动收 token 落盘退出；授权环节不再有「选登录方式」页（实测
-     /__/auth/device/ 对一切浏览器 UA 均 404，页面只给 App 原生消费）
-  ⚠ 必须用目标迅雷账号（有云盘权益/VIP 的那个）确认；未绑定的第三方会
-    登成另一个账号 → token 授权错身份，A2 校准作废
+授权姿势（2026-08-30 二次实测修正，重要）：
+  主路径（网页统一授权页，登录方式全集合）：
+  1. 手机/电脑任意浏览器打开本脚本打出的 /yc/ 链接（或扫终端二维码）
+  2. 未登录 → 跳官方网页登录页：账密 / 短信验证码 / App 扫码 /
+     微信 / QQ / 微博第三方全支持（第三方须已绑定目标迅雷账号：
+     App → 设置 → 账号与安全 → 第三方账号绑定）
+  3. 登录后出现「远程设备」授权确认 → 点确认 → 2s 内 token 落盘退出
+     （页面 POST api-pan.xunlei.com/v1/user/device/authorize；页面 JS
+     内置默认 client_id 即本脚本所用 X9ibISwpIp8jQ4Ya + 同款 scope，
+     并适配 App/PC/Mac/微信小程序 webview 四端 bridge）
+  备路径（App 原生）：App 扫 short_uri 短链（若 App 版本可处理；
+  网页浏览器打开短链必 404 —— /__/auth/device/ 页 App-only，实测）
+  ⚠ 必须用目标迅雷账号（有云盘权益/VIP 的那个）登录并确认；
+    未绑定的第三方会登成另一个账号 → token 授权错身份，A2 校准作废
 
 路径均可被环境变量覆盖（SD_QR_STATE / SD_QR_HOME / SD_QR_ARCHIVE），
 client_id/secret 同理（SD_XL_CLIENT_ID / SD_XL_CLIENT_SECRET，便于轮换）。
@@ -30,6 +36,15 @@ CLIENT_SECRET = os.environ.get("SD_XL_CLIENT_SECRET", "BlPF2z7HEeutzH4t6zyjLw")
 SCOPE = "pan user profile sso offline pan/xunlei/share/create"
 CODE_URL = "https://xluser-ssl.xunlei.com/v1/auth/device/code"
 TOKEN_URL = "https://xluser-ssl.xunlei.com/v1/auth/token"
+# 网页统一授权页（实测 200 可渲染；/yc/ 页 JS 默认 queryAuth 即本 client_id+scope，
+# 未登录自动跳官方网页登录页——账密/短信/扫码/微信/QQ/微博全方式）
+WEB_AUTH_BASE = "https://pan.xunlei.com/yc/"
+
+def web_auth_url(user_code):
+    """构造 /yc/ 统一授权页链接（scope 显式透传，页面从 URL 参数读取）。"""
+    q = urllib.parse.urlencode({"client_id": CLIENT_ID, "user_code": user_code,
+                                "scope": SCOPE})
+    return WEB_AUTH_BASE + "?" + q
 # 路径区：默认相对脚本自身定位（任意机器/任意克隆位置均可跑），env 可覆盖
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE = os.environ.get("SD_QR_STATE",
@@ -71,12 +86,15 @@ def render_qr(url):
 
 
 def main():
-    print("=" * 54)
-    print(" 迅雷 App 扫码授权：先在 App 登录好目标账号再扫码")
-    print(" App → 扫一扫 → 扫下方二维码 → 确认授权 → token 自动落盘")
-    print(" ⚠ 授权环节没有选登录方式的网页（浏览器打开必 404，实测）；")
-    print("   微信/QQ/微博登录在 App 自身登录页，且需已绑定目标迅雷账号")
-    print("=" * 54, flush=True)
+    print("=" * 58)
+    print(" 迅雷设备授权（网页统一授权页 · 登录方式全集合）")
+    print(" 手机/电脑任意浏览器打开下方 /yc/ 链接（或扫二维码）：")
+    print("   未登录 → 跳官方网页登录（账密/短信/扫码/微信/QQ/微博）")
+    print("   已登录 → 「远程设备」授权确认 → 点确认 → token 自动落盘")
+    print(" ⚠ 必须用有云盘权益的目标迅雷账号登录；未绑定的第三方")
+    print("   会登成另一个账号 → token 授权错身份，A2 校准作废")
+    print(" 备选：手机迅雷 App 扫一扫 short_uri 短链（App 原生确认流）")
+    print("=" * 58, flush=True)
     deadline = time.time() + MAX_RUN
     n = 0
     while time.time() < deadline:
@@ -85,11 +103,14 @@ def main():
         short = code.get("short_uri_complete", "")
         full = code.get("verification_uri_complete", "")
         dc = code["device_code"]
-        write_state({"round": n, "short_url": short, "full_url": full,
+        web = web_auth_url(code.get("user_code", ""))
+        write_state({"round": n, "web_auth_url": web, "short_url": short,
+                     "full_url": full,
                      "user_code": code.get("user_code"), "issued_at": int(time.time()),
-                     "expires_in": code.get("expires_in", 120), "status": "waiting_scan"})
-        print(f"[round {n}] short={short} (expires {code.get('expires_in',120)}s)", flush=True)
-        render_qr(short)
+                     "expires_in": code.get("expires_in", 120), "status": "waiting_auth"})
+        print(f"[round {n}] 网页授权链接（浏览器打开，全登录方式）:\n  {web}", flush=True)
+        print(f"[round {n}] App 短链（备选）: {short} (expires {code.get('expires_in',120)}s)", flush=True)
+        render_qr(web)
         # 轮询当前码直至授权/过期
         t_end = time.time() + code.get("expires_in", 120)
         while time.time() < t_end:
