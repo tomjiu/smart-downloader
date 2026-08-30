@@ -160,3 +160,15 @@ Phase 3 四端可行性定案的原始证据（APK 解包 + NAS 引擎 + cnk3x �
   - `apk-unpacked/` — hezi APK 解包（确认无引擎，为管理端）
   - `cnk3x/` — 群晖模拟最小集参考实现（MIT）
 - **文档**: `docs/research/xunlei/CROSS_PLATFORM_FOUR_OS_2026-08-30.md`（附录 E）
+## Phase 3b（B 档）：NAS 引擎集成骨架 + 统一身份层
+
+在附录 E 四端定案基础上的工程落地（本 PR 分支）：
+
+- **B-1 FTP 引擎**：`httpdl::FtpEngine` 早已交付（15 测试全绿，`--features ftp`），状态核实后从待办表移除
+- **B-2 NasRemoteEngine**：`crates/daemon/src/nas_remote.rs` —— `DownloadEngine` 适配器，经 `DriveListen`（默认 `127.0.0.1:5050`）TCP 面探活 + 能力声明；下载端点表按假设区 #9 占位（UNTESTED，待扫码实测后校准）
+- **B-3 L1→xllite 身份桥**：`crates/daemon/src/nas.rs::sync_l1_token` —— L1 云盘登录态（`xunlei_auth.json`）自动映射为 xllite 引擎预置 token；`serve.rs` 第 4e 步启动时自动同步（`SD_L1_TOKEN` 可覆盖路径）。字段映射为格式假设（假设区 #8），以扫码实测拿到的原生 token 文件为准校准
+- **B-4 Android Termux 一键部署**：`scripts/nas/android-termux-setup.sh` —— proot-distro Debian + arm64 SPK 引擎下载解包 + 启动协议包装（`DriveListen/LauncherListen/ConfigPath/HOME`，unset PLATFORM）
+- **A 档扫码守护**：`scripts/nas/nas_qr_daemon.py` —— RFC 8628 设备码自动续发（120s/码，运行 2h），token 到手自动落盘 `~/.nas-engine-test/data/.drive/auth_token.json`（引擎预置路径）+ 取证归档；零第三方依赖
+- **core**：`EngineKind::XunleiNas` 新枚举值
+
+原始证据（SPK/APK 解包/cnk3x）见上方 Release 附件；引擎实测记录见 `docs/research/xunlei/CROSS_PLATFORM_FOUR_OS_2026-08-30.md` 附录 E。

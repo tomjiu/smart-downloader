@@ -66,6 +66,8 @@ pub enum EngineKind {
     Http,
     Ftp,
     Provider,
+    /// NAS 版迅雷引擎（xllite/pan-cli 远程托管，daemon feature `nas`，附录 E）。
+    XunleiNas,
 }
 
 /// 引擎任务句柄（v1 用引擎侧生成字符串 id）。

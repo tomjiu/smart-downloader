@@ -195,6 +195,23 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         tracing::info!("FTP 引擎已启用");
     }
 
+    // 4e. NAS 引擎身份桥（feature `nas`，B-3 统一身份层）：L1 登录态存在时
+    // 自动同步为 xllite 引擎预置 token（免扫码启动；格式校准=假设区 #8）。
+    #[cfg(feature = "nas")]
+    {
+        let l1_path = std::env::var("SD_L1_TOKEN")
+            .unwrap_or_else(|_| "xunlei_auth.json".to_string());
+        let l1 = std::path::PathBuf::from(&l1_path);
+        if l1.exists() {
+            match crate::nas::sync_l1_token(&l1).await {
+                Ok(p) => tracing::info!("L1→xllite 身份桥：token 已预置至 {}", p.display()),
+                Err(e) => tracing::warn!("L1→xllite 身份桥跳过：{e}"),
+            }
+        } else {
+            tracing::info!("NAS 身份桥：L1 token 不存在（{l1_path}），引擎首次启动需扫码或 /nas/token 投喂");
+        }
+    }
+
     // 4b. 任务持久化 + 启动恢复（须在引擎表就绪后：恢复会重新 add）
     let tasks_path = cfg.storage.tasks_path.clone();
     if let Some(parent) = tasks_path.parent() {

@@ -383,6 +383,54 @@ pub async fn put_auth_token(mgr: &NasManager, token_json: &str) -> Result<PathBu
     Ok(path)
 }
 
+/// 统一身份层（B-3）：L1 云登录 token → xllite 引擎预置桥。
+///
+/// L1 侧（xunlei_auth.json）：`{access_token, refresh_token, device_id,
+/// access_token_expires_at, user_id?}`；xllite 侧为 xluser OAuth 响应形
+/// `{access_token, refresh_token, token_type, expires_in}`（RFC 8628 兑换产物）。
+/// 字段映射为**格式假设**（假设区 #8）：引擎实际读取的字段集与文件名，以扫码
+/// 实测拿到的原生 token 文件为准校准；本桥保证 L1 已登录时引擎可免扫码复用。
+pub async fn sync_l1_token(l1_token_path: &Path) -> Result<PathBuf, NasError> {
+    let raw = tokio::fs::read_to_string(l1_token_path)
+        .await
+        .map_err(|e| NasError::Io(format!("读 L1 token {}: {e}", l1_token_path.display())))?;
+    let v: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| NasError::Install(format!("L1 token JSON 解析失败: {e}")))?;
+    let access = v
+        .get("access_token")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| NasError::Install("L1 token 缺 access_token".into()))?
+        .to_string();
+    let refresh = v
+        .get("refresh_token")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if access.is_empty() || refresh.is_empty() {
+        return Err(NasError::Install("L1 token 缺 access/refresh_token（未登录？）".into()));
+    }
+    // expires_at（unix 秒）→ expires_in（剩余秒）；缺省 1h
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let expires_at = v
+        .get("access_token_expires_at")
+        .and_then(|x| x.as_u64())
+        .unwrap_or(now + 3600);
+    let expires_in = expires_at.saturating_sub(now).max(60);
+    let bridged = serde_json::json!({
+        "access_token": access,
+        "refresh_token": refresh,
+        "token_type": "Bearer",
+        "expires_in": expires_in,
+        "src": "l1-bridge",
+        "src_file": l1_token_path.to_string_lossy(),
+    });
+    let mgr = manager();
+    put_auth_token(mgr, &bridged.to_string()).await
+}
+
 /// 自检：当前平台是否支持（Linux only）。
 pub const fn platform_supported() -> bool {
     cfg!(target_os = "linux")
