@@ -1539,6 +1539,7 @@ dependencies = [
  "base64",
  "fs2",
  "futures",
+ "qrcode",
  "reqwest",
  "serde",
  "serde_json",

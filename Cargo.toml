@@ -16,6 +16,16 @@ exclude = ["spike/cxx"]
 version = "0.1.0"
 edition = "2021"
 
+# Task 5-a（2026-08-30）：dev/test 只保留行表级调试信息。
+# 背景：9.9G 磁盘下，全量 debuginfo（默认 2）使每个 daemon 测试二进制 ~100MB，
+# 并行代理反复构建即撑爆磁盘（ld Bus error / No space left）。
+# line-tables-only 保留回溯行号，二进制体积约减半；release 不受影响。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
