@@ -1,0 +1,67 @@
+{
+  "phase": "__inner__",
+  "started_at": 1788145605,
+  "inner_binds": {
+    "usr-keep": 0,
+    "var-keep": 0,
+    "usr-shadow": 0,
+    "var-shadow": 0,
+    "etc-shadow": 0
+  },
+  "inner_checks": {
+    "synoinfo": true,
+    "authcgi": true,
+    "pkgdest_version": true,
+    "loader": true,
+    "orig_usr": true,
+    "orig_var": true
+  },
+  "boot": true,
+  "log_sig": {
+    "config_init": "&{isInit:true NasIDKey: NasId: NasSubIdKey: NasSubId: DeviceId: WorkDir: BinPath:/home/z/my-project/repo-smart-downloader/scripts/research/xunlei/extracted/cross-platform/spk-x64/payload/bin/bin Platform:群晖 PathSplit:: DownloadPATHs:[/home/z/.nas-engine-test/downloads] TorrentPath: DriveFileMount:map[] PluginTokenDuration:5h0m0s PluginPATH:/home/z/.nas-engine-test/data/.drive/plugins AuthTokenPATH: DriveArgs: DrivePlayer: DriveListen:127.0.0.1:5050 DrivePortFile: DriveLogLevel:info DriveLogFile: DriveLogSize:10MB DriveLogFormat: DriveUpdate: DriveConfigPATH:/home/z/.nas-engine-test/data DrivePIDFile: DriveInfoFile: DrivePublicPort:21603 FreePortRange:[] FreePortRangeUDP:[] LauncherLogFile: LauncherLogSize: LauncherPIDFile: LauncherListen:127.0.0.1:5051 RefreshTokenDuration:1h KvCacheDuration:24h0m0s TaskCfgPath: ScrapeCacheDuration:24h0m0s SyncWatchDogDuration:30m0s CachePATH: DeviceSpace: DeviceName: TLSInsecureSkipVerify:true AllowCustomPlatform:true ImportTask:true SingleTaskMaxMB:100 SingleTaskReserveMB:20 OverallShareMaxMB:200 IdleMemoryUsageLimit:419430400 ThirdAuthURL: PanCliEnv: GeneDBShadowFileDuration:24h DebugPrintFileEvents:[] GossipFile:/home/z/.nas-engine-test/data/.drive/gossip.json PluginWithBash:false Webhook:{Modules:map[] URL:} HostXluser:https://xluser-ssl.xunlei.com HostApiPan:https://api-pan.xunlei.com HostShoulei:https://api-shoulei-ssl.xunlei.com HostHighSpeedFlow:https://api-pan.xunlei.com EnableTaskCfg:true WebhookHealthzToken: XlliteNotifyTaskComplete: EnableDownloadLog:false DisableNfo:false DownloadPipeLimit:256 UploadPipeLimit:256 DriveAuthorizationTokenPath:}\n08/31 03:06:45.72 INFO  > config.init init succ: &{isInit:true NasIDKey: NasId: NasSubIdKey: NasSubId: DeviceId: WorkDir: BinPath:/home/z/my-project/repo-smart-downloader/scripts/research/xunlei/extracted/cross-platform/spk-x64/payload/bin/bin Platform:群晖 PathSplit:: DownloadPATHs:[/home/z/.nas-engine-test/downloads] TorrentPath: DriveFileMount:map[] PluginTokenDuration:5h0m0s PluginPATH:/home/z/.nas-engine-test/data/.drive/plugins AuthTokenPATH: DriveArgs: DrivePlayer: DriveListen:127.0.0.1:5050 DrivePortFile: DriveLogLevel:info DriveLogFile: DriveLogSize:10MB DriveLogFormat: DriveUpdate: DriveConfigPATH:/home/z/.nas-engine-test/data DrivePIDFile: DriveInfoFile: DrivePublicPort:21603 FreePortRange:[] FreePortRangeUDP:[] LauncherLogFile: LauncherLogSize: LauncherPIDFile: LauncherListen:127.0.0.1:5051 RefreshTokenDuration:1h KvCacheDuration:24h0m0s TaskCfgPath: ScrapeCacheDuration:24h0m0s SyncWatchDogDuration:30m0s CachePATH: DeviceSpace: DeviceName: TLSInsecureSkipVeri",
+    "panic": false,
+    "platform_field": "群晖",
+    "privilege_lines": [
+      "PlatformPrivilege 6"
+    ],
+    "package_name": []
+  },
+  "jwt_ok": true,
+  "list": {
+    "status": 200,
+    "n": 3,
+    "tasks": [
+      {
+        "id": "VP0KNOaNsrS1AQwFA7InIHZ5A1",
+        "name": "dbg.dat",
+        "phase": "PHASE_TYPE_ERROR",
+        "message": "失败",
+        "error": "下载(90120)"
+      },
+      {
+        "id": "VP0KMtRt9YR062Fb-w1iypBJA1",
+        "name": "a4r3-10Mb.dat",
+        "phase": "PHASE_TYPE_ERROR",
+        "message": "失败",
+        "error": "下载(90120)"
+      },
+      {
+        "id": "VP0KL0GDAslWfb9gld0reITPA1",
+        "name": "a4-speedtest-10mb.bin",
+        "phase": "PHASE_TYPE_ERROR",
+        "message": "失败",
+        "error": "下载(90120)"
+      }
+    ]
+  },
+  "create": {
+    "status": 403,
+    "body": "{\"error\":\"task_create_count_limit\",\"error_code\":11,\"error_description\":\"任务创建次数达到上限\",\"error_details\":[{\"@type\":\"type.googleapis.com/google.rpc.LocalizedMessage\",\"locale\":\"zh-cn\",\"message\":\"任务创建次数达到上限\"}],\"HttpStatus\":403}"
+  },
+  "get_info": {
+    "status": 200,
+    "body": "{\"status\":0,\"usage\":{\"total\":3,\"used\":0},\"count_down\":{\"total\":0,\"used\":0},\"task_counter\":{\"super_speed\":null,\"team\":null},\"statistic\":{\"average_speed\":0,\"saved_sec\":0,\"start_time\":0,\"end_time\":0,\"stop_reason\":\"\"},\"expire_sec\":10}"
+  },
+  "log_tail": "=openStorm&keys_len=1&trace_id=_06RxRTZH&hasDBFile=true&report=true&filename=/home/z/.nas-engine-test/data/.drive/cbe30c3d9b6b11ffd09f82c213da6218&db_size=65536&db_name=cbe30c3d9b6b11ffd09f82c213da6218&key=cd8223004eda9c12b60898823700b60c&func_st=08/31 03:06:45&key_idx=0&pid=6473] > storm.Open succ\n08/31 03:06:45.89 INFO  configengine/engine.go:110  > configEngine start watch 4\n08/31 03:06:45.89 INFO  configengine/engine.go:121  > configEngine watch self change\n08/31 03:06:45.89 INFO  runner/runner.go:364 [device_space=] > DeviceRunner.RegisterRunner finish.runnerName:user#download\n08/31 03:06:45.89 INFO  runner/runner.go:364 [device_space=] > DeviceRunner.RegisterRunner finish.runnerName:user#download-url\n08/31 03:06:45.89 INFO  runner/runner.go:364 [device_space=] > DeviceRunner.RegisterRunner finish.runnerName:user#nfo\n08/31 03:06:45.89 INFO  runner/runner.go:364 [device_space=] > DeviceRunner.RegisterRunner finish.runnerName:user#app\n08/31 03:06:45.89 INFO  configengine/engine.go:71  > configEngine register PlatformPrivilege 6\n08/31 03:06:45.89 INFO  runner/device_runners.go:73 [trace_id=CreateTasksRunner_WUsaD7HE&func_st=08/31 03:06:45&pid=6473&func_name=CreateTasksRunner] > init runner [] [device_id#c7d089aad73f7e2ddd2c263c2956b5a6]\n08/31 03:06:45.89 INFO  storage/core_storm.go:92 [biz=StorageManager] > core set core-device-device-device_spaces\n08/31 03:06:45.89 INFO  service/service.go:515 [from_startup=2] > service.Start.\n08/31 03:06:45.89 INFO  cleaner/fact.go:32  > CleanerFactory.Register name:TaskFileCleaner curr_len:1 err:<nil>\n08/31 03:06:45.89 INFO  cleaner/fact.go:32  > CleanerFactory.Register name:LocalFileCleaner curr_len:2 err:<nil>\n08/31 03:06:45.89 INFO  service/service.go:545 [report=true&address=127.0.0.1:5050&from_startup=2] > service.Start start web service\n2026-08-31T03:06:45.899988908Z INFO [6473]initializing grpc: appservice\n2026-08-31T03:06:45.900006606Z INFO [6473]succeed register grpc gateway: appservice\n2026-08-31T03:06:45.90000988Z INFO [6473]initializing grpc: eventservice\n2026-08-31T03:06:45.90001468Z INFO [6473]succeed register grpc gateway: eventservice\n2026-08-31T03:06:45.900016803Z INFO [6473]initializing grpc: driveservice\n",
+  "finished_at": 1788145608
+}

@@ -1,0 +1,30 @@
+{
+  "phase": "baseline",
+  "started_at": 1788143783,
+  "boot": true,
+  "log_sig": {
+    "config_init": "&{isInit:true NasIDKey: NasId: NasSubIdKey: NasSubId: DeviceId: WorkDir: BinPath:/home/z/my-project/repo-smart-downloader/scripts/research/xunlei/extracted/cross-platform/spk-x64/payload/bin/bin Platform: PathSplit:: DownloadPATHs:[/home/z/.nas-engine-test/downloads] TorrentPath: DriveFileMount:map[] PluginTokenDuration:5h0m0s PluginPATH:/home/z/.nas-engine-test/data/.drive/plugins AuthTokenPATH: DriveArgs: DrivePlayer: DriveListen:127.0.0.1:5050 DrivePortFile: DriveLogLevel:info DriveLogFile: DriveLogSize:10MB DriveLogFormat: DriveUpdate: DriveConfigPATH:/home/z/.nas-engine-test/data DrivePIDFile: DriveInfoFile: DrivePublicPort:21603 FreePortRange:[] FreePortRangeUDP:[] LauncherLogFile: LauncherLogSize: LauncherPIDFile: LauncherListen:127.0.0.1:5051 RefreshTokenDuration:1h KvCacheDuration:24h0m0s TaskCfgPath: ScrapeCacheDuration:24h0m0s SyncWatchDogDuration:30m0s CachePATH: DeviceSpace: DeviceName: TLSInsecureSkipVerify:true AllowCustomPlatform:false ImportTask:true SingleTaskMaxMB:100 SingleTaskReserveMB:20 OverallShareMaxMB:200 IdleMemoryUsageLimit:419430400 ThirdAuthURL: PanCliEnv: GeneDBShadowFileDuration:24h DebugPrintFileEvents:[] GossipFile:/home/z/.nas-engine-test/data/.drive/gossip.json PluginWithBash:false Webhook:{Modules:map[] URL:} HostXluser:https://xluser-ssl.xunlei.com HostApiPan:https://api-pan.xunlei.com HostShoulei:https://api-shoulei-ssl.xunlei.com HostHighSpeedFlow:https://api-pan.xunlei.com EnableTaskCfg:true WebhookHealthzToken: XlliteNotifyTaskComplete: EnableDownloadLog:false DisableNfo:false DownloadPipeLimit:256 UploadPipeLimit:256 DriveAuthorizationTokenPath:}\n08/31 02:36:23.47 INFO  > config.init init succ: &{isInit:true NasIDKey: NasId: NasSubIdKey: NasSubId: DeviceId: WorkDir: BinPath:/home/z/my-project/repo-smart-downloader/scripts/research/xunlei/extracted/cross-platform/spk-x64/payload/bin/bin Platform: PathSplit:: DownloadPATHs:[/home/z/.nas-engine-test/downloads] TorrentPath: DriveFileMount:map[] PluginTokenDuration:5h0m0s PluginPATH:/home/z/.nas-engine-test/data/.drive/plugins AuthTokenPATH: DriveArgs: DrivePlayer: DriveListen:127.0.0.1:5050 DrivePortFile: DriveLogLevel:info DriveLogFile: DriveLogSize:10MB DriveLogFormat: DriveUpdate: DriveConfigPATH:/home/z/.nas-engine-test/data DrivePIDFile: DriveInfoFile: DrivePublicPort:21603 FreePortRange:[] FreePortRangeUDP:[] LauncherLogFile: LauncherLogSize: LauncherPIDFile: LauncherListen:127.0.0.1:5051 RefreshTokenDuration:1h KvCacheDuration:24h0m0s TaskCfgPath: ScrapeCacheDuration:24h0m0s SyncWatchDogDuration:30m0s CachePATH: DeviceSpace: DeviceName: TLSInsecureSkipVerify:",
+    "panic": false,
+    "platform_field": null,
+    "privilege_lines": [
+      "PlatformPrivilege 6"
+    ],
+    "package_name": []
+  },
+  "jwt_ok": true,
+  "list": {
+    "status": 403,
+    "n": 0,
+    "tasks": []
+  },
+  "create": {
+    "status": 403,
+    "body": "{\"error\":\"task_create_count_limit\",\"error_code\":11,\"error_description\":\"任务创建次数达到上限\",\"error_details\":[{\"@type\":\"type.googleapis.com/google.rpc.LocalizedMessage\",\"locale\":\"zh-cn\",\"message\":\"任务创建次数达到上限\"}],\"HttpStatus\":403}"
+  },
+  "get_info": {
+    "status": 200,
+    "body": "{\"status\":0,\"usage\":{\"total\":3,\"used\":0},\"count_down\":{\"total\":0,\"used\":0},\"task_counter\":{\"super_speed\":null,\"team\":null},\"statistic\":{\"average_speed\":0,\"saved_sec\":0,\"start_time\":0,\"end_time\":0,\"stop_reason\":\"\"},\"expire_sec\":10}"
+  },
+  "log_tail": "30c3d9b6b11ffd09f82c213da6218&key_idx=0&db_name=cbe30c3d9b6b11ffd09f82c213da6218&trace_id=_UsaD7HEd&keys_len=1&report=true] > dbFile EXISTS\n08/31 02:36:23.61 INFO  storage/repair.go:522 [func_st=08/31 02:36:23&key=cd8223004eda9c12b60898823700b60c&db_name=cbe30c3d9b6b11ffd09f82c213da6218&db_size=65536&trace_id=_UsaD7HEd&func_name=openStorm&report=true&key_idx=0&hasDBFile=true&keys_len=1&pid=5408&filename=/home/z/.nas-engine-test/data/.drive/cbe30c3d9b6b11ffd09f82c213da6218] > storm.Open start.\n08/31 02:36:23.61 INFO  storage/repair.go:526 [trace_id=_UsaD7HEd&func_name=openStorm&keys_len=1&hasDBFile=true&func_st=08/31 02:36:23&filename=/home/z/.nas-engine-test/data/.drive/cbe30c3d9b6b11ffd09f82c213da6218&db_name=cbe30c3d9b6b11ffd09f82c213da6218&report=true&key=cd8223004eda9c12b60898823700b60c&pid=5408&key_idx=0&db_size=65536] > storm.Open succ\n08/31 02:36:23.61 INFO  runner/runner.go:364 [device_space=] > DeviceRunner.RegisterRunner finish.runnerName:user#download\n08/31 02:36:23.61 INFO  runner/runner.go:364 [device_space=] > DeviceRunner.RegisterRunner finish.runnerName:user#download-url\n08/31 02:36:23.61 INFO  runner/runner.go:364 [device_space=] > DeviceRunner.RegisterRunner finish.runnerName:user#nfo\n08/31 02:36:23.61 INFO  runner/runner.go:364 [device_space=] > DeviceRunner.RegisterRunner finish.runnerName:user#app\n08/31 02:36:23.61 INFO  configengine/engine.go:71  > configEngine register PlatformPrivilege 6\n08/31 02:36:23.61 INFO  runner/device_runners.go:73 [trace_id=CreateTasksRunner_z1ThbXfQ&func_name=CreateTasksRunner&pid=5408&func_st=08/31 02:36:23] > init runner [] [device_id#c7d089aad73f7e2ddd2c263c2956b5a6]\n08/31 02:36:23.61 INFO  storage/core_storm.go:92 [biz=StorageManager] > core set core-device-device-device_spaces\n08/31 02:36:23.61 INFO  service/service.go:515 [from_startup=3] > service.Start.\n08/31 02:36:23.61 INFO  cleaner/fact.go:32  > CleanerFactory.Register name:TaskFileCleaner curr_len:1 err:<nil>\n08/31 02:36:23.61 INFO  cleaner/fact.go:32  > CleanerFactory.Register name:LocalFileCleaner curr_len:2 err:<nil>\n08/31 02:36:23.61 INFO  service/service.go:545 [from_startup=3&report=true&address=127.0.0.1:5050] > service.Start start web service\n",
+  "finished_at": 1788143785
+}
