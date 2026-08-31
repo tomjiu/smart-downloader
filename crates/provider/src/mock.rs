@@ -4,9 +4,10 @@ use crate::types::{
     link_expired, ProviderError, ProviderRuntime, ProviderStatus, ProviderTaskId,
     ResolvedRemoteFile,
 };
+use parking_lot::Mutex;
 use smart_dl_core::types::{Capability, DownloadSource};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 struct MockTask {
     status: ProviderStatus,
@@ -76,27 +77,27 @@ impl MockProvider {
     }
 
     pub fn with_quota(self, q: u64) -> Self {
-        self.state.lock().unwrap().quota_remaining = q;
+        self.state.lock().quota_remaining = q;
         self
     }
 
     pub fn disabled(self) -> Self {
-        self.state.lock().unwrap().enabled = false;
+        self.state.lock().enabled = false;
         self
     }
 
     pub fn unauthenticated(self) -> Self {
-        self.state.lock().unwrap().authenticated = false;
+        self.state.lock().authenticated = false;
         self
     }
 
     pub fn with_backoff(self, until_unix: u64) -> Self {
-        self.state.lock().unwrap().backoff_until = Some(until_unix);
+        self.state.lock().backoff_until = Some(until_unix);
         self
     }
 
     pub fn with_concurrency(self, n: u32) -> Self {
-        self.state.lock().unwrap().concurrency_limit = n;
+        self.state.lock().concurrency_limit = n;
         self
     }
 
@@ -105,39 +106,39 @@ impl MockProvider {
     /// Bug B 免配额复现钥匙：用慢速 Mock 拉开协调器 poll_ready 等待窗，
     /// 等效真实云盘「离线下载数分钟」，不消耗账号配额。
     pub fn with_ready_delay_secs(self, secs: u64) -> Self {
-        self.state.lock().unwrap().ready_delay = std::time::Duration::from_secs(secs);
+        self.state.lock().ready_delay = std::time::Duration::from_secs(secs);
         self
     }
 
     pub fn with_files(self, files: Vec<ResolvedRemoteFile>) -> Self {
-        self.state.lock().unwrap().files = files;
+        self.state.lock().files = files;
         self
     }
 
     /// resubmit 轮次的 resolve 文件（新直链）。
     pub fn set_resubmit_files(&self, files: Vec<ResolvedRemoteFile>) {
-        self.state.lock().unwrap().resubmit_files = files;
+        self.state.lock().resubmit_files = files;
     }
 
     /// update_sources 携带的新 URL（refresh_links 输出，resolve 时替换 files url）。
     pub fn set_update_urls(&self, urls: Vec<String>) {
-        self.state.lock().unwrap().update_urls = Some(urls);
+        self.state.lock().update_urls = Some(urls);
     }
 
     /// 测试观察：当前占用并发。
     pub fn set_busy(&self, n: u32) {
-        self.state.lock().unwrap().busy = n;
+        self.state.lock().busy = n;
     }
 
     /// 测试注入：下一次 submit 创建的任务直接进入 Failed（poll_ready 失败分支）。
     pub fn fail_next_submits(&self) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         st.fail_next = true;
     }
 
     /// 测试观察：剩余配额。
     pub fn quota(&self) -> u64 {
-        self.state.lock().unwrap().quota_remaining
+        self.state.lock().quota_remaining
     }
 
     /// refresh_links：update_sources 用的新 URL 列表（None = 无新链接）。
@@ -145,7 +146,7 @@ impl MockProvider {
         &self,
         id: &ProviderTaskId,
     ) -> Result<Option<Vec<String>>, ProviderError> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         if !st.tasks.contains_key(id) {
             return Err(ProviderError::NotFound);
         }
@@ -165,7 +166,7 @@ impl crate::RemoteProvider for MockProvider {
     }
 
     fn runtime(&self) -> ProviderRuntime {
-        let st = self.state.lock().unwrap();
+        let st = self.state.lock();
         ProviderRuntime {
             enabled: st.enabled,
             authenticated: st.authenticated,
@@ -178,13 +179,13 @@ impl crate::RemoteProvider for MockProvider {
     }
 
     async fn refresh_auth(&self) -> Result<(), ProviderError> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         st.authenticated = true;
         Ok(())
     }
 
     async fn submit(&self, _source: &DownloadSource) -> Result<ProviderTaskId, ProviderError> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         if !st.enabled {
             return Err(ProviderError::Other("disabled".into()));
         }
@@ -209,8 +210,7 @@ impl crate::RemoteProvider for MockProvider {
         let ready_at = if matches!(initial, ProviderStatus::Failed) {
             None
         } else {
-            (st.ready_delay.as_secs() > 0)
-                .then(|| std::time::Instant::now() + st.ready_delay)
+            (st.ready_delay.as_secs() > 0).then(|| std::time::Instant::now() + st.ready_delay)
         };
         st.tasks.insert(
             id.clone(),
@@ -225,7 +225,7 @@ impl crate::RemoteProvider for MockProvider {
     }
 
     async fn status(&self, id: &ProviderTaskId) -> Result<ProviderStatus, ProviderError> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         let t = st.tasks.get_mut(id).ok_or(ProviderError::NotFound)?;
         t.status_calls += 1;
         // Failed 是终态（fail_task 注入）——不自动推进
@@ -251,7 +251,7 @@ impl crate::RemoteProvider for MockProvider {
     }
 
     async fn resolve(&self, id: &ProviderTaskId) -> Result<Vec<ResolvedRemoteFile>, ProviderError> {
-        let st = self.state.lock().unwrap();
+        let st = self.state.lock();
         let t = st.tasks.get(id).ok_or(ProviderError::NotFound)?;
         if t.status != ProviderStatus::Ready {
             return Err(ProviderError::Other("task not ready".into()));
@@ -279,7 +279,7 @@ impl crate::RemoteProvider for MockProvider {
     }
 
     async fn remove(&self, id: &ProviderTaskId) -> Result<(), ProviderError> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.state.lock();
         st.tasks.remove(id).ok_or(ProviderError::NotFound)?;
         Ok(())
     }
@@ -301,8 +301,7 @@ pub(crate) fn any_expired(files: &[ResolvedRemoteFile], now: u64) -> bool {
 /// 缺失/非法 → 0（旧行为：秒级 Ready）。独立纯函数便于单测（避免测试进程
 /// 内改环境变量的并行竞态）。
 pub fn parse_ready_delay_secs(raw: Option<&str>) -> u64 {
-    raw.and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(0)
+    raw.and_then(|s| s.trim().parse::<u64>().ok()).unwrap_or(0)
 }
 
 /// 从进程环境读取延迟 Ready 秒数（MockProvider::new 装配时调用一次）。

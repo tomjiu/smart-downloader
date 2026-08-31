@@ -16,9 +16,9 @@ use crate::xunlei::auth::AuthState;
 use crate::xunlei::client::{Client, CLIENT_ID, CLIENT_VERSION, PAN_BASE, XLUSER_BASE};
 use crate::xunlei::sign::{captcha_sign, device_id_32, PACKAGE_NAME};
 use md5::{Digest as Md5Digest, Md5};
+use parking_lot::Mutex;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use serde::Deserialize;
-use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 解析后的分享链接。
@@ -151,7 +151,10 @@ pub fn parse_share_link(url: &str) -> Option<SharedLink> {
         })
         .filter(|s| !s.is_empty());
 
-    Some(SharedLink { share_id, pass_code })
+    Some(SharedLink {
+        share_id,
+        pass_code,
+    })
 }
 
 /// 分享解析器。
@@ -198,14 +201,8 @@ impl Sharer {
             "Referer",
             HeaderValue::from_static("https://pan.xunlei.com/"),
         );
-        h.insert(
-            "Origin",
-            HeaderValue::from_static("https://pan.xunlei.com"),
-        );
-        h.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/json"),
-        );
+        h.insert("Origin", HeaderValue::from_static("https://pan.xunlei.com"));
+        h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         h
     }
 
@@ -218,7 +215,7 @@ impl Sharer {
     /// （与 client.rs::refresh_captcha 一致），并按需求用本地生成的匿名设备号。
     async fn ensure_captcha(&self) -> Result<String, ShareError> {
         // 已有则直接复用。
-        if let Some(t) = self.captcha.lock().unwrap().clone() {
+        if let Some(t) = self.captcha.lock().clone() {
             return Ok(t);
         }
         let full_dev = anonymous_device_id();
@@ -259,7 +256,7 @@ impl Sharer {
         }
         let body: CaptchaResp = resp.json().await?;
         // 缓存（忽略 expires，下次 list/resolve 若失败可重试刷新）。
-        *self.captcha.lock().unwrap() = Some(body.captcha_token.clone());
+        *self.captcha.lock() = Some(body.captcha_token.clone());
         Ok(body.captcha_token)
     }
 
@@ -324,9 +321,9 @@ impl Sharer {
         // 若带提取码，先校验拿到 pass_code_token 并缓存（list→resolve 复用）。
         if link.pass_code.is_some() {
             let token = self.verify_pass_code_authed(link, state).await?;
-            *self.pass_token.lock().unwrap() = Some(token);
+            *self.pass_token.lock() = Some(token);
         }
-        let pass_token = self.pass_token.lock().unwrap().clone();
+        let pass_token = self.pass_token.lock().clone();
 
         let url = build_share_detail_url(&link.share_id, pass_token.as_deref());
         let resp = self
@@ -364,7 +361,7 @@ impl Sharer {
         file_id: &str,
         state: &AuthState,
     ) -> Result<ResolvedLink, ShareError> {
-        let pass_token = self.pass_token.lock().unwrap().clone();
+        let pass_token = self.pass_token.lock().clone();
         let url = build_share_play_url(file_id, &link.share_id, pass_token.as_deref());
 
         let resp = self
@@ -441,7 +438,7 @@ impl Sharer {
             let token = self
                 .verify_pass_code(link, device_id, &captcha_token)
                 .await?;
-            *self.pass_token.lock().unwrap() = Some(token);
+            *self.pass_token.lock() = Some(token);
         }
 
         // **【B级 · 推断】** 分享详情端点形态来自 `verify_share_nologin.py` 文件头注释
@@ -452,7 +449,7 @@ impl Sharer {
         // - 带 xluser-ssl 的 captcha_token → `400 no client info found`（api-pan 不认 xluser 的 token）
         // 即 `share/detail` 在匿名链路下**实测必然失败**。此处仍按形态实现，错误体会透传给调用方；
         // 登录态对症版本见 `list_with_auth`。
-        let pass_token = self.pass_token.lock().unwrap().clone();
+        let pass_token = self.pass_token.lock().clone();
 
         let url = build_share_detail_url(&link.share_id, pass_token.as_deref());
 
@@ -498,7 +495,7 @@ impl Sharer {
         let captcha_token = self.ensure_captcha().await?;
         let full_dev = anonymous_device_id();
         let device_id = device_id_32(&full_dev);
-        let pass_token = self.pass_token.lock().unwrap().clone();
+        let pass_token = self.pass_token.lock().clone();
 
         let url = build_share_play_url(file_id, &link.share_id, pass_token.as_deref());
 
@@ -531,7 +528,11 @@ pub(crate) fn build_share_detail_url(share_id: &str, pass_code_token: Option<&st
 }
 
 /// 纯函数：分享取直链 URL（匿名/登录态共用，A 级形状还原自 verify_share_nologin.py line 325）。
-pub(crate) fn build_share_play_url(file_id: &str, share_id: &str, pass_code_token: Option<&str>) -> String {
+pub(crate) fn build_share_play_url(
+    file_id: &str,
+    share_id: &str,
+    pass_code_token: Option<&str>,
+) -> String {
     let mut url = format!(
         "{}/drive/v1/files/{}?space=&usage=PLAY&share_id={}",
         PAN_BASE,
@@ -592,8 +593,9 @@ fn parse_play_body(body_text: String) -> Result<ResolvedLink, ShareError> {
         #[serde(default)]
         size: Option<u64>,
     }
-    let play: Play = serde_json::from_str(&body_text)
-        .map_err(|_| ShareError::NoLink { body: body_text.clone() })?;
+    let play: Play = serde_json::from_str(&body_text).map_err(|_| ShareError::NoLink {
+        body: body_text.clone(),
+    })?;
     if play.web_content_link.is_empty() {
         return Err(ShareError::NoLink { body: body_text });
     }
@@ -775,7 +777,10 @@ mod tests {
     fn rejects_non_pan_domain() {
         assert_eq!(parse_share_link("https://www.baidu.com/s/abc?pwd=x"), None);
         assert_eq!(parse_share_link("https://xunlei.com/s/abc"), None);
-        assert_eq!(parse_share_link("https://pan.xunlei.com.evil.com/s/abc"), None);
+        assert_eq!(
+            parse_share_link("https://pan.xunlei.com.evil.com/s/abc"),
+            None
+        );
     }
 
     #[test]
@@ -906,7 +911,8 @@ mod tests {
 
     #[test]
     fn parse_play_body_resolves_size_and_expiry() {
-        let body = r#"{"web_content_link":"https://dl.xunlei.com/f?e=1700000000&f=12345"}"#.to_string();
+        let body =
+            r#"{"web_content_link":"https://dl.xunlei.com/f?e=1700000000&f=12345"}"#.to_string();
         let r = parse_play_body(body).expect("应解析出直链");
         assert_eq!(r.size, 12345);
         assert_eq!(r.expires_at, Some(1700000000));

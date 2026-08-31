@@ -6,10 +6,11 @@
 // 按测试二进制编译，未使用的构造/helper 属正常
 #![allow(dead_code)]
 
+use parking_lot::Mutex;
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -191,7 +192,7 @@ async fn handle_control(
                 data_listener = None;
             }
             "RETR" => {
-                rest_offsets.lock().unwrap().push(rest);
+                rest_offsets.lock().push(rest);
                 retr_count.fetch_add(1, Ordering::SeqCst);
                 if cfg.retr_550 {
                     let _ = conn.write_all(b"550 file unavailable\r\n").await;

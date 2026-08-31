@@ -13,11 +13,12 @@ use axum::{
     Router,
 };
 use md5::{Digest as Md5Digest, Md5};
+use parking_lot::Mutex;
 use sha2::Sha256;
 use std::net::SocketAddr;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 
 /// 确定性内容：i % 251（质数周期，避免 256 对齐巧合）。
@@ -155,7 +156,7 @@ async fn handler(State(st): State<ServerState>, headers: HeaderMap) -> Response 
             let start = parse_range_start(&r);
             let total = st.body.len() as u64;
             let end = parse_range_end(&r).unwrap_or(total - 1).min(total - 1);
-            st.range_starts.lock().unwrap().push(start);
+            st.range_starts.lock().push(start);
             // 中途断流/mirror 失效：指定起点 → 404；配 fail_ranges_min_len 时仅对长度 >= 阈值的 Range 生效
             if st.cfg.fail_ranges.contains(&start) {
                 let req_len = end - start + 1;

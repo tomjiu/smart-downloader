@@ -89,8 +89,7 @@ async fn segment_requests_cover_file_without_overlap() {
     let tid = engine.add(&task).await.unwrap();
     wait_terminal(&engine, &tid).await;
 
-    let starts: std::collections::HashSet<u64> =
-        srv.range_starts.lock().unwrap().iter().copied().collect();
+    let starts: std::collections::HashSet<u64> = srv.range_starts.lock().iter().copied().collect();
     let expected: std::collections::HashSet<u64> =
         [0u64, 16 * MB, 32 * MB, 48 * MB].into_iter().collect();
     assert!(

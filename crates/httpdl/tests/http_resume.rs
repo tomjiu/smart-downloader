@@ -67,7 +67,7 @@ async fn part_continues_from_offset_with_matching_etag() {
     );
 
     // 服务器确实收到了从 40KB 起的 Range（续传位置验证）
-    let starts = srv.range_starts.lock().unwrap().clone();
+    let starts = srv.range_starts.lock().clone();
     assert!(
         starts.contains(&(40 * 1024)),
         "必须从 .part 偏移续传，实际 Range 起点: {starts:?}"
@@ -109,7 +109,7 @@ async fn etag_mismatch_but_range_respected_still_resumes() {
     assert_eq!(final_bytes.len(), 48 * 1024);
     assert_eq!(final_bytes, patterned(48 * 1024));
 
-    let starts = srv.range_starts.lock().unwrap().clone();
+    let starts = srv.range_starts.lock().clone();
     assert!(
         starts.contains(&(20 * 1024)),
         "ETag 不一致但 range 支持 → 仍从偏移续，实际: {starts:?}"
@@ -149,7 +149,7 @@ async fn part_longer_than_file_restarts() {
     assert_eq!(final_bytes, patterned(32 * 1024), "重下内容必须正确");
 
     // 重下覆盖旧 .part：Range 起点含 0（从头）
-    let starts = srv.range_starts.lock().unwrap().clone();
+    let starts = srv.range_starts.lock().clone();
     assert!(
         starts.contains(&0),
         "作废重下应从 0 开始，实际 Range 起点: {starts:?}"
