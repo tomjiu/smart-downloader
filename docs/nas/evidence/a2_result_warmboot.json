@@ -1,0 +1,96 @@
+{
+  "mode": "warmboot-online",
+  "started_at": 1788135636,
+  "drive_listen_up": true,
+  "login_attempted": false,
+  "login_ok_seen": false,
+  "engine_log_tail": "ame=StartDeviceRunner&func_st=08/31 00:20:37&pid=2286] > StartDeviceRunner start\n08/31 00:20:37.04 INFO  commands/runner.go:92 [func_name=StartDeviceRunner&peerid=D6840C124CD7004V&sdk_version=docker_3.23.5&func_st=08/31 00:20:37&pid=2286&trace_id=_qZTa3N0] > StartRunner download.Init\n08/31 00:20:37.04 INFO  storage/core_storm.go:59 [biz=StorageManager] > core get core-device-device-device_spaces\n08/31 00:20:37.04 INFO  storage/repair.go:517 [func_st=08/31 00:20:37&func_name=openStorm&pid=2286&key=5c14679171f7c150e32a1e78f967b08c&trace_id=_6RxRTZHW&db_name=user.core.db&report=true&key_idx=0&keys_len=1&filename=/home/z/.nas-engine-test/data/.drive/user.core.db&hasDBFile=true&db_size=65536] > dbFile EXISTS\n08/31 00:20:37.04 INFO  storage/repair.go:522 [func_st=08/31 00:20:37&func_name=openStorm&db_name=user.core.db&filename=/home/z/.nas-engine-test/data/.drive/user.core.db&key_idx=0&keys_len=1&pid=2286&key=5c14679171f7c150e32a1e78f967b08c&trace_id=_6RxRTZHW&report=true&db_size=65536&hasDBFile=true] > storm.Open start.\n08/31 00:20:37.04 INFO  storage/repair.go:526 [filename=/home/z/.nas-engine-test/data/.drive/user.core.db&key_idx=0&trace_id=_6RxRTZHW&db_name=user.core.db&report=true&func_st=08/31 00:20:37&func_name=openStorm&pid=2286&db_size=65536&keys_len=1&hasDBFile=true&key=5c14679171f7c150e32a1e78f967b08c] > storm.Open succ\n08/31 00:20:37.04 INFO  storage/repair.go:517 [report=true&filename=/home/z/.nas-engine-test/data/.drive/cbe30c3d9b6b11ffd09f82c213da6218&func_st=08/31 00:20:37&key=cd8223004eda9c12b60898823700b60c&db_name=cbe30c3d9b6b11ffd09f82c213da6218&pid=2286&key_idx=0&trace_id=_UsaD7HEd&keys_len=1&hasDBFile=true&func_name=openStorm&db_size=65536] > dbFile EXISTS\n08/31 00:20:37.04 INFO  storage/repair.go:522 [keys_len=1&func_st=08/31 00:20:37&func_name=openStorm&pid=2286&key_idx=0&db_name=cbe30c3d9b6b11ffd09f82c213da6218&filename=/home/z/.nas-engine-test/data/.drive/cbe30c3d9b6b11ffd09f82c213da6218&key=cd8223004eda9c12b60898823700b60c&hasDBFile=true&trace_id=_UsaD7HEd&report=true&db_size=65536] > storm.Open start.\n08/31 00:20:37.04 INFO  storage/repair.go:526 [key_idx=0&db_size=65536&func_name=openStorm&report=true&func_st=08/31 00:20:37&keys_len=1&filename=/home/z/.nas-engine-test/data/.drive/cbe30c3d9b6b11ffd09f82c213da6218&pid=2286&db_name=cbe30c3d9b6b11ffd09f82c213da6218&key=cd8223004eda9c12b60898823700b60c&hasDBFile=true&trace_id=_UsaD7HEd] > storm.Open succ\n08/31 00:20:37.04 INFO  runner/runner.go:364 [device_space=] > DeviceRunner.RegisterRunner finish.runnerName:user#nfo\n08/31 00:20:37.04 INFO  runner/runner.go:364 [device_space=] > DeviceRunner.RegisterRunner finish.runnerName:user#app\n08/31 00:20:37.04 INFO  runner/runner.go:364 [device_space=] > DeviceRunner.RegisterRunner finish.runnerName:user#download\n08/31 00:20:37.04 INFO  runner/runner.go:364 [device_space=] > DeviceRunner.RegisterRunner finish.runnerName:user#download-url\n08/31 00:20:37.04 INFO  configengine/engine.go:71  > configEngine register PlatformPrivilege 6\n08/31 00:20:37.04 INFO  runner/device_runners.go:73 [func_name=CreateTasksRunner&pid=2286&func_st=08/31 00:20:37&trace_id=CreateTasksRunner_z1ThbXfQ] > init runner [] [device_id#c7d089aad73f7e2ddd2c263c2956b5a6]\n08/31 00:20:37.04 INFO  storage/core_storm.go:92 [biz=StorageManager] > core set core-device-device-device_spaces\n08/31 00:20:37.04 INFO  configengine/engine.go:110  > configEngine start watch 4\n08/31 00:20:37.04 INFO  configengine/engine.go:121  > configEngine watch self change\n08/31 00:20:37.04 INFO  service/service.go:515 [from_startup=3] > service.Start.\n08/31 00:20:37.04 INFO  cleaner/fact.go:32  > CleanerFactory.Register name:TaskFileCleaner curr_len:1 err:<nil>\n08/31 00:20:37.04 INFO  cleaner/fact.go:32  > CleanerFactory.Register name:LocalFileCleaner curr_len:2 err:<nil>\n08/31 00:20:37.04 INFO  service/service.go:545 [report=true&address=127.0.0.1:5050&from_startup=4] > service.Start start web service\n2026-08-31T00:20:37.046055172Z INFO [2286]initializing grpc: fileservice\n",
+  "api_probe": {
+    "GET /": {
+      "status": 200,
+      "body": "<!DOCTYPE html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"UTF-8\" />\n    <meta name=\"renderer\" content=\"webkit\" />\n    <meta name=\"force-rendering\" content=\"w"
+    },
+    "GET /webman/3rdparty/pan-xunlei-com/index.cgi/": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /drive/v1/user/info": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /drive/v1/tasks": {
+      "status": 403,
+      "body": {
+        "error": "permissi…<redacted>",
+        "error_code": 403,
+        "HttpStatus": 0
+      }
+    },
+    "GET /drive/v1/events": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /device/v1/info": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /device/v1/config": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "POST /device/v1/try_speed/get_info": {
+      "status": 404,
+      "body": "404 page not found"
+    }
+  },
+  "tryspeed": {
+    "anon POST /device/v1/try_speed/get_info {}": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "anon POST /device/v1/try_speed/get_info {\"file_size\": 104857600}": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "anon GET /device/v1/try_speed/get_info null": {
+      "status": 403,
+      "body": {
+        "error": "permissi…<redacted>",
+        "error_code": 403,
+        "HttpStatus": 0
+      }
+    },
+    "anon POST /device/v1/try_speed/apply {}": {
+      "status": 403,
+      "body": {
+        "error": "permissi…<redacted>",
+        "error_code": 403,
+        "HttpStatus": 0
+      }
+    },
+    "auth POST /device/v1/try_speed/get_info {}": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "auth POST /device/v1/try_speed/get_info {\"file_size\": 104857600}": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "auth GET /device/v1/try_speed/get_info null": {
+      "status": 403,
+      "body": {
+        "error": "permissi…<redacted>",
+        "error_code": 403,
+        "HttpStatus": 0
+      }
+    },
+    "auth POST /device/v1/try_speed/apply {}": {
+      "status": 403,
+      "body": {
+        "error": "permissi…<redacted>",
+        "error_code": 403,
+        "HttpStatus": 0
+      }
+    }
+  }
+}

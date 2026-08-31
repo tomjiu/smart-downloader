@@ -1,0 +1,17 @@
+{
+  "mode": "ns-login-injection",
+  "lo": "ip-cmd",
+  "hosts": 5,
+  "token_200": false,
+  "mitm_hits": {
+    "device_code": 1,
+    "token": 1,
+    "other": 121
+  },
+  "kv_changed": {
+    "6c8497ab1ec13cc128c281abf114f576": true,
+    "请勿删除,本目录文件.txt": true,
+    "cc7bb060f8efc7462b6cbbb5f7a21015": true
+  },
+  "auth_token_rewritten": false
+}
