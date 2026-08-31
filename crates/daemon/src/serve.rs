@@ -30,11 +30,18 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
 
     // 1b. 安全修复（V1/V13）fail-closed：非回环监听 + 未配置 http_token → 拒绝启动。
     // 防止用户把 addr 改成 0.0.0.0 后 API（写文件/NAS 执行链）对局域网裸奔。
-    // 环境变量 SMART_DL_HTTP_TOKEN 优先（免把 token 写进配置文件）。
-    let http_token = std::env::var("SMART_DL_HTTP_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-        .or(cfg.server.http_token.clone());
+    // token 解析：env `SMART_DL_HTTP_TOKEN` > config；`auto` → 生成强随机临时值
+    // 并打印到 stdout（第六轮 9.3.5，防手设弱 token）。
+    let (http_token, token_generated) = resolve_http_token(
+        std::env::var("SMART_DL_HTTP_TOKEN").ok(),
+        cfg.server.http_token.clone(),
+    );
+    if token_generated {
+        println!(
+            "[smart-dl] SMART_DL_HTTP_TOKEN=auto：已生成本次运行的临时 token: {}",
+            http_token.as_deref().unwrap_or_default()
+        );
+    }
     if !Config::is_loopback_addr(&cfg.server.addr) && http_token.is_none() {
         return Err(ServeError::Engine(
             "检测到非回环监听地址但未配置 [server] http_token：API 将对网络裸奔，
@@ -117,16 +124,18 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
             let save = cfg.bt_save_path();
             std::fs::create_dir_all(&save)
                 .map_err(|e| ServeError::Engine(format!("BT 落盘目录创建失败 {save:?}: {e}")))?;
-            let bt = Arc::new(crate::bt::BtEngine::new(
-                &save,
-                Some(cfg.download.proxy.as_str()),
-                cfg.download.max_download_kb_s,
-                cfg.bt.max_upload_kb_s,
-                cfg.bt.enable_dht,
-                cfg.bt.enable_lsd,
-                cfg.bt.enable_upnp,
-            )
-            .map_err(ServeError::Engine)?);
+            let bt = Arc::new(
+                crate::bt::BtEngine::new(
+                    &save,
+                    Some(cfg.download.proxy.as_str()),
+                    cfg.download.max_download_kb_s,
+                    cfg.bt.max_upload_kb_s,
+                    cfg.bt.enable_dht,
+                    cfg.bt.enable_lsd,
+                    cfg.bt.enable_upnp,
+                )
+                .map_err(ServeError::Engine)?,
+            );
             let core = bt.core(); // Arc<BtCore>：alert 轮询句柄（trait 化前保存）
             bt_typed = Some(bt.clone()); // Bug A：alert 循环的暂停意图压制句柄
             let bt_arc: Arc<dyn smart_dl_core::types::DownloadEngine> = bt.clone();
@@ -197,8 +206,8 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     // 自动同步为 xllite 引擎预置 token（免扫码启动；格式校准=假设区 #8）。
     #[cfg(feature = "nas")]
     {
-        let l1_path = std::env::var("SD_L1_TOKEN")
-            .unwrap_or_else(|_| "xunlei_auth.json".to_string());
+        let l1_path =
+            std::env::var("SD_L1_TOKEN").unwrap_or_else(|_| "xunlei_auth.json".to_string());
         let l1 = std::path::PathBuf::from(&l1_path);
         if l1.exists() {
             match crate::nas::sync_l1_token(&l1).await {
@@ -206,7 +215,9 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
                 Err(e) => tracing::warn!("L1→xllite 身份桥跳过：{e}"),
             }
         } else {
-            tracing::info!("NAS 身份桥：L1 token 不存在（{l1_path}），引擎首次启动需扫码或 /nas/token 投喂");
+            tracing::info!(
+                "NAS 身份桥：L1 token 不存在（{l1_path}），引擎首次启动需扫码或 /nas/token 投喂"
+            );
         }
     }
 
@@ -310,6 +321,17 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     Ok(())
 }
 
+/// 解析生效 HTTP token（第六轮 9.3.5）：env `SMART_DL_HTTP_TOKEN`（空串视为未设）
+/// > config `[server] http_token`；值为 `auto` → 生成强随机临时 token
+/// （uuid v4，122 位随机，getrandom 支撑），`generated=true` 由调用方负责打印。
+fn resolve_http_token(env_val: Option<String>, cfg_val: Option<String>) -> (Option<String>, bool) {
+    let raw = env_val.filter(|t| !t.is_empty()).or(cfg_val);
+    match raw.as_deref() {
+        Some("auto") => (Some(uuid::Uuid::new_v4().simple().to_string()), true),
+        _ => (raw, false),
+    }
+}
+
 /// 从代理 URL 提取 `user:pass@`（HTTP 引擎 reqwest basic_auth 用；BT 引擎由
 /// btcore::parse_proxy 解析同一格式）。无凭据 → None。
 fn proxy_auth_of(url: &str) -> Option<(String, String)> {
@@ -342,6 +364,33 @@ pub fn parse_args(args: &[String]) -> Result<Option<std::path::PathBuf>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_http_token_env_priority_and_auto() {
+        // env 优先于 config
+        let (t, gen) = resolve_http_token(Some("env-tok".into()), Some("cfg-tok".into()));
+        assert_eq!(t.as_deref(), Some("env-tok"));
+        assert!(!gen);
+        // env 空串视为未设 → 回落 config
+        let (t, gen) = resolve_http_token(Some(String::new()), Some("cfg-tok".into()));
+        assert_eq!(t.as_deref(), Some("cfg-tok"));
+        assert!(!gen);
+        // auto → 生成强随机值（非 "auto" 字面量），generated 标记
+        let (t1, gen) = resolve_http_token(Some("auto".into()), None);
+        assert!(gen);
+        assert_ne!(t1.as_deref(), Some("auto"));
+        assert_eq!(t1.as_deref().map(str::len), Some(32)); // uuid simple = 32 hex
+                                                           // 两次生成互不相同
+        let (t2, _) = resolve_http_token(Some("auto".into()), None);
+        assert_ne!(t1, t2);
+        // config 值为 auto 同样触发生成
+        let (_, gen) = resolve_http_token(None, Some("auto".into()));
+        assert!(gen);
+        // 双 None → 无 token（回环兼容模式）
+        let (t, gen) = resolve_http_token(None, None);
+        assert!(t.is_none());
+        assert!(!gen);
+    }
 
     #[test]
     fn parse_config_flag() {

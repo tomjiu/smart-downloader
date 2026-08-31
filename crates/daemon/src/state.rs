@@ -511,14 +511,15 @@ impl DaemonState {
 
     /// 校验 HTTP 请求 Bearer token（安全修复 V1/V13）：
     /// - 未配置 token（None）→ 放行（serve 已保证该模式仅回环监听可达）；
-    /// - 已配置 → `Authorization: Bearer <token>` 必须精确匹配，否则 false。
+    /// - 已配置 → `Authorization: Bearer <token>` 必须精确匹配，否则 false
+    ///   （比较走 `ct_eq` 常量时间路径，第六轮 9.3.4）。
     /// 覆盖全部路由含 /ws 升级握手（同一 Router layer）。
     pub fn verify_http_token(&self, authorization: Option<&str>) -> bool {
         match self.http_token.as_deref() {
             None | Some("") => true,
             Some(expect) => authorization
                 .and_then(|v| v.strip_prefix("Bearer "))
-                .map(|t| t == expect)
+                .map(|t| ct_eq(t, expect))
                 .unwrap_or(false),
         }
     }
@@ -3695,5 +3696,53 @@ mod webseed_tests {
                 st.progress
             );
         }
+    }
+}
+
+/// 常量时间字节串比较（第六轮审计 9.3.4）：token 精确比较走固定时长路径，
+/// 消除逐字节短路比较的时序侧信道。长度不等提前返回会泄露长度信息——
+/// 对高熵随机 token 而言长度本身非敏感，业界标准做法可接受。
+fn ct_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
+
+#[cfg(test)]
+mod ct_eq_tests {
+    use super::{ct_eq, DaemonState};
+    use std::sync::Arc;
+
+    #[test]
+    fn ct_eq_matches_equality_semantics() {
+        assert!(ct_eq("abc", "abc"));
+        assert!(ct_eq("", ""));
+        assert!(!ct_eq("abc", "abd"));
+        assert!(!ct_eq("abc", "abC"));
+        assert!(!ct_eq("abc", "abcd"));
+        assert!(!ct_eq("abcd", "abc"));
+        assert!(!ct_eq("", "a"));
+        // 高熵长 token 等价性
+        let t = "a1B2c3D4e5F6g7H8";
+        assert!(ct_eq(t, t));
+        assert!(!ct_eq(t, "a1B2c3D4e5F6g7H9"));
+    }
+
+    #[test]
+    fn verify_http_token_end_to_end() {
+        let engine = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
+        let st =
+            DaemonState::new(Arc::new(engine), vec![]).with_http_token(Some("s3cret".to_string()));
+        assert!(st.verify_http_token(Some("Bearer s3cret")));
+        // 前缀大小写敏感（Bearer 规范）
+        assert!(!st.verify_http_token(Some("bearer s3cret")));
+        assert!(!st.verify_http_token(Some("Bearer s3cretX")));
+        assert!(!st.verify_http_token(Some("Bearer ")));
+        assert!(!st.verify_http_token(Some("Basic s3cret")));
+        assert!(!st.verify_http_token(None));
     }
 }

@@ -78,7 +78,10 @@ pub struct NasManager {
 
 impl NasManager {
     pub fn new(cfg: NasConfig) -> Self {
-        Self { cfg, child: Arc::new(Mutex::new(None)) }
+        Self {
+            cfg,
+            child: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// DriveListen 地址（host:port）：探活/反代/远程引擎适配器共用同一来源，
@@ -91,11 +94,13 @@ impl NasManager {
         &self.cfg.work_dir
     }
 
-    /// SPK 安装：tar 解包 → package.tgz(xz) 解包 → 产物定位。
+    /// SPK 安装：tar 预检 → tar 解包 → package.tgz(xz) 预检+解包 → 产物定位。
     /// 使用系统 tar（零新增 crate 依赖；Linux 标配，支持 --xz 自动解压）。
     /// 安全修复（V5，CWE-22）：tar 全程 `--no-absolute-names --no-same-owner
-    /// --no-same-permissions` 防成员绝对路径/越权落盘；解包后遍历校验无 `..`
-    /// 逃逸产物，spk_path 不存在/不在 work_dir 内的压缩包拒绝安装。
+    /// --no-same-permissions` 防成员绝对路径/越权落盘；解包【前】列举成员显式
+    /// 拒绝绝对路径/`..` 成员（第六轮 9.3.2，不依赖系统 tar 版本默认行为）；
+    /// 解包后遍历校验无 `..` 逃逸产物，spk_path 不存在/不在 work_dir 内的
+    /// 压缩包拒绝安装。
     pub async fn install(&self) -> Result<NasInstallInfo, NasError> {
         let dest = self.cfg.work_dir.join("target");
         tokio::fs::create_dir_all(&dest)
@@ -107,7 +112,10 @@ impl NasManager {
 
         // V5：SPK 源文件必须存在且为常规文件（拒绝目录/设备等怪异路径）
         let spk_md = tokio::fs::metadata(&self.cfg.spk_path).await.map_err(|e| {
-            NasError::Install(format!("SPK 文件不可达 {}: {e}", self.cfg.spk_path.display()))
+            NasError::Install(format!(
+                "SPK 文件不可达 {}: {e}",
+                self.cfg.spk_path.display()
+            ))
         })?;
         if !spk_md.is_file() {
             return Err(NasError::Install(format!(
@@ -115,6 +123,10 @@ impl NasManager {
                 self.cfg.spk_path.display()
             )));
         }
+
+        // V5 残留加固（第六轮 9.3.2）：解包前列举外层 SPK 成员，显式拒绝
+        // 绝对路径/`..` 成员——不依赖运行时 tar 版本的默认行为
+        Self::precheck_tar_members(&["-tf", &self.cfg.spk_path.to_string_lossy()]).await?;
 
         // 解包外层 tar（SPK 容器：package.tgz / INFO / conf / scripts ...）
         let out = Command::new("tar")
@@ -136,6 +148,9 @@ impl NasManager {
                 String::from_utf8_lossy(&out.stderr)
             )));
         }
+
+        // 内层 package.tgz 同样预检（成员才是真正的文件载荷）
+        Self::precheck_tar_members(&["-tJf", &dest.join("package.tgz").to_string_lossy()]).await?;
 
         // 解包内层 package.tgz（xz 压缩 tar；tar 的 --xz/自动探测依赖 xz-utils）
         let out = Command::new("tar")
@@ -166,6 +181,40 @@ impl NasManager {
         let info = Self::locate_install(&dest)?;
         tracing::info!(?info, "NAS 引擎安装完成");
         Ok(info)
+    }
+
+    /// V5 残留加固（第六轮 9.3.2）：解包前 `tar -t` 列举成员并逐条校验，
+    /// 含危险成员（绝对路径/`..`）即拒绝安装——防御显式化，不再依赖
+    /// GNU/busybox tar 各版本的默认行为漂移。
+    async fn precheck_tar_members(args: &[&str]) -> Result<(), NasError> {
+        let out = Command::new("tar")
+            .args(args)
+            .output()
+            .await
+            .map_err(|e| NasError::Io(format!("spawn tar -t: {e}")))?;
+        if !out.status.success() {
+            return Err(NasError::Install(format!(
+                "tar 列举成员失败: {}",
+                String::from_utf8_lossy(&out.stderr)
+            )));
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let dangerous: Vec<&str> = stdout
+            .lines()
+            .filter(|m| tar_member_dangerous(m))
+            .collect();
+        if !dangerous.is_empty() {
+            return Err(NasError::Install(format!(
+                "SPK 含危险 tar 成员（绝对路径/..），拒绝安装: {}",
+                dangerous
+                    .iter()
+                    .take(5)
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        Ok(())
     }
 
     /// V5：遍历 dest，发现符号链接即拒绝（不可信压缩包不得在文件系统
@@ -204,11 +253,13 @@ impl NasManager {
             .trim()
             .to_string();
         if version.is_empty() {
-            return Err(NasError::Install(
-                "version 文件为空（SPK 结构异常）".into(),
-            ));
+            return Err(NasError::Install("version 文件为空（SPK 结构异常）".into()));
         }
-        let arch = if cfg!(target_arch = "aarch64") { "arm64" } else { "amd64" };
+        let arch = if cfg!(target_arch = "aarch64") {
+            "arm64"
+        } else {
+            "amd64"
+        };
         let launcher = dest.join(format!("bin/bin/xunlei-pan-cli-launcher.{arch}"));
         let engine = dest.join(format!("bin/bin/xunlei-pan-cli.{version}.{arch}"));
         // arm64 包文件名约定同 amd64（3.1.10 实证）
@@ -274,7 +325,10 @@ impl NasManager {
             .args(["-pid", &pid_file.to_string_lossy()])
             .env_clear()
             .envs(envs)
-            .env("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            .env(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::from(log_file))
             .stderr(Stdio::from(log_err))
@@ -311,7 +365,11 @@ impl NasManager {
             .await
             .map(|r| r.status().as_u16())
             .ok();
-        NasStatus { pid, proc_alive, http_code: http }
+        NasStatus {
+            pid,
+            proc_alive,
+            http_code: http,
+        }
     }
 }
 
@@ -352,7 +410,11 @@ pub enum NasError {
 pub async fn nas_proxy(State(_state): State<Arc<DaemonState>>, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     // 去掉 /nas 前缀后透传
-    let rest = parts.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+    let rest = parts
+        .uri
+        .path_and_query()
+        .map(|pq| pq.as_str())
+        .unwrap_or("/");
     let rest = rest.strip_prefix("/nas").unwrap_or(rest);
     let rest = if rest.is_empty() { "/" } else { rest };
     let target_uri: Uri = match rest.parse() {
@@ -366,7 +428,9 @@ pub async fn nas_proxy(State(_state): State<Arc<DaemonState>>, req: Request) -> 
         .build()
     {
         Ok(c) => c,
-        Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Err(e) => {
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
     };
 
     let method = reqwest::Method::from_bytes(parts.method.as_str().as_bytes())
@@ -389,7 +453,10 @@ pub async fn nas_proxy(State(_state): State<Arc<DaemonState>>, req: Request) -> 
                 out = out.body(bytes.to_vec());
             }
             Err(e) => {
-                return (axum::http::StatusCode::BAD_GATEWAY, format!("read body: {e}"))
+                return (
+                    axum::http::StatusCode::BAD_GATEWAY,
+                    format!("read body: {e}"),
+                )
                     .into_response()
             }
         }
@@ -466,8 +533,9 @@ pub async fn sync_l1_token(l1_token_path: &Path) -> Result<PathBuf, NasError> {
     let raw = tokio::fs::read_to_string(l1_token_path)
         .await
         .map_err(|e| NasError::Io(format!("读 L1 token {}: {e}", l1_token_path.display())))?;
-    let v: serde_json::Value = serde_json::from_str(&raw)
-        .map_err(|e| NasError::Token(format!("JSON 解析失败（{}）: {e}", l1_token_path.display())))?;
+    let v: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+        NasError::Token(format!("JSON 解析失败（{}）: {e}", l1_token_path.display()))
+    })?;
     // 诊断信息：实际存在的字段集（格式漂移时一眼定位，避免盲目猜）
     let keys = v
         .as_object()
@@ -483,7 +551,9 @@ pub async fn sync_l1_token(l1_token_path: &Path) -> Result<PathBuf, NasError> {
             ))
         })?;
     if access.is_empty() {
-        return Err(NasError::Token(format!("access_token 为空串（未登录？keys=[{keys}]）")));
+        return Err(NasError::Token(format!(
+            "access_token 为空串（未登录？keys=[{keys}]）"
+        )));
     }
     // refresh_token 宽容处理：缺省不阻断桥接（登录门是否能静默续期以 A2 实测为准，
     // 引擎若要求非空 refresh 会在登录门显形——那时再回补硬校验）。
@@ -493,7 +563,9 @@ pub async fn sync_l1_token(l1_token_path: &Path) -> Result<PathBuf, NasError> {
         .unwrap_or_default()
         .to_string();
     if refresh.is_empty() {
-        tracing::warn!("L1 token 缺 refresh_token（keys=[{keys}]）——桥接继续，续期能力以 A2 实测为准");
+        tracing::warn!(
+            "L1 token 缺 refresh_token（keys=[{keys}]）——桥接继续，续期能力以 A2 实测为准"
+        );
     }
     // expires_in：原生形直取；L1 形由 access_token_expires_at（unix 秒；兼容数字
     // 字符串形）折算剩余秒；缺省/异常按 1h 兜底
@@ -505,13 +577,17 @@ pub async fn sync_l1_token(l1_token_path: &Path) -> Result<PathBuf, NasError> {
         Some(n) if n > 0 => n, // 原生形：直取，桥接幂等
         _ => {
             let expires_raw = v.get("access_token_expires_at");
-            let expires_at = expires_raw
-                .and_then(|x| x.as_u64())
-                .or_else(|| expires_raw.and_then(|x| x.as_str()).and_then(|s| s.parse::<u64>().ok()));
+            let expires_at = expires_raw.and_then(|x| x.as_u64()).or_else(|| {
+                expires_raw
+                    .and_then(|x| x.as_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+            });
             match expires_at {
                 Some(t) if t > now => t.saturating_sub(now).max(60),
                 Some(_) => {
-                    tracing::warn!("L1 token access_token_expires_at 已过期——按剩余 1h 处理（keys=[{keys}]）");
+                    tracing::warn!(
+                        "L1 token access_token_expires_at 已过期——按剩余 1h 处理（keys=[{keys}]）"
+                    );
                     3600
                 }
                 None => {
@@ -571,4 +647,62 @@ pub fn manager() -> &'static NasManager {
         }
         NasManager::new(cfg)
     })
+}
+
+/// V5 残留加固（第六轮 9.3.2）：tar 成员名危险判定——绝对路径（含盘符前缀）
+/// 或 `..` 分量即危险。与 `verify_no_escape`（解包后复核）构成解包前/后双层防线。
+fn tar_member_dangerous(name: &str) -> bool {
+    // tar 成员按 POSIX 应为 `/` 分隔；防御性归一反斜杠后统一判定
+    let name = name.replace('\\', "/");
+    if name.starts_with('/') {
+        return true;
+    }
+    // Windows 盘符前缀（C:/...）防呆
+    let b = name.as_bytes();
+    if b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic() {
+        return true;
+    }
+    name.split('/').any(|c| c == "..")
+}
+
+#[cfg(test)]
+mod tar_member_tests {
+    use super::tar_member_dangerous as dangerous;
+
+    #[test]
+    fn rejects_absolute_and_parent_members() {
+        assert!(dangerous("/etc/passwd"));
+        assert!(dangerous("../evil"));
+        assert!(dangerous("a/../b"));
+        assert!(dangerous("ok/../../out"));
+        assert!(dangerous("./x/../../../y"));
+    }
+
+    #[test]
+    fn rejects_windows_drive_prefix_and_backslash() {
+        assert!(dangerous("C:/Windows/system32"));
+        assert!(dangerous("c:\\..\\evil"));
+        assert!(dangerous("D:\\abs"));
+    }
+
+    #[test]
+    fn allows_benign_relative_members() {
+        assert!(!dangerous("package.tgz"));
+        assert!(!dangerous("INFO"));
+        assert!(!dangerous("bin/bin/xunlei-pan-cli"));
+        assert!(!dangerous("./conf/app.ini"));
+        assert!(!dangerous("a/b/./c"));
+        // 空段（双斜杠）与尾斜杠不误报
+        assert!(!dangerous("a//b"));
+        assert!(!dangerous("dir/"));
+    }
+
+    #[test]
+    fn dot_and_dotdot_distinction() {
+        // 单个 `.` 分量是常见相对前缀，不得误报
+        assert!(!dangerous("./package.tgz"));
+        // `..` 恰为完整分量才危险，`...`/`a..b` 不误报
+        assert!(!dangerous(".../x"));
+        assert!(!dangerous("a..b/c"));
+    }
 }
