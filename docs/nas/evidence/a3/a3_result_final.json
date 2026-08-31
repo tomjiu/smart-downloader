@@ -1,0 +1,65 @@
+{
+  "mode": "a3-panauth-final",
+  "started_at": 1788137781,
+  "jwt_payload": {
+    "key": "UIAuth",
+    "exp": 1788396983,
+    "iat": 1788137783,
+    "nbf": 1788137783
+  },
+  "tasks": {
+    "status": 200,
+    "body": "{\"HttpStatus\":0,\"tasks\":[{\"kind\":\"drive#task\",\"id\":\"VP0KAmXWuewDEGRvs9ADJaw3A1\",\"name\":\"Docker-c-6a94bbe8-145d6674-b43aa432958a\",\"type\":\"user#runner\",\"user_id\":\"860599297\",\"params\":{\"accept\":\"true\",\"access\":\"user#app,user#download,user#download-url,user#nfo\",\"arch\":\"amd64\",\"client_id\":\"X9ibISwpIp8jQ4Ya\",\"client_version\":\"3.23.5\",\"device_config\":\"{\\\"custom_device_name\\\":\\\"\\\",\\\"device_space\\\":\\\"\\\",\\\"speed_limit\\\":-1,\\\"runner_count\\\":5,\\\"download_infos\\\":null,\\\"download_paths\\\":[\\\"/home/z/.nas-engine-test/downloads/\\\"],\\\"filter_paths\\\":null,\\\"access_task_type\\\":null,\\\"file_mount\\\":{},\\\"single_tas"
+  },
+  "deep": {
+    "GET /drive/v1/user/info": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /drive/v1/storage/info": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /drive/v1/events": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /drive/v1/tasks?page_token=": {
+      "status": 200,
+      "body": "{\"HttpStatus\":0,\"tasks\":[{\"kind\":\"drive#task\",\"id\":\"VP0KJJAIqrNfncFtp4Q1yEWmA1\",\"name\":\"Docker-c-6a94bbe8-145d6674-b43aa432958a\",\"type\":\"user#runner\",\"user_id\":\"860599297\",\"params\":{\"access\":\"user#app,user#download,user#download-url,user#nfo\",\"client_id\":\"X9ibISwpIp8jQ4Ya\",\"client_version\":\"3.23.5\",\"device_model\":\"c-6a94bbe8-145d6674-b43aa432958a\",\"ip\":\"47.57.232.232\",\"package_name\":\"pan.xunlei.cli.docker\",\"start_at\":\"2026/08/31 00:56:23\",\"target\":\"device_id#c7d089aad73f7e2ddd2c263c2956b5a6\"},\"f"
+    },
+    "GET /device/v1/try_speed/get_info": {
+      "status": 200,
+      "body": "{\"status\":0,\"usage\":{\"total\":3,\"used\":0},\"count_down\":{\"total\":0,\"used\":0},\"task_counter\":{\"super_speed\":null,\"team\":null},\"statistic\":{\"average_speed\":0,\"saved_sec\":0,\"start_time\":0,\"end_time\":0,\"stop_reason\":\"\"},\"expire_sec\":10}"
+    },
+    "POST /device/v1/try_speed/get_info": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "POST /device/v1/try_speed/apply": {
+      "status": 200,
+      "body": "{\"message\":\"NO_RUNNING_TASK\"}"
+    },
+    "GET /device/v1/info": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /device/v1/config": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /drive/v1/statistics": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /drive/v1/setting": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /drive/v1/history": {
+      "status": 404,
+      "body": "404 page not found"
+    }
+  },
+  "finished_at": 1788137784
+}

@@ -1,0 +1,83 @@
+{
+  "mode": "a3-webui-capture",
+  "started_at": 1788137544,
+  "drive_up": true,
+  "root": {
+    "status": 200,
+    "headers": {
+      "cache-control": "no-cache",
+      "content-type": "text/html; charset=utf-8",
+      "xllite-trace-id": "_2jkGdgNi",
+      "date": "Mon, 31 Aug 2026 00:52:26 GMT",
+      "connection": "close",
+      "transfer-encoding": "chunked"
+    },
+    "body_head": "<!DOCTYPE html>\n<html lang=\"en\">\n  <head>\n    <meta charset=\"UTF-8\" />\n    <meta name=\"renderer\" content=\"webkit\" />\n    <meta name=\"force-rendering\" content=\"webkit\" />\n    <meta http-equiv=\"X-UA-Compatible\" content=\"IE=Edge,chrome=1\" />\n    <link rel=\"icon\" type=\"image/x-icon\" href=\"//pan.xunlei.com/icon.png\" />\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\" />\n    <sc"
+  },
+  "tasks_403_headers": {
+    "access-control-allow-credentials": "true",
+    "access-control-allow-headers": "*",
+    "access-control-allow-methods": "*",
+    "access-control-allow-origin": "*",
+    "access-control-expose-headers": "*",
+    "cache-control": "no-cache",
+    "content-type": "application/json; charset=utf-8",
+    "xllite-trace-id": "_YC6fcJqy",
+    "date": "Mon, 31 Aug 2026 00:52:26 GMT",
+    "content-length": "129",
+    "connection": "close"
+  },
+  "tasks_403_body": "{\"error\":\"permission_deny: checkAuth failed:token contains an invalid number of segments token:\",\"error_code\":403,\"HttpStatus\":0}",
+  "assets_found": [],
+  "auth_probes": {
+    "GET /device/v1/auth": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /drive/v1/auth": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /auth": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /login": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /device/v1/token": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /drive/v1/user/info": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /drive/v1/storage/info": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /drive/v1/tasks?page_token=&filters=": {
+      "status": 403,
+      "body": "{\"error\":\"permission_deny: checkAuth failed:token contains an invalid number of segments token:\",\"error_code\":403,\"HttpStatus\":0}"
+    },
+    "GET /device/v1/info": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /device/v1/config": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "GET /favicon.ico": {
+      "status": 404,
+      "body": "404 page not found"
+    },
+    "OPTIONS /drive/v1/tasks": {
+      "status": 204,
+      "body": ""
+    }
+  },
+  "finished_at": 1788137546
+}
