@@ -15,6 +15,8 @@ pub mod strategy;
 pub mod xudt;
 #[cfg(feature = "xunlei")]
 pub mod xunlei_engine;
+#[cfg(feature = "nas")]
+pub mod nas_remote;
 
 pub use alerts::{Alert, AlertKind, StateSubKind};
 pub use bare::Bare;
@@ -23,3 +25,5 @@ pub use ffi::{Error, Result};
 pub use resume::ResumeBytes;
 #[cfg(feature = "xunlei")]
 pub use xunlei_engine::XunleiBtEngine;
+#[cfg(feature = "nas")]
+pub use nas_remote::{NasRemoteConfig, NasRemoteEngine};

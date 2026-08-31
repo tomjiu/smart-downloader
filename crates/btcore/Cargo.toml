@@ -15,8 +15,13 @@ fs2 = { workspace = true }
 # Xunlei BT 引擎（Windows-only，免登录匿名模式）。
 xunlei-ffi = { path = "../../crates/xunlei-ffi", optional = true }
 
+# NAS 远程引擎（XunleiNas，附录 E）：pan-auth HTTP 协议面，全平台可用。
+reqwest = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+
 [build-dependencies]
 bindgen = "0.71"
 
 [features]
 xunlei = ["dep:xunlei-ffi"]
+nas = ["dep:reqwest", "dep:serde_json"]
