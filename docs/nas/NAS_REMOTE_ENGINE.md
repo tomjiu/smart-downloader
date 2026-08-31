@@ -45,10 +45,10 @@ NAS 路线 = Linux/远程盒子上的迅雷官方下载内核（云加速/离线
 
 | `DownloadEngine` 方法 | 迅雷本地 API | 备注 |
 |------------------------|--------------|------|
-| `add` | `POST /drive/v1/task` | 仅 `Http/Thunder` 源；`Magnet/TorrentFile` → `Unsupported`（未校准） |
+| `add` | `POST /drive/v1/task` | `Http/Thunder` 已实弹；`Magnet` 静态定案与 URL 同构（A6_PREP §2，待实弹）；`TorrentFile` → 云端 file_id 型，本端不产（A6_PREP §3） |
 | `status` | `GET /drive/v1/tasks?filters={"id":{"in":id}}` | `PHASE_TYPE_* → EngineState` 映射；`params.error`（如 `下载(90120)`）透出 |
 | `remove` | `DELETE /drive/v1/tasks?task_ids=` | 引擎同步清理本地文件+远端同步，阻塞 >30s（超时 95s） |
-| `pause/resume` | —（未挂载，A2 实测 404） | `Unsupported` |
+| `pause/resume` | `PATCH /drive/v1/task`（`set_params.spec={"phase":"pause"/"running"}`，A6_PREP §4 静态定案；A2 的 404 系路由打错） | v1 `Unsupported`，v2 待实弹挂载 |
 | `update_sources` | `POST /device/v1/try_speed/apply` | 仅 RUNNING 生效；body `{}`；403 配额/无任务 → `classify_error` |
 | `peers/ban_peer/read_piece/add_url_seed` | — | v1 `Unsupported`/空 |
 
@@ -65,3 +65,11 @@ NAS 路线 = Linux/远程盒子上的迅雷官方下载内核（云加速/离线
   space URL 编码、config 归一化。
 - 实弹联调：待 A6（每日创建配额北京时间 0 点重置后）——建任务 → RUNNING →
   `apply`（`usage.used` 0→1）→ 90120 终验。
+
+## 5. v1.1 静态补充（2026-08-31，零额度）
+
+引擎前端 bundle 静态校准完成（`A6_PREP_STATIC_CALIBRATION.md`）：magnet 与 URL
+任务同构、pause/resume 真实路由为 `PATCH /drive/v1/task`、`device/btinfo`
+端点、A6 验证矩阵 P1–P6 及额度预算（最省 1 次创建）。实弹探针
+`scripts/nas/a6_probe.py`，工作区冷恢复 `scripts/nas/a6_ops.py`
+（SPK 已归档 `research_bin/nas/spk/`，哈希见 `ASSET_MANIFEST.md`）。
