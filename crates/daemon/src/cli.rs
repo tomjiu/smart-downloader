@@ -38,10 +38,12 @@ pub enum CliCommand {
     },
     /// 迅雷原生登录（Task 5-b）：--page 本地 App 同款登录页（默认）/ --browser
     /// 跳转官方授权页 / --qr 终端二维码。本地执行，不需要 daemon 在跑。
+    /// `--tier <web|nas>`（P1-1）：身份档位，登录态按档分文件（防互踢）。
     XunleiLogin {
         mode: XunleiLoginMode,
         token_path: Option<String>,
         port: u16,
+        tier: Option<String>,
     },
     /// 迅雷任务导入（M9）：xlbt.cfg + 一组 .bt.xltd + .torrent → fastresume。
     #[cfg(feature = "xunlei-import")]
@@ -190,12 +192,21 @@ fn parse_command(args: &[String]) -> Result<CliCommand, CliError> {
             let mut mode = XunleiLoginMode::Page;
             let mut token_path = None;
             let mut port = 0u16;
+            let mut tier = None;
             let mut i = 1;
             while i < args.len() {
                 match args[i].as_str() {
                     "--browser" => mode = XunleiLoginMode::Browser,
                     "--page" => mode = XunleiLoginMode::Page,
                     "--qr" => mode = XunleiLoginMode::Qr,
+                    "--tier" => {
+                        tier = Some(
+                            args.get(i + 1)
+                                .ok_or_else(|| CliError::MissingArg("--tier <web|nas>".to_string()))?
+                                .clone(),
+                        );
+                        i += 1;
+                    }
                     "--token" => {
                         token_path = Some(
                             args.get(i + 1)
@@ -217,7 +228,7 @@ fn parse_command(args: &[String]) -> Result<CliCommand, CliError> {
                 }
                 i += 1;
             }
-            Ok(CliCommand::XunleiLogin { mode, token_path, port })
+            Ok(CliCommand::XunleiLogin { mode, token_path, port, tier })
         }
         other => Err(CliError::Unknown(other.to_string())),
     }

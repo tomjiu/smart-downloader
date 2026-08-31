@@ -53,3 +53,4 @@ scripts/research/xunlei/extracted/
 
 # NAS 校准证据（含个人元数据，不入库；结论已写入 docs/nas/*.md）
 docs/nas/evidence/
+/.cargo/

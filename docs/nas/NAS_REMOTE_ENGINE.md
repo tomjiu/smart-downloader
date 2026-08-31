@@ -1,5 +1,15 @@
 # NasRemoteEngine — 迅雷 NAS 引擎远程托管适配层（附录 E 落地）
 
+> **【2026-08-31 归档横幅】** 路线裁定（收尾计划
+> `docs/superpowers/plans/2026-08-31-xunlei-closeout-plan.md`）：主线回归
+> **Win/Mac/Linux/Android 的 Xqp0（web）档**，本 NAS 线归档为**研究文献与
+> 可用代码 v1**，不再投入。复活路径（若未来需要）：①SPK 引擎落位 + 扫码
+> 注入凭据（`scripts/nas/a2_device_flow.py`，需覆盖当前 device_id
+> `cb49eeec…`）②daemon 配置 `[provider]` 走本引擎 feature `nas`
+> （引用 A6_PREP §11 路线图）。身份档位层面：nas 档参数已入
+> `crates/provider/src/xunlei/tier.rs`（P1-1），无需本引擎即可携带
+> docker 档身份。
+
 > 代码：`crates/btcore/src/nas_remote.rs`（feature `nas`）。
 > 校准依据：本目录 `A2/A3/A4/A5_CALIBRATION_FINDINGS.md`（Task 31 实测链）。
 > 状态：**v1 可用**（URL 任务创建/轮询/删除/超速申请）；`cargo check --features nas`

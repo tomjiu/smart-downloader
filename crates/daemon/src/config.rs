@@ -95,6 +95,9 @@ pub struct ProviderXunleiCfg {
     /// 登录态 JSON 路径（examples 会写入；daemon 只读加载 + 续期回写）。
     /// 缺省时 daemon 用 `xunlei_auth.json`。
     pub token_path: Option<PathBuf>,
+    /// 身份档位（P1-1）：`web`（默认）/ `nas`；未知档拒绝启动。
+    /// 环境变量 `SMART_DL_XUNLEI_TIER` 优先于此字段（部署覆盖友好）。
+    pub tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -185,6 +188,17 @@ impl Config {
             .unwrap_or_else(|| self.download.dest_root.clone())
     }
 
+    /// 解析迅雷身份档位名（P1-1）：env `SMART_DL_XUNLEI_TIER` > config > web。
+    /// 只返回名字字符串；合法性校验归 serve（需要报错上下文）。
+    pub fn resolve_xunlei_tier_name(&self) -> String {
+        std::env::var("SMART_DL_XUNLEI_TIER")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.provider_xunlei.tier.clone())
+            .unwrap_or_else(|| "web".to_string())
+    }
+
     /// 精简配置快照（`GET /config` 返回；不含敏感项——proxy 可能带凭据故隐藏；
     /// serve 注入 + 热重载共用）。
     pub fn snapshot_json(&self, tasks_path: &std::path::Path) -> serde_json::Value {
@@ -211,6 +225,8 @@ impl Config {
             "proxy_enabled": !self.download.proxy.is_empty(),
             "provider_enabled": self.provider.enabled,
             "provider_xunlei_enabled": self.provider_xunlei.enabled,
+            // 身份档位名（非敏感；无 token 布尔那样有路径泄露风险）。
+            "provider_xunlei_tier": self.resolve_xunlei_tier_name(),
             // 仅暴露「登录态文件是否存在」布尔，不泄露路径字符串本身。
             "provider_xunlei_token_exists": self
                 .provider_xunlei
@@ -413,6 +429,33 @@ path = "/tmp/sd.lock"
         let snap2 = c2.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
         assert_eq!(snap2["provider_xunlei_enabled"], true);
         assert_eq!(snap2["provider_xunlei_token_exists"], false);
+    }
+
+    #[test]
+    fn provider_xunlei_tier_parsing_and_precedence() {
+        // P1-1：tier 字段解析 + env 覆盖 + 默认 web。
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "[provider_xunlei]\nenabled = true\ntier = \"nas\"\n").unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert_eq!(c.provider_xunlei.tier.as_deref(), Some("nas"));
+        // 无 env：config 生效
+        std::env::remove_var("SMART_DL_XUNLEI_TIER");
+        assert_eq!(c.resolve_xunlei_tier_name(), "nas");
+        // 快照暴露档位名（非敏感）
+        let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap["provider_xunlei_tier"], "nas");
+
+        // env 优先于 config
+        std::env::set_var("SMART_DL_XUNLEI_TIER", "web");
+        assert_eq!(c.resolve_xunlei_tier_name(), "web");
+        std::env::remove_var("SMART_DL_XUNLEI_TIER");
+
+        // 默认（无 config 无 env）= web
+        let d = Config::default();
+        assert_eq!(d.resolve_xunlei_tier_name(), "web");
+        let snap_d = d.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap_d["provider_xunlei_tier"], "web");
     }
 
     #[test]

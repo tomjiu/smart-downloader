@@ -4,6 +4,7 @@ use crate::types::{ProviderError, ProviderRuntime, ProviderStatus, ProviderTaskI
 use crate::xunlei::auth::{load as load_auth, save as save_auth, AuthState};
 use crate::xunlei::client::Client;
 use crate::xunlei::device::DeviceAuthFlow;
+use crate::xunlei::tier::{Tier, TIER_WEB};
 use smart_dl_core::types::{Capability, DownloadSource};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -15,6 +16,8 @@ pub struct XunleiProvider {
     client: Client,
     auth: Arc<AsyncMutex<Option<AuthState>>>,
     token_path: PathBuf,
+    /// 身份档位（P1-1）：随 Client 下发；这里存一份供运行时/诊断查询。
+    tier: &'static Tier,
     /// 本地任务句柄：ProviderTaskId → 云端 (task_id, file_id)。
     tasks: Arc<AsyncMutex<HashMap<ProviderTaskId, CloudTaskHandle>>>,
     /// 自动冷却：失败后该时刻前不参与 fallback 选择。
@@ -32,15 +35,26 @@ struct CloudTaskHandle {
 
 impl XunleiProvider {
     pub fn new(name: &str, token_path: PathBuf) -> Self {
+        Self::with_tier(name, token_path, &TIER_WEB)
+    }
+
+    /// 指定身份档位构造（P1-1 多 profile；缺省 web 档零回归）。
+    pub fn with_tier(name: &str, token_path: PathBuf, tier: &'static Tier) -> Self {
         let auth = load_auth(&token_path);
         XunleiProvider {
             name: name.to_string(),
-            client: Client::new(),
+            client: Client::new().with_tier(tier),
             auth: Arc::new(AsyncMutex::new(auth)),
             token_path,
+            tier,
             tasks: Arc::new(AsyncMutex::new(HashMap::new())),
             backoff_until: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// 当前身份档位。
+    pub fn tier(&self) -> &'static Tier {
+        self.tier
     }
 
     /// 从登录态取 user_id（若已加载）；未登录或解析失败返回 None。
