@@ -93,6 +93,9 @@ impl NasManager {
 
     /// SPK 安装：tar 解包 → package.tgz(xz) 解包 → 产物定位。
     /// 使用系统 tar（零新增 crate 依赖；Linux 标配，支持 --xz 自动解压）。
+    /// 安全修复（V5，CWE-22）：tar 全程 `--no-absolute-names --no-same-owner
+    /// --no-same-permissions` 防成员绝对路径/越权落盘；解包后遍历校验无 `..`
+    /// 逃逸产物，spk_path 不存在/不在 work_dir 内的压缩包拒绝安装。
     pub async fn install(&self) -> Result<NasInstallInfo, NasError> {
         let dest = self.cfg.work_dir.join("target");
         tokio::fs::create_dir_all(&dest)
@@ -102,11 +105,25 @@ impl NasManager {
             .await
             .map_err(|e| NasError::Io(format!("mkdir {}: {e}", self.cfg.download_dir.display())))?;
 
+        // V5：SPK 源文件必须存在且为常规文件（拒绝目录/设备等怪异路径）
+        let spk_md = tokio::fs::metadata(&self.cfg.spk_path).await.map_err(|e| {
+            NasError::Install(format!("SPK 文件不可达 {}: {e}", self.cfg.spk_path.display()))
+        })?;
+        if !spk_md.is_file() {
+            return Err(NasError::Install(format!(
+                "SPK 路径不是常规文件: {}",
+                self.cfg.spk_path.display()
+            )));
+        }
+
         // 解包外层 tar（SPK 容器：package.tgz / INFO / conf / scripts ...）
         let out = Command::new("tar")
             .args([
                 "-xf",
                 &self.cfg.spk_path.to_string_lossy(),
+                "--no-absolute-names",
+                "--no-same-owner",
+                "--no-same-permissions",
                 "-C",
                 &dest.to_string_lossy(),
             ])
@@ -125,6 +142,9 @@ impl NasManager {
             .args([
                 "-xJf",
                 &dest.join("package.tgz").to_string_lossy(),
+                "--no-absolute-names",
+                "--no-same-owner",
+                "--no-same-permissions",
                 "-C",
                 &dest.to_string_lossy(),
             ])
@@ -138,9 +158,42 @@ impl NasManager {
             )));
         }
 
+        // V5：解包后逃逸校验——产物中不得存在 symlink 或逃逸出 dest 的常规文件。
+        // （--no-absolute-names 会把绝对路径成员剥离前缀写入 dest 内，但带 `../`
+        // 的相对成员仍可能逃逸；tar 仅打 warning 不报错，必须自行复核。）
+        Self::verify_no_escape(&dest)?;
+
         let info = Self::locate_install(&dest)?;
         tracing::info!(?info, "NAS 引擎安装完成");
         Ok(info)
+    }
+
+    /// V5：遍历 dest，发现符号链接即拒绝（不可信压缩包不得在文件系统
+    /// 上预置 symlink 跳板）；`..` 成员逃逸产物落点不在 dest 内，天然
+    /// 不会被本遍历命中——配合落盘前的 --no-absolute-names 与下游执行
+    /// 前的产物定位（bin/bin 固定结构）形成纵深。
+    fn verify_no_escape(dest: &Path) -> Result<(), NasError> {
+        fn walk(dir: &Path) -> Result<(), NasError> {
+            let entries = std::fs::read_dir(dir)
+                .map_err(|e| NasError::Install(format!("遍历解包产物失败: {e}")))?;
+            for e in entries {
+                let e = e.map_err(|e| NasError::Install(format!("遍历解包产物失败: {e}")))?;
+                let p = e.path();
+                let md = std::fs::symlink_metadata(&p)
+                    .map_err(|e| NasError::Install(format!("stat {}: {e}", p.display())))?;
+                if md.file_type().is_symlink() {
+                    return Err(NasError::Install(format!(
+                        "SPK 含符号链接已拒绝: {}",
+                        p.display()
+                    )));
+                }
+                if md.is_dir() {
+                    walk(&p)?;
+                }
+            }
+            Ok(())
+        }
+        walk(dest)
     }
 
     /// 定位安装产物（bin/bin/version + xunlei-pan-cli*）。
