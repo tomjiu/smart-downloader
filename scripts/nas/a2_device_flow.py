@@ -26,7 +26,7 @@ SCOPE = "pan user profile sso offline pan/xunlei/share/create"
 CODE_URL = "https://xluser-ssl.xunlei.com/v1/auth/device/code"
 TOKEN_URL = "https://xluser-ssl.xunlei.com/v1/auth/token"
 GRANT = "urn:ietf:params:oauth:grant-type:device_code"
-DEVICE_ID = "c7d089aad73f7e2ddd2c263c2956b5a6"
+DEVICE_ID = os.environ.get("SD_DEVICE_ID", "c7d089aad73f7e2ddd2c263c2956b5a6")
 
 WS = os.path.expanduser("~/.nas-engine-test")
 FLOW = f"{WS}/device_flow.json"

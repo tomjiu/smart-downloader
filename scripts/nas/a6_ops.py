@@ -12,7 +12,7 @@
   python3 scripts/nas/a6_ops.py status
   python3 scripts/nas/a6_ops.py snapshot > docs/nas/evidence/a6/workspace_snapshot.json
 """
-import hashlib, json, os, subprocess, sys, tarfile
+import hashlib, json, os, pty, select, signal, socket, struct, subprocess, sys, tarfile, termios, time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SPK = os.environ.get("A6_SPK", f"{REPO}/research_bin/nas/spk/nasxunlei-DSM7-x86_64.spk")
@@ -124,6 +124,87 @@ def snapshot():
     print(json.dumps(snap, ensure_ascii=False, indent=2))
 
 
+def nsprep():
+    """A2 MITM 预备 (曾为会话外手工步骤, 现固化): /tmp/a2ns/{fake_hosts,cert.pem,key.pem}."""
+    d = "/tmp/a2ns"
+    os.makedirs(d, exist_ok=True)
+    hosts = ("127.0.0.1 localhost\n::1 localhost\n"
+             "127.0.0.1 xluser-ssl.xunlei.com\n"
+             "127.0.0.1 dev-xluser-ssl.xunlei.com\n")
+    open(f"{d}/fake_hosts", "w").write(hosts)
+    if not os.path.exists(f"{d}/cert.pem"):
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+                        "-keyout", f"{d}/key.pem", "-out", f"{d}/cert.pem",
+                        "-days", "2", "-nodes",
+                        "-subj", "/CN=xluser-ssl.xunlei.com"], check=True,
+                       capture_output=True)
+    print(f"[+] {d}/fake_hosts (xunlei x2 -> 127.0.0.1)")
+    print(f"[+] {d}/cert.pem + key.pem (自签 CN=xluser-ssl.xunlei.com)")
+    print("[+] 后续: unshare -Urnm python3 scripts/nas/a2_nsd_login.py")
+
+
+def preflight():
+    """干启动引擎 (无凭据, launcher 入口) -> 读 info.file 的 device_id. 零配额."""
+    engdir = ENGINE_BIN
+    launcher = f"{engdir}/xunlei-pan-cli-launcher.amd64"
+    logp = f"{WS}/logs/preflight_pty.log"
+    drive, rows, cols = "127.0.0.1:5050", 40, 120
+    env = {k: v for k, v in os.environ.items() if k != "PLATFORM"}
+    env.update({"DriveListen": drive, "LauncherListen": "127.0.0.1:5051",
+                "ConfigPath": f"{WS}/data", "DownloadPATH": f"{WS}/downloads",
+                "HOME": f"{WS}/data/.drive", "GIN_MODE": "release",
+                "TERM": "xterm", "COLUMNS": str(cols), "LINES": str(rows)})
+    for d in (f"{WS}/logs", f"{WS}/data/.drive/bin", f"{WS}/downloads"):
+        os.makedirs(d, exist_ok=True)
+    open(logp, "w").close()
+    pid, master = pty.fork()
+    if pid == 0:
+        os.chdir(engdir)
+        os.execve(launcher, [launcher, "-pid", f"{WS}/engine.pid"], env)
+        os._exit(127)
+    import fcntl
+    fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+    t0, up = time.time(), False
+    while time.time() - t0 < 55:
+        r, _, _ = select.select([master], [], [], 1.0)
+        if r:
+            try:
+                chunk = os.read(master, 65536)
+            except OSError:
+                chunk = b""
+            if chunk:
+                with open(logp, "ab") as f:
+                    f.write(chunk)
+        try:
+            with socket.create_connection(("127.0.0.1", 5050), timeout=1):
+                up = True
+                break
+        except OSError:
+            pass
+        wpid, _ = os.waitpid(pid, os.WNOHANG)
+        if wpid == pid:
+            print(json.dumps({"preflight": "ENGINE_EXITED", "log": logp}, ensure_ascii=False))
+            return
+    info = {}
+    for cand in (f"{engdir}/info.file", f"{WS}/data/.drive/bin/info.file",
+                 f"{WS}/data/.drive/info.file"):
+        if os.path.exists(cand):
+            info = json.load(open(cand))
+            break
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except Exception:
+        pass
+    out = {"drive_up": up, "boot_secs": round(time.time() - t0, 1),
+           "pty_log": logp, "pty_tail": open(logp, errors="replace").read()[-600:],
+           "info_file": {k: info.get(k) for k in ("device_id", "device_space", "version") if k in info},
+           "url_device_id": "c7d089aad73f7e2ddd2c263c2956b5a6",
+           "device_id_match": info.get("device_id") == "c7d089aad73f7e2ddd2c263c2956b5a6"}
+    print(json.dumps(out, ensure_ascii=False, indent=2))
+    if out["info_file"].get("device_id") and not out["device_id_match"]:
+        print(f"[!] device_id 已变 -> 授权前需 SD_DEVICE_ID={out['info_file']['device_id']}")
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     if cmd == "extract":
@@ -134,5 +215,9 @@ if __name__ == "__main__":
         status()
     elif cmd == "snapshot":
         snapshot()
+    elif cmd == "nsprep":
+        nsprep()
+    elif cmd == "preflight":
+        preflight()
     else:
         __doc__ and print(__doc__)

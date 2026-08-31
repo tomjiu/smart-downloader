@@ -23,16 +23,18 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 WS = os.path.expanduser("~/.nas-engine-test")
-ENGINE = ("/home/z/my-project/repo-smart-downloader/scripts/research/xunlei/"
-          "extracted/cross-platform/spk-x64/payload/bin/bin/xunlei-pan-cli.3.23.5.amd64")
+ENGINE = os.environ.get("A6_ENGINE_BIN",
+          os.path.expanduser("~/.nas-engine-test/engine/bin/bin/xunlei-pan-cli.3.23.5.amd64"))
 LOG = f"{WS}/logs/engine_ns.log"
-ARCHIVE = ("/home/z/my-project/repo-smart-downloader/scripts/research/xunlei/"
-           "extracted/cross-platform/xllite_token.json")
+ARCHIVE = os.environ.get("A6_TOKEN_ARCHIVE",
+           os.path.expanduser("~/.nas-engine-test/data/.drive/auth_token.json"))
 OUT = f"{WS}/ns_login_result.json"
 DRIVE = "127.0.0.1:5050"
 ROWS, COLS = 40, 120
 
-TOKEN_PAYLOAD = json.load(open(ARCHIVE))["response"]
+_tokraw = json.load(open(ARCHIVE))
+# 兼容两种落盘形态: 裸 OAuth 响应(a2_device_flow auth_token.json) / {"response":...}(xllite_token.json)
+TOKEN_PAYLOAD = _tokraw["response"] if isinstance(_tokraw.get("response"), dict) else _tokraw
 hits = {"device_code": 0, "token": 0, "other": 0}
 
 
