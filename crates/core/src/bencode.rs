@@ -21,7 +21,7 @@ impl Value {
     }
 }
 
-#[derive(Debug, Error, PartialEq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum DecodeError {
     #[error("unexpected end of input at position {0}")]
     UnexpectedEof(usize),

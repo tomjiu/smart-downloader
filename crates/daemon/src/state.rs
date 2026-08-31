@@ -486,6 +486,12 @@ impl DaemonState {
         self
     }
 
+    /// 读取 HTTP 任务默认落盘目录（V15：`POST /bt/metadata` 的 `save_to`
+    /// 落盘白名单根——save_to 必须落在该目录内）。
+    pub fn default_dest_root(&self) -> PathBuf {
+        self.default_dest_root.lock().clone()
+    }
+
     /// 注入 HTTP API Bearer token（V1/V13）：Some = 全端点（含 /ws 握手）强制
     /// `Authorization: Bearer <token>`；None = 未配置（serve 已保证非回环监听拒绝启动）。
     pub fn with_http_token(mut self, token: Option<String>) -> Self {

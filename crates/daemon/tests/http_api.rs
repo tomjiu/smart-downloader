@@ -17,10 +17,11 @@ async fn serve() -> (std::net::SocketAddr, Arc<DaemonState>) {
     let engine = HttpEngine::new(reqwest::Client::new());
     // 安全修复（V2）适配：测试的显式 dest 落在系统临时目录（/tmp/m6-test-*），
     // 必须把它注入为白名单根，否则 dest 预检按越界拒绝（400）。
-    let state = DaemonState::new(Arc::new(engine), vec![])
-        .with_dest_root(std::env::temp_dir());
+    // bt 构建下注入 BtEngine；非 bt 构建纯 HTTP（双态声明，两个 cfg 均零警告）
     #[cfg(feature = "bt")]
-    {
+    let state = {
+        let base =
+            DaemonState::new(Arc::new(engine), vec![]).with_dest_root(std::env::temp_dir());
         let tmp = tempfile::tempdir().expect("tempdir");
         let bt = smart_dl_daemon::bt::BtEngine::new(
             tmp.path(),
@@ -32,8 +33,11 @@ async fn serve() -> (std::net::SocketAddr, Arc<DaemonState>) {
             false,
         )
         .expect("bt engine");
-        state = state.with_bt(Arc::new(bt));
-    }
+        base.with_bt(Arc::new(bt))
+    };
+    #[cfg(not(feature = "bt"))]
+    let state =
+        DaemonState::new(Arc::new(engine), vec![]).with_dest_root(std::env::temp_dir());
     let state = Arc::new(state);
     let app = http::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -10,6 +10,7 @@ pub mod alerts;
 pub mod bare;
 pub mod engine;
 pub mod ffi;
+pub mod magnet;
 pub mod resume;
 pub mod strategy;
 pub mod xudt;
@@ -22,6 +23,7 @@ pub use alerts::{Alert, AlertKind, StateSubKind};
 pub use bare::Bare;
 pub use engine::{peer_flags, BtCore, PeerInfo, TorrentStatus};
 pub use ffi::{Error, Result};
+pub use magnet::{fetch_metadata, FetchError, FetchOpts, FetchedTorrent};
 pub use resume::ResumeBytes;
 #[cfg(feature = "xunlei")]
 pub use xunlei_engine::XunleiBtEngine;
