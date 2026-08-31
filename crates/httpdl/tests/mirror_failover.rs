@@ -121,7 +121,7 @@ async fn weighted_score_prefers_healthy_mirror() {
 
     // 换源重试轮：m1 已被罚（段1 缩小粒度仍失败）→ 排序优先 m2 → m2 服务全部 4 段起点
     // （首轮 mirrors 只有 [m1]，m1 的 16M 起点留痕属正常；断言 m2 全量接管即可证明排序生效）
-    let m2_starts = m2.range_starts.lock().unwrap();
+    let m2_starts = m2.range_starts.lock();
     for want in [0u64, 16 * MB, 32 * MB, 48 * MB] {
         assert!(
             m2_starts.contains(&want),
@@ -200,7 +200,7 @@ async fn failed_large_segment_recovers_by_halving() {
     assert_eq!(sha256_of(&got), expected, "缩小粒度重试后文件必须完整");
 
     // 拆分过程留痕：整段尝试（16MB）、left 再拆（20MB）、right（24MB）都应出现在 Range 起点里
-    let starts = m1.range_starts.lock().unwrap();
+    let starts = m1.range_starts.lock();
     for want in [0u64, 16 * MB, 20 * MB, 24 * MB] {
         assert!(
             starts.contains(&want),

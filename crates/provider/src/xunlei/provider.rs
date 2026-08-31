@@ -1,14 +1,17 @@
 //! XunleiProvider：迅雷云盘渠道，实现 RemoteProvider。
 
-use crate::types::{ProviderError, ProviderRuntime, ProviderStatus, ProviderTaskId, ResolvedRemoteFile};
+use crate::types::{
+    ProviderError, ProviderRuntime, ProviderStatus, ProviderTaskId, ResolvedRemoteFile,
+};
 use crate::xunlei::auth::{load as load_auth, save as save_auth, AuthState};
 use crate::xunlei::client::Client;
 use crate::xunlei::device::DeviceAuthFlow;
 use crate::xunlei::tier::{Tier, TIER_WEB};
+use parking_lot::Mutex;
 use smart_dl_core::types::{Capability, DownloadSource};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
 pub struct XunleiProvider {
@@ -65,19 +68,19 @@ impl XunleiProvider {
 
     /// 设置冷却截止时刻（失败后自动降级）。
     fn set_backoff(&self, duration: std::time::Duration) {
-        let mut guard = self.backoff_until.lock().unwrap();
+        let mut guard = self.backoff_until.lock();
         *guard = Some(std::time::Instant::now() + duration);
     }
 
     /// 清除冷却（操作成功时调用）。
     fn clear_backoff(&self) {
-        let mut guard = self.backoff_until.lock().unwrap();
+        let mut guard = self.backoff_until.lock();
         *guard = None;
     }
 
     /// 剩余冷却时间（None = 无冷却）。
     fn backoff_remaining(&self) -> Option<std::time::Duration> {
-        let guard = self.backoff_until.lock().unwrap();
+        let guard = self.backoff_until.lock();
         guard.and_then(|until| {
             let remaining = until.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -130,14 +133,20 @@ impl XunleiProvider {
     }
 
     /// 把设备码登录拿到的 token 写入登录态并持久化。
-    pub async fn store_login(&self, access_token: String, refresh_token: String) -> Result<(), ProviderError> {
+    pub async fn store_login(
+        &self,
+        access_token: String,
+        refresh_token: String,
+    ) -> Result<(), ProviderError> {
         // 登录后需初始化 captcha_token 和 device_id。
         // device_id：若已有则复用，否则生成 32 位随机 hex（captcha_sign 只需 32 位）。
         // 注：完整 device_id 是 `wdi10.` + 64位hex（device-sign 流程），
         //     但 captcha_sign/取链只用到前 32 位，故这里按 32 位存储。
         let device_id = {
             let guard = self.auth.lock().await;
-            guard.as_ref().map(|s| s.device_id.clone())
+            guard
+                .as_ref()
+                .map(|s| s.device_id.clone())
                 .unwrap_or_else(generate_device_id)
         };
         let mut state = AuthState {
@@ -152,7 +161,10 @@ impl XunleiProvider {
         // 从 access_token（JWT sub）解析 user_id，captcha/init 需要。
         state.fill_user_id_from_token();
         // 拉取 captcha_token（带真实 meta + captcha_sign）。
-        self.client.refresh_captcha(&mut state).await.map_err(|e| ProviderError::Other(e.to_string()))?;
+        self.client
+            .refresh_captcha(&mut state)
+            .await
+            .map_err(|e| ProviderError::Other(e.to_string()))?;
         let mut guard = self.auth.lock().await;
         *guard = Some(state.clone());
         save_auth(&self.token_path, &state).map_err(|e| ProviderError::Other(e.to_string()))?;
@@ -162,7 +174,9 @@ impl XunleiProvider {
 
 #[async_trait::async_trait]
 impl crate::RemoteProvider for XunleiProvider {
-    fn name(&self) -> &str { &self.name }
+    fn name(&self) -> &str {
+        &self.name
+    }
     fn capabilities(&self) -> Vec<Capability> {
         vec![Capability::OfflineCache, Capability::UrlRefresh]
     }
@@ -171,9 +185,7 @@ impl crate::RemoteProvider for XunleiProvider {
         // 测试中通过 runtime_authenticated_false_when_no_auth 验证默认状态。
         // 生产环境应在已有运行时上下文中调用。
         let authenticated = self.auth.try_lock().map(|g| g.is_some()).unwrap_or(false);
-        let backoff_until = self
-            .backoff_remaining()
-            .map(|d| now_unix() + d.as_secs());
+        let backoff_until = self.backoff_remaining().map(|d| now_unix() + d.as_secs());
         ProviderRuntime {
             enabled: true,
             authenticated,
@@ -188,10 +200,16 @@ impl crate::RemoteProvider for XunleiProvider {
         let mut guard = self.auth.lock().await;
         if let Some(state) = guard.as_mut() {
             if state.access_token_expiring(now_unix()) {
-                self.client.refresh(state).await.map_err(|e| ProviderError::Other(e.to_string()))?;
+                self.client
+                    .refresh(state)
+                    .await
+                    .map_err(|e| ProviderError::Other(e.to_string()))?;
             }
             if state.captcha_token_expiring(now_unix()) {
-                self.client.refresh_captcha(state).await.map_err(|e| ProviderError::Other(e.to_string()))?;
+                self.client
+                    .refresh_captcha(state)
+                    .await
+                    .map_err(|e| ProviderError::Other(e.to_string()))?;
             }
             let _ = save_auth(&self.token_path, state);
         }
@@ -206,8 +224,10 @@ impl crate::RemoteProvider for XunleiProvider {
             let (url, name) = match source {
                 DownloadSource::Magnet(m) => (m.clone(), magnet_name(m)),
                 DownloadSource::Http { url, .. } => (url.clone(), url_file_name(url)),
-                DownloadSource::TorrentFile(_) | DownloadSource::Thunder(_)
-                | DownloadSource::XunleiShare(_) | DownloadSource::Ftp { .. }
+                DownloadSource::TorrentFile(_)
+                | DownloadSource::Thunder(_)
+                | DownloadSource::XunleiShare(_)
+                | DownloadSource::Ftp { .. }
                 | DownloadSource::Ed2k(_) => {
                     return Err(ProviderError::Other(
                         "v1 离线提交仅支持磁力/HTTP 链接（torrent 字节上传留后续）".into(),
@@ -215,7 +235,10 @@ impl crate::RemoteProvider for XunleiProvider {
                 }
             };
             let state = self.auth.lock().await.clone().ok_or(ProviderError::Auth)?;
-            let resp = self.client.offline_submit(&state, &url, &name).await
+            let resp = self
+                .client
+                .offline_submit(&state, &url, &name)
+                .await
                 .map_err(|e| ProviderError::Other(e.to_string()))?;
 
             let pid = if resp.task_id.is_empty() {
@@ -223,10 +246,13 @@ impl crate::RemoteProvider for XunleiProvider {
             } else {
                 format!("{}-{}", self.name, resp.task_id)
             };
-            self.tasks.lock().await.insert(pid.clone(), CloudTaskHandle {
-                cloud_task_id: resp.task_id,
-                file_id: resp.file_id,
-            });
+            self.tasks.lock().await.insert(
+                pid.clone(),
+                CloudTaskHandle {
+                    cloud_task_id: resp.task_id,
+                    file_id: resp.file_id,
+                },
+            );
             Ok(pid)
         })
         .await
@@ -245,7 +271,10 @@ impl crate::RemoteProvider for XunleiProvider {
             // Bug B 修复：此处原有一次重复 refresh_auth（入口已刷过）——每次都触发
             // save_auth 同步写盘，poll_ready 高频轮询下造成 fs 阻塞累积（运行时饿死）。
             let state = self.auth.lock().await.clone().ok_or(ProviderError::Auth)?;
-            let tasks = self.client.offline_tasks(&state).await
+            let tasks = self
+                .client
+                .offline_tasks(&state)
+                .await
                 .map_err(|e| ProviderError::Other(e.to_string()))?;
             let (phase, discovered_file_id) = {
                 let mut phase = String::new();
@@ -291,13 +320,21 @@ impl crate::RemoteProvider for XunleiProvider {
             self.refresh_auth().await?;
             let file_id = {
                 let tasks = self.tasks.lock().await;
-                tasks.get(id).map(|h| h.file_id.clone()).ok_or(ProviderError::NotFound)?
+                tasks
+                    .get(id)
+                    .map(|h| h.file_id.clone())
+                    .ok_or(ProviderError::NotFound)?
             };
             if file_id.is_empty() {
-                return Err(ProviderError::Other("云端 file_id 尚未生成（任务未完成？）".into()));
+                return Err(ProviderError::Other(
+                    "云端 file_id 尚未生成（任务未完成？）".into(),
+                ));
             }
             let state = self.auth.lock().await.clone().ok_or(ProviderError::Auth)?;
-            let play = self.client.resolve_link(&state, &file_id).await
+            let play = self
+                .client
+                .resolve_link(&state, &file_id)
+                .await
                 .map_err(|e| ProviderError::Other(e.to_string()))?;
             let url = play.web_content_link;
             if url.is_empty() {
@@ -306,7 +343,11 @@ impl crate::RemoteProvider for XunleiProvider {
             let size = play.size.or_else(|| url_query_u64(&url, "f")).unwrap_or(0);
             let expires_at = url_query_u64(&url, "e");
             Ok(vec![ResolvedRemoteFile {
-                rel_path: if play.name.is_empty() { file_id } else { play.name },
+                rel_path: if play.name.is_empty() {
+                    file_id
+                } else {
+                    play.name
+                },
                 url,
                 size,
                 etag: None,
@@ -316,17 +357,27 @@ impl crate::RemoteProvider for XunleiProvider {
         .await
     }
     async fn remove(&self, id: &ProviderTaskId) -> Result<(), ProviderError> {
-        self.tasks.lock().await.remove(id).ok_or(ProviderError::NotFound)?;
+        self.tasks
+            .lock()
+            .await
+            .remove(id)
+            .ok_or(ProviderError::NotFound)?;
         Ok(())
     }
-    async fn refresh_links(&self, id: &ProviderTaskId) -> Result<Option<Vec<String>>, ProviderError> {
+    async fn refresh_links(
+        &self,
+        id: &ProviderTaskId,
+    ) -> Result<Option<Vec<String>>, ProviderError> {
         let _ = id;
         Ok(None)
     }
 }
 
 fn now_unix() -> u64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 /// 从磁力链接提取展示名：`dn=` 参数优先，否则取 btih 末 8 位。
@@ -341,7 +392,14 @@ fn magnet_name(m: &str) -> String {
     }
     let xt = m.split("btih:").nth(1).unwrap_or("unknown");
     let h = xt.split('&').next().unwrap_or("unknown");
-    let tail: String = h.chars().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = h
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("magnet-{tail}")
 }
 
@@ -350,7 +408,11 @@ fn url_file_name(url: &str) -> String {
     let no_query = url.split('?').next().unwrap_or(url);
     let seg = no_query.rsplit('/').next().unwrap_or("");
     let name = urldecode(seg);
-    if name.is_empty() { format!("offline-{}", now_unix()) } else { name }
+    if name.is_empty() {
+        format!("offline-{}", now_unix())
+    } else {
+        name
+    }
 }
 
 /// 极简 percent-decode（+ → 空格，%XX → 字节），足够覆盖 dn=/文件名场景。
@@ -360,7 +422,10 @@ fn urldecode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            b'+' => { out.push(b' '); i += 1; }
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
             b'%' if i + 2 < bytes.len() + 1 && i + 2 < bytes.len() + 1 => {
                 let hex = |b: u8| -> Option<u8> {
                     match b {
@@ -380,7 +445,10 @@ fn urldecode(s: &str) -> String {
                 out.push(b'%');
                 i += 1;
             }
-            b => { out.push(b); i += 1; }
+            b => {
+                out.push(b);
+                i += 1;
+            }
         }
     }
     String::from_utf8_lossy(&out).into_owned()
@@ -394,7 +462,10 @@ fn urldecode(s: &str) -> String {
 /// 对取链/列表并非必需，故这里本地随机生成即可。
 fn generate_device_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     // 用纳秒低 64 位 + 地址随机化（ASLR），展开成 32 位 hex。
     let mut seed = nanos as u64;
     let aslr = &seed as *const _ as u64;
@@ -455,7 +526,10 @@ mod tests {
 
     #[test]
     fn magnet_name_prefers_dn_param() {
-        assert_eq!(magnet_name("magnet:?xt=urn:btih:ABCDEF1234567890&dn=My%20Movie.mp4"), "My Movie.mp4");
+        assert_eq!(
+            magnet_name("magnet:?xt=urn:btih:ABCDEF1234567890&dn=My%20Movie.mp4"),
+            "My Movie.mp4"
+        );
     }
 
     #[test]
@@ -467,7 +541,10 @@ mod tests {
 
     #[test]
     fn url_file_name_extracts_last_segment() {
-        assert_eq!(url_file_name("https://example.com/a/b/file.zip?token=x"), "file.zip");
+        assert_eq!(
+            url_file_name("https://example.com/a/b/file.zip?token=x"),
+            "file.zip"
+        );
         assert_eq!(url_file_name("https://example.com/file.zip"), "file.zip");
         // 裸域名 → 最后一段即主机名
         assert_eq!(url_file_name("https://example.com"), "example.com");

@@ -1488,6 +1488,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",
@@ -1507,6 +1508,7 @@ dependencies = [
  "base64",
  "fs2",
  "futures",
+ "parking_lot",
  "qrcode",
  "reqwest",
  "serde",
@@ -1524,6 +1526,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "uuid",
  "xunlei-convert",
 ]
 
@@ -1534,6 +1537,7 @@ dependencies = [
  "async-trait",
  "axum",
  "md-5",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
@@ -1552,6 +1556,7 @@ dependencies = [
  "async-trait",
  "axum",
  "md-5",
+ "parking_lot",
  "qrcode",
  "reqwest",
  "serde",

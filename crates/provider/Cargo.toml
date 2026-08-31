@@ -10,8 +10,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 async-trait = { workspace = true }
-tracing = { workspace = true } # BUGB-INSTR（诊断插桩；与 daemon 同版本）
+tracing = { workspace = true }
 smart-dl-core = { path = "../core" }
+parking_lot = { workspace = true }
 md-5 = "0.10"
 sha1 = { workspace = true }
 # 本地登录页服务（Task 5-b：与迅雷 App 一致的原生登录页）

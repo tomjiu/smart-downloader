@@ -1,10 +1,10 @@
 //! 共享 mock 引擎：实现 `DownloadEngine`，可注入 peers/seeds/progress/error。
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{Capability, DownloadEngine, EngineError, EngineKind, EngineStatus};
 use std::net::SocketAddr;
-use std::sync::Mutex;
 
 pub struct MockEngine {
     pub id: String,
@@ -66,23 +66,23 @@ impl MockEngine {
     }
 
     pub fn set_peers_seeds(&self, peers: u32, seeds: u32) {
-        let mut s = self.status.lock().unwrap();
+        let mut s = self.status.lock();
         s.num_peers = peers;
         s.num_seeds = seeds;
     }
 
     pub fn set_progress(&self, ratio: f64) {
-        let mut s = self.status.lock().unwrap();
+        let mut s = self.status.lock();
         s.total = 1000;
         s.total_done = (1000.0 * ratio) as u64;
     }
 
     pub fn set_error(&self, err: EngineError) {
-        *self.error.lock().unwrap() = Some(err);
+        *self.error.lock() = Some(err);
     }
 
     pub fn added_tasks(&self) -> Vec<String> {
-        self.added.lock().unwrap().clone()
+        self.added.lock().clone()
     }
 }
 
@@ -101,15 +101,12 @@ impl DownloadEngine for MockEngine {
     }
 
     async fn add(&self, task: &DownloadTask) -> Result<String, EngineError> {
-        if let Some(e) = self.error.lock().unwrap().as_ref() {
+        if let Some(e) = self.error.lock().as_ref() {
             if matches!(e, EngineError::Other(s) if s == "add") {
                 return Err(EngineError::Other("add".into()));
             }
         }
-        self.added
-            .lock()
-            .unwrap()
-            .push(task.canonical_id.identity.clone());
+        self.added.lock().push(task.canonical_id.identity.clone());
         Ok(format!("{}-1", self.id))
     }
 
@@ -122,10 +119,10 @@ impl DownloadEngine for MockEngine {
     }
 
     async fn status(&self, _id: &String) -> Result<EngineStatus, EngineError> {
-        if let Some(e) = self.error.lock().unwrap().clone() {
+        if let Some(e) = self.error.lock().clone() {
             return Err(e);
         }
-        Ok(self.status.lock().unwrap().clone())
+        Ok(self.status.lock().clone())
     }
 
     async fn remove(&self, _id: &String, _delete_data: bool) -> Result<(), EngineError> {
