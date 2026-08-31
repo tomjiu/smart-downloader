@@ -446,6 +446,12 @@ impl DaemonState {
         self
     }
 
+    /// 读取 HTTP 任务默认落盘目录（V15：`POST /bt/metadata` 的 `save_to`
+    /// 落盘白名单根——save_to 必须落在该目录内）。
+    pub fn default_dest_root(&self) -> PathBuf {
+        self.default_dest_root.lock().unwrap().clone()
+    }
+
     /// 注入生效配置快照（`GET /config` 返回；serve 组装精简字段）。
     pub fn with_config(self, snapshot: serde_json::Value) -> Self {
         *self.config_snapshot.lock().unwrap() = Some(snapshot);

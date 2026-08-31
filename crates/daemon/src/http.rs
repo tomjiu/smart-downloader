@@ -129,21 +129,27 @@ pub struct MagnetMetaReq {
     /// 已知 peer 引导（`ip:port`；本地 seeder / 手动注入）。
     #[serde(default)]
     pub peers: Vec<String>,
-    /// 可选：成功后将 .torrent 落盘到该路径（父目录须存在）。
+    /// 可选：成功后将 .torrent 落盘到「下载根目录」（`[download] dest_root`）下
+    /// 的该相对路径（V15：拒绝绝对路径/`..`/盘符前缀；父目录须已存在）。
     #[serde(default)]
     pub save_to: Option<String>,
 }
 
 #[cfg(feature = "bt")]
 async fn bt_magnet_metadata(
-    State(_state): State<Arc<DaemonState>>,
+    State(state): State<Arc<DaemonState>>,
     Json(req): Json<MagnetMetaReq>,
 ) -> impl IntoResponse {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Semaphore;
 
-    static BUSY: AtomicBool = AtomicBool::new(false);
+    // V16（CWE-667）：单并发门禁改为 RAII 信号量——`try_acquire` 拿到的 permit
+    // 在 drop 时自动归还。修复前用裸 `AtomicBool` + `compare_exchange`：客户端在
+    // 抓取 `await` 期间断连 → handler future 被 drop → `BUSY.store(false)` 永不
+    // 执行 → 端点此后对所有请求永久 409。permit 是 handler future 的局部值，
+    // 正常返回与取消（断连）两条路径都必然 drop，门禁不可能锁死。
+    static METADATA_GATE: Semaphore = Semaphore::const_new(1);
 
-    // 参数面校验（同步、快）：magnet / peers / timeout
+    // 参数面校验（同步、快）：magnet / peers / save_to / timeout
     let peers: Vec<std::net::SocketAddr> = match req
         .peers
         .iter()
@@ -159,6 +165,21 @@ async fn bt_magnet_metadata(
                 .into_response();
         }
     };
+    // V15（CWE-22/23）：save_to 前置校验——必须是相对下载根目录的相对路径，
+    // 越界/穿越在抓取（5-600s）开始前即 400 快速失败（不占门禁）。
+    let save_to = match &req.save_to {
+        Some(s) => match validate_save_dest(&state.default_dest_root(), s) {
+            Ok(p) => Some(p),
+            Err(msg) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": msg })),
+                )
+                    .into_response();
+            }
+        },
+        None => None,
+    };
     let timeout = std::time::Duration::from_secs(req.timeout_s.unwrap_or(60).clamp(5, 600));
     let opts = smart_dl_btcore::magnet::FetchOpts {
         timeout,
@@ -168,20 +189,19 @@ async fn bt_magnet_metadata(
         ..Default::default()
     };
     let magnet = req.magnet.clone();
-    let save_to = req.save_to.clone();
 
-    if BUSY
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
-    {
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({ "error": "已有 metadata 抓取进行中（单并发）" })),
-        )
-            .into_response();
-    }
+    let _permit = match METADATA_GATE.try_acquire() {
+        Ok(p) => p,
+        Err(_) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({ "error": "已有 metadata 抓取进行中（单并发）" })),
+            )
+                .into_response();
+        }
+    };
+    // 持有 _permit 直至 handler 结束（含取消路径）→ 无需手动释放。
     let result = run_magnet_fetch(&magnet, &opts, save_to.as_deref()).await;
-    BUSY.store(false, Ordering::SeqCst);
 
     match result {
         Ok(body) => Json(body).into_response(),
@@ -189,12 +209,63 @@ async fn bt_magnet_metadata(
     }
 }
 
+/// 安全修复（V15，CWE-22/23）：`POST /bt/metadata` 的 `save_to` 落盘路径校验。
+/// 修复前 `std::fs::write(dest)` 直写用户输入 → 已认证客户端可写任意路径
+/// （绝对路径 `/etc/crontab`、`..` 穿越、Windows 目标上的盘符前缀）。
+/// 修复后语义：
+/// - 仅接受相对路径，逐分量白名单（Normal/CurDir），拒绝 `..`、绝对前缀、
+///   盘符（与 fix/security-p0（PR #5）`sanitize_rel` 同构，合并后两处一致）；
+/// - 最终落盘点 = `<default_dest_root>/save_to`，不再接受任意绝对目标；
+/// - 父目录须已存在（保留原契约），且 canonicalize 后必须仍在根目录内——
+///   拦截已存在的 symlink 指向根外（写穿逃逸）。
+///
+/// 纯路径校验（仅 std，无 btcore 依赖）：不挂 cfg(bt)——无 bt 构建的测试
+/// 同样覆盖，亦可供其他落盘端点复用。
+pub fn validate_save_dest(
+    root: &std::path::Path,
+    raw: &str,
+) -> Result<std::path::PathBuf, String> {
+    let rel = std::path::PathBuf::from(raw);
+    if rel.as_os_str().is_empty() {
+        return Err("save_to 为空".into());
+    }
+    if rel.is_absolute() {
+        return Err(format!("save_to 必须是相对下载根目录的相对路径: {raw}"));
+    }
+    for comp in rel.components() {
+        match comp {
+            std::path::Component::Normal(_) | std::path::Component::CurDir => {}
+            // ParentDir(..) / RootDir(/) / Prefix(C:) / 其他 → 一律拒绝
+            _ => {
+                return Err(format!(
+                    "save_to 含非法路径分量（拒绝 .. 穿越、绝对/盘符前缀）: {raw}"
+                ))
+            }
+        }
+    }
+    let dest = root.join(&rel);
+    let parent = dest
+        .parent()
+        .ok_or_else(|| format!("save_to 无父目录: {raw}"))?
+        .to_path_buf();
+    let parent_canon = parent
+        .canonicalize()
+        .map_err(|e| format!("save_to 父目录须已存在且可达: {}: {e}", parent.display()))?;
+    let root_canon = root
+        .canonicalize()
+        .map_err(|e| format!("下载根目录不可达: {}: {e}", root.display()))?;
+    if !parent_canon.starts_with(&root_canon) {
+        return Err(format!("save_to 越界（解析后不在下载根目录内）: {raw}"));
+    }
+    Ok(dest)
+}
+
 /// 抓取执行体（spawn_blocking 包装阻塞流程 + 临时 scratch 目录管理）。
 #[cfg(feature = "bt")]
 async fn run_magnet_fetch(
     magnet: &str,
     opts: &smart_dl_btcore::magnet::FetchOpts,
-    save_to: Option<&str>,
+    save_to: Option<&std::path::Path>,
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     use smart_dl_btcore::magnet::{fetch_metadata, FetchError};
 
@@ -235,16 +306,17 @@ async fn run_magnet_fetch(
     let _ = std::fs::remove_dir_all(&scratch);
     let fetched = res?;
 
-    // 可选落盘（父目录须存在；写失败 → 500）
+    // 可选落盘（V15：save_to 已在 handler 前置校验=根内相对路径+父目录存在；
+    // 此处写失败 → 500）
     let mut saved_to: Option<String> = None;
     if let Some(dest) = save_to {
         std::fs::write(dest, &fetched.torrent).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!(".torrent 落盘失败 {dest}: {e}"),
+                format!(".torrent 落盘失败 {}: {e}", dest.display()),
             )
         })?;
-        saved_to = Some(dest.to_string());
+        saved_to = Some(dest.display().to_string());
     }
 
     let s = &fetched.summary;
