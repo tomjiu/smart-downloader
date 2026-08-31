@@ -30,8 +30,8 @@ import urllib.error
 import urllib.request
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-# 常量区：引擎内嵌 OAuth 客户端（附录 E.2.3；env 可覆盖以便轮换）
-CLIENT_ID = os.environ.get("SD_XL_CLIENT_ID", "X9ibISwpIp8jQ4Ya")
+# 常量区：引擎内嵌 OAuth 客户端（附录 E.2.3；env 注入，无明文 fallback）
+CLIENT_ID = os.environ["SD_XL_CLIENT_ID"]
 DEFAULT_TOKEN_FILE = os.environ.get(
     "SD_A2_TOKEN_FILE",
     os.path.expanduser("~/.nas-engine-test/data/.drive/auth_token.json"))

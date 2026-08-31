@@ -44,9 +44,9 @@ try:
 except ImportError:  # 可选依赖：缺省时仅打印链接 + 安装提示
     qrcode = None
 
-# ── 常量区：引擎内嵌 OAuth 客户端（已随附录 E.2.3 公开；环境变量可覆盖以便轮换）
-CLIENT_ID = os.environ.get("SD_XL_CLIENT_ID", "X9ibISwpIp8jQ4Ya")
-CLIENT_SECRET = os.environ.get("SD_XL_CLIENT_SECRET", "BlPF2z7HEeutzH4t6zyjLw")
+# ── 常量区：引擎内嵌 OAuth 客户端（环境变量注入，无明文 fallback）
+CLIENT_ID = os.environ["SD_XL_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SD_XL_CLIENT_SECRET"]
 SCOPE = "pan user profile sso offline pan/xunlei/share/create"
 CODE_URL = "https://xluser-ssl.xunlei.com/v1/auth/device/code"
 TOKEN_URL = "https://xluser-ssl.xunlei.com/v1/auth/token"

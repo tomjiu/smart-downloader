@@ -15,14 +15,19 @@ import time
 import urllib.error
 import urllib.request
 
-ENGINE = ("/home/z/my-project/repo-smart-downloader/scripts/research/xunlei/"
-          "extracted/cross-platform/spk-x64/payload/bin/bin/xunlei-pan-cli.3.23.5.amd64")
+if sys.platform == "win32":
+    sys.exit("a2_warmboot_run.py 依赖 Linux-only 模块（fcntl/pty/termios），请于 WSL/Linux 运行")
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ENGINE = os.environ.get("SD_A2_ENGINE", os.path.normpath(os.path.join(
+    SCRIPT_DIR, "..", "research", "xunlei", "extracted", "cross-platform",
+    "spk-x64", "payload", "bin", "bin", "xunlei-pan-cli.3.23.5.amd64")))
 WS = os.path.expanduser("~/.nas-engine-test")
 LOG = f"{WS}/logs/engine_warmboot.log"
 OUT = f"{WS}/a2_result_warmboot.json"
 DRIVE = "127.0.0.1:5050"
 ROWS, COLS = 40, 120
-CLIENT_ID = "X9ibISwpIp8jQ4Ya"
+CLIENT_ID = os.environ["SD_XL_CLIENT_ID"]
 
 API_PROBES = [
     ("GET", "/", None),

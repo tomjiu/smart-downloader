@@ -7,7 +7,7 @@
   status  : 单次无副作用探测
 
 端点与凭据：NAS 引擎内嵌 client（附录 E.2.3）
-  client_id=X9ibISwpIp8jQ4Ya  client_secret=BlPF2z7HEeutzH4t6zyjLw
+  client_id / client_secret 通过环境变量注入（SD_XL_CLIENT_ID / SD_XL_CLIENT_SECRET）
   scope="pan user profile sso offline pan/xunlei/share/create"
 
 device_id 取引擎工作区确定性值（硬件哈希，跨重启不变）：
@@ -20,19 +20,21 @@ import time
 import urllib.error
 import urllib.request
 
-CLIENT_ID = "X9ibISwpIp8jQ4Ya"
-CLIENT_SECRET = "BlPF2z7HEeutzH4t6zyjLw"
+CLIENT_ID = os.environ["SD_XL_CLIENT_ID"]
+CLIENT_SECRET = os.environ["SD_XL_CLIENT_SECRET"]
 SCOPE = "pan user profile sso offline pan/xunlei/share/create"
 CODE_URL = "https://xluser-ssl.xunlei.com/v1/auth/device/code"
 TOKEN_URL = "https://xluser-ssl.xunlei.com/v1/auth/token"
 GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 DEVICE_ID = os.environ.get("SD_DEVICE_ID", "c7d089aad73f7e2ddd2c263c2956b5a6")
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 WS = os.path.expanduser("~/.nas-engine-test")
 FLOW = f"{WS}/device_flow.json"
 TOKP = f"{WS}/data/.drive/auth_token.json"
-ARCHIVE = ("/home/z/my-project/repo-smart-downloader/scripts/research/xunlei/"
-           "extracted/cross-platform/xllite_token.json")
+ARCHIVE = os.environ.get("SD_QR_ARCHIVE", os.path.normpath(os.path.join(
+    SCRIPT_DIR, "..", "research", "xunlei", "extracted", "cross-platform",
+    "xllite_token.json")))
 
 
 def post(url, obj):
