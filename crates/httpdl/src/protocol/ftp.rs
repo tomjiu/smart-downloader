@@ -124,8 +124,11 @@ impl FtpEngine {
         }
 
         // 落位目录：dest_root/<目录名>（URL 最后一段非空名称；根目录 → host）
+        // 安全修复（V3）：目录名可能来自远端 LIST 响应，join 前净化。
         let dir_name = dir_name_of(&path, &host);
-        let dest_dir = task.dest_root.join(&dir_name);
+        let dir_pb = smart_dl_core::session::output::sanitize_rel(&dir_name)
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let dest_dir = task.dest_root.join(&dir_pb);
         std::fs::create_dir_all(&dest_dir)
             .map_err(|e| EngineError::Other(format!("mkdir {}: {e}", dest_dir.display())))?;
 
@@ -686,7 +689,10 @@ impl DownloadEngine for FtpEngine {
                     .name
                     .clone()
                     .unwrap_or_else(|| "download.bin".to_string());
-                let dest = task.dest_root.join(&rel);
+                // 安全修复（V3）：任务名净化后再 join（拒 .. / 绝对路径）。
+                let rel_pb = smart_dl_core::session::output::sanitize_rel(&rel)
+                    .map_err(|e| EngineError::Other(e.to_string()))?;
+                let dest = task.dest_root.join(&rel_pb);
                 // .part 超长（源变小）→ 作废
                 let part = part_path_of(&dest);
                 if let Ok(md) = std::fs::metadata(&part) {

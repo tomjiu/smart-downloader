@@ -28,9 +28,28 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     let _lock = InstanceLock::acquire(&cfg.lock.path)?;
     tracing::info!("单实例锁已持有: {:?}", cfg.lock.path);
 
-    // 2. dest_root 预检（缺失目录自动创建）
-    crate::state::ensure_dest_root(Some(cfg.download.dest_root.to_string_lossy().into_owned()))
-        .map_err(|e| ServeError::Engine(format!("dest_root 预检失败: {e}")))?;
+    // 1b. 安全修复（V1/V13）fail-closed：非回环监听 + 未配置 http_token → 拒绝启动。
+    // 防止用户把 addr 改成 0.0.0.0 后 API（写文件/NAS 执行链）对局域网裸奔。
+    // 环境变量 SMART_DL_HTTP_TOKEN 优先（免把 token 写进配置文件）。
+    let http_token = std::env::var("SMART_DL_HTTP_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .or(cfg.server.http_token.clone());
+    if !Config::is_loopback_addr(&cfg.server.addr) && http_token.is_none() {
+        return Err(ServeError::Engine(
+            "检测到非回环监听地址但未配置 [server] http_token：API 将对网络裸奔，
+            已拒绝启动。请在配置中设置 http_token（或环境变量 SMART_DL_HTTP_TOKEN），
+            或改回 127.0.0.1"
+                .into(),
+        ));
+    }
+
+    // 2. dest_root 预检（缺失目录自动创建）；白名单 = [dest_root]（V2）
+    crate::state::ensure_dest_root(
+        Some(cfg.download.dest_root.to_string_lossy().into_owned()),
+        &[cfg.download.dest_root.clone()],
+    )
+    .map_err(|e| ServeError::Engine(format!("dest_root 预检失败: {e}")))?;
 
     // 3. 引擎组装：HTTP（必需）+ BT（feature bt 且配置开启）
     // 全局代理（config `[download] proxy`，启动时生效）：http/socks5/socks4，可带凭据
@@ -54,32 +73,7 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     // 开发/演示占位，真实 provider（迅雷云盘等）落地后按类型构造）
     let mut providers: Vec<Arc<dyn smart_dl_provider::RemoteProvider>> = Vec::new();
     if cfg.provider.enabled && cfg.provider.mock {
-        // BUGB-INSTR（临时诊断装配，修复验证后移除）：env SMART_DL_MOCK_URL 注入
-        // mock 直链文件，使兜底链在无真实云端配额时也能走完整传输路径。
-        let mut mp = smart_dl_provider::MockProvider::new("mock");
-        if let Ok(url) = std::env::var("SMART_DL_MOCK_URL") {
-            if !url.is_empty() {
-                let rel = std::env::var("SMART_DL_MOCK_NAME").unwrap_or_else(|_| "mockfile.bin".into());
-                let size = std::env::var("SMART_DL_MOCK_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                mp = mp.with_files(vec![smart_dl_provider::ResolvedRemoteFile {
-                    rel_path: rel,
-                    url: url.clone(),
-                    size,
-                    etag: None,
-                    expires_at: None,
-                }]);
-            }
-        }
-        // BUGB-INSTR（临时诊断装配，修复验证后移除）：SMARTDL_MOCK_READY_DELAY_SECS
-        // 延迟 Ready——submit 后 N 秒内 status=Downloading，模拟真实云盘「离线
-        // 数分钟」等待窗（免配额复现 Bug B 协调器状态窗）；缺省 0 = 旧行为。
-        if let Ok(secs) = std::env::var("SMARTDL_MOCK_READY_DELAY_SECS") {
-            let secs = secs.trim().parse::<u64>().unwrap_or(0);
-            if secs > 0 {
-                mp = mp.with_ready_delay_secs(secs);
-            }
-        }
-        providers.push(Arc::new(mp));
+        providers.push(Arc::new(smart_dl_provider::MockProvider::new("mock")));
         tracing::info!("云兜底已启用（provider=mock，开发占位）");
     }
     // 3b+. 迅雷云盘 Provider 装配（XunleiProvider）。
@@ -104,11 +98,13 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         );
     }
     #[cfg(feature = "bt")]
-    let mut state =
-        DaemonState::new(http_engine, providers).with_dest_root(cfg.download.dest_root.clone());
+    let mut state = DaemonState::new(http_engine, providers)
+        .with_dest_root(cfg.download.dest_root.clone())
+        .with_http_token(http_token.clone());
     #[cfg(not(feature = "bt"))]
-    let mut state =
-        DaemonState::new(http_engine, providers).with_dest_root(cfg.download.dest_root.clone());
+    let mut state = DaemonState::new(http_engine, providers)
+        .with_dest_root(cfg.download.dest_root.clone())
+        .with_http_token(http_token.clone());
 
     // 4. BT 引擎（先取 core 句柄，供 alert 事件流）
     #[cfg(feature = "bt")]
@@ -295,34 +291,6 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         let _ = tokio::signal::ctrl_c().await;
         let _ = tx.send(());
     });
-
-    // BUGB-INSTR（临时诊断，修复后移除）：纯 sleep 心跳——若此日志停更，
-    // 说明 tokio runtime 已无可调度 worker（全被同步阻塞调用钉死）。
-    {
-        let t0 = std::time::Instant::now();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                tracing::info!("[bugb] watchdog alive uptime_ms={}", t0.elapsed().as_millis());
-            }
-        });
-    }
-
-    // BUGB-INSTR（临时诊断，修复验证后移除）：OS 线程心跳 + tasks 锁探测——
-    // 与 tokio watchdog 互为对照：os-tick 停更 = 进程级冻结；os-tick 活而
-    // tasks_free=false = tasks Mutex 被长期持有且 tokio worker 全数饿死。
-    {
-        let st2 = state_arc.clone();
-        let t0 = std::time::Instant::now();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(300));
-            tracing::debug!(
-                "[bugb] os-tick alive_ms={} tasks_free={}",
-                t0.elapsed().as_millis(),
-                st2.debug_try_lock_tasks()
-            );
-        });
-    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async {

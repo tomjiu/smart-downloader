@@ -151,6 +151,12 @@ pub struct DaemonState {
     /// HTTP 任务默认落盘目录（dest 未指定时用；serve 从配置 `[download] dest_root` 注入；
     /// Mutex 支持 #6 TOML 热重载动态更新）。
     default_dest_root: Mutex<PathBuf>,
+    /// 安全修复（V2）：dest 白名单根目录。空 = 兜底用 default_dest_root
+    /// （保持未注入时的测试/默认行为）；serve 注入 [dest_root]，热重载跟随更新。
+    allowed_roots: Mutex<Vec<PathBuf>>,
+    /// 安全修复（V1/V13）：HTTP API Bearer token。None/空 = 未配置（serve 保证
+    /// 非回环监听时拒绝启动，回环监听放行兼容本机 CLI）；Some = 全端点强制校验。
+    http_token: Option<String>,
     /// 生效配置快照（`GET /config` 返回；serve 注入精简字段；热重载后刷新）。
     config_snapshot: Mutex<Option<serde_json::Value>>,
 }
@@ -164,11 +170,28 @@ pub struct PersistedTask {
 }
 
 /// 原子写任务文件（tmp + rename，防半写）。
+/// 安全修复（V12，CWE-312/732）：PersistedTask 含完整 source（可能带凭据的 URL/headers），
+/// 落盘必须 0600（rename 保留权限位）；存量宽松权限文件在下次写入时被收紧。
 pub fn write_tasks_atomic(path: &Path, tasks: &[PersistedTask]) -> std::io::Result<()> {
     let json = serde_json::to_vec_pretty(tasks).map_err(std::io::Error::other)?;
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, &json)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
     std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(md) = std::fs::metadata(path) {
+            let mode = md.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -236,7 +259,7 @@ impl TorrentMeta {
                     piece_length = be_int(b, i).ok_or_else(|| {
                         DaemonError::InvalidSource("piece length 解析失败".into())
                     })? as u32;
-                    i = value_skip(b, i).ok_or_else(|| {
+                    i = value_skip(b, i, 0).ok_or_else(|| {
                         DaemonError::InvalidSource(".torrent info dict 解析失败".into())
                     })?;
                 }
@@ -254,7 +277,7 @@ impl TorrentMeta {
                         .chunks_exact(20)
                         .map(|ch| <[u8; 20]>::try_from(ch).unwrap())
                         .collect();
-                    i = value_skip(b, i).ok_or_else(|| {
+                    i = value_skip(b, i, 0).ok_or_else(|| {
                         DaemonError::InvalidSource(".torrent info dict 解析失败".into())
                     })?;
                 }
@@ -264,7 +287,14 @@ impl TorrentMeta {
                             DaemonError::InvalidSource("name 解析失败".into())
                         })?.0)
                             .into_owned();
-                    i = value_skip(b, i).ok_or_else(|| {
+                    // 安全修复（V3）：torrent 根名直通 dest_root.join，恶意 name
+                    // （../、绝对路径）即任意文件写——parse 层即拒任务。
+                    smart_dl_core::session::output::sanitize_rel(&name).map_err(|_| {
+                        DaemonError::InvalidSource(format!(
+                            ".torrent name 含非法路径分量已拒绝: {name}"
+                        ))
+                    })?;
+                    i = value_skip(b, i, 0).ok_or_else(|| {
                         DaemonError::InvalidSource(".torrent info dict 解析失败".into())
                     })?;
                 }
@@ -273,21 +303,21 @@ impl TorrentMeta {
                         DaemonError::InvalidSource("length 解析失败".into())
                     })? as u64;
                     has_length = true;
-                    i = value_skip(b, i).ok_or_else(|| {
+                    i = value_skip(b, i, 0).ok_or_else(|| {
                         DaemonError::InvalidSource(".torrent info dict 解析失败".into())
                     })?;
                 }
                 b"files" => {
                     has_files = true;
                     // files value 是 list（l...e）
-                    let list_end = list_skip(b, i).ok_or_else(|| {
+                    let list_end = list_skip(b, i, 0).ok_or_else(|| {
                         DaemonError::InvalidSource("files 解析失败".into())
                     })?;
                     files = parse_file_list(&b[i + 1..list_end], piece_length)?;
                     i = list_end + 1; // 跳过 list 的闭合 'e'
                 }
                 _ => {
-                    i = value_skip(b, i).ok_or_else(|| {
+                    i = value_skip(b, i, 0).ok_or_else(|| {
                         DaemonError::InvalidSource(".torrent info dict 解析失败".into())
                     })?;
                 }
@@ -341,12 +371,12 @@ fn parse_file_list(
 
     while pos < data.len() {
         if data.get(pos) != Some(&b'd') {
-            pos = value_skip(data, pos).ok_or_else(|| {
+            pos = value_skip(data, pos, 0).ok_or_else(|| {
                 DaemonError::InvalidSource("files 列表解析失败".into())
             })?;
             continue;
         }
-        let dict_end = dict_skip(data, pos).ok_or_else(|| {
+        let dict_end = dict_skip(data, pos, 0).ok_or_else(|| {
             DaemonError::InvalidSource("files dict 解析失败".into())
         })?;
         let file_dict = &data[pos..=dict_end];
@@ -364,20 +394,20 @@ fn parse_file_list(
                     length = be_int(file_dict, j).ok_or_else(|| {
                         DaemonError::InvalidSource("files length 解析失败".into())
                     })? as u64;
-                    j = value_skip(file_dict, j).ok_or_else(|| {
+                    j = value_skip(file_dict, j, 0).ok_or_else(|| {
                         DaemonError::InvalidSource("files dict value 解析失败".into())
                     })?;
                 }
                 b"path" => {
                     // path value 是 list（l...e）
-                    let path_list_end = list_skip(file_dict, j).ok_or_else(|| {
+                    let path_list_end = list_skip(file_dict, j, 0).ok_or_else(|| {
                         DaemonError::InvalidSource("files path list 解析失败".into())
                     })?;
                     path = parse_path_list(&file_dict[j + 1..path_list_end])?;
                     j = path_list_end + 1;
                 }
                 _ => {
-                    j = value_skip(file_dict, j).ok_or_else(|| {
+                    j = value_skip(file_dict, j, 0).ok_or_else(|| {
                         DaemonError::InvalidSource("files dict value 解析失败".into())
                     })?;
                 }
@@ -404,6 +434,7 @@ fn parse_file_list(
 }
 
 /// 解析 path list 内容（bencode，`l`/`e` 已剥离）为路径字符串。
+/// 安全修复（V3）：逐段净化——拒 `..` / 绝对路径段，恶意种子不得写出 dest_root。
 #[cfg(feature = "bt")]
 fn parse_path_list(data: &[u8]) -> Result<String, DaemonError> {
     let mut parts = Vec::new();
@@ -412,7 +443,17 @@ fn parse_path_list(data: &[u8]) -> Result<String, DaemonError> {
         let (seg, after) = be_str(data, p).ok_or_else(|| {
             DaemonError::InvalidSource("path segment 解析失败".into())
         })?;
-        parts.push(String::from_utf8_lossy(seg).into_owned());
+        let seg_str = String::from_utf8_lossy(seg).into_owned();
+        if seg_str == ".."
+            || seg_str.contains('/')
+            || seg_str.contains('\\')
+            || seg_str.is_empty()
+        {
+            return Err(DaemonError::InvalidSource(format!(
+                "files path 含非法段已拒绝: {seg_str}"
+            )));
+        }
+        parts.push(seg_str);
         p = after;
     }
     if parts.is_empty() {
@@ -436,14 +477,53 @@ impl DaemonState {
             next_id: AtomicU64::new(1),
             persist_path: None,
             default_dest_root: Mutex::new(PathBuf::from(".")),
+            allowed_roots: Mutex::new(Vec::new()),
+            http_token: None,
             config_snapshot: Mutex::new(None),
         }
     }
 
     /// 注入 HTTP 任务默认落盘目录（dest 未指定时使用；serve 从 `[download] dest_root` 传入）。
+    /// 同时把该目录加入 dest 白名单（V2）——默认白名单 = [dest_root]。
     pub fn with_dest_root(self, default_dest_root: PathBuf) -> Self {
-        *self.default_dest_root.lock().unwrap() = default_dest_root;
+        *self.default_dest_root.lock().unwrap() = default_dest_root.clone();
+        let mut roots = self.allowed_roots.lock().unwrap();
+        if !roots.contains(&default_dest_root) {
+            roots.push(default_dest_root);
+        }
+        drop(roots);
         self
+    }
+
+    /// 注入 HTTP API Bearer token（V1/V13）：Some = 全端点（含 /ws 握手）强制
+    /// `Authorization: Bearer <token>`；None = 未配置（serve 已保证非回环监听拒绝启动）。
+    pub fn with_http_token(mut self, token: Option<String>) -> Self {
+        self.http_token = token.filter(|t| !t.is_empty());
+        self
+    }
+
+    /// 生效的 dest 白名单（V2）：未显式注入时兜底 default_dest_root。
+    fn dest_roots(&self) -> Vec<PathBuf> {
+        let g = self.allowed_roots.lock().unwrap();
+        if g.is_empty() {
+            vec![self.default_dest_root.lock().unwrap().clone()]
+        } else {
+            g.clone()
+        }
+    }
+
+    /// 校验 HTTP 请求 Bearer token（安全修复 V1/V13）：
+    /// - 未配置 token（None）→ 放行（serve 已保证该模式仅回环监听可达）；
+    /// - 已配置 → `Authorization: Bearer <token>` 必须精确匹配，否则 false。
+    /// 覆盖全部路由含 /ws 升级握手（同一 Router layer）。
+    pub fn verify_http_token(&self, authorization: Option<&str>) -> bool {
+        match self.http_token.as_deref() {
+            None | Some("") => true,
+            Some(expect) => authorization
+                .and_then(|v| v.strip_prefix("Bearer "))
+                .map(|t| t == expect)
+                .unwrap_or(false),
+        }
     }
 
     /// 注入生效配置快照（`GET /config` 返回；serve 组装精简字段）。
@@ -492,17 +572,10 @@ impl DaemonState {
         let Some(path) = self.persist_path.clone() else {
             return;
         };
-        tracing::info!("[bugb] autosave BEGIN path={path:?}"); // BUGB-INSTR（低频：仅状态迁移时）
         let data = self.persisted_tasks();
         if let Err(e) = write_tasks_atomic(&path, &data) {
             tracing::warn!("任务持久化失败 {path:?}: {e}");
         }
-        tracing::info!("[bugb] autosave END"); // BUGB-INSTR
-    }
-
-    /// BUGB-INSTR（临时诊断，修复验证后移除）：OS 线程侧探测 tasks 锁是否被长期持有。
-    pub fn debug_try_lock_tasks(&self) -> bool {
-        self.tasks.try_lock().is_ok()
     }
 
     /// 从持久化文件恢复任务：逐条重新 add 到引擎（保留原 task_id，
@@ -637,7 +710,7 @@ impl DaemonState {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        let dest_root = ensure_dest_root(dest_root.or(Some(def)))?;
+        let dest_root = ensure_dest_root(dest_root.or(Some(def)), &self.dest_roots())?;
         let canonical = CanonicalId {
             kind: CanonicalKind::Bt,
             identity: btih_of(&magnet).unwrap_or_else(|| magnet.clone()),
@@ -724,7 +797,7 @@ impl DaemonState {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        let dest_root = ensure_dest_root(dest_root.or(Some(def)))?;
+        let dest_root = ensure_dest_root(dest_root.or(Some(def)), &self.dest_roots())?;
         let Some(ih) = torrent_infohash(&torrent_bytes) else {
             return Err(DaemonError::InvalidSource(
                 ".torrent 解析失败：无法定位 info dict".into(),
@@ -853,7 +926,7 @@ impl DaemonState {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        let dest_root = ensure_dest_root(dest_root.or(Some(def)))?;
+        let dest_root = ensure_dest_root(dest_root.or(Some(def)), &self.dest_roots())?;
 
         // 3. 空间预检（总大小已知）
         precheck_space(&dest_root, total_size)?;
@@ -1065,7 +1138,7 @@ impl DaemonState {
             .to_string_lossy()
             .into_owned();
         let dest = dest_root.or(Some(def));
-        let dest_root = ensure_dest_root(dest)?;
+        let dest_root = ensure_dest_root(dest, &self.dest_roots())?;
         let canonical = CanonicalId {
             kind: CanonicalKind::Http,
             identity: canonical_http_url(&url), // D34：剥 token 参数后的 canonical 身份
@@ -1166,7 +1239,7 @@ impl DaemonState {
             .unwrap()
             .to_string_lossy()
             .into_owned();
-        let dest_root = ensure_dest_root(dest_root.or(Some(def)))?;
+        let dest_root = ensure_dest_root(dest_root.or(Some(def)), &self.dest_roots())?;
         let (user, pass) = smart_dl_core::source_parse::ftp::parse_ftp_auth(&url);
         // D34 复用 canonical 归一化（url 无 query 时基本原样）：FTP 身份键 = 归一化 URL
         let canonical = CanonicalId {
@@ -1282,7 +1355,6 @@ impl DaemonState {
 
     /// 任务快照（实时读引擎状态；未完成时引擎可能已移动）。
     pub async fn task_snapshot(&self, id: &str) -> Option<TaskSnapshot> {
-        let t0 = std::time::Instant::now(); // BUGB-INSTR
         let rec = self.tasks.lock().unwrap().get(id).cloned()?;
         let engine = self.engine_for(rec.engine_kind).ok();
         let (engine_name, status) = match (&rec.engine_tid, &engine) {
@@ -1292,14 +1364,6 @@ impl DaemonState {
             }
             _ => (None, None),
         };
-        { // BUGB-INSTR：快照耗时（>1s 说明引擎调用阻塞）
-            let ms = t0.elapsed().as_millis();
-            if ms > 1000 {
-                tracing::warn!("[bugb] snapshot SLOW id={id} elapsed_ms={ms}");
-            } else if ms > 50 {
-                tracing::info!("[bugb] snapshot id={id} elapsed_ms={ms}");
-            }
-        }
         // 显示层权威（qB 式）：用户暂停是记录级事实，不被引擎实时态覆盖
         // （lt 暂停后 status 枚举仍报 downloading，ABI 未透出 paused 位）。
         let effective_state = match &rec.task.state {
@@ -1313,7 +1377,8 @@ impl DaemonState {
         Some(TaskSnapshot {
             task_id: id.to_string(),
             state,
-            source: format!("{:?}", rec.task.source),
+            // 安全修复（V6）：source 可能含凭据（headers/auth/userinfo），不得 {:?} 直通
+            source: rec.task.source.redacted_debug(),
             dest_root: rec.task.dest_root.clone(),
             engine: engine_name,
             done: status.as_ref().map(|s| s.total_done).unwrap_or(0),
@@ -1331,7 +1396,8 @@ impl DaemonState {
             .map(|(id, rec)| TaskSummary {
                 task_id: id.clone(),
                 state: state_label(&rec.task.state),
-                source: format!("{:?}", rec.task.source),
+                // 安全修复（V6）：同快照，source 脱敏
+                source: rec.task.source.redacted_debug(),
             })
             .collect()
     }
@@ -1572,6 +1638,15 @@ impl DaemonState {
                 *def = new_root;
             }
         }
+        // 安全修复（V2）联动：热重载换默认目录时，白名单同步追加新根
+        //（追加而非替换——保留旧根允许显式 dest 指向旧目录的存量工作流；
+        // 白名单为空表时不必动：dest_roots() 兜底跟随 default_dest_root）。
+        {
+            let mut roots = self.allowed_roots.lock().unwrap();
+            if !roots.is_empty() && !roots.contains(&cfg.download.dest_root) {
+                roots.push(cfg.download.dest_root.clone());
+            }
+        }
         let snap = crate::config::Config::snapshot_json(cfg, tasks_path);
         if *self.config_snapshot.lock().unwrap() != Some(snap.clone()) {
             *self.config_snapshot.lock().unwrap() = Some(snap);
@@ -1709,11 +1784,55 @@ fn parse_bt_peer(s: &str) -> Option<(String, u16)> {
 
 /// B10（§12 D36）：dest_root 预检——缺失目录自动创建 + 可写探测（探针文件）。
 /// 空间充足性由 `precheck_space` 在总大小已知时另行检查。
-pub fn ensure_dest_root(dest: Option<String>) -> Result<PathBuf, DaemonError> {
-    let p = PathBuf::from(dest.unwrap_or_else(|| ".".to_string()));
+///
+/// 安全修复（V2，CWE-22 变体）：`allowed_roots` 白名单——dest 规范化后必须落在
+/// 某个白名单根内（拒 symlink 逃逸）；原始输入含 `..` 分量直接拒绝。
+/// `allowed_roots` 传空切片 = 不校验（仅测试/serve 初始化自身使用；
+/// 生产路径必须传非空，DaemonState 内部兜底 default_dest_root）。
+pub fn ensure_dest_root(
+    dest: Option<String>,
+    allowed_roots: &[PathBuf],
+) -> Result<PathBuf, DaemonError> {
+    let raw = dest.unwrap_or_else(|| ".".to_string());
+    let p = PathBuf::from(&raw);
+    // 1) 原始输入拒绝 `..`（canonicalize 前快速拒绝，语义清晰）
+    for comp in p.components() {
+        if matches!(comp, std::path::Component::ParentDir) {
+            return Err(DaemonError::InvalidSource(format!(
+                "dest 含 `..` 分量已拒绝: {raw}"
+            )));
+        }
+    }
     fs::create_dir_all(&p)
         .map_err(|e| DaemonError::InvalidSource(format!("目标目录不可创建: {e}")))?;
-    let probe = p.join(format!(".write_probe-{}", std::process::id()));
+    // 2) 白名单校验：canonicalize 后比对前缀（同时拦截 symlink 指向白名单外）
+    if !allowed_roots.is_empty() {
+        let cp = p
+            .canonicalize()
+            .map_err(|e| DaemonError::InvalidSource(format!("目标目录规范化失败: {e}")))?;
+        let inside = allowed_roots.iter().any(|r| {
+            // root 不存在则先建（首启场景 root == dest 本身，上一步已建好）
+            let _ = fs::create_dir_all(r);
+            match r.canonicalize() {
+                Ok(cr) => cp.starts_with(&cr),
+                Err(_) => false,
+            }
+        });
+        if !inside {
+            return Err(DaemonError::InvalidSource(format!(
+                "dest 越界（不在允许的下载根目录内）: {raw}"
+            )));
+        }
+    }
+    // 3) 可写探针：随机后缀防可预测竞态（V10-3）
+    let probe = p.join(format!(
+        ".write_probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     fs::write(&probe, b"ok")
         .map_err(|e| DaemonError::InvalidSource(format!("目标目录不可写: {e}")))?;
     let _ = fs::remove_file(&probe);
@@ -1943,7 +2062,7 @@ pub fn torrent_total_size(b: &[u8]) -> Option<u64> {
                 return std::str::from_utf8(&b[i + 1..e]).ok()?.parse().ok();
             }
             b"files" => return None, // 多文件：v1 不解析
-            _ => i = value_skip(b, i)?,
+            _ => i = value_skip(b, i, 0)?,
         }
     }
     None
@@ -1980,11 +2099,11 @@ fn locate_info(b: &[u8]) -> Option<(usize, usize)> {
             if b.get(i) != Some(&b'd') {
                 return None; // info 必须是 dict
             }
-            let end = dict_skip(b, i)?;
+            let end = dict_skip(b, i, 0)?;
             return Some((i, end));
         }
         // 跳过值（结构感知），继续找 `info`
-        i = value_skip(b, i)?;
+        i = value_skip(b, i, 0)?;
     }
     None
 }
@@ -2012,32 +2131,37 @@ fn be_int(b: &[u8], at: usize) -> Option<i64> {
 /// dict 结束下标：从 `start`（'d'）按 键(字符串)→值 结构推进到闭合 'e'。
 /// 键位置固定为字符串（len: 数字开头），值可为任意类型——值内的数据字节
 /// （如 pieces 的 20 字节）不会被误当 len: 解析。
+/// 安全修复（V4）：带深度参数，超限返回 None（恶意种子不再能栈溢出 abort）。
 #[cfg(feature = "bt")]
-fn dict_skip(b: &[u8], start: usize) -> Option<usize> {
+fn dict_skip(b: &[u8], start: usize, depth: usize) -> Option<usize> {
+    const MAX_DEPTH: usize = 64;
+    if depth > MAX_DEPTH {
+        return None;
+    }
     let mut i = start + 1;
     while b.get(i) != Some(&b'e') {
         let (_, after) = be_str(b, i)?; // 键：字符串
-        i = value_skip(b, after)?; // 值：任意类型
+        i = value_skip(b, after, depth + 1)?; // 值：任意类型
     }
     Some(i)
 }
 
 /// list 结束下标：从 `start`（'l'）按 值* 推进到闭合 'e'。
 #[cfg(feature = "bt")]
-fn list_skip(b: &[u8], start: usize) -> Option<usize> {
+fn list_skip(b: &[u8], start: usize, depth: usize) -> Option<usize> {
     let mut i = start + 1;
     while b.get(i) != Some(&b'e') {
-        i = value_skip(b, i)?;
+        i = value_skip(b, i, depth + 1)?;
     }
     Some(i)
 }
 
 /// 跳过任意 bencode 值（dict/list/int/str），返回其后的下标。
 #[cfg(feature = "bt")]
-fn value_skip(b: &[u8], i: usize) -> Option<usize> {
+fn value_skip(b: &[u8], i: usize, depth: usize) -> Option<usize> {
     match b.get(i)? {
-        b'd' => dict_skip(b, i).map(|e| e + 1),
-        b'l' => list_skip(b, i).map(|e| e + 1),
+        b'd' => dict_skip(b, i, depth).map(|e| e + 1),
+        b'l' => list_skip(b, i, depth).map(|e| e + 1),
         b'i' => {
             let e = b[i..].iter().position(|&c| c == b'e')? + i;
             Some(e + 1)
@@ -2666,26 +2790,68 @@ mod b10_tests {
     fn creates_missing_dir() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nested/deep");
-        let p = ensure_dest_root(Some(missing.to_string_lossy().into_owned())).unwrap();
+        let p = ensure_dest_root(
+            Some(missing.to_string_lossy().into_owned()),
+            &[dir.path().to_path_buf()],
+        )
+        .unwrap();
         assert!(p.is_dir(), "缺失目录应自动创建");
     }
 
     #[test]
     fn default_is_dot() {
-        let p = ensure_dest_root(None).unwrap();
+        let p = ensure_dest_root(None, &[]).unwrap();
         assert!(p.is_dir());
     }
 
     #[test]
     fn invalid_path_rejected() {
         // Windows：非法路径字符 → 创建失败 → InvalidSource
-        let r = ensure_dest_root(Some("a/b*c/d".into()));
+        let r = ensure_dest_root(Some("a/b*c/d".into()), &[]);
         if let Err(DaemonError::InvalidSource(msg)) = r {
             assert!(msg.contains("不可创建") || msg.contains("不可写"));
         } else {
             // 某些平台可能允许——不强断言，仅确认类型
             assert!(r.is_ok() || r.is_err());
         }
+    }
+
+    // 安全回归（V2）：dest 越界必须被白名单拦截。
+    #[test]
+    fn dest_outside_allowed_roots_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("dl");
+        std::fs::create_dir_all(&root).unwrap();
+        // 白名单内的子目录 → 放行
+        assert!(ensure_dest_root(
+            Some(root.join("sub").to_string_lossy().into_owned()),
+            &[root.clone()]
+        )
+        .is_ok());
+        // 白名单外的目录 → 拒绝
+        let outside = dir.path().join("elsewhere");
+        let r = ensure_dest_root(
+            Some(outside.to_string_lossy().into_owned()),
+            &[root.clone()],
+        );
+        assert!(matches!(r, Err(DaemonError::InvalidSource(m)) if m.contains("越界")));
+        // 绝对路径穿越到白名单外 → 拒绝
+        let r2 = ensure_dest_root(
+            Some(dir.path().to_string_lossy().into_owned()),
+            &[root],
+        );
+        assert!(r2.is_err(), "白名单父目录本身也必须被拒");
+    }
+
+    // 安全回归（V2）：`..` 分量在 canonicalize 前即被拒。
+    #[test]
+    fn dest_with_dotdot_rejected_early() {
+        let dir = tempfile::tempdir().unwrap();
+        let r = ensure_dest_root(
+            Some(dir.path().join("sub/../../escape").to_string_lossy().into_owned()),
+            &[dir.path().to_path_buf()],
+        );
+        assert!(matches!(r, Err(DaemonError::InvalidSource(m)) if m.contains("..")));
     }
 
     #[test]
@@ -2990,23 +3156,47 @@ mod persist_tests {
 
     #[tokio::test]
     async fn explicit_dest_overrides_default() {
-        // Task 5-a：默认 dest_root 同样改为临时目录（保持沙盒可跑）
+        // Task 5-a：默认 dest_root 同样改为临时目录（保持沙盒可跑）。
+        // 安全修复（V2）：显式 dest 必须落在白名单内——用 dest_root 子目录验证
+        // 「显式 dest 优先于默认」契约保持；白名单外由 reject_dest_outside_roots 覆盖。
         let tmp = tempfile::tempdir().unwrap();
+        let sub = tmp.path().join("custom");
+        std::fs::create_dir_all(&sub).unwrap();
         let fake = Arc::new(FakeEngine::new(EngineKind::Http));
         let state = DaemonState::new(fake.clone(), vec![])
             .with_dest_root(tmp.path().to_path_buf());
         let tid = state
             .add_http_task(
                 "https://example.com/override.bin".into(),
-                Some("/tmp/custom".into()),
+                Some(sub.to_string_lossy().into_owned()),
             )
             .await
             .unwrap();
         let rec = state.tasks.lock().unwrap().get(&tid).cloned().unwrap();
         assert_eq!(
             rec.task.dest_root,
-            std::path::PathBuf::from("/tmp/custom"),
-            "显式 dest 优先于默认"
+            sub,
+            "显式 dest（白名单内）优先于默认"
+        );
+    }
+
+    #[tokio::test]
+    async fn reject_dest_outside_roots() {
+        // 安全回归（V2）：显式 dest 在白名单外 → 拒绝任务（不再任意目录可写）。
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap(); // 白名单外独立目录
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![])
+            .with_dest_root(tmp.path().to_path_buf());
+        let r = state
+            .add_http_task(
+                "https://example.com/escape.bin".into(),
+                Some(outside.path().to_string_lossy().into_owned()),
+            )
+            .await;
+        assert!(
+            matches!(&r, Err(DaemonError::InvalidSource(m)) if m.contains("越界")),
+            "白名单外 dest 必须拒绝: {r:?}"
         );
     }
 

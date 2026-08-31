@@ -351,7 +351,11 @@ impl DownloadEngine for HttpEngine {
             .name
             .clone()
             .unwrap_or_else(|| "download.bin".to_string());
-        let dest = task.dest_root.join(&rel);
+        // 安全修复（V3）：任务名可能来自恶意 torrent/远端，join 前必须净化
+        // （拒 `..` / 绝对路径 / 盘符前缀），非法即拒任务。
+        let rel_pb = smart_dl_core::session::output::sanitize_rel(&rel)
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let dest = task.dest_root.join(&rel_pb);
         // 断点续传（#4）：.part 存在 → 探测+决策 → 从偏移续传或作废重下；
         // 探测到的 ETag 持久化到 `<part>.etag` 供下次决策。
         // P0 动态分段：只记录续传起点 offset，段由 SegmentManager 动态领取。

@@ -303,18 +303,11 @@ impl DownloadEngine for BtEngine {
     }
 
     async fn status(&self, id: &EngineTaskId) -> Result<EngineStatus, EngineError> {
-        let t0 = std::time::Instant::now(); // BUGB-INSTR
         // 会话内未注册的 infohash → NotFound（任务已移除/从未添加）。
-        let r = match self.core.status(id) {
+        match self.core.status(id) {
             Ok(st) => Ok(map_status(&st)),
             Err(_) => Err(EngineError::NotFound),
-        };
-        // BUGB-INSTR：status 正常极快，仅慢调用告警（内核阻塞探针）
-        let ms = t0.elapsed().as_millis();
-        if ms > 200 {
-            tracing::warn!("[bugb] bt::status SLOW ih={id} elapsed_ms={ms}");
         }
-        r
     }
 
     async fn remove(&self, id: &EngineTaskId, delete_data: bool) -> Result<(), EngineError> {

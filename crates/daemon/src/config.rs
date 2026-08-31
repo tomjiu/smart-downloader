@@ -22,6 +22,11 @@ pub struct Config {
 pub struct ServerCfg {
     /// HTTP/WS 监听地址，如 `127.0.0.1:8787`。
     pub addr: String,
+    /// 安全修复（V1/V13）：HTTP API Bearer token。配置后全端点（含 /ws 握手）
+    /// 要求 `Authorization: Bearer <token>`；未配置时：回环监听放行（本机 CLI
+    /// 兼容），**非回环监听拒绝启动**（fail-closed，防 0.0.0.0 裸奔）。
+    /// 不参与热重载（避免认证态中途抖动）。敏感项：不出现在 `/config` 快照。
+    pub http_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -108,6 +113,7 @@ impl Default for Config {
         Config {
             server: ServerCfg {
                 addr: "127.0.0.1:8787".into(),
+                http_token: None,
             },
             download: DownloadCfg {
                 dest_root: PathBuf::from("./downloads"),
@@ -148,6 +154,17 @@ impl Config {
         toml::from_str(&text).map_err(|e| format!("配置解析失败 {p:?}: {e}"))
     }
 
+    /// 判定 addr 是否仅绑定回环地址（127.x/::1/localhost）。
+    /// serve 启动检查用：非回环 + 无 http_token → 拒绝启动（V1 fail-closed）。
+    pub fn is_loopback_addr(addr: &str) -> bool {
+        let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host == "localhost"
+            || host.starts_with("127.")
+            || host == "::1"
+            || host == "[::1]"
+    }
+
     /// BT 实际落盘目录（save_path 或默认 dest_root）。
     pub fn bt_save_path(&self) -> PathBuf {
         self.bt
@@ -176,6 +193,13 @@ impl Config {
             "bt_enable_upnp": self.bt.enable_upnp,
             "xunlei_enabled": self.xunlei.enabled,
             "listen_addr": self.server.addr,
+            // 安全修复（V1）：仅暴露是否启用认证（布尔），token 本身绝不出快照
+            "http_token_enabled": self
+                .server
+                .http_token
+                .as_deref()
+                .map(|t| !t.is_empty())
+                .unwrap_or(false),
             "persist_path": tasks_path,
             "max_download_kb_s": self.download.max_download_kb_s,
             "max_upload_kb_s": self.bt.max_upload_kb_s,
@@ -196,6 +220,31 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_token_not_in_snapshot() {
+        // 安全回归（V1）：快照只给布尔，绝不泄露 token 本身
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(&p, "[server]\nhttp_token = \"s3cret\"\n").unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert_eq!(c.server.http_token.as_deref(), Some("s3cret"));
+        let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap["http_token_enabled"], true);
+        let raw = snap.to_string();
+        assert!(!raw.contains("s3cret"), "token 不得出现在快照: {raw}");
+    }
+
+    #[test]
+    fn loopback_addr_detection() {
+        assert!(Config::is_loopback_addr("127.0.0.1:8787"));
+        assert!(Config::is_loopback_addr("127.9.1.1:80"));
+        assert!(Config::is_loopback_addr("localhost:8787"));
+        assert!(Config::is_loopback_addr("[::1]:8787"));
+        assert!(!Config::is_loopback_addr("0.0.0.0:8787"));
+        assert!(!Config::is_loopback_addr("192.168.1.5:8787"));
+        assert!(!Config::is_loopback_addr(":::8787"));
+    }
 
     #[test]
     fn default_values() {
