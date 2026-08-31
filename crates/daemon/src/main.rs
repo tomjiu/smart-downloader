@@ -40,8 +40,13 @@ fn main() {
         return;
     }
 
-    // —— 客户端模式：过滤 --server，其余交给 Cli 解析 ——
+    // —— 客户端模式：过滤 --server / --token，其余交给 Cli 解析 ——
     let mut server = "http://127.0.0.1:8787".to_string();
+    // 安全修复（V1 配套）：token 优先级 CLI --token > 环境变量 SMART_DL_HTTP_TOKEN
+    //（与 serve 同 env，用户配置一次两边生效）；均无 = None（回环未配置模式）。
+    let mut token: Option<String> = std::env::var("SMART_DL_HTTP_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty());
     let mut rest: Vec<String> = Vec::new();
     let mut i = 1;
     while i < args.len() {
@@ -51,6 +56,15 @@ fn main() {
                 std::process::exit(2);
             };
             server = v.clone();
+            i += 2;
+            continue;
+        }
+        if args[i] == "--token" {
+            let Some(v) = args.get(i + 1) else {
+                eprintln!("--token 缺少值");
+                std::process::exit(2);
+            };
+            token = Some(v.clone()).filter(|t| !t.is_empty());
             i += 2;
             continue;
         }
@@ -64,7 +78,7 @@ fn main() {
         Ok(c) => c,
         Err(e) => {
             eprintln!("参数错误: {e}");
-            eprintln!("用法: smart-dl-daemon <add|pause|resume|remove|list|status|logs|fallback|xunlei-login|import-xunlei> [args] [--server URL] [--json]");
+            eprintln!("用法: smart-dl-daemon <add|pause|resume|remove|list|status|logs|fallback|xunlei-login|import-xunlei> [args] [--server URL] [--token TOKEN] [--json]");
             std::process::exit(2);
         }
     };
@@ -80,7 +94,7 @@ fn main() {
     }
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime 创建失败");
-    let client = smart_dl_daemon::client::CliClient::new(&server);
+    let client = smart_dl_daemon::client::CliClient::new(&server, token.as_deref());
     match rt.block_on(client.run(&cli.command, cli.json)) {
         Ok(()) => {}
         Err(e) => {

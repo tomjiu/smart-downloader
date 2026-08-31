@@ -40,6 +40,9 @@ pub struct DownloadCfg {
     pub proxy: String,
     /// 全局下载限速（KiB/s，HTTP + BT 共用）；0 = 不限。启动时生效。
     pub max_download_kb_s: u32,
+    /// 安全修复（V10-2）：磁盘预检严格模式——true = 磁盘可用空间不可探测时
+    /// 拒绝入队（防预检被绕过后续盘写满）；false（默认）= 告警 + 放行（旧行为）。
+    pub disk_precheck_strict: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -119,6 +122,7 @@ impl Default for Config {
                 dest_root: PathBuf::from("./downloads"),
                 proxy: String::new(),
                 max_download_kb_s: 0,
+                disk_precheck_strict: false,
             },
             bt: BtCfg {
                 enabled: true,
@@ -202,6 +206,7 @@ impl Config {
                 .unwrap_or(false),
             "persist_path": tasks_path,
             "max_download_kb_s": self.download.max_download_kb_s,
+            "disk_precheck_strict": self.download.disk_precheck_strict,
             "max_upload_kb_s": self.bt.max_upload_kb_s,
             "proxy_enabled": !self.download.proxy.is_empty(),
             "provider_enabled": self.provider.enabled,

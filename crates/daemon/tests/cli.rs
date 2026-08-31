@@ -128,7 +128,7 @@ async fn cli_add_list_status_roundtrip() {
         axum::serve(listener, app).await.unwrap();
     });
     let base = format!("http://{addr}");
-    let client = CliClient::new(&base);
+    let client = CliClient::new(&base, None);
 
     let srv = common::TestServer::start(common::patterned(1024)).await;
     let url = srv.url();
@@ -205,7 +205,7 @@ async fn cli_json_output_success() {
         axum::serve(listener, app).await.unwrap();
     });
     let base = format!("http://{addr}");
-    let client = CliClient::new(&base);
+    let client = CliClient::new(&base, None);
 
     // 空列表 --json 输出
     client.run(&CliCommand::List, true).await.unwrap();
@@ -213,4 +213,39 @@ async fn cli_json_output_success() {
     // D37 端点补齐：config 命令 → GET /config（v1 有端点，成功返回配置快照）
     client.run(&CliCommand::Config, false).await.unwrap();
     client.run(&CliCommand::Config, true).await.unwrap();
+}
+
+// ===== 安全回归（V1 配套）：CLI --token 与 daemon auth_mw 配对 =====
+
+#[tokio::test]
+async fn cli_token_roundtrip_against_secured_daemon() {
+    // token 配置的 daemon + 携带正确 token 的 CliClient → 全命令可用；
+    // 错 token → 401 → CliError。
+    let engine = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
+    let state = Arc::new(
+        DaemonState::new(Arc::new(engine), vec![])
+            .with_dest_root(std::env::temp_dir())
+            .with_http_token(Some("cli-e2e-token".into())),
+    );
+    let app = http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{addr}");
+
+    // 无 token → 401
+    let anon = CliClient::new(&base, None);
+    let r = anon.run(&CliCommand::List, false).await;
+    assert!(r.is_err(), "无 token 访问受保护 daemon 应失败: {r:?}");
+
+    // 错 token → 401
+    let wrong = CliClient::new(&base, Some("wrong"));
+    assert!(wrong.run(&CliCommand::List, false).await.is_err());
+
+    // 正确 token → list/config 正常
+    let ok = CliClient::new(&base, Some("cli-e2e-token"));
+    ok.run(&CliCommand::List, false).await.unwrap();
+    ok.run(&CliCommand::Config, false).await.unwrap();
 }

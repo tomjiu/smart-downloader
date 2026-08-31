@@ -100,11 +100,13 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     #[cfg(feature = "bt")]
     let mut state = DaemonState::new(http_engine, providers)
         .with_dest_root(cfg.download.dest_root.clone())
-        .with_http_token(http_token.clone());
+        .with_http_token(http_token.clone())
+        .with_disk_precheck_strict(cfg.download.disk_precheck_strict);
     #[cfg(not(feature = "bt"))]
     let mut state = DaemonState::new(http_engine, providers)
         .with_dest_root(cfg.download.dest_root.clone())
-        .with_http_token(http_token.clone());
+        .with_http_token(http_token.clone())
+        .with_disk_precheck_strict(cfg.download.disk_precheck_strict);
 
     // 4. BT 引擎（先取 core 句柄，供 alert 事件流）
     #[cfg(feature = "bt")]

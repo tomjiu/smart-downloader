@@ -157,6 +157,9 @@ pub struct DaemonState {
     /// 安全修复（V1/V13）：HTTP API Bearer token。None/空 = 未配置（serve 保证
     /// 非回环监听时拒绝启动，回环监听放行兼容本机 CLI）；Some = 全端点强制校验。
     http_token: Option<String>,
+    /// 安全修复（V10-2）：磁盘预检严格模式（true = 空间不可探测时拒绝入队）。
+    /// 启动时由 `[download] disk_precheck_strict` 注入，不参与热重载。
+    disk_precheck_strict: bool,
     /// 生效配置快照（`GET /config` 返回；serve 注入精简字段；热重载后刷新）。
     config_snapshot: Mutex<Option<serde_json::Value>>,
 }
@@ -479,6 +482,7 @@ impl DaemonState {
             default_dest_root: Mutex::new(PathBuf::from(".")),
             allowed_roots: Mutex::new(Vec::new()),
             http_token: None,
+            disk_precheck_strict: false,
             config_snapshot: Mutex::new(None),
         }
     }
@@ -499,6 +503,12 @@ impl DaemonState {
     /// `Authorization: Bearer <token>`；None = 未配置（serve 已保证非回环监听拒绝启动）。
     pub fn with_http_token(mut self, token: Option<String>) -> Self {
         self.http_token = token.filter(|t| !t.is_empty());
+        self
+    }
+
+    /// 注入磁盘预检严格模式（V10-2）：true = 空间不可探测时拒绝入队。
+    pub fn with_disk_precheck_strict(mut self, strict: bool) -> Self {
+        self.disk_precheck_strict = strict;
         self
     }
 
@@ -806,7 +816,7 @@ impl DaemonState {
         // B10：torrent 总大小已知 → 空间预检（多文件按 files 各项求和；解析失败
         // 回退单文件最小解析；均拿不到才跳过）
         if let Some(total) = torrent_precheck_total(&torrent_bytes) {
-            precheck_space(&dest_root, total)?;
+            precheck_space(&dest_root, total, self.disk_precheck_strict)?;
         }
         let canonical = CanonicalId {
             kind: CanonicalKind::Bt,
@@ -929,7 +939,7 @@ impl DaemonState {
         let dest_root = ensure_dest_root(dest_root.or(Some(def)), &self.dest_roots())?;
 
         // 3. 空间预检（总大小已知）
-        precheck_space(&dest_root, total_size)?;
+        precheck_space(&dest_root, total_size, self.disk_precheck_strict)?;
 
         // 4. 查重
         let canonical = CanonicalId {
@@ -1840,9 +1850,21 @@ pub fn ensure_dest_root(
 }
 
 /// B10：空间预检（总大小已知时调用）——`evaluate_disk` 判定不足 → 拒绝入队。
-/// 磁盘可用空间取不到（fs2 失败）时静默放行（非致命）。
-pub fn precheck_space(p: &Path, total: u64) -> Result<(), DaemonError> {
+/// 安全/健壮性修复（V10-2）：磁盘可用空间取不到（fs2 失败）时不再静默放行——
+/// 非严格模式（默认）告警日志 + 放行（保留旧行为）；`strict=true` 时拒绝入队，
+/// 防止预检被绕过后续盘写满。由配置 `[download] disk_precheck_strict` 控制。
+pub fn precheck_space(p: &Path, total: u64, strict: bool) -> Result<(), DaemonError> {
     let Ok(avail) = fs2::free_space(p) else {
+        if strict {
+            return Err(DaemonError::InvalidSource(format!(
+                "磁盘可用空间不可探测且 disk_precheck_strict=true，拒绝入队: {}",
+                p.display()
+            )));
+        }
+        tracing::warn!(
+            "磁盘可用空间不可探测，空间预检已跳过（可配置 [download] disk_precheck_strict=true 强制拒绝）: {}",
+            p.display()
+        );
         return Ok(());
     };
     use smart_dl_core::session::output::{evaluate_disk, DiskCheck};
@@ -2857,7 +2879,7 @@ mod b10_tests {
     #[test]
     fn check_space_zero_total_ok() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(precheck_space(dir.path(), 0).is_ok());
+        assert!(precheck_space(dir.path(), 0, false).is_ok());
     }
 }
 
