@@ -181,9 +181,7 @@ impl FtpEngine {
         let inner = self.inner.clone();
         let backoff = self.backoff;
         let spawn_tid = tid.clone();
-        tokio::spawn(async move {
-            download_dir_loop(inner, spawn_tid, backoff).await;
-        });
+        spawn_ftp_loop(download_dir_loop, inner, spawn_tid, backoff);
         Ok(tid)
     }
 }
@@ -192,6 +190,37 @@ impl Default for FtpEngine {
     fn default() -> Self {
         FtpEngine::new()
     }
+}
+
+/// 可靠性修复（V11，报告第二轮）：spawn 下载循环 + panic 收尸监控——
+/// 修复前 JoinHandle 直接丢弃，循环 panic 会静默变僵尸（任务状态永停
+/// Downloading、无 Failed 事件、引擎名额永不释放）；现在监控任务捕获
+/// panic → 任务标 Error（状态可见、上游轮询可正常推进）。
+fn spawn_ftp_loop<F, Fut>(
+    f: F,
+    inner: std::sync::Arc<EngineInner>,
+    tid: EngineTaskId,
+    backoff: Backoff,
+) where
+    F: FnOnce(std::sync::Arc<EngineInner>, EngineTaskId, Backoff) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handle = tokio::spawn(f(inner.clone(), tid.clone(), backoff));
+    tokio::spawn(async move {
+        if let Err(e) = handle.await {
+            if e.is_panic() {
+                let msg = format!("FTP 下载循环 panic（V11 收尸）: {e}");
+                tracing::error!("[V11] tid={tid}: {msg}");
+                // 毒锁时放弃标记（不再用 unwrap 级联引爆监控线程）
+                if let Ok(mut tasks) = inner.tasks.lock() {
+                    if let Some(t) = tasks.get_mut(&tid) {
+                        t.state = EngineState::Error;
+                        t.error = Some(msg);
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// 解析 `ftp://[user:pass@]host[:port]/path`。
@@ -724,9 +753,7 @@ impl DownloadEngine for FtpEngine {
                 let inner = self.inner.clone();
                 let backoff = self.backoff;
                 let spawn_tid = tid.clone();
-                tokio::spawn(async move {
-                    download_loop(inner, spawn_tid, backoff).await;
-                });
+                spawn_ftp_loop(download_loop, inner, spawn_tid, backoff);
                 Ok(tid)
             }
         }

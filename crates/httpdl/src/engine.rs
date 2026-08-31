@@ -86,12 +86,34 @@ impl HttpEngine {
     }
 
     /// 启动下载循环（代次 gen）。
+    /// 可靠性修复（V11，报告第二轮）：不再丢弃 JoinHandle——监控任务捕获
+    /// 下载循环 panic，把任务标 Error（修复前 panic 任务静默变僵尸：状态
+    /// 永停 Downloading、无 Failed 事件、无收尸路径）。
     fn spawn_download(&self, tid: EngineTaskId, gen: u64) {
         let client = self.client.clone();
         let limiter = self.limiter.clone();
         let inner = self.inner.clone();
-        tokio::spawn(async move {
+        let inner_mon = self.inner.clone();
+        let tid_mon = tid.clone();
+        let handle = tokio::spawn(async move {
             download_loop(&client, limiter, inner, tid, gen).await;
+        });
+        // 收尸监控：panic → 任务标 Error（毒锁时放弃标记，不级联引爆监控）
+        tokio::spawn(async move {
+            if let Err(join_err) = handle.await {
+                if join_err.is_panic() {
+                    let msg = format!("下载循环 panic（V11 收尸）: {join_err}");
+                    tracing::error!("[V11] tid={tid_mon}: {msg}");
+                    if let Ok(mut tasks) = inner_mon.tasks.lock() {
+                        if let Some(t) = tasks.get_mut(&tid_mon) {
+                            if t.gen == gen {
+                                t.state = EngineState::Error;
+                                t.error = Some(msg);
+                            }
+                        }
+                    }
+                }
+            }
         });
     }
 }
