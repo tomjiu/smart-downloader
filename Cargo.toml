@@ -32,7 +32,19 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
 async-trait = "0.1"
-reqwest = { version = "0.12", features = ["json", "multipart"] }
+# TLS 后端（P1-3 安卓交叉，2026-08-31）：default-features=false 关掉 native-tls
+#（openssl-sys 需要目标平台 openssl 头，Android/termux 交叉编译即断点），
+# 改用纯 Rust rustls（ring 有 aarch64-android asm 支路，NDK clang 直接编）。
+# 同时去掉 macos-system-configuration（仅影响 macOS 系统代理自动探测；
+# daemon 代理由 [download] proxy 显式配置，不受影响）。Linux x86_64 回归：
+# 全量单测通过（P4-2 验收记录）。
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "multipart",
+    "rustls-tls",
+    "charset",
+    "http2",
+] }
 tracing = "0.1"
 futures = "0.3"
 uuid = { version = "1", features = ["v4"] }
