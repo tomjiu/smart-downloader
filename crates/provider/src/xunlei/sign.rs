@@ -79,9 +79,27 @@ pub fn device_id_32(device_id: &str) -> &str {
 ///   9 轮 md5(s + salt)
 ///   返回 "1." + s
 pub fn captcha_sign(device_id_32: &str, timestamp_millis: &str) -> String {
+    captcha_sign_with(
+        CLIENT_ID,
+        CLIENT_VERSION,
+        HOST,
+        device_id_32,
+        timestamp_millis,
+    )
+}
+
+/// 档位泛化版 captcha_sign（P1-1）：base 三段（clientId/version/host）由调用方
+/// 按身份档位下发，盐链沿用 web 链（nas 档未实弹验证，见 tier.rs 假设区标注）。
+pub fn captcha_sign_with(
+    client_id: &str,
+    client_version: &str,
+    host: &str,
+    device_id_32: &str,
+    timestamp_millis: &str,
+) -> String {
     let mut s = format!(
         "{}{}{}{}{}",
-        CLIENT_ID, CLIENT_VERSION, HOST, device_id_32, timestamp_millis
+        client_id, client_version, host, device_id_32, timestamp_millis
     );
     for salt in WEB_SALTS {
         let mut h = Md5::new();

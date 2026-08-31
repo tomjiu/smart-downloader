@@ -12,9 +12,8 @@
 //! 逆向依据见 docs/research/2026-08-22-xunlei-login-reverse-status.md。
 
 use crate::xunlei::auth::AuthState;
-use crate::xunlei::client::{
-    device_code_qr_url, now_unix, web_auth_url, Client, ClientError,
-};
+use crate::xunlei::client::{now_unix, web_auth_url_for, Client, ClientError};
+use crate::xunlei::tier::{tier_authorize_url, Tier};
 
 /// 与研究脚本 get_device_code_link.py 实测一致的 scope。
 pub const DEVICE_SCOPE: &str = "profile offline pan sso user";
@@ -61,10 +60,11 @@ pub struct DeviceSession {
 
 /// 发起设备码会话：请求 device/code → 本地构造 QR URL。
 /// `client` 可用 [`Client::with_bases`] 注入 mock 地址（测试）。
+/// 授权页 URL 的 client_id 随 `client` 的身份档位（P1-1；web 档与旧版逐字节一致）。
 pub async fn start_device_session(client: &Client, scope: &str) -> Result<DeviceSession, ClientError> {
     let code = client.request_device_code(scope).await?;
-    let qr_url = device_code_qr_url(&code.user_code);
-    let web_url = web_auth_url(&code.user_code, scope);
+    let qr_url = crate::xunlei::client::device_code_qr_url_for(client.tier(), &code.user_code);
+    let web_url = web_auth_url_for(client.tier(), &code.user_code, scope);
     Ok(DeviceSession {
         device_code: code.device_code,
         user_code: code.user_code,
@@ -73,6 +73,11 @@ pub async fn start_device_session(client: &Client, scope: &str) -> Result<Device
         expires_at: now_unix() + code.expires_in,
         interval: if code.interval == 0 { 3 } else { code.interval },
     })
+}
+
+/// 档位授权页 URL 快捷入口（tier_authorize_url 转发；CLI 帮助文案用）。
+pub fn authorize_url_for(tier: &Tier, user_code: &str, scope: &str) -> String {
+    tier_authorize_url(tier, user_code, scope)
 }
 
 /// 轮询一次设备码授权。
@@ -176,7 +181,7 @@ pub fn store_auth_state(path: &std::path::Path, state: &AuthState) -> std::io::R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::xunlei::client::DEVICE_CLIENT_ID;
+    use crate::xunlei::client::{device_code_qr_url, web_auth_url, DEVICE_CLIENT_ID};
 
     #[test]
     fn qr_url_uses_local_template() {

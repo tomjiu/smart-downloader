@@ -94,11 +94,24 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
             .token_path
             .clone()
             .unwrap_or_else(|| PathBuf::from("xunlei_auth.json"));
-        let xp = smart_dl_provider::xunlei::provider::XunleiProvider::new("xunlei", tp.clone());
+        // 身份档位（P1-1）：env SMART_DL_XUNLEI_TIER > [provider_xunlei] tier > web。
+        // 未知档拒绝启动（防错档静默运行——错档 = 服务端可见的异常指纹）。
+        let tier_name = cfg.resolve_xunlei_tier_name();
+        let tier = smart_dl_provider::xunlei::tier::Tier::by_name(&tier_name).ok_or_else(|| {
+            ServeError::Engine(format!(
+                "未知迅雷身份档位 '{tier_name}'（可用: web/nas；env SMART_DL_XUNLEI_TIER 或 [provider_xunlei] tier）"
+            ))
+        })?;
+        let xp = smart_dl_provider::xunlei::provider::XunleiProvider::with_tier(
+            "xunlei",
+            tp.clone(),
+            tier,
+        );
         let authenticated = xp.runtime().authenticated;
         providers.push(Arc::new(xp));
         tracing::info!(
-            "迅雷云盘 Provider 已装配: token_path={:?}, authenticated={}",
+            "迅雷云盘 Provider 已装配: tier={}, token_path={:?}, authenticated={}",
+            tier.name,
             tp,
             authenticated
         );
