@@ -92,6 +92,13 @@ def phase_of(task):
             json.loads(task.get("params", "{}")).get("status", "{}") if isinstance(task.get("params"), str) else "")
 
 
+def cloud_identity(task):
+    """从任务对象提取云端身份档 (A6_PREP §8: 第一观测点)."""
+    p = task.get("params", {}) if isinstance(task.get("params"), dict) else {}
+    return {k: p.get(k) for k in ("client_id", "package_name", "platform",
+                                   "device_model", "client_version") if p.get(k)}
+
+
 def get_task(H, tid):
     import urllib.parse
     filters = urllib.parse.quote(json.dumps({"id": {"in": tid}}))
@@ -128,6 +135,13 @@ def main():
     st, bd = http("GET", "/drive/v1/tasks?page_token=&filters=", headers=H)
     rep["tasks_listed"] = {"status": st}
     log(f"[*] list tasks -> {st}")
+    try:
+        _t0 = json.loads(bd).get("tasks", [])
+        if _t0:
+            rep["cloud_identity_listing"] = cloud_identity(_t0[0])
+            log(f"[*] cloud identity (existing task): {rep['cloud_identity_listing']}")
+    except Exception:
+        pass
 
     # ---- P6: 清理历史 ERROR 任务 (DELETE 100s+ 超时) ----
     if mode in ("p6", "full"):
@@ -173,6 +187,8 @@ def main():
         task = json.loads(bd)
         tid = task.get("id", "")
         rep["p1"]["task_id"] = tid
+        rep["p1"]["cloud_identity"] = cloud_identity(task)  # §8 第一观测点
+        log(f"[*] cloud identity (created task): {rep['p1']['cloud_identity']}")
     except Exception:
         tid = ""
     if not tid:

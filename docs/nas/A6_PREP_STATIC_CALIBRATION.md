@@ -112,3 +112,31 @@ body = {
 | 本文档 | `docs/nas/A6_PREP_STATIC_CALIBRATION.md` |
 | A6 探针（P1/P4/P5/P6 一体化，单进程引擎链） | `scripts/nas/a6_probe.py` |
 | 引擎前端 bundle（证据本体） | `docs/nas/evidence/a3/assets/index-1ded6b9a.js` |
+
+## 8. 配额归属再校准（用户域知识输入，2026-08-31）
+
+**修正前的粗归因**："本地下载每日 3 次限制"——不准确。
+**修正后模型**（对齐 Windows 客户端用户实测经验）：
+
+| 通道 | 限制 | 归属 |
+|------|------|------|
+| Windows 客户端：URL/磁力下载到本地 | **无次数限制** | PC client_id 档 |
+| 磁链提交云盘离线下载 | 每日限次 | 云盘空间配额 |
+| 会员试用加速 | `try_speed usage.total=3`（A4 实测吻合） | 试用配额，独立 |
+| **我们实测的 403** | 每日 3 次，`task_create_count_limit` | **pan-cli/docker 引擎档的云端提交策略** |
+
+**证据**：A4 全部任务对象 `params.client_id=X9ibISwpIp8jQ4Ya`、
+`package_name=pan.xunlei.cli.docker`、`platform=docker`（a4_run3.json）；
+403 发生在 device 空间提交（real_path 落本地 downloads），故限制绑的是
+**客户端身份档**而非"本地下载"行为本身；cnk3x #229（NAS 引擎用户同款 3/日）
+属同一档位策略。**90120 与 3/日配额大概率同根**：云端按 docker 预览档
+权限面裁剪（A4 嫌疑二 PLATFORM_DOCKER 的强化版）。
+
+**对 A6 实验设计的直接影响**：
+1. "云端身份观感"从附带观测升级为**第一观测点**——创建响应 200 body 的
+   task.params 自带 client_id/package_name/platform（零额外成本）：
+   群晖伪装后若任务对象仍报 docker → 身份未随引擎配置切换 → 90120/配额
+   大概率照旧；若报 syn/群晖 → 立即复测下载执行。
+2. 若身份未切换且 90120 照旧，下一杠杆 = launcher report 的
+   client_id/package_name 载荷本身（深水区，观测优先、动手术慎重）。
+3. a6_probe.py 已加 `cloud_identity` 提取（建任务响应 + 既有任务列表双路）。
