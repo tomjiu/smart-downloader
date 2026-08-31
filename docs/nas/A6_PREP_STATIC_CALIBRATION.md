@@ -140,3 +140,36 @@ body = {
 2. 若身份未切换且 90120 照旧，下一杠杆 = launcher report 的
    client_id/package_name 载荷本身（深水区，观测优先、动手术慎重）。
 3. a6_probe.py 已加 `cloud_identity` 提取（建任务响应 + 既有任务列表双路）。
+
+## 9. 「群晖的停止」三类型定性（用户问询驱动核查，2026-08-31）
+
+> 用户问："群晖的下载停止，是所有的下载都停滞了吗？到底是什么类型的？"
+> 三层一手证据核查定案：**不存在任何"全局暂停"API；"全停"只有进程级与会话级两种**。
+
+### 9.1 三类型对照表
+
+| 类型 | 触发面 | 真实机制 | 影响范围 |
+|------|--------|----------|----------|
+| **任务级暂停/恢复** | 迅雷 web UI 单任务按钮 | `PATCH drive/v1/task`（单数），body `{space,type,id,set_params:{spec:JSON.stringify({phase:"pause"\|"running"})}}` | **仅指定 id 的那一个任务** |
+| **套件级停止** | DSM 套件中心「停止」 | `start-stop-status` 的 `stop_daemon`：`kill -TERM $PID` → 超时 `kill -KILL`（杀 launcher→pan-cli 进程树，service-setup L88 经 `xunlei-pan-cli.sh --pid` 拉起） | **全部下载立刻停**（进程生死），重启套件后任务自 storm db 断点恢复 |
+| **会话级签退** | UI 解绑/退出登录 | 同一 PATCH 路由 `{phase:"signout"}`，bundle 中 `a==="signout"&&(d.space="")` | **全部任务失去宿主**，需重新扫码绑定 |
+
+### 9.2 证据链（三层独立来源交叉）
+
+1. **UI bundle**（a3 证据 index-1ded6b9a.js）：store action 签名
+   `operateTask({id,space,type,action})` —— **严格单任务**，一次只带一个 `id`；
+   全 bundle 无「全部暂停」批量操作（仅"全部文件"字样，无批量任务操作）。
+2. **引擎二进制**（xunlei-pan-cli.3.23.5.amd64 全文扫描）：
+   `set_params`×19、`signout`×15、`phase→pause/running`×14，
+   **`pause_all`/`PauseAll` 0 命中** —— 内核层不存在全局暂停概念。
+3. **DSM 脚本**（spk-unpacked/scripts/start-stop-status + service-setup）：
+   套件停止 = 对 PID_FILE 直接 `kill -TERM`/`kill -KILL`，无任务层优雅下坡。
+
+### 9.3 与 A6 实弹的关系
+
+- P4 的 PATCH pause 测试属**类型 1**（单任务），沙盒自建任务 + 独立登录，
+  与用户真实 NAS 上的任何任务零交集。
+- bundle 中 `pauseTasks`/`resumeTasks`（offset 1202000/1202222）为 UI 方法名，
+  复数命名不改变 wire format 单 id 的事实。
+- 引擎进程级停止（类型 2）即 A2 起复用的 pty.fork 生命周期的真实对应物；
+  v2 代码面 pause/resume 只需覆盖类型 1。
