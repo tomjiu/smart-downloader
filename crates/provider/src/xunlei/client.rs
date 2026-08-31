@@ -1,7 +1,12 @@
 //! 迅雷 HTTP 客户端：三要素头 + OAuth refresh + captcha 刷新。
+//!
+//! 身份档位（P1-1）：Client 持有 `&'static Tier`，所有请求体的 `client_id`、
+//! captcha meta 的 `package_name`/`client_version`、三要素头的 `x-client-id`
+//! 均随档位下发；缺省 web 档，行为与档位化之前逐字节一致。
 
 use crate::xunlei::auth::AuthState;
-use crate::xunlei::sign::{captcha_sign, device_id_32, PACKAGE_NAME};
+use crate::xunlei::sign::{captcha_sign_with, device_id_32};
+use crate::xunlei::tier::{Tier, TIER_WEB};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
 use sha1::Digest as _;
@@ -31,6 +36,28 @@ pub fn device_code_qr_url(user_code: &str) -> String {
     QR_AUTHORIZE_URL_TEMPLATE
         .replace("{client_id}", CLIENT_ID)
         .replace("{user_code}", user_code)
+}
+
+/// 本地构造扫码授权页 URL（任意档位版；web 档与上者逐字节一致）。
+pub fn device_code_qr_url_for(tier: &Tier, user_code: &str) -> String {
+    QR_AUTHORIZE_URL_TEMPLATE
+        .replace("{client_id}", tier.client_id)
+        .replace("{user_code}", user_code)
+}
+
+/// /yc/ 统一授权页 URL（scope 显式透传）。
+///
+/// 与 `scripts/nas/nas_qr_daemon.py::web_auth_url` 同构：页面 JS 从 URL 参数
+/// 读取 client_id/user_code/scope 组装 `deviceAuthorize`（Task 22 实证），
+/// 显式带 scope 避免依赖页面内置默认值随版本漂移。scope 仅含字母/空格/斜杠，
+/// 空格按 query 规范转 `%20`。
+pub fn web_auth_url(user_code: &str, scope: &str) -> String {
+    device_code_qr_url(user_code) + "&scope=" + &scope.replace(' ', "%20")
+}
+
+/// /yc/ 统一授权页 URL（档位版：client_id 取自档位表，scope 显式透传）。
+pub fn web_auth_url_for(tier: &Tier, user_code: &str, scope: &str) -> String {
+    device_code_qr_url_for(tier, user_code) + "&scope=" + &scope.replace(' ', "%20")
 }
 
 pub(crate) fn now_unix() -> u64 {
@@ -196,6 +223,8 @@ pub struct Client {
     xluser_base: String,
     /// 网盘 drive 服务基地址（生产 = PAN_BASE；mock 测试注入本地地址）。
     pan_base: String,
+    /// 身份档位（P1-1）：client_id/package_name/client_version 随此下发。
+    tier: &'static Tier,
 }
 
 impl Default for Client {
@@ -208,6 +237,7 @@ impl Client {
             http: reqwest::Client::new(),
             xluser_base: XLUSER_BASE.to_string(),
             pan_base: PAN_BASE.to_string(),
+            tier: &TIER_WEB,
         }
     }
 
@@ -217,29 +247,46 @@ impl Client {
             http: reqwest::Client::new(),
             xluser_base: xluser_base.into(),
             pan_base: pan_base.into(),
+            tier: &TIER_WEB,
         }
     }
 
-    /// 构造 drive API 的三要素请求头。
+    /// 切换身份档位（builder 风格；缺省 web，老调用方零回归）。
+    pub fn with_tier(mut self, tier: &'static Tier) -> Self {
+        self.tier = tier;
+        self
+    }
+
+    /// 当前身份档位。
+    pub fn tier(&self) -> &'static Tier {
+        self.tier
+    }
+
+    /// 构造 drive API 的三要素请求头（web 档；share/cloud_search 显式钉死 web）。
     /// 注意：x-device-id 用 32 位 device_id（与 captcha/init 的 device_id 一致）。
     pub(crate) fn auth_headers(state: &AuthState) -> HeaderMap {
+        Self::auth_headers_for(&TIER_WEB, state)
+    }
+
+    /// 构造 drive API 的三要素请求头（档位版：x-client-id 随档位）。
+    pub(crate) fn auth_headers_for(tier: &Tier, state: &AuthState) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", state.access_token)).unwrap());
         h.insert("x-device-id", HeaderValue::from_str(device_id_32(&state.device_id)).unwrap());
         h.insert("x-captcha-token", HeaderValue::from_str(&state.captcha_token).unwrap());
-        h.insert("x-client-id", HeaderValue::from_static(CLIENT_ID));
+        h.insert("x-client-id", HeaderValue::from_static(tier.client_id));
         h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         h
     }
 
-    /// refresh_token 换新 access_token（已验证可行）。
+    /// refresh_token 换新 access_token（已验证可行；client_id 随档位）。
     pub async fn refresh(&self, state: &mut AuthState) -> Result<(), ClientError> {
         let resp: TokenResp = self.http
             .post(format!("{}/v1/auth/token", self.xluser_base))
             .json(&serde_json::json!({
                 "grant_type": "refresh_token",
                 "refresh_token": state.refresh_token,
-                "client_id": CLIENT_ID,
+                "client_id": self.tier.client_id,
             }))
             .send().await?.error_for_status()?.json().await?;
         state.access_token = resp.access_token;
@@ -269,12 +316,19 @@ impl Client {
         // 1) 登录前 captcha/init：全量 meta（账号标识 + timestamp/captcha_sign 套件）。
         //    实测（2026-08-25）：极简 meta 会被风控打回 result:review → signin 报
         //    captcha_invalid(4002)；带签名套件后风控才可能直接 pass。
+        //    client_version/package_name 随档位（P1-1：错档 = 异常指纹）。
         let did32 = device_id_32(device_id);
         let timestamp = now_millis().to_string();
-        let sign = captcha_sign(did32, &timestamp);
+        let sign = captcha_sign_with(
+            self.tier.client_id,
+            self.tier.client_version,
+            self.tier.host,
+            did32,
+            &timestamp,
+        );
         let mut meta = serde_json::json!({
-            "client_version": CLIENT_VERSION,
-            "package_name": PACKAGE_NAME,
+            "client_version": self.tier.client_version,
+            "package_name": self.tier.package_name,
             "user_id": "",
             "timestamp": timestamp,
             "captcha_sign": sign,
@@ -297,7 +351,7 @@ impl Client {
             .json(&serde_json::json!({
                 "action": action,
                 "captcha_token": "",
-                "client_id": CLIENT_ID,
+                "client_id": self.tier.client_id,
                 "device_id": did32,
                 "meta": meta,
                 "redirect_uri": "xlaccsdk01://xunlei.com/callback?state=harbor",
@@ -330,7 +384,7 @@ impl Client {
         }
         let mut headers = HeaderMap::new();
         headers.insert("x-captcha-token", HeaderValue::from_str(&captcha_token).unwrap());
-        headers.insert("x-client-id", HeaderValue::from_static(CLIENT_ID));
+        headers.insert("x-client-id", HeaderValue::from_static(self.tier.client_id));
         headers.insert("x-device-id", HeaderValue::from_str(did32).unwrap());
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
@@ -340,7 +394,7 @@ impl Client {
             .json(&serde_json::json!({
                 "username": username,
                 "password": password,
-                "client_id": CLIENT_ID,
+                "client_id": self.tier.client_id,
             }))
             .send().await?;
         let status = resp.status();
@@ -384,22 +438,29 @@ impl Client {
 
         let timestamp = now_millis().to_string();
         // captcha_sign 用 32 位 device_id（wdi10. 前缀去掉 + 取前 32 位）。
+        // base 三段随档位（P1-1）。
         let did32 = device_id_32(&state.device_id);
-        let sign = captcha_sign(did32, &timestamp);
+        let sign = captcha_sign_with(
+            self.tier.client_id,
+            self.tier.client_version,
+            self.tier.host,
+            did32,
+            &timestamp,
+        );
 
         let resp: CaptchaResp = self.http
             .post(format!("{}/v1/shield/captcha/init", self.xluser_base))
             .json(&serde_json::json!({
                 "action": "POST:/drive/v1/files",
                 "captcha_token": "",
-                "client_id": CLIENT_ID,
+                "client_id": self.tier.client_id,
                 "device_id": did32,
                 "meta": {
                     "timestamp": timestamp,
                     "captcha_sign": sign,
                     "user_id": state.user_id,
-                    "client_version": CLIENT_VERSION,
-                    "package_name": PACKAGE_NAME,
+                    "client_version": self.tier.client_version,
+                    "package_name": self.tier.package_name,
                 },
                 "redirect_uri": "xlaccsdk01://xunlei.com/callback?state=harbor",
             }))
@@ -409,7 +470,7 @@ impl Client {
         Ok(())
     }
 
-    /// 请求设备码（RFC 8628 设备码流程第一步，已实测端点）。
+    /// 请求设备码（RFC 8628 设备码流程第一步，已实测端点；client_id 随档位）。
     pub async fn request_device_code(&self, scope: &str) -> Result<DeviceCode, ClientError> {
         #[derive(Deserialize)]
         struct Resp {
@@ -422,7 +483,7 @@ impl Client {
         }
         let resp: Resp = self.http
             .post(format!("{}/v1/auth/device/code", self.xluser_base))
-            .form(&[("scope", scope), ("client_id", DEVICE_CLIENT_ID)])
+            .form(&[("scope", scope), ("client_id", self.tier.client_id)])
             .send().await?.error_for_status()?.json().await?;
         Ok(DeviceCode {
             device_code: resp.device_code,
@@ -433,7 +494,7 @@ impl Client {
         })
     }
 
-    /// 轮询设备码是否已被扫码授权（RFC 8628 第二步，已实测端点）。
+    /// 轮询设备码是否已被扫码授权（RFC 8628 第二步，已实测端点；client_id 随档位）。
     /// 返回 `Ok(Some(TokenResp))` = 授权成功；`Ok(None)` = 未授权（authorization_pending/slow_down）。
     pub async fn poll_device_token(&self, device_code: &str) -> Result<Option<TokenResp>, ClientError> {
         #[derive(Deserialize)]
@@ -443,7 +504,7 @@ impl Client {
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", device_code),
-                ("client_id", DEVICE_CLIENT_ID),
+                ("client_id", self.tier.client_id),
             ])
             .send().await?;
         let status = resp.status();
@@ -544,7 +605,13 @@ impl Client {
         // 0) 本 action 的 captcha/init：实测必须携带（400 captcha_required 否则）。
         //    全量签名套件与 signin/drive 同构；风控 verdict 由服务端定。
         let timestamp = now_millis().to_string();
-        let sign = captcha_sign(did32, &timestamp);
+        let sign = captcha_sign_with(
+            self.tier.client_id,
+            self.tier.client_version,
+            self.tier.host,
+            did32,
+            &timestamp,
+        );
         #[derive(Deserialize)]
         struct CapResp {
             #[serde(default)] captcha_token: String,
@@ -554,12 +621,12 @@ impl Client {
             .json(&serde_json::json!({
                 "action": "POST:/v1/auth/verification",
                 "captcha_token": "",
-                "client_id": CLIENT_ID,
+                "client_id": self.tier.client_id,
                 "device_id": did32,
                 "meta": {
                     "phone_number": phone,
-                    "client_version": CLIENT_VERSION,
-                    "package_name": PACKAGE_NAME,
+                    "client_version": self.tier.client_version,
+                    "package_name": self.tier.package_name,
                     "user_id": "",
                     "timestamp": timestamp,
                     "captcha_sign": sign,
@@ -584,7 +651,7 @@ impl Client {
 
         let mut headers = HeaderMap::new();
         headers.insert("x-captcha-token", HeaderValue::from_str(&cap.captcha_token).unwrap());
-        headers.insert("x-client-id", HeaderValue::from_static(CLIENT_ID));
+        headers.insert("x-client-id", HeaderValue::from_static(self.tier.client_id));
         headers.insert("x-device-id", HeaderValue::from_str(did32).unwrap());
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
@@ -593,7 +660,7 @@ impl Client {
             .headers(headers)
             .json(&serde_json::json!({
                 "phone_number": phone,
-                "client_id": CLIENT_ID,
+                "client_id": self.tier.client_id,
                 "target": "ANY",
                 "usage": "SIGN_IN",
                 "captcha_token": cap.captcha_token,
@@ -655,7 +722,7 @@ impl Client {
         let verify = self.http
             .post(format!("{}/v1/auth/verification/verify", self.xluser_base))
             .json(&serde_json::json!({
-                "client_id": CLIENT_ID,
+                "client_id": self.tier.client_id,
                 "phone_number": phone,
                 "verification_id": verification_id,
                 "verification_code": code,
@@ -708,7 +775,13 @@ impl Client {
         // 3a) signin 动作的 captcha/init（实测 4001 captcha_required 否则）。
         //     SMS 已验身会话，风控大概率直接 pass（区别于密码路径的 review）。
         let ts2 = now_millis().to_string();
-        let sign2 = captcha_sign(did32, &ts2);
+        let sign2 = captcha_sign_with(
+            self.tier.client_id,
+            self.tier.client_version,
+            self.tier.host,
+            did32,
+            &ts2,
+        );
         #[derive(Deserialize)]
         struct CapResp2 {
             #[serde(default)] captcha_token: String,
@@ -718,12 +791,12 @@ impl Client {
             .json(&serde_json::json!({
                 "action": "POST:/v1/auth/signin",
                 "captcha_token": "",
-                "client_id": CLIENT_ID,
+                "client_id": self.tier.client_id,
                 "device_id": did32,
                 "meta": {
                     "phone_number": phone,
-                    "client_version": CLIENT_VERSION,
-                    "package_name": PACKAGE_NAME,
+                    "client_version": self.tier.client_version,
+                    "package_name": self.tier.package_name,
                     "user_id": "",
                     "timestamp": ts2,
                     "captcha_sign": sign2,
@@ -748,7 +821,7 @@ impl Client {
 
         let mut headers = HeaderMap::new();
         headers.insert("x-captcha-token", HeaderValue::from_str(&cap2.captcha_token).unwrap());
-        headers.insert("x-client-id", HeaderValue::from_static(CLIENT_ID));
+        headers.insert("x-client-id", HeaderValue::from_static(self.tier.client_id));
         headers.insert("x-device-id", HeaderValue::from_str(did32).unwrap());
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
@@ -759,7 +832,7 @@ impl Client {
                 "username": phone,
                 "verification_code": code,
                 "verification_token": token,
-                "client_id": CLIENT_ID,
+                "client_id": self.tier.client_id,
             }))
             .send().await?;
         let status = resp.status();

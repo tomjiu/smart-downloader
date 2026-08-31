@@ -305,12 +305,23 @@ pub enum BencodeValue {
 }
 
 /// 最小 bencode 解码器。
+/// 安全修复（V4）：递归深度上限 64（恶意 fastresume 的超深嵌套会栈溢出 abort）。
 pub fn bdecode(data: &[u8]) -> Result<BencodeValue, BencodeError> {
-    let (val, _) = bdecode_at(data, 0)?;
+    let (val, _) = bdecode_at(data, 0, 0)?;
     Ok(val)
 }
 
-fn bdecode_at(data: &[u8], pos: usize) -> Result<(BencodeValue, usize), BencodeError> {
+fn bdecode_at(
+    data: &[u8],
+    pos: usize,
+    depth: usize,
+) -> Result<(BencodeValue, usize), BencodeError> {
+    const MAX_DEPTH: usize = 64;
+    if depth > MAX_DEPTH {
+        return Err(BencodeError::InvalidData(format!(
+            "nesting depth exceeds {MAX_DEPTH}"
+        )));
+    }
     if pos >= data.len() {
         return Err(BencodeError::InvalidData("unexpected eof".into()));
     }
@@ -320,7 +331,7 @@ fn bdecode_at(data: &[u8], pos: usize) -> Result<(BencodeValue, usize), BencodeE
             let mut p = pos + 1;
             while p < data.len() && data[p] != b'e' {
                 let (k, p1) = bdecode_bytes(data, p)?;
-                let (v, p2) = bdecode_at(data, p1)?;
+                let (v, p2) = bdecode_at(data, p1, depth + 1)?;
                 dict.push((k, v));
                 p = p2;
             }
@@ -330,7 +341,7 @@ fn bdecode_at(data: &[u8], pos: usize) -> Result<(BencodeValue, usize), BencodeE
             let mut list = Vec::new();
             let mut p = pos + 1;
             while p < data.len() && data[p] != b'e' {
-                let (v, p1) = bdecode_at(data, p)?;
+                let (v, p1) = bdecode_at(data, p, depth + 1)?;
                 list.push(v);
                 p = p1;
             }
@@ -462,5 +473,28 @@ mod bencode_tests {
         assert_eq!(pair.len(), 2);
         assert_eq!(pair[0].as_int(), Some(123));
         assert_eq!(pair[1].as_int(), Some(0));
+    }
+
+    // 安全回归（V4）：恶意 fastresume 的超深嵌套必须报错而非栈溢出。
+    #[test]
+    fn bdecode_excessive_nesting_rejected() {
+        let mut data = vec![b'l'; 100_000];
+        data.extend(std::iter::repeat_n(b'e', 100_000));
+        let err = bdecode(&data).unwrap_err();
+        assert!(err.to_string().contains("depth"), "got: {err}");
+    }
+
+    #[test]
+    fn bdecode_deep_but_legal_ok() {
+        let mut data = Vec::new();
+        for _ in 0..60 {
+            data.push(b'd');
+            data.extend_from_slice(b"1:k");
+        }
+        data.extend_from_slice(b"i1e");
+        for _ in 0..60 {
+            data.push(b'e');
+        }
+        assert!(bdecode(&data).is_ok());
     }
 }

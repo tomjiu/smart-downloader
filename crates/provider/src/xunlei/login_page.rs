@@ -1,18 +1,20 @@
-//! 本地登录页服务（Task 5-b）：与迅雷 App 登录页一致视觉的本地渲染方案。
+//! 本地登录页服务（Task 5-b，Task 25 补全）。
 //!
-//! - 页面：`include_str!("login_page.html")`，深蓝渐变 + 白卡片 + 三 Tab
-//!   （扫码 / 密码 / 短信），扫码二维码由本地 [`crate::xunlei::login_flow`] 构造的
-//!   官方授权 URL 生成（SVG，qrcode crate，无图片依赖）。
+//! - 页面：`include_str!("login_page.html")`，深蓝渐变 + 白卡片 + 四 Tab
+//!   （扫码 / 密码 / 短信 / 第三方），扫码二维码由本地 [`crate::xunlei::login_flow`]
+//!   构造的官方授权 URL 生成（SVG，qrcode crate，无图片依赖）。
 //! - API：
 //!   | 端点 | 说明 |
 //!   |------|------|
 //!   | GET  /                  | 登录页 HTML |
 //!   | GET  /api/qr.svg        | 当前设备码会话的二维码 SVG |
-//!   | POST /api/start         | 发起设备码会话 |
-//!   | GET  /api/status        | {state: pending/authorized/expired/error, ...} |
+//!   | POST /api/start         | 发起设备码会话（返回 web_auth_url） |
+//!   | GET  /api/status        | {state: pending/authorized/expired/error, web_auth_url, ...} |
 //!   | POST /api/login/pwd     | 账密登录（captcha/init + signin 全链） |
-//!   | POST /api/login/sms/send | 发送短信验证码 |
-//!   | POST /api/login/sms/verify | 验证短信验证码 |
+//!   | POST /api/login/sms/send | 发送短信验证码（返回 verification_id，服务端同时记住） |
+//!   | POST /api/login/sms/verify | 验证短信验证码（verification_id 缺省时服务端兜底） |
+//! - 第三方（微信/QQ/微博）：页面跳官方 /yc/ 授权页（appid 回调白名单绑死
+//!   迅雷域，本地无法自托管），同一 user_code 确认后轮询自动截 token。
 //! - 成功后登录态写入 `token_path`（0600），页面展示成功状态。
 //! - 只绑定 `127.0.0.1`，不对外监听。
 //!
@@ -43,6 +45,9 @@ pub struct LoginSession {
     scope: &'static str,
     device: Mutex<Option<DeviceSession>>,
     last_error: Mutex<Option<String>>,
+    /// 短信会话兜底：send 时记住 verification_id（前端断链/页面刷新丢失时
+    /// verify 可不带，服务端补上）。client.rs 实证会话必须绑 id，手机号无效。
+    sms_verification_id: Mutex<Option<String>>,
     /// 已完成的登录态（authorized 后可读，测试断言用）。
     pub done: Mutex<Option<AuthState>>,
 }
@@ -65,6 +70,7 @@ impl LoginSession {
             scope: login_flow::DEVICE_SCOPE,
             device: Mutex::new(preset),
             last_error: Mutex::new(None),
+            sms_verification_id: Mutex::new(None),
             done: Mutex::new(None),
         })
     }
@@ -134,7 +140,13 @@ async fn start(State(sess): State<Arc<LoginSession>>) -> axum::response::Respons
     match start_device_session(&sess.client, sess.scope).await {
         Ok(d) => {
             *sess.device.lock().await = Some(d.clone());
-            Json(json!({ "ok": true, "user_code": d.user_code, "expires_at": d.expires_at })).into_response()
+            Json(json!({
+                "ok": true,
+                "user_code": d.user_code,
+                "expires_at": d.expires_at,
+                "web_auth_url": d.web_auth_url,
+            }))
+            .into_response()
         }
         Err(e) => {
             *sess.last_error.lock().await = Some(e.to_string());
@@ -170,7 +182,11 @@ async fn status(State(sess): State<Arc<LoginSession>>) -> impl IntoResponse {
             } else {
                 "pending"
             };
-            Json(json!({ "state": state, "user_code": d.user_code }))
+            Json(json!({
+                "state": state,
+                "user_code": d.user_code,
+                "web_auth_url": d.web_auth_url,
+            }))
         }
         Err(e) => {
             let s = e.to_string();
@@ -200,7 +216,11 @@ struct SmsSendReq {
 
 async fn sms_send(State(sess): State<Arc<LoginSession>>, Json(req): Json<SmsSendReq>) -> axum::response::Response {
     match login_flow::send_sms_code(&sess.client, &req.phone).await {
-        Ok(vid) => Json(json!({ "ok": true, "verification_id": vid })).into_response(),
+        Ok(vid) => {
+            // 服务端记住会话 id：前端断链/刷新丢失时 verify 兜底（Task 25）。
+            *sess.sms_verification_id.lock().await = Some(vid.clone());
+            Json(json!({ "ok": true, "verification_id": vid })).into_response()
+        }
         Err(e) => err_resp(&e),
     }
 }
@@ -215,7 +235,12 @@ struct SmsVerifyReq {
 }
 
 async fn sms_verify(State(sess): State<Arc<LoginSession>>, Json(req): Json<SmsVerifyReq>) -> axum::response::Response {
-    match login_flow::verify_sms_code(&sess.client, &req.phone, &req.code, &req.verification_id).await {
+    // 兜底链：前端没带 verification_id（旧版页面/刷新丢失）时用 send 时记住的。
+    let mut vid = req.verification_id;
+    if vid.is_empty() {
+        vid = sess.sms_verification_id.lock().await.clone().unwrap_or_default();
+    }
+    match login_flow::verify_sms_code(&sess.client, &req.phone, &req.code, &vid).await {
         Ok(auth) => finalize(sess, auth).await,
         Err(e) => err_resp(&e),
     }
@@ -302,6 +327,16 @@ mod tests {
                         "refresh_token": "rt_pwd", "expires_in": 7200
                     }))
                 }),
+            )
+            // 短信两步（Task 25 e2e）：send 下发会话 id；verify 返
+            // verification_token（SDK 口径），第二段走 /v1/auth/signin 换 token。
+            .route(
+                "/v1/auth/verification",
+                post(|| async { axum::Json(serde_json::json!({ "verification_id": "VID9" })) }),
+            )
+            .route(
+                "/v1/auth/verification/verify",
+                post(|| async { axum::Json(serde_json::json!({ "verification_token": "VT9" })) }),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -330,12 +365,16 @@ mod tests {
         let body = html.text().await.unwrap();
         assert!(body.contains("迅雷"));
         assert!(body.contains("扫码登录") && body.contains("密码登录") && body.contains("短信登录"));
+        assert!(body.contains("第三方") && body.contains("微信") && body.contains("微博"));
 
         // 2) start → pending → （mock 第 3 次 poll 放行）→ authorized
         let r = http.post(format!("{base}/api/start")).send().await.unwrap();
         assert!(r.status().is_success());
         let j: serde_json::Value = r.json().await.unwrap();
         assert_eq!(j["user_code"], "UC5678");
+        // Task 25：start 必须回传带 scope 的官方授权页链接（第三方 Tab 用）。
+        assert_eq!(j["web_auth_url"],
+            "https://pan.xunlei.com/yc/?client_id=Xqp0kJBXWhwaTpB6&user_code=UC5678&scope=profile%20offline%20pan%20sso%20user");
 
         // 二维码 SVG 端点
         let svg = http.get(format!("{base}/api/qr.svg")).send().await.unwrap();
@@ -386,5 +425,44 @@ mod tests {
         assert_eq!(j["ok"], true);
         assert_eq!(j["user_id"], "777");
         assert_eq!(crate::xunlei::auth::load(&token_path).unwrap().user_id, "777");
+    }
+
+    #[tokio::test]
+    async fn login_page_sms_flow_with_fallback() {
+        // Task 25 短信链路 e2e：send 返回 verification_id；verify 故意不带
+        // verification_id（模拟旧前端断链/页面刷新丢失），服务端兜底应生效。
+        let upstream = spawn_mock_upstream().await;
+        let client = Client::with_bases(upstream.clone(), upstream.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let token_path = dir.path().join("auth.json");
+        let sess = LoginSession::new(client, token_path.clone());
+        let app = login_router(sess);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        let base = format!("http://{addr}");
+
+        let http = reqwest::Client::new();
+        let r = http
+            .post(format!("{base}/api/login/sms/send"))
+            .json(&json!({ "phone": "13800000000" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success());
+        let j: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(j["verification_id"], "VID9");
+
+        // 故意不带 verification_id —— 服务端记住的会话 id 应兜底。
+        let r = http
+            .post(format!("{base}/api/login/sms/verify"))
+            .json(&json!({ "phone": "13800000000", "code": "123456" }))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "verify 兜底失败: {}", r.status());
+        let j: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(j["ok"], true);
+        assert!(crate::xunlei::auth::load(&token_path).is_some(), "短信登录态未落盘");
     }
 }

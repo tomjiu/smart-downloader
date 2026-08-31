@@ -51,7 +51,6 @@ pub fn spawn_alert_loop(
     guard: Option<Arc<crate::bt::BtEngine>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut tick_count: u64 = 0; // BUGB-INSTR
         loop {
             tokio::time::sleep(interval).await;
             let alerts = match &guard {
@@ -61,10 +60,6 @@ pub fn spawn_alert_loop(
                     Err(_) => continue, // 会话暂时不可用：下轮再试
                 },
             };
-            tick_count += 1;
-            if tick_count % 20 == 1 {
-                tracing::info!("[bugb] alert-loop alive ticks={tick_count} batch={}", alerts.len());
-            }
             for alert in &alerts {
                 let Some(effect) = state.apply_bt_alert(alert) else {
                     continue;

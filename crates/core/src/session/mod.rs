@@ -8,5 +8,7 @@ pub mod single_instance;
 pub use manager::{
     should_save, LoadOutcome, ResumeOutcome, SaveReason, SessionError, SessionManager,
 };
-pub use output::{evaluate_disk, required_disk, DiskCheck, OutputError, OutputManager};
+pub use output::{
+    evaluate_disk, required_disk, sanitize_rel, DiskCheck, OutputError, OutputManager,
+};
 pub use single_instance::{InstanceLock, LockStatus};

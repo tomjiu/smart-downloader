@@ -16,7 +16,13 @@ async fn serve_bt() -> (std::net::SocketAddr, Arc<DaemonState>) {
     let dir = tempfile::tempdir().unwrap();
     let bt = smart_dl_daemon::bt::BtEngine::new(dir.path(), None, 0, 0, false, false, false).unwrap();
     let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
-    let state = Arc::new(DaemonState::new(Arc::new(http), vec![]).with_bt(Arc::new(bt)));
+    // 安全修复（V2）适配：测试 dest 均在系统临时目录下，注入为白名单根
+    // （否则 dest 预检按越界 400，引擎层「全局落盘」约束断言失配）。
+    let state = Arc::new(
+        DaemonState::new(Arc::new(http), vec![])
+            .with_dest_root(std::env::temp_dir())
+            .with_bt(Arc::new(bt)),
+    );
     let app = http::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

@@ -89,6 +89,21 @@
 | JNI 边界 | ✅ | 确认 JNI-internal，C 导出不可直接用 |
 | Rust FFI 绑定 | ❌ 未开始 | 需通过 JNI 或直接调用 .so 内部函数 |
 
+### NAS 引擎线（Phase 3b · B 档落地，Linux/Android 端）
+
+官方 NAS 版 SPK 内的 xllite 引擎（`xunlei-pan-cli`）已在 Debian 容器实测可跑（附录 E）；B 档为工程化落地：
+
+| 项 | 状态 | 说明 |
+|------|------|------|
+| B-1 FTP 引擎 | ✅ 早已交付 | `httpdl::FtpEngine`（`--features ftp`），15 测试全绿 |
+| B-2 NasRemoteEngine | 🔶 骨架 | `daemon/nas_remote.rs`：`DownloadEngine` 适配器，`DriveListen` TCP 探活+能力声明；端点表按假设区 #9 占位（UNTESTED） |
+| B-3 L1→xllite 身份桥 | 🔶 代码就位 | `nas.rs::sync_l1_token` + `serve.rs` 4e 启动自动同步（`SD_L1_TOKEN`）；文件格式已定案（2026-08-30 扫码实测：原生 9 字段形、引擎登录门通过），桥已对齐原生形；缺字段宽容度待 A2 engine 步 |
+| B-4 Android Termux 部署 | ✅ 脚本就位 | `scripts/nas/android-termux-setup.sh`：proot-distro Debian + arm64 SPK 引擎 |
+| A 档扫码守护 | ✅ 就绪待扫 | `scripts/nas/nas_qr_daemon.py`：RFC 8628 设备码 120s 自动续发，token 到手自动预置引擎路径 |
+| core 引擎枚举 | ✅ | `EngineKind::XunleiNas`（core/types.rs） |
+
+验证：`cargo check -p smart-dl-daemon --features nas` 与 `--features "nas,ftp,xunlei-import"` 零警告；`cargo test -p smart-dl-core --lib` 全绿。
+
 ---
 
 ## 三、迅雷登录的原生解决办法

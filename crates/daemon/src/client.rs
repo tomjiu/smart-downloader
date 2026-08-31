@@ -23,10 +23,21 @@ async fn ensure_ok(resp: reqwest::Response) -> Result<reqwest::Response, CliErro
 }
 
 impl CliClient {
-    pub fn new(base: &str) -> Self {
+    /// 安全修复（V1 配套）：`token` Some 时经 reqwest default_headers 给全部请求
+    /// 注入 `Authorization: Bearer <token>`（与 daemon 的 auth_mw 配对）；
+    /// None = 未认证模式（回环未配置 token 的兼容行为）。
+    pub fn new(base: &str, token: Option<&str>) -> Self {
+        let mut builder = reqwest::Client::builder();
+        if let Some(t) = token.filter(|t| !t.is_empty()) {
+            let mut headers = reqwest::header::HeaderMap::new();
+            if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {t}")) {
+                headers.insert(reqwest::header::AUTHORIZATION, v);
+            }
+            builder = builder.default_headers(headers);
+        }
         CliClient {
             base: base.trim_end_matches('/').to_string(),
-            client: reqwest::Client::new(),
+            client: builder.build().expect("reqwest client 构建失败"),
         }
     }
 
@@ -290,7 +301,7 @@ mod tests {
 
     #[test]
     fn base_url_trims_slash() {
-        let c = CliClient::new("http://x:1/");
+        let c = CliClient::new("http://x:1/", None);
         assert_eq!(c.base, "http://x:1");
     }
 }

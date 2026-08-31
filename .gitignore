@@ -47,3 +47,10 @@ scripts/research/xunlei/extracted_android/
 
 # 超大安装包（已放 GitHub Release，仓库内仅保留 Git LFS 的 APK）
 research_bin/installers/thunder_5.80.7.66659.dmg
+
+# 跨平台提取原始产物（SPK/APK 解包，体积大；走 Release 附件）
+scripts/research/xunlei/extracted/
+
+# NAS 校准证据（含个人元数据，不入库；结论已写入 docs/nas/*.md）
+docs/nas/evidence/
+/.cargo/

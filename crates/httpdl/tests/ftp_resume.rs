@@ -34,7 +34,7 @@ async fn rest_resumes_from_part_offset() {
 
     let got = std::fs::read(dir.path().join("r.bin")).unwrap();
     assert_eq!(got, src, "续传后文件必须完整");
-    let offsets = srv.rest_offsets.lock().unwrap().clone();
+    let offsets = srv.rest_offsets.lock().clone();
     assert!(
         offsets.contains(&(40 * 1024)),
         "必须从 .part 偏移 40960 续传，实际 offsets: {offsets:?}"
@@ -57,7 +57,7 @@ async fn rest_offset_zero_without_part() {
     let task = make_ftp_task("r2", &srv.url("/z.bin"), dir.path().to_path_buf(), "z.bin");
     let tid = engine.add(&task).await.unwrap();
     wait_terminal(&engine, &tid).await;
-    let offsets = srv.rest_offsets.lock().unwrap().clone();
+    let offsets = srv.rest_offsets.lock().clone();
     assert!(offsets.contains(&0), "无 .part → REST 0，实际 {offsets:?}");
 }
 

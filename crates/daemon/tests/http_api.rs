@@ -15,10 +15,13 @@ use std::sync::Arc;
 
 async fn serve() -> (std::net::SocketAddr, Arc<DaemonState>) {
     let engine = HttpEngine::new(reqwest::Client::new());
+    // 安全修复（V2）适配：测试的显式 dest 落在系统临时目录（/tmp/m6-test-*），
+    // 必须把它注入为白名单根，否则 dest 预检按越界拒绝（400）。
     // bt 构建下注入 BtEngine；非 bt 构建纯 HTTP（双态声明，两个 cfg 均零警告）
     #[cfg(feature = "bt")]
     let state = {
-        let base = DaemonState::new(Arc::new(engine), vec![]);
+        let base =
+            DaemonState::new(Arc::new(engine), vec![]).with_dest_root(std::env::temp_dir());
         let tmp = tempfile::tempdir().expect("tempdir");
         let bt = smart_dl_daemon::bt::BtEngine::new(
             tmp.path(),
@@ -33,7 +36,8 @@ async fn serve() -> (std::net::SocketAddr, Arc<DaemonState>) {
         base.with_bt(Arc::new(bt))
     };
     #[cfg(not(feature = "bt"))]
-    let state = DaemonState::new(Arc::new(engine), vec![]);
+    let state =
+        DaemonState::new(Arc::new(engine), vec![]).with_dest_root(std::env::temp_dir());
     let state = Arc::new(state);
     let app = http::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -600,4 +604,94 @@ async fn http_task_failure_marks_failed_in_list() {
     // 幂等
     let again = state.poll_http_task_states().await;
     assert!(again.is_empty(), "已 Failed 任务不应重复推进: {again:?}");
+}
+
+// ===== 安全回归（V1/V13）：API 认证中间件 =====
+
+/// 带 token 的测试 server：`Authorization: Bearer test-token-123` 必须校验。
+async fn serve_with_token() -> std::net::SocketAddr {
+    let engine = HttpEngine::new(reqwest::Client::new());
+    let state = DaemonState::new(Arc::new(engine), vec![])
+        .with_http_token(Some("test-token-123".into()));
+    let state = Arc::new(state);
+    let app = http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+#[tokio::test]
+async fn auth_required_when_token_configured() {
+    let addr = serve_with_token().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 无 Authorization → 401（快照/列表/配置三个代表性端点）
+    for path in ["/tasks", "/config", "/providers"] {
+        let r = client.get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED, "GET {path} 应 401");
+    }
+
+    // 错误 token → 401
+    let r = client
+        .get(format!("{base}/tasks"))
+        .header("Authorization", "Bearer wrong-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 非 Bearer scheme → 401
+    let r = client
+        .get(format!("{base}/tasks"))
+        .header("Authorization", "Basic dXNlcjpwYXNz")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 正确 token → 200
+    let r = client
+        .get(format!("{base}/tasks"))
+        .header("Authorization", "Bearer test-token-123")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::OK, "正确 token 应放行");
+}
+
+#[tokio::test]
+async fn auth_open_when_token_not_configured() {
+    // 未配置 token（回环兼容模式）→ 不带 Authorization 也放行
+    let (addr, _state) = serve().await;
+    let client = reqwest::Client::new();
+    let r = client
+        .get(format!("http://{addr}/tasks"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        reqwest::StatusCode::OK,
+        "未配置 token 时（回环）应保持兼容放行"
+    );
+}
+
+#[test]
+fn verify_http_token_unit() {
+    let engine = HttpEngine::new(reqwest::Client::new());
+    let bare = DaemonState::new(Arc::new(engine), vec![]);
+    assert!(bare.verify_http_token(None));
+    assert!(bare.verify_http_token(Some("whatever")));
+
+    let engine2 = HttpEngine::new(reqwest::Client::new());
+    let secured = DaemonState::new(Arc::new(engine2), vec![])
+        .with_http_token(Some("t-abc".into()));
+    assert!(!secured.verify_http_token(None));
+    assert!(!secured.verify_http_token(Some("Bearer wrong")));
+    assert!(!secured.verify_http_token(Some("t-abc"))); // 必须带 Bearer 前缀
+    assert!(secured.verify_http_token(Some("Bearer t-abc")));
 }

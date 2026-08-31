@@ -8,7 +8,19 @@ use std::path::PathBuf;
 #[test]
 fn part_path_appends_dot_part() {
     let om = OutputManager::new(PathBuf::from("D:/dl"));
-    assert_eq!(om.part_path("a/b.bin"), PathBuf::from("D:/dl/a/b.bin.part"));
+    assert_eq!(
+        om.part_path("a/b.bin").unwrap(),
+        PathBuf::from("D:/dl/a/b.bin.part")
+    );
+}
+
+// 安全回归（V3）：穿越路径在 part_path 入口即被拒绝。
+#[test]
+fn part_path_rejects_traversal() {
+    let om = OutputManager::new(PathBuf::from("D:/dl"));
+    assert!(om.part_path("../evil.bin").is_err());
+    assert!(om.part_path("/etc/passwd").is_err());
+    assert!(om.part_path("a/../../x").is_err());
 }
 
 #[test]
@@ -16,7 +28,7 @@ fn finalize_renames_part_to_destination() {
     let dir = tempfile::tempdir().unwrap();
     let om = OutputManager::new(dir.path().to_path_buf());
     let rel = "movie.bin";
-    let part = om.part_path(rel);
+    let part = om.part_path(rel).unwrap();
     fs::create_dir_all(part.parent().unwrap()).unwrap();
     fs::write(&part, b"1234567890").unwrap();
 
@@ -30,7 +42,7 @@ fn finalize_renames_part_to_destination() {
 fn finalize_size_mismatch_rejected() {
     let dir = tempfile::tempdir().unwrap();
     let om = OutputManager::new(dir.path().to_path_buf());
-    let part = om.part_path("m.bin");
+    let part = om.part_path("m.bin").unwrap();
     fs::create_dir_all(part.parent().unwrap()).unwrap();
     fs::write(&part, b"short").unwrap();
 
@@ -71,7 +83,7 @@ fn copy_fallback_copies_verifies_and_removes_part() {
     // 跨卷 rename 的环境无法在单盘 CI 注入 → fallback 逻辑独立测
     let dir = tempfile::tempdir().unwrap();
     let om = OutputManager::new(dir.path().to_path_buf());
-    let part = om.part_path("f2.bin");
+    let part = om.part_path("f2.bin").unwrap();
     fs::create_dir_all(part.parent().unwrap()).unwrap();
     fs::write(&part, b"cross-volume-payload").unwrap();
     let dest = dir.path().join("f2.bin");
@@ -86,7 +98,7 @@ fn finalize_to_unwritable_dest_reports_io() {
     // rename/copy 双失败路径 → Io 错误（覆盖失败分支行）
     let dir = tempfile::tempdir().unwrap();
     let om = OutputManager::new(dir.path().to_path_buf());
-    let part = om.part_path("x.bin");
+    let part = om.part_path("x.bin").unwrap();
     fs::create_dir_all(part.parent().unwrap()).unwrap();
     fs::write(&part, b"data").unwrap();
     // dest 指向不存在的父目录 → rename 与 copy 都失败
@@ -105,7 +117,7 @@ fn finalize_idempotent_cleans_residual_part() {
     // finalize_to 幂等短路时应清理 .part，避免后续落位冲突。
     let dir = tempfile::tempdir().unwrap();
     let om = OutputManager::new(dir.path().to_path_buf());
-    let part = om.part_path("seeded.bin");
+    let part = om.part_path("seeded.bin").unwrap();
     fs::create_dir_all(part.parent().unwrap()).unwrap();
     fs::write(&part, b"residual-part-data").unwrap();
     let dest = dir.path().join("seeded.bin");

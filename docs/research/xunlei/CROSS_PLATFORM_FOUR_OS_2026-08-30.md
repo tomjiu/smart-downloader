@@ -73,13 +73,13 @@ unset PLATFORM                      # ⚠ 外层脏 PLATFORM（如 lexar:xxx）�
 
 ```text
 POST https://xluser-ssl.xunlei.com/v1/auth/device/code
-{"client_id":"X9ibISwpIp8jQ4Ya","client_secret":"BlPF2z7HEeutzH4t6zyjLw",
+{"client_id":"X9ibISwpIp8jQ4Ya","client_secret":"<engine-internal>",
  "scope":"pan user profile sso offline pan/xunlei/share/create"}
 → {"device_code":"…","verification_uri_complete":"https://xluser-ssl.xunlei.com/__/auth/device/?...&user_code=…","user_code":"…"}
 → 轮询 token（RefreshTokenDuration 1h 刷新）
 ```
 
-- `client_id=X9ibISwpIp8jQ4Ya` 为 docker 平台客户端（与 E.2.4 平台检测结果一致），`client_secret` 同为引擎内嵌常量。
+- `client_id=X9ibISwpIp8jQ4Ya` 为 docker 平台客户端（与 E.2.4 平台检测结果一致）；`client_secret` 现改为环境变量注入（`SD_XL_CLIENT_SECRET`），不再明文入库。
 - **token 预置路径**：`DriveAuthorizationTokenPath` 指向的文件若有效可跳过扫码（格式校准=假设区实测项，候选=L1 云登录 OAuth token JSON 同构）。
 - 无 TTY 且无 token 时 `DoLogin`（login.go:48）因 `open /dev/tty` panic——生产部署需先在有终端的环境完成一次扫码，或走 token 预置。
 

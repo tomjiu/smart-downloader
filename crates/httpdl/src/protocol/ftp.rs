@@ -4,6 +4,7 @@
 
 use crate::retry::Backoff;
 use crate::static_split::plan_segments;
+use parking_lot::Mutex;
 use smart_dl_core::session::output::OutputManager;
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
@@ -13,7 +14,7 @@ use smart_dl_core::types::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 
@@ -124,8 +125,11 @@ impl FtpEngine {
         }
 
         // 落位目录：dest_root/<目录名>（URL 最后一段非空名称；根目录 → host）
+        // 安全修复（V3）：目录名可能来自远端 LIST 响应，join 前净化。
         let dir_name = dir_name_of(&path, &host);
-        let dest_dir = task.dest_root.join(&dir_name);
+        let dir_pb = smart_dl_core::session::output::sanitize_rel(&dir_name)
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let dest_dir = task.dest_root.join(&dir_pb);
         std::fs::create_dir_all(&dest_dir)
             .map_err(|e| EngineError::Other(format!("mkdir {}: {e}", dest_dir.display())))?;
 
@@ -157,7 +161,7 @@ impl FtpEngine {
 
         let tid = task.id.clone();
         {
-            let mut tasks = self.inner.tasks.lock().unwrap();
+            let mut tasks = self.inner.tasks.lock();
             tasks.insert(
                 tid.clone(),
                 FtpTask {
@@ -178,9 +182,7 @@ impl FtpEngine {
         let inner = self.inner.clone();
         let backoff = self.backoff;
         let spawn_tid = tid.clone();
-        tokio::spawn(async move {
-            download_dir_loop(inner, spawn_tid, backoff).await;
-        });
+        spawn_ftp_loop(download_dir_loop, inner, spawn_tid, backoff);
         Ok(tid)
     }
 }
@@ -189,6 +191,36 @@ impl Default for FtpEngine {
     fn default() -> Self {
         FtpEngine::new()
     }
+}
+
+/// 可靠性修复（V11，报告第二轮）：spawn 下载循环 + panic 收尸监控——
+/// 修复前 JoinHandle 直接丢弃，循环 panic 会静默变僵尸（任务状态永停
+/// Downloading、无 Failed 事件、引擎名额永不释放）；现在监控任务捕获
+/// panic → 任务标 Error（状态可见、上游轮询可正常推进）。
+fn spawn_ftp_loop<F, Fut>(
+    f: F,
+    inner: std::sync::Arc<EngineInner>,
+    tid: EngineTaskId,
+    backoff: Backoff,
+) where
+    F: FnOnce(std::sync::Arc<EngineInner>, EngineTaskId, Backoff) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let handle = tokio::spawn(f(inner.clone(), tid.clone(), backoff));
+    tokio::spawn(async move {
+        if let Err(e) = handle.await {
+            if e.is_panic() {
+                let msg = format!("FTP 下载循环 panic（V11 收尸）: {e}");
+                tracing::error!("[V11] tid={tid}: {msg}");
+                // V11 锁治理后 parking_lot 无中毒——无条件锁，收尸保证执行
+                let mut tasks = inner.tasks.lock();
+                if let Some(t) = tasks.get_mut(&tid) {
+                    t.state = EngineState::Error;
+                    t.error = Some(msg);
+                }
+            }
+        }
+    });
 }
 
 /// 解析 `ftp://[user:pass@]host[:port]/path`。
@@ -491,7 +523,7 @@ async fn download_file<F: Fn(u64)>(
 /// 单文件任务的下载循环：download_file 包装 + 任务状态落定。
 async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Backoff) {
     let (host, port, user, pass, path, dest, total) = {
-        let tasks = inner.tasks.lock().unwrap();
+        let tasks = inner.tasks.lock();
         let t = tasks.get(&tid).unwrap();
         (
             t.host.clone(),
@@ -505,12 +537,22 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
     };
     let inner2 = inner.clone();
     let tid2 = tid.clone();
-    let r = download_file(&host, port, &user, &pass, &path, &dest, total, backoff, move |n| {
-        let mut tasks = inner2.tasks.lock().unwrap();
-        if let Some(t) = tasks.get_mut(&tid2) {
-            t.done += n;
-        }
-    })
+    let r = download_file(
+        &host,
+        port,
+        &user,
+        &pass,
+        &path,
+        &dest,
+        total,
+        backoff,
+        move |n| {
+            let mut tasks = inner2.tasks.lock();
+            if let Some(t) = tasks.get_mut(&tid2) {
+                t.done += n;
+            }
+        },
+    )
     .await;
     match r {
         Ok(()) => finish(&inner, &tid, EngineState::Completed, None),
@@ -522,7 +564,7 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
 /// 任一文件终态失败 → 整任务 Error（错误消息带文件名）。
 async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Backoff) {
     let (host, port, user, pass, dir_dest, files) = {
-        let tasks = inner.tasks.lock().unwrap();
+        let tasks = inner.tasks.lock();
         let t = tasks.get(&tid).unwrap();
         (
             t.host.clone(),
@@ -538,7 +580,12 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
     };
     // add 时已建目录；此处幂等兜底（目录被外部删除的场景）
     if let Err(e) = std::fs::create_dir_all(&dir_dest) {
-        finish(&inner, &tid, EngineState::Error, Some(format!("mkdir: {e}")));
+        finish(
+            &inner,
+            &tid,
+            EngineState::Error,
+            Some(format!("mkdir: {e}")),
+        );
         return;
     }
     for (name, fpath, size) in files {
@@ -557,7 +604,7 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
             size,
             backoff,
             move |n| {
-                let mut tasks = inner2.tasks.lock().unwrap();
+                let mut tasks = inner2.tasks.lock();
                 if let Some(t) = tasks.get_mut(&tid2) {
                     t.done += n;
                     if let Some(f) = t.files.iter_mut().find(|f| f.name == name2) {
@@ -586,7 +633,7 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
 
 /// 更新目录任务中某文件的状态。
 fn set_file_state(inner: &Arc<EngineInner>, tid: &str, name: &str, state: EngineState) {
-    let mut tasks = inner.tasks.lock().unwrap();
+    let mut tasks = inner.tasks.lock();
     if let Some(t) = tasks.get_mut(tid) {
         if let Some(f) = t.files.iter_mut().find(|f| f.name == name) {
             f.state = state;
@@ -611,7 +658,7 @@ fn finalize_part(part: &Path, dest: &Path, total: u64) -> Result<(), String> {
 }
 
 fn finish(inner: &Arc<EngineInner>, tid: &str, state: EngineState, error: Option<String>) {
-    let mut tasks = inner.tasks.lock().unwrap();
+    let mut tasks = inner.tasks.lock();
     if let Some(t) = tasks.get_mut(tid) {
         t.state = state;
         t.error = error;
@@ -650,10 +697,7 @@ impl DownloadEngine for FtpEngine {
 
         match target {
             // 目录分支：LIST 探测 → 逐文件条目 → 目录下载循环
-            FtpTarget::Dir(path) => {
-                self.add_directory(task, host, port, user, pass, path)
-                    .await
-            }
+            FtpTarget::Dir(path) => self.add_directory(task, host, port, user, pass, path).await,
             FtpTarget::File(path) => {
                 // 探测：连接 + 登录 + SIZE（421 → 退避重试）
                 let total = {
@@ -677,7 +721,9 @@ impl DownloadEngine for FtpEngine {
                     }
                     match size {
                         Some(t) => t,
-                        None => return Err(EngineError::Other(format!("ftp probe failed: {last}"))),
+                        None => {
+                            return Err(EngineError::Other(format!("ftp probe failed: {last}")))
+                        }
                     }
                 };
 
@@ -686,7 +732,10 @@ impl DownloadEngine for FtpEngine {
                     .name
                     .clone()
                     .unwrap_or_else(|| "download.bin".to_string());
-                let dest = task.dest_root.join(&rel);
+                // 安全修复（V3）：任务名净化后再 join（拒 .. / 绝对路径）。
+                let rel_pb = smart_dl_core::session::output::sanitize_rel(&rel)
+                    .map_err(|e| EngineError::Other(e.to_string()))?;
+                let dest = task.dest_root.join(&rel_pb);
                 // .part 超长（源变小）→ 作废
                 let part = part_path_of(&dest);
                 if let Ok(md) = std::fs::metadata(&part) {
@@ -697,7 +746,7 @@ impl DownloadEngine for FtpEngine {
 
                 let tid = task.id.clone();
                 {
-                    let mut tasks = self.inner.tasks.lock().unwrap();
+                    let mut tasks = self.inner.tasks.lock();
                     tasks.insert(
                         tid.clone(),
                         FtpTask {
@@ -718,30 +767,28 @@ impl DownloadEngine for FtpEngine {
                 let inner = self.inner.clone();
                 let backoff = self.backoff;
                 let spawn_tid = tid.clone();
-                tokio::spawn(async move {
-                    download_loop(inner, spawn_tid, backoff).await;
-                });
+                spawn_ftp_loop(download_loop, inner, spawn_tid, backoff);
                 Ok(tid)
             }
         }
     }
 
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError> {
-        let mut tasks = self.inner.tasks.lock().unwrap();
+        let mut tasks = self.inner.tasks.lock();
         let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
         t.state = EngineState::Paused;
         Ok(())
     }
 
     async fn resume(&self, id: &EngineTaskId) -> Result<(), EngineError> {
-        let mut tasks = self.inner.tasks.lock().unwrap();
+        let mut tasks = self.inner.tasks.lock();
         let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
         t.state = EngineState::Downloading;
         Ok(())
     }
 
     async fn status(&self, id: &EngineTaskId) -> Result<EngineStatus, EngineError> {
-        let tasks = self.inner.tasks.lock().unwrap();
+        let tasks = self.inner.tasks.lock();
         let t = tasks.get(id).ok_or(EngineError::NotFound)?;
         // 目录任务 → 文件级进度（FileProgress）；单文件任务 → 空（保持既有行为）
         let files = t
@@ -768,7 +815,7 @@ impl DownloadEngine for FtpEngine {
     }
 
     async fn remove(&self, id: &EngineTaskId, _delete_data: bool) -> Result<(), EngineError> {
-        let mut tasks = self.inner.tasks.lock().unwrap();
+        let mut tasks = self.inner.tasks.lock();
         tasks.remove(id).ok_or(EngineError::NotFound)?;
         Ok(())
     }

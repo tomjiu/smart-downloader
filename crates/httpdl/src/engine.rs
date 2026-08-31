@@ -7,6 +7,7 @@ use crate::rate::RateLimiter;
 use crate::resume;
 use crate::segment_manager::DEFAULT_MIN_SPLIT;
 use crate::verify::{verify_file, verify_file_md5};
+use parking_lot::Mutex;
 use smart_dl_core::identity::ContentIdentity;
 use smart_dl_core::session::output::OutputManager;
 use smart_dl_core::task::DownloadTask;
@@ -17,7 +18,7 @@ use smart_dl_core::types::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// 换源竞态窗口：段失败后等待 update_sources 到达（mirrors 变化则重试）。
@@ -86,12 +87,34 @@ impl HttpEngine {
     }
 
     /// 启动下载循环（代次 gen）。
+    /// 可靠性修复（V11，报告第二轮）：不再丢弃 JoinHandle——监控任务捕获
+    /// 下载循环 panic，把任务标 Error（修复前 panic 任务静默变僵尸：状态
+    /// 永停 Downloading、无 Failed 事件、无收尸路径）。
     fn spawn_download(&self, tid: EngineTaskId, gen: u64) {
         let client = self.client.clone();
         let limiter = self.limiter.clone();
         let inner = self.inner.clone();
-        tokio::spawn(async move {
+        let inner_mon = self.inner.clone();
+        let tid_mon = tid.clone();
+        let handle = tokio::spawn(async move {
             download_loop(&client, limiter, inner, tid, gen).await;
+        });
+        // 收尸监控：panic → 任务标 Error（V11 锁治理后 parking_lot 无中毒，
+        // 无条件锁不再有级联引爆风险，收尸保证执行；锁在子线程 unwind 时已随 RAII 释放）
+        tokio::spawn(async move {
+            if let Err(join_err) = handle.await {
+                if join_err.is_panic() {
+                    let msg = format!("下载循环 panic（V11 收尸）: {join_err}");
+                    tracing::error!("[V11] tid={tid_mon}: {msg}");
+                    let mut tasks = inner_mon.tasks.lock();
+                    if let Some(t) = tasks.get_mut(&tid_mon) {
+                        if t.gen == gen {
+                            t.state = EngineState::Error;
+                            t.error = Some(msg);
+                        }
+                    }
+                }
+            }
         });
     }
 }
@@ -106,7 +129,7 @@ async fn download_loop(
     loop {
         // 快照任务参数（不跨 await 持锁）
         let (part, offset, mirrors_raw, total, sha256, md5) = {
-            let tasks = inner.tasks.lock().unwrap();
+            let tasks = inner.tasks.lock();
             let t = match tasks.get(&tid) {
                 Some(t) if t.gen == gen => t,
                 _ => return, // 换源代次已推进 → 本循环作废
@@ -124,7 +147,7 @@ async fn download_loop(
         // Mirror 加权评分：按历史分数降序稳定排序（同分保持原序），优先健康源。
         let mut mirrors = mirrors_raw.clone();
         {
-            let scores = inner.mirror_scores.lock().unwrap();
+            let scores = inner.mirror_scores.lock();
             mirrors.sort_by_key(|u| -scores.get(u).copied().unwrap_or(0));
         }
 
@@ -145,7 +168,6 @@ async fn download_loop(
                 let still_current = inner
                     .tasks
                     .lock()
-                    .unwrap()
                     .get(&tid)
                     .map(|t| t.gen == gen)
                     .unwrap_or(false);
@@ -175,7 +197,7 @@ async fn download_loop(
                     }
                     Ok(false) => {
                         let attempts = {
-                            let mut tasks = inner.tasks.lock().unwrap();
+                            let mut tasks = inner.tasks.lock();
                             let t = tasks.get_mut(&tid).unwrap();
                             t.verify_attempts += 1;
                             t.verify_attempts
@@ -187,12 +209,12 @@ async fn download_loop(
                         }
                         // 主源两次校验失败 → 切备用源（夸克 backup_url/backup_md5 机制）
                         let (backup_url, backup_md5, backup_used) = {
-                            let tasks = inner.tasks.lock().unwrap();
+                            let tasks = inner.tasks.lock();
                             let t = tasks.get(&tid).unwrap();
                             (t.backup_url.clone(), t.backup_md5.clone(), t.backup_used)
                         };
                         if let (Some(bu), false) = (&backup_url, backup_used) {
-                            let mut tasks = inner.tasks.lock().unwrap();
+                            let mut tasks = inner.tasks.lock();
                             let t = tasks.get_mut(&tid).unwrap();
                             t.backup_used = true;
                             t.mirrors = vec![bu.clone()];
@@ -242,7 +264,7 @@ async fn download_loop(
                 // 段全 mirror 失败：给 update_sources 一个竞态窗口
                 tokio::time::sleep(SOURCE_WINDOW).await;
                 let now_mirrors = {
-                    let tasks = inner.tasks.lock().unwrap();
+                    let tasks = inner.tasks.lock();
                     tasks.get(&tid).map(|t| t.mirrors.clone())
                 };
                 if now_mirrors.as_deref() != Some(mirrors_raw.as_slice()) {
@@ -259,14 +281,13 @@ fn dest_of(inner: &Arc<EngineInner>, tid: &str) -> PathBuf {
     inner
         .tasks
         .lock()
-        .unwrap()
         .get(tid)
         .map(|t| t.dest.clone())
         .unwrap_or_default()
 }
 
 fn finish(inner: &Arc<EngineInner>, tid: &str, state: EngineState, error: Option<String>) {
-    let mut tasks = inner.tasks.lock().unwrap();
+    let mut tasks = inner.tasks.lock();
     if let Some(t) = tasks.get_mut(tid) {
         t.state = state;
         t.done = t.total;
@@ -351,7 +372,11 @@ impl DownloadEngine for HttpEngine {
             .name
             .clone()
             .unwrap_or_else(|| "download.bin".to_string());
-        let dest = task.dest_root.join(&rel);
+        // 安全修复（V3）：任务名可能来自恶意 torrent/远端，join 前必须净化
+        // （拒 `..` / 绝对路径 / 盘符前缀），非法即拒任务。
+        let rel_pb = smart_dl_core::session::output::sanitize_rel(&rel)
+            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let dest = task.dest_root.join(&rel_pb);
         // 断点续传（#4）：.part 存在 → 探测+决策 → 从偏移续传或作废重下；
         // 探测到的 ETag 持久化到 `<part>.etag` 供下次决策。
         // P0 动态分段：只记录续传起点 offset，段由 SegmentManager 动态领取。
@@ -379,16 +404,14 @@ impl DownloadEngine for HttpEngine {
         resume::write_part_etag(&part0, probe.etag.as_deref());
         let (sha256, backup_md5) = match &task.identity {
             ContentIdentity::SingleFile {
-                sha256,
-                backup_md5,
-                ..
+                sha256, backup_md5, ..
             } => (sha256.clone(), backup_md5.clone()),
             _ => (None, None),
         };
 
         let tid = task.id.clone();
         {
-            let mut tasks = self.inner.tasks.lock().unwrap();
+            let mut tasks = self.inner.tasks.lock();
             tasks.insert(
                 tid.clone(),
                 HttpTask {
@@ -416,21 +439,21 @@ impl DownloadEngine for HttpEngine {
     }
 
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError> {
-        let mut tasks = self.inner.tasks.lock().unwrap();
+        let mut tasks = self.inner.tasks.lock();
         let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
         t.state = EngineState::Paused;
         Ok(())
     }
 
     async fn resume(&self, id: &EngineTaskId) -> Result<(), EngineError> {
-        let mut tasks = self.inner.tasks.lock().unwrap();
+        let mut tasks = self.inner.tasks.lock();
         let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
         t.state = EngineState::Downloading;
         Ok(())
     }
 
     async fn status(&self, id: &EngineTaskId) -> Result<EngineStatus, EngineError> {
-        let tasks = self.inner.tasks.lock().unwrap();
+        let tasks = self.inner.tasks.lock();
         let t = tasks.get(id).ok_or(EngineError::NotFound)?;
         Ok(EngineStatus {
             state: t.state,
@@ -447,7 +470,7 @@ impl DownloadEngine for HttpEngine {
     }
 
     async fn remove(&self, id: &EngineTaskId, _delete_data: bool) -> Result<(), EngineError> {
-        let mut tasks = self.inner.tasks.lock().unwrap();
+        let mut tasks = self.inner.tasks.lock();
         tasks.remove(id).ok_or(EngineError::NotFound)?;
         Ok(())
     }
@@ -464,14 +487,14 @@ impl DownloadEngine for HttpEngine {
         if urls.is_empty() {
             return Err(EngineError::Other("empty source list".to_string()));
         }
-        // 锁外探测（std MutexGuard 不可跨 await）
+        // 锁外探测（锁不跨 await：parking_lot guard 跨 await 会阻塞执行器）
         let headers = {
-            let tasks = self.inner.tasks.lock().unwrap();
+            let tasks = self.inner.tasks.lock();
             tasks.get(id).ok_or(EngineError::NotFound)?.headers.clone()
         };
         let probe = probe_range(&self.client, &urls[0], &headers).await?;
 
-        let mut tasks = self.inner.tasks.lock().unwrap();
+        let mut tasks = self.inner.tasks.lock();
         let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
         let etag_changed = probe.etag.is_some() && t.etag.is_some() && probe.etag != t.etag;
         if etag_changed {

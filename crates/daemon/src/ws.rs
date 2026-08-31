@@ -3,9 +3,9 @@
 //! 真 WS 升级端点在 http 层；本模块是纯逻辑，测试直连。
 
 use crate::events::{Envelope, SchedulerEvent};
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 
 /// 默认事件队列上限（D36：队列 256）。
 pub const DEFAULT_CAPACITY: usize = 256;
@@ -39,7 +39,7 @@ impl WsHub {
     /// 关键事件绝不移出（新非关键事件丢弃；新关键事件丢队头兜底防死锁）。
     pub fn publish(&self, event: SchedulerEvent) {
         let seq = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut q = self.queue.lock().unwrap();
+        let mut q = self.queue.lock();
         if q.len() >= self.cap {
             match q.iter().position(|e| !e.event.is_critical()) {
                 Some(i) => {
@@ -61,7 +61,7 @@ impl WsHub {
 
     /// 消费全量（幂等：调用后队列清空）——掉队客户端重连重同步入口。
     pub fn drain(&self) -> Vec<Envelope> {
-        let mut q = self.queue.lock().unwrap();
+        let mut q = self.queue.lock();
         q.drain(..).collect()
     }
 
@@ -69,7 +69,6 @@ impl WsHub {
     pub fn snapshot_upto(&self, last_seen: u64) -> Vec<Envelope> {
         self.queue
             .lock()
-            .unwrap()
             .iter()
             .filter(|e| e.seq > last_seen)
             .cloned()
@@ -83,12 +82,12 @@ impl WsHub {
 
     /// 当前队列长度（背压观测）。
     pub fn len(&self) -> usize {
-        self.queue.lock().unwrap().len()
+        self.queue.lock().len()
     }
 
     /// 队列是否为空。
     pub fn is_empty(&self) -> bool {
-        self.queue.lock().unwrap().is_empty()
+        self.queue.lock().is_empty()
     }
 }
 

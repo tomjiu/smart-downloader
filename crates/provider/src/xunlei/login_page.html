@@ -71,6 +71,10 @@
   .msg { margin-top: 10px; font-size: 13px; min-height: 18px; text-align: center; }
   .msg.ok { color: #10b981; } .msg.err { color: #ef4444; }
   .foot { margin-top: 18px; text-align: center; color: #b6bdca; font-size: 11px; line-height: 1.7; }
+  .third-tip { margin: 2px 0 14px; font-size: 12px; color: #6b7280; line-height: 1.8; text-align: left; }
+  .third-btn { margin-bottom: 10px; }
+  .third-btn.alt { background: linear-gradient(90deg, #12b7f5, #3b82f6); }
+  .third-btn.alt2 { background: linear-gradient(90deg, #e6643c, #f09b4d); }
   .hidden { display: none !important; }
 </style>
 </head>
@@ -83,6 +87,7 @@
     <div class="tab active" data-tab="qr">扫码登录</div>
     <div class="tab" data-tab="pwd">密码登录</div>
     <div class="tab" data-tab="sms">短信登录</div>
+    <div class="tab" data-tab="third">第三方</div>
   </div>
 
   <!-- 扫码登录 -->
@@ -114,9 +119,21 @@
     <div class="msg" id="sms-msg"></div>
   </div>
 
+  <!-- 第三方登录（官方页承载） -->
+  <div class="panel" id="panel-third">
+    <div class="third-tip">
+      微信 / QQ / 微博登录由迅雷<b>官方授权页</b>承载（第三方 appid 与回调白名单绑在迅雷官方域名，本地无法自托管）。点击任意按钮打开官方页，用任意方式登录并点「确认」，本页会自动检测到授权成功。
+    </div>
+    <button class="btn third-btn" id="tp-wechat">微信登录</button>
+    <button class="btn third-btn alt" id="tp-qq">QQ 登录</button>
+    <button class="btn third-btn alt2" id="tp-weibo">微博登录</button>
+    <div class="msg" id="third-msg"></div>
+  </div>
+
   <div class="foot">
     本页面为 smart-dl 本地渲染的登录入口（127.0.0.1，不对外监听）。<br>
-    扫码跳转迅雷官方授权页完成确认；密码/短信经 HTTPS 直连迅雷服务端。
+    扫码跳转迅雷官方授权页完成确认；密码/短信经 HTTPS 直连迅雷服务端；<br>
+    第三方（微信/QQ/微博）由官方授权页承载，确认后本页自动完成取证。
   </div>
 </div>
 
@@ -145,6 +162,8 @@ async function startDeviceFlow() {
     $('qr-retry').classList.remove('hidden');
     return;
   }
+  const j = await r.json().catch(() => ({}));
+  if (j.web_auth_url) webAuthUrl = j.web_auth_url;
   started = true;
   poll();
 }
@@ -155,6 +174,7 @@ async function poll() {
     let st;
     try { st = await (await fetch('/api/status')).json(); }
     catch (e) { await sleep(1500); continue; }
+    if (st.web_auth_url) webAuthUrl = st.web_auth_url;
     if (st.state === 'pending') {
       $('qr-state').className = 'qr-state';
       $('qr-state').textContent = '等待扫码确认…（授权码 ' + (st.user_code || '') + '）';
@@ -183,6 +203,23 @@ async function poll() {
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 $('qr-retry').addEventListener('click', startDeviceFlow);
 
+// —— 第三方登录（官方页承载）——
+let webAuthUrl = '';
+function openOfficial() {
+  const m = $('third-msg');
+  if (!webAuthUrl) {
+    m.className = 'msg err';
+    m.textContent = '会话未就绪：请先切到「扫码登录」Tab 等待二维码生成';
+    return;
+  }
+  window.open(webAuthUrl, '_blank');
+  m.className = 'msg';
+  m.textContent = '已在官方页打开：任意方式登录 → 点「确认」→ 回本页等 ✓';
+}
+$('tp-wechat').addEventListener('click', openOfficial);
+$('tp-qq').addEventListener('click', openOfficial);
+$('tp-weibo').addEventListener('click', openOfficial);
+
 // —— 密码登录 ——
 $('pwd-btn').addEventListener('click', async () => {
   const u = $('pwd-user').value.trim(), p = $('pwd-pass').value;
@@ -203,6 +240,7 @@ $('pwd-btn').addEventListener('click', async () => {
 
 // —— 短信登录 ——
 let smsCountdown = 0;
+let smsVerificationId = '';   // send 返回的会话 id，verify 必须携带（服务端另有兜底）
 $('sms-send').addEventListener('click', async () => {
   const phone = $('sms-phone').value.trim();
   const m = $('sms-msg');
@@ -214,6 +252,7 @@ $('sms-send').addEventListener('click', async () => {
     });
     const j = await r.json();
     if (r.ok && j.ok) {
+      smsVerificationId = j.verification_id || '';
       smsCountdown = 60;
       const timer = setInterval(() => {
         smsCountdown--;
@@ -231,7 +270,7 @@ $('sms-btn').addEventListener('click', async () => {
   try {
     const r = await fetch('/api/login/sms/verify', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ phone, code })
+      body: JSON.stringify({ phone, code, verification_id: smsVerificationId })
     });
     const j = await r.json();
     if (r.ok && j.ok) { m.className = 'msg ok'; m.textContent = '✓ 登录成功（user_id: ' + (j.user_id || '-') + '）'; }

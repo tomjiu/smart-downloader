@@ -28,9 +28,35 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     let _lock = InstanceLock::acquire(&cfg.lock.path)?;
     tracing::info!("单实例锁已持有: {:?}", cfg.lock.path);
 
-    // 2. dest_root 预检（缺失目录自动创建）
-    crate::state::ensure_dest_root(Some(cfg.download.dest_root.to_string_lossy().into_owned()))
-        .map_err(|e| ServeError::Engine(format!("dest_root 预检失败: {e}")))?;
+    // 1b. 安全修复（V1/V13）fail-closed：非回环监听 + 未配置 http_token → 拒绝启动。
+    // 防止用户把 addr 改成 0.0.0.0 后 API（写文件/NAS 执行链）对局域网裸奔。
+    // token 解析：env `SMART_DL_HTTP_TOKEN` > config；`auto` → 生成强随机临时值
+    // 并打印到 stdout（第六轮 9.3.5，防手设弱 token）。
+    let (http_token, token_generated) = resolve_http_token(
+        std::env::var("SMART_DL_HTTP_TOKEN").ok(),
+        cfg.server.http_token.clone(),
+    );
+    if token_generated {
+        println!(
+            "[smart-dl] SMART_DL_HTTP_TOKEN=auto：已生成本次运行的临时 token: {}",
+            http_token.as_deref().unwrap_or_default()
+        );
+    }
+    if !Config::is_loopback_addr(&cfg.server.addr) && http_token.is_none() {
+        return Err(ServeError::Engine(
+            "检测到非回环监听地址但未配置 [server] http_token：API 将对网络裸奔，
+            已拒绝启动。请在配置中设置 http_token（或环境变量 SMART_DL_HTTP_TOKEN），
+            或改回 127.0.0.1"
+                .into(),
+        ));
+    }
+
+    // 2. dest_root 预检（缺失目录自动创建）；白名单 = [dest_root]（V2）
+    crate::state::ensure_dest_root(
+        Some(cfg.download.dest_root.to_string_lossy().into_owned()),
+        &[cfg.download.dest_root.clone()],
+    )
+    .map_err(|e| ServeError::Engine(format!("dest_root 预检失败: {e}")))?;
 
     // 3. 引擎组装：HTTP（必需）+ BT（feature bt 且配置开启）
     // 全局代理（config `[download] proxy`，启动时生效）：http/socks5/socks4，可带凭据
@@ -54,32 +80,7 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     // 开发/演示占位，真实 provider（迅雷云盘等）落地后按类型构造）
     let mut providers: Vec<Arc<dyn smart_dl_provider::RemoteProvider>> = Vec::new();
     if cfg.provider.enabled && cfg.provider.mock {
-        // BUGB-INSTR（临时诊断装配，修复验证后移除）：env SMART_DL_MOCK_URL 注入
-        // mock 直链文件，使兜底链在无真实云端配额时也能走完整传输路径。
-        let mut mp = smart_dl_provider::MockProvider::new("mock");
-        if let Ok(url) = std::env::var("SMART_DL_MOCK_URL") {
-            if !url.is_empty() {
-                let rel = std::env::var("SMART_DL_MOCK_NAME").unwrap_or_else(|_| "mockfile.bin".into());
-                let size = std::env::var("SMART_DL_MOCK_SIZE").ok().and_then(|s| s.parse().ok()).unwrap_or(0);
-                mp = mp.with_files(vec![smart_dl_provider::ResolvedRemoteFile {
-                    rel_path: rel,
-                    url: url.clone(),
-                    size,
-                    etag: None,
-                    expires_at: None,
-                }]);
-            }
-        }
-        // BUGB-INSTR（临时诊断装配，修复验证后移除）：SMARTDL_MOCK_READY_DELAY_SECS
-        // 延迟 Ready——submit 后 N 秒内 status=Downloading，模拟真实云盘「离线
-        // 数分钟」等待窗（免配额复现 Bug B 协调器状态窗）；缺省 0 = 旧行为。
-        if let Ok(secs) = std::env::var("SMARTDL_MOCK_READY_DELAY_SECS") {
-            let secs = secs.trim().parse::<u64>().unwrap_or(0);
-            if secs > 0 {
-                mp = mp.with_ready_delay_secs(secs);
-            }
-        }
-        providers.push(Arc::new(mp));
+        providers.push(Arc::new(smart_dl_provider::MockProvider::new("mock")));
         tracing::info!("云兜底已启用（provider=mock，开发占位）");
     }
     // 3b+. 迅雷云盘 Provider 装配（XunleiProvider）。
@@ -94,21 +95,38 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
             .token_path
             .clone()
             .unwrap_or_else(|| PathBuf::from("xunlei_auth.json"));
-        let xp = smart_dl_provider::xunlei::provider::XunleiProvider::new("xunlei", tp.clone());
+        // 身份档位（P1-1）：env SMART_DL_XUNLEI_TIER > [provider_xunlei] tier > web。
+        // 未知档拒绝启动（防错档静默运行——错档 = 服务端可见的异常指纹）。
+        let tier_name = cfg.resolve_xunlei_tier_name();
+        let tier = smart_dl_provider::xunlei::tier::Tier::by_name(&tier_name).ok_or_else(|| {
+            ServeError::Engine(format!(
+                "未知迅雷身份档位 '{tier_name}'（可用: web/nas；env SMART_DL_XUNLEI_TIER 或 [provider_xunlei] tier）"
+            ))
+        })?;
+        let xp = smart_dl_provider::xunlei::provider::XunleiProvider::with_tier(
+            "xunlei",
+            tp.clone(),
+            tier,
+        );
         let authenticated = xp.runtime().authenticated;
         providers.push(Arc::new(xp));
         tracing::info!(
-            "迅雷云盘 Provider 已装配: token_path={:?}, authenticated={}",
+            "迅雷云盘 Provider 已装配: tier={}, token_path={:?}, authenticated={}",
+            tier.name,
             tp,
             authenticated
         );
     }
     #[cfg(feature = "bt")]
-    let mut state =
-        DaemonState::new(http_engine, providers).with_dest_root(cfg.download.dest_root.clone());
+    let mut state = DaemonState::new(http_engine, providers)
+        .with_dest_root(cfg.download.dest_root.clone())
+        .with_http_token(http_token.clone())
+        .with_disk_precheck_strict(cfg.download.disk_precheck_strict);
     #[cfg(not(feature = "bt"))]
-    let mut state =
-        DaemonState::new(http_engine, providers).with_dest_root(cfg.download.dest_root.clone());
+    let mut state = DaemonState::new(http_engine, providers)
+        .with_dest_root(cfg.download.dest_root.clone())
+        .with_http_token(http_token.clone())
+        .with_disk_precheck_strict(cfg.download.disk_precheck_strict);
 
     // 4. BT 引擎（先取 core 句柄，供 alert 事件流）
     #[cfg(feature = "bt")]
@@ -119,16 +137,18 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
             let save = cfg.bt_save_path();
             std::fs::create_dir_all(&save)
                 .map_err(|e| ServeError::Engine(format!("BT 落盘目录创建失败 {save:?}: {e}")))?;
-            let bt = Arc::new(crate::bt::BtEngine::new(
-                &save,
-                Some(cfg.download.proxy.as_str()),
-                cfg.download.max_download_kb_s,
-                cfg.bt.max_upload_kb_s,
-                cfg.bt.enable_dht,
-                cfg.bt.enable_lsd,
-                cfg.bt.enable_upnp,
-            )
-            .map_err(ServeError::Engine)?);
+            let bt = Arc::new(
+                crate::bt::BtEngine::new(
+                    &save,
+                    Some(cfg.download.proxy.as_str()),
+                    cfg.download.max_download_kb_s,
+                    cfg.bt.max_upload_kb_s,
+                    cfg.bt.enable_dht,
+                    cfg.bt.enable_lsd,
+                    cfg.bt.enable_upnp,
+                )
+                .map_err(ServeError::Engine)?,
+            );
             let core = bt.core(); // Arc<BtCore>：alert 轮询句柄（trait 化前保存）
             bt_typed = Some(bt.clone()); // Bug A：alert 循环的暂停意图压制句柄
             let bt_arc: Arc<dyn smart_dl_core::types::DownloadEngine> = bt.clone();
@@ -193,6 +213,25 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
             Arc::new(smart_dl_httpdl::FtpEngine::new());
         state = state.with_ftp(ftp_engine);
         tracing::info!("FTP 引擎已启用");
+    }
+
+    // 4e. NAS 引擎身份桥（feature `nas`，B-3 统一身份层）：L1 登录态存在时
+    // 自动同步为 xllite 引擎预置 token（免扫码启动；格式校准=假设区 #8）。
+    #[cfg(feature = "nas")]
+    {
+        let l1_path =
+            std::env::var("SD_L1_TOKEN").unwrap_or_else(|_| "xunlei_auth.json".to_string());
+        let l1 = std::path::PathBuf::from(&l1_path);
+        if l1.exists() {
+            match crate::nas::sync_l1_token(&l1).await {
+                Ok(p) => tracing::info!("L1→xllite 身份桥：token 已预置至 {}", p.display()),
+                Err(e) => tracing::warn!("L1→xllite 身份桥跳过：{e}"),
+            }
+        } else {
+            tracing::info!(
+                "NAS 身份桥：L1 token 不存在（{l1_path}），引擎首次启动需扫码或 /nas/token 投喂"
+            );
+        }
     }
 
     // 4b. 任务持久化 + 启动恢复（须在引擎表就绪后：恢复会重新 add）
@@ -279,34 +318,6 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         let _ = tx.send(());
     });
 
-    // BUGB-INSTR（临时诊断，修复后移除）：纯 sleep 心跳——若此日志停更，
-    // 说明 tokio runtime 已无可调度 worker（全被同步阻塞调用钉死）。
-    {
-        let t0 = std::time::Instant::now();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(2)).await;
-                tracing::info!("[bugb] watchdog alive uptime_ms={}", t0.elapsed().as_millis());
-            }
-        });
-    }
-
-    // BUGB-INSTR（临时诊断，修复验证后移除）：OS 线程心跳 + tasks 锁探测——
-    // 与 tokio watchdog 互为对照：os-tick 停更 = 进程级冻结；os-tick 活而
-    // tasks_free=false = tasks Mutex 被长期持有且 tokio worker 全数饿死。
-    {
-        let st2 = state_arc.clone();
-        let t0 = std::time::Instant::now();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(Duration::from_millis(300));
-            tracing::debug!(
-                "[bugb] os-tick alive_ms={} tasks_free={}",
-                t0.elapsed().as_millis(),
-                st2.debug_try_lock_tasks()
-            );
-        });
-    }
-
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = rx.await;
@@ -321,6 +332,17 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     }
 
     Ok(())
+}
+
+/// 解析生效 HTTP token（第六轮 9.3.5）：env `SMART_DL_HTTP_TOKEN`（空串视为未设）
+/// > config `[server] http_token`；值为 `auto` → 生成强随机临时 token
+/// （uuid v4，122 位随机，getrandom 支撑），`generated=true` 由调用方负责打印。
+fn resolve_http_token(env_val: Option<String>, cfg_val: Option<String>) -> (Option<String>, bool) {
+    let raw = env_val.filter(|t| !t.is_empty()).or(cfg_val);
+    match raw.as_deref() {
+        Some("auto") => (Some(uuid::Uuid::new_v4().simple().to_string()), true),
+        _ => (raw, false),
+    }
 }
 
 /// 从代理 URL 提取 `user:pass@`（HTTP 引擎 reqwest basic_auth 用；BT 引擎由
@@ -355,6 +377,33 @@ pub fn parse_args(args: &[String]) -> Result<Option<std::path::PathBuf>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolve_http_token_env_priority_and_auto() {
+        // env 优先于 config
+        let (t, gen) = resolve_http_token(Some("env-tok".into()), Some("cfg-tok".into()));
+        assert_eq!(t.as_deref(), Some("env-tok"));
+        assert!(!gen);
+        // env 空串视为未设 → 回落 config
+        let (t, gen) = resolve_http_token(Some(String::new()), Some("cfg-tok".into()));
+        assert_eq!(t.as_deref(), Some("cfg-tok"));
+        assert!(!gen);
+        // auto → 生成强随机值（非 "auto" 字面量），generated 标记
+        let (t1, gen) = resolve_http_token(Some("auto".into()), None);
+        assert!(gen);
+        assert_ne!(t1.as_deref(), Some("auto"));
+        assert_eq!(t1.as_deref().map(str::len), Some(32)); // uuid simple = 32 hex
+                                                           // 两次生成互不相同
+        let (t2, _) = resolve_http_token(Some("auto".into()), None);
+        assert_ne!(t1, t2);
+        // config 值为 auto 同样触发生成
+        let (_, gen) = resolve_http_token(None, Some("auto".into()));
+        assert!(gen);
+        // 双 None → 无 token（回环兼容模式）
+        let (t, gen) = resolve_http_token(None, None);
+        assert!(t.is_none());
+        assert!(!gen);
+    }
 
     #[test]
     fn parse_config_flag() {

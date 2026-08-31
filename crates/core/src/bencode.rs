@@ -31,7 +31,15 @@ pub enum DecodeError {
 
     #[error("invalid integer at position {0}")]
     InvalidInt(usize),
+
+    #[error("nesting depth exceeds limit {0} at position {1}")]
+    TooDeep(usize, usize),
 }
+
+/// 安全修复（V4）：bencode 解析递归深度上限。
+/// 无上限递归会被恶意种子（`l`×10万）直接打成栈溢出 abort 整个进程
+/// （Rust 栈溢出不可 catch_unwind）。正常 bencode 嵌套极少超过 10 层。
+const MAX_DEPTH: usize = 64;
 
 /// Encode a `Value` into its bencode byte representation.
 pub fn encode(v: &Value) -> Vec<u8> {
@@ -107,12 +115,19 @@ pub fn decode(data: &[u8]) -> Result<Value, DecodeError> {
 }
 
 fn decode_at(data: &[u8], pos: usize) -> Result<(Value, usize), DecodeError> {
+    decode_at_d(data, pos, 0)
+}
+
+fn decode_at_d(data: &[u8], pos: usize, depth: usize) -> Result<(Value, usize), DecodeError> {
+    if depth > MAX_DEPTH {
+        return Err(DecodeError::TooDeep(MAX_DEPTH, pos));
+    }
     let c = byte_at(data, pos)?;
     match c {
         b'i' => decode_int(data, pos),
         b'0'..=b'9' => decode_bytes(data, pos),
-        b'l' => decode_list(data, pos),
-        b'd' => decode_dict(data, pos),
+        b'l' => decode_list_d(data, pos, depth),
+        b'd' => decode_dict_d(data, pos, depth),
         _ => Err(DecodeError::InvalidByte(c, pos)),
     }
 }
@@ -176,11 +191,11 @@ fn decode_bytes(data: &[u8], pos: usize) -> Result<(Value, usize), DecodeError> 
     Ok((Value::Bytes(data[start..start + len].to_vec()), start + len))
 }
 
-fn decode_list(data: &[u8], pos: usize) -> Result<(Value, usize), DecodeError> {
+fn decode_list_d(data: &[u8], pos: usize, depth: usize) -> Result<(Value, usize), DecodeError> {
     let mut items = Vec::new();
     let mut pos = pos + 1;
     while pos < data.len() && data[pos] != b'e' {
-        let (v, next) = decode_at(data, pos)?;
+        let (v, next) = decode_at_d(data, pos, depth + 1)?;
         items.push(v);
         pos = next;
     }
@@ -190,11 +205,11 @@ fn decode_list(data: &[u8], pos: usize) -> Result<(Value, usize), DecodeError> {
     Ok((Value::List(items), pos + 1))
 }
 
-fn decode_dict(data: &[u8], pos: usize) -> Result<(Value, usize), DecodeError> {
+fn decode_dict_d(data: &[u8], pos: usize, depth: usize) -> Result<(Value, usize), DecodeError> {
     let mut items = Vec::new();
     let mut pos = pos + 1;
     while pos < data.len() && data[pos] != b'e' {
-        let (k, next) = decode_at(data, pos)?;
+        let (k, next) = decode_at_d(data, pos, depth + 1)?;
         let k = match k {
             Value::Bytes(b) => b,
             _ => return Err(DecodeError::InvalidByte(b'd', pos)),
@@ -203,7 +218,7 @@ fn decode_dict(data: &[u8], pos: usize) -> Result<(Value, usize), DecodeError> {
         if pos >= data.len() {
             return Err(DecodeError::UnexpectedEof(pos));
         }
-        let (v, next) = decode_at(data, pos)?;
+        let (v, next) = decode_at_d(data, pos, depth + 1)?;
         items.push((k, v));
         pos = next;
     }
@@ -331,5 +346,38 @@ mod tests {
     #[test]
     fn decode_trailing_garbage_errors() {
         assert!(decode(b"i42ex").is_err());
+    }
+
+    // 安全回归（V4）：超深嵌套必须报 TooDeep 而非栈溢出。
+    #[test]
+    fn decode_excessive_nesting_rejected() {
+        // 10 万层嵌套 list：修复前会栈溢出 abort 进程，现在应优雅报错。
+        let mut data = vec![b'l'; 100_000];
+        data.extend(std::iter::repeat_n(b'e', 100_000));
+        match decode(&data) {
+            Err(DecodeError::TooDeep(_, _)) => {}
+            other => panic!("expected TooDeep, got {:?}", other.map(|_| "decoded")),
+        }
+    }
+
+    #[test]
+    fn decode_deep_but_legal_nesting_ok() {
+        // 上限 64 层以内正常解码（构造 60 层 dict 嵌套）。
+        let mut data = Vec::new();
+        for _ in 0..60 {
+            data.extend_from_slice(b"d1:k");
+        }
+        data.extend_from_slice(b"i1e");
+        for _ in 0..60 {
+            data.push(b'e');
+        }
+        assert!(decode(&data).is_ok());
+    }
+
+    #[test]
+    fn decode_excessive_dict_nesting_rejected() {
+        let mut data = vec![b'd'; 200];
+        data.extend(std::iter::repeat_n(b'e', 200));
+        assert!(matches!(decode(&data), Err(DecodeError::TooDeep(_, _))));
     }
 }

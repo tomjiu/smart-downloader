@@ -69,7 +69,7 @@ pub struct BtEngine {
     /// 暂停意图表（engine_tid → 上次采样 done）：lt auto_managed 队列会在
     /// metadata 到达后反复复活用户暂停的任务，单次压制无效——
     /// 改为持续执法：alert 循环周期性对比 done 增长，增长即再压（Bug A，调度层）。
-    pause_intents: std::sync::Mutex<std::collections::HashMap<String, u64>>,
+    pause_intents: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
 }
 
 impl BtEngine {
@@ -107,7 +107,7 @@ impl BtEngine {
         Ok(BtEngine {
             core: Arc::new(core),
             save_path: save_path.to_path_buf(),
-            pause_intents: std::sync::Mutex::new(std::collections::HashMap::new()),
+            pause_intents: parking_lot::Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -117,7 +117,7 @@ impl BtEngine {
 
     /// 暂停意图登记（true=登记并采样当前 done 基线；false=清除）。
     pub fn set_pause_intent(&self, id: &str, intended: bool) {
-        let mut m = self.pause_intents.lock().unwrap();
+        let mut m = self.pause_intents.lock();
         if intended {
             let done = self
                 .core
@@ -131,7 +131,7 @@ impl BtEngine {
     }
 
     pub fn pause_intended(&self, id: &str) -> bool {
-        self.pause_intents.lock().unwrap().contains_key(id)
+        self.pause_intents.lock().contains_key(id)
     }
 
     /// 持续执法：对每个带暂停意图的任务，每轮直接下发 pause。
@@ -139,11 +139,13 @@ impl BtEngine {
     /// 只要意图仍在，每 500ms 至少重压一次，真正把"保持暂停"从"检测后反应"
     /// 变成"持续压制"（Bug A 终局修复）。
     pub fn enforce_pauses(&self) {
-        let ids: Vec<String> = self.pause_intents.lock().unwrap().keys().cloned().collect();
+        let ids: Vec<String> = self.pause_intents.lock().keys().cloned().collect();
         for id in ids {
             let _ = self.core.pause(&id);
             if let Ok(st) = self.core.status(&id) {
-                self.pause_intents.lock().unwrap().insert(id.clone(), st.downloaded.max(0) as u64);
+                self.pause_intents
+                    .lock()
+                    .insert(id.clone(), st.downloaded.max(0) as u64);
             }
         }
     }
@@ -280,9 +282,8 @@ impl DownloadEngine for BtEngine {
             },
             _ => return Err(EngineError::Other("source is not bt".to_string())),
         };
-        ih.map_err(|e| EngineError::Other(core_err(&e))).map(|ih| {
-            ih
-        })
+        ih.map_err(|e| EngineError::Other(core_err(&e)))
+            .map(|ih| ih)
     }
 
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError> {
@@ -303,18 +304,11 @@ impl DownloadEngine for BtEngine {
     }
 
     async fn status(&self, id: &EngineTaskId) -> Result<EngineStatus, EngineError> {
-        let t0 = std::time::Instant::now(); // BUGB-INSTR
         // 会话内未注册的 infohash → NotFound（任务已移除/从未添加）。
-        let r = match self.core.status(id) {
+        match self.core.status(id) {
             Ok(st) => Ok(map_status(&st)),
             Err(_) => Err(EngineError::NotFound),
-        };
-        // BUGB-INSTR：status 正常极快，仅慢调用告警（内核阻塞探针）
-        let ms = t0.elapsed().as_millis();
-        if ms > 200 {
-            tracing::warn!("[bugb] bt::status SLOW ih={id} elapsed_ms={ms}");
         }
-        r
     }
 
     async fn remove(&self, id: &EngineTaskId, delete_data: bool) -> Result<(), EngineError> {
@@ -368,7 +362,11 @@ impl DownloadEngine for BtEngine {
             .map_err(|e| EngineError::Other(core_err(&e)))
     }
 
-    async fn add_peer(&self, id: &EngineTaskId, peer: std::net::SocketAddr) -> Result<(), EngineError> {
+    async fn add_peer(
+        &self,
+        id: &EngineTaskId,
+        peer: std::net::SocketAddr,
+    ) -> Result<(), EngineError> {
         self.core
             .add_peer(id, &peer.ip().to_string(), peer.port())
             .map_err(|e| EngineError::Other(core_err(&e)))

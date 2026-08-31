@@ -15,13 +15,14 @@ use crate::types::{
     ProviderError, ProviderRuntime, ProviderStatus, ProviderTaskId, ResolvedRemoteFile,
 };
 use crate::RemoteProvider;
+use parking_lot::Mutex;
 use smart_dl_core::types::{Capability, DownloadSource};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 
-use super::client::{SaveTaskState, QuarkClient};
+use super::client::{QuarkClient, SaveTaskState};
 use super::types::{load_auth, save_auth, QuarkAuth, QuarkError};
 
 /// 解析后的夸克分享链接：`https://pan.quark.cn/s/<pwd_id>`（提取码可选）。
@@ -123,15 +124,15 @@ impl QuarkProvider {
     }
 
     fn set_backoff(&self, duration: std::time::Duration) {
-        *self.backoff_until.lock().unwrap() = Some(std::time::Instant::now() + duration);
+        *self.backoff_until.lock() = Some(std::time::Instant::now() + duration);
     }
 
     fn clear_backoff(&self) {
-        *self.backoff_until.lock().unwrap() = None;
+        *self.backoff_until.lock() = None;
     }
 
     fn backoff_remaining(&self) -> Option<std::time::Duration> {
-        self.backoff_until.lock().unwrap().and_then(|until| {
+        self.backoff_until.lock().and_then(|until| {
             let remaining = until.saturating_duration_since(std::time::Instant::now());
             (!remaining.is_zero()).then_some(remaining)
         })
@@ -189,7 +190,9 @@ impl QuarkProvider {
             .map(|f| f.fid.clone())
             .collect();
         if fids.is_empty() {
-            return Err(ProviderError::Other("quark share has no files at root".into()));
+            return Err(ProviderError::Other(
+                "quark share has no files at root".into(),
+            ));
         }
         let save_task_id = self
             .client
@@ -197,10 +200,10 @@ impl QuarkProvider {
             .await
             .map_err(ProviderError::from)?;
         let pid = format!("{}-{}", self.name, link.pwd_id);
-        self.tasks.lock().await.insert(
-            pid.clone(),
-            QuarkTaskHandle { save_task_id, fids },
-        );
+        self.tasks
+            .lock()
+            .await
+            .insert(pid.clone(), QuarkTaskHandle { save_task_id, fids });
         Ok(pid)
     }
 }
@@ -311,7 +314,11 @@ impl RemoteProvider for QuarkProvider {
                 .into_iter()
                 .filter(|l| !l.url.is_empty())
                 .map(|l| ResolvedRemoteFile {
-                    rel_path: if l.file_name.is_empty() { l.fid.clone() } else { l.file_name },
+                    rel_path: if l.file_name.is_empty() {
+                        l.fid.clone()
+                    } else {
+                        l.file_name
+                    },
                     url: l.url,
                     size: l.size,
                     etag: None,
@@ -323,7 +330,11 @@ impl RemoteProvider for QuarkProvider {
     }
 
     async fn remove(&self, id: &ProviderTaskId) -> Result<(), ProviderError> {
-        self.tasks.lock().await.remove(id).ok_or(ProviderError::NotFound)?;
+        self.tasks
+            .lock()
+            .await
+            .remove(id)
+            .ok_or(ProviderError::NotFound)?;
         Ok(())
     }
 
@@ -372,7 +383,8 @@ mod tests {
         assert_eq!(l2.passcode, "6666");
 
         // fragment 内带提取码的形状
-        let l3 = parse_share_link("https://pan.quark.cn/s/xy99?entry=1#/list/share?pwd=8888").unwrap();
+        let l3 =
+            parse_share_link("https://pan.quark.cn/s/xy99?entry=1#/list/share?pwd=8888").unwrap();
         assert_eq!(l3.pwd_id, "xy99");
         assert_eq!(l3.passcode, "8888");
 
@@ -396,7 +408,10 @@ mod tests {
     }
 
     fn err_envelope(status: i64, message: &str) -> (StatusCode, Json<Value>) {
-        (StatusCode::OK, Json(json!({"status": status, "code": status, "message": message})))
+        (
+            StatusCode::OK,
+            Json(json!({"status": status, "code": status, "message": message})),
+        )
     }
 
     fn has_cookie(headers: &HeaderMap) -> bool {
@@ -414,7 +429,10 @@ mod tests {
     ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
         st.calls.fetch_add(1, Ordering::Relaxed);
         if !has_cookie(&headers) || st.fail_auth {
-            return Err((StatusCode::UNAUTHORIZED, Json(json!({"message": "login required"}))));
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"message": "login required"})),
+            ));
         }
         if st.share_expired || body["pwd_id"] == "expired" {
             return Err(err_envelope(41008, "分享已失效"));
@@ -427,7 +445,10 @@ mod tests {
         headers: HeaderMap,
     ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
         if !has_cookie(&headers) {
-            return Err((StatusCode::UNAUTHORIZED, Json(json!({"message": "login required"}))));
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"message": "login required"})),
+            ));
         }
         if st.share_expired {
             return Err(err_envelope(41008, "分享已失效"));
@@ -443,7 +464,10 @@ mod tests {
         headers: HeaderMap,
     ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
         if !has_cookie(&headers) {
-            return Err((StatusCode::UNAUTHORIZED, Json(json!({"message": "login required"}))));
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"message": "login required"})),
+            ));
         }
         Ok(ok_envelope(json!({"task_id": "T-1"})))
     }
@@ -459,13 +483,18 @@ mod tests {
         Json(body): Json<Value>,
     ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
         if !has_cookie(&headers) {
-            return Err((StatusCode::UNAUTHORIZED, Json(json!({"message": "login required"}))));
+            return Err((
+                StatusCode::UNAUTHORIZED,
+                Json(json!({"message": "login required"})),
+            ));
         }
         let fids = body["fids"].as_array().cloned().unwrap_or_default();
         let links: Vec<Value> = fids
             .iter()
-            .map(|f| json!({"fid": f, "file_name": "setup.zip", "size": 1024u64,
-                            "download_url": "https://dl-mock.quark.cn/file/setup.zip?e=999"}))
+            .map(|f| {
+                json!({"fid": f, "file_name": "setup.zip", "size": 1024u64,
+                            "download_url": "https://dl-mock.quark.cn/file/setup.zip?e=999"})
+            })
             .collect();
         Ok(ok_envelope(Value::Array(links)))
     }
@@ -482,7 +511,12 @@ mod tests {
     }
 
     fn share_source(url: &str) -> DownloadSource {
-        DownloadSource::Http { url: url.into(), headers: vec![], auth: None, backup_url: None }
+        DownloadSource::Http {
+            url: url.into(),
+            headers: vec![],
+            auth: None,
+            backup_url: None,
+        }
     }
 
     async fn spawn_mock(st: MockState) -> (String, tokio::task::JoinHandle<()>) {
@@ -502,7 +536,9 @@ mod tests {
         let (base, server) = spawn_mock(MockState::default()).await;
         let dir = tempfile::tempdir().unwrap();
         let p = QuarkProvider::with_base("quark", dir.path().join("cookie.json"), base);
-        p.set_cookie("__pus=valid; __puus=ok".into(), "u1".into()).await.unwrap();
+        p.set_cookie("__pus=valid; __puus=ok".into(), "u1".into())
+            .await
+            .unwrap();
 
         // runtime：已登录、可选
         let rt = p.runtime();
@@ -529,7 +565,10 @@ mod tests {
 
         // remove 后句柄消失
         p.remove(&pid).await.unwrap();
-        assert!(matches!(p.resolve(&pid).await, Err(ProviderError::NotFound)));
+        assert!(matches!(
+            p.resolve(&pid).await,
+            Err(ProviderError::NotFound)
+        ));
         server.abort();
     }
 
@@ -557,10 +596,16 @@ mod tests {
 
     #[tokio::test]
     async fn share_expired_classified_and_backoff() {
-        let (base, server) = spawn_mock(MockState { share_expired: true, ..Default::default() }).await;
+        let (base, server) = spawn_mock(MockState {
+            share_expired: true,
+            ..Default::default()
+        })
+        .await;
         let dir = tempfile::tempdir().unwrap();
         let p = QuarkProvider::with_base("quark", dir.path().join("cookie.json"), base);
-        p.set_cookie("__pus=valid".into(), String::new()).await.unwrap();
+        p.set_cookie("__pus=valid".into(), String::new())
+            .await
+            .unwrap();
 
         let err = p
             .submit(&share_source("https://pan.quark.cn/s/expired"))
@@ -587,8 +632,13 @@ mod tests {
         let (base, server) = spawn_mock(MockState::default()).await;
         let dir = tempfile::tempdir().unwrap();
         let p = QuarkProvider::with_base("quark", dir.path().join("cookie.json"), base);
-        p.set_cookie("__pus=valid".into(), String::new()).await.unwrap();
-        let err = p.submit(&share_source("https://example.com/file.zip")).await.unwrap_err();
+        p.set_cookie("__pus=valid".into(), String::new())
+            .await
+            .unwrap();
+        let err = p
+            .submit(&share_source("https://example.com/file.zip"))
+            .await
+            .unwrap_err();
         assert!(err.to_string().contains("not a quark share link"));
         server.abort();
     }

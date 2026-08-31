@@ -9,7 +9,8 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, State,
     },
-    http::StatusCode,
+    http::{header, StatusCode},
+    middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -620,6 +621,29 @@ macro_rules! router_base {
     };
 }
 
+/// 安全修复（V1/V13，CWE-306）：HTTP API 认证中间件——覆盖全部路由（含 /ws
+/// 升级握手与 NAS 代理）。未配置 token 时放行（serve 启动检查已保证该模式
+/// 仅回环可达）；已配置时非 Bearer 匹配一律 401。
+async fn auth_mw(
+    State(state): State<Arc<DaemonState>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    let authorization = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if state.verify_http_token(authorization) {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized: 需要 Authorization: Bearer <token>" })),
+        )
+            .into_response()
+    }
+}
+
 #[cfg(feature = "nas")]
 macro_rules! router_nas {
     ($app:expr) => {
@@ -646,12 +670,15 @@ macro_rules! router_nas {
 pub fn router(state: Arc<DaemonState>) -> Router {
     router_nas!(router_base!(Router::new()))
         .route("/tasks/xunlei-import", post(add_xunlei_import))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
         .with_state(state)
 }
 
 #[cfg(not(feature = "xunlei-import"))]
 pub fn router(state: Arc<DaemonState>) -> Router {
-    router_nas!(router_base!(Router::new())).with_state(state)
+    router_nas!(router_base!(Router::new()))
+        .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
+        .with_state(state)
 }
 
 /// ===== NAS 引擎管理端点（feature nas）=====
@@ -669,13 +696,25 @@ async fn nas_install(
     req: Option<Json<NasInstallReq>>,
 ) -> Response {
     use nas::NasError;
-    let mgr = nas::manager();
+    // 安全修复（V8，CWE-759/UB）：API 请求不得写入进程环境变量——多线程
+    // set_var 是 UB，且无认证调用方可借它把 SPK 解包源指向任意路径（联动 V5）。
+    // SPK 路径只能经启动期环境变量 SD_NAS_SPK 配置；请求值与生效配置不一致 → 409。
     if let Some(Json(r)) = req {
         if let Some(p) = r.spk_path {
-            std::env::set_var("SD_NAS_SPK", p);
-            // manager 已初始化则此赋值不生效；首次调用前设置生效。此处仅透传提示。
+            let configured = std::env::var("SD_NAS_SPK").unwrap_or_default();
+            if configured != p {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": "spk_path 仅支持启动期配置（环境变量 SD_NAS_SPK），API 运行时变更已禁用（安全修复 V8）"
+                    })),
+                )
+                    .into_response();
+            }
         }
     }
+    let mgr = nas::manager();
     match mgr.install().await {
         Ok(info) => Json(serde_json::json!({
             "ok": true,
@@ -684,7 +723,8 @@ async fn nas_install(
             "engine": info.engine,
         }))
         .into_response(),
-        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e)) => (
+        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e))
+        | Err(NasError::Token(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": e })),
         )
@@ -697,7 +737,8 @@ async fn nas_start(State(_): State<Arc<DaemonState>>) -> Response {
     use nas::NasError;
     match nas::manager().start().await {
         Ok(pid) => Json(serde_json::json!({ "ok": true, "pid": pid })).into_response(),
-        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e)) => (
+        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e))
+        | Err(NasError::Token(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": e })),
         )
@@ -731,7 +772,8 @@ async fn nas_token(
     use nas::NasError;
     match nas::put_auth_token(nas::manager(), &req.token_json).await {
         Ok(p) => Json(serde_json::json!({ "ok": true, "path": p })).into_response(),
-        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e)) => (
+        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e))
+        | Err(NasError::Token(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": e })),
         )

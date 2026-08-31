@@ -12,11 +12,13 @@ pub mod login_page;
 pub mod provider;
 pub mod share;
 pub mod sign;
+pub mod tier;
 pub mod url_class;
 pub mod vip_speedup;
 
 pub use client::{device_code_qr_url, DEVICE_CLIENT_ID};
 pub use login_flow::{LoginMode, DeviceSession};
+pub use tier::{tier_authorize_url, Tier, ALL_TIERS, TIER_NAS, TIER_WEB};
 
 pub use hash::{bcid, cid, gcid};
 pub use share::{parse_share_link, ResolvedLink, SharedFile, SharedLink, Sharer, ShareError};

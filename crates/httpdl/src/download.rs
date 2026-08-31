@@ -5,10 +5,11 @@
 use crate::rate::RateLimiter;
 use crate::segment_manager::SegmentManager;
 use crate::static_split::segment_count;
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Mirror 评分 clamp 边界（防单个坏源被无限惩罚/好源无限膨胀）。
 const SCORE_MAX: i64 = 4;
@@ -53,7 +54,7 @@ pub async fn download_dynamic(
         workers.spawn(async move {
             loop {
                 let seg = {
-                    let mut m = manager.lock().unwrap();
+                    let mut m = manager.lock();
                     match m.take_segment() {
                         Some(s) => s,
                         None => return Ok::<(), String>(()),
@@ -83,7 +84,7 @@ pub async fn download_dynamic(
                         seg.start, seg.end
                     ));
                 }
-                manager.lock().unwrap().complete(seg);
+                manager.lock().complete(seg);
             }
         });
     }
@@ -106,7 +107,7 @@ pub async fn download_dynamic(
 
 /// 更新 mirror 评分（成功 +delta / 失败惩罚，clamp [SCORE_MIN, SCORE_MAX]）。
 fn update_score(scores: &Mutex<HashMap<String, i64>>, url: &str, delta: i64) {
-    let mut m = scores.lock().unwrap();
+    let mut m = scores.lock();
     let s = m.entry(url.to_string()).or_insert(0);
     *s = (*s + delta).clamp(SCORE_MIN, SCORE_MAX);
 }

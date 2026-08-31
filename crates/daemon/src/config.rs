@@ -22,6 +22,11 @@ pub struct Config {
 pub struct ServerCfg {
     /// HTTP/WS 监听地址，如 `127.0.0.1:8787`。
     pub addr: String,
+    /// 安全修复（V1/V13）：HTTP API Bearer token。配置后全端点（含 /ws 握手）
+    /// 要求 `Authorization: Bearer <token>`；未配置时：回环监听放行（本机 CLI
+    /// 兼容），**非回环监听拒绝启动**（fail-closed，防 0.0.0.0 裸奔）。
+    /// 不参与热重载（避免认证态中途抖动）。敏感项：不出现在 `/config` 快照。
+    pub http_token: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -35,6 +40,9 @@ pub struct DownloadCfg {
     pub proxy: String,
     /// 全局下载限速（KiB/s，HTTP + BT 共用）；0 = 不限。启动时生效。
     pub max_download_kb_s: u32,
+    /// 安全修复（V10-2）：磁盘预检严格模式——true = 磁盘可用空间不可探测时
+    /// 拒绝入队（防预检被绕过后续盘写满）；false（默认）= 告警 + 放行（旧行为）。
+    pub disk_precheck_strict: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -87,6 +95,9 @@ pub struct ProviderXunleiCfg {
     /// 登录态 JSON 路径（examples 会写入；daemon 只读加载 + 续期回写）。
     /// 缺省时 daemon 用 `xunlei_auth.json`。
     pub token_path: Option<PathBuf>,
+    /// 身份档位（P1-1）：`web`（默认）/ `nas`；未知档拒绝启动。
+    /// 环境变量 `SMART_DL_XUNLEI_TIER` 优先于此字段（部署覆盖友好）。
+    pub tier: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -108,11 +119,13 @@ impl Default for Config {
         Config {
             server: ServerCfg {
                 addr: "127.0.0.1:8787".into(),
+                http_token: None,
             },
             download: DownloadCfg {
                 dest_root: PathBuf::from("./downloads"),
                 proxy: String::new(),
                 max_download_kb_s: 0,
+                disk_precheck_strict: false,
             },
             bt: BtCfg {
                 enabled: true,
@@ -148,6 +161,17 @@ impl Config {
         toml::from_str(&text).map_err(|e| format!("配置解析失败 {p:?}: {e}"))
     }
 
+    /// 判定 addr 是否仅绑定回环地址（127.x/::1/localhost）。
+    /// serve 启动检查用：非回环 + 无 http_token → 拒绝启动（V1 fail-closed）。
+    pub fn is_loopback_addr(addr: &str) -> bool {
+        let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host == "localhost"
+            || host.starts_with("127.")
+            || host == "::1"
+            || host == "[::1]"
+    }
+
     /// BT 实际落盘目录（save_path 或默认 dest_root）。
     pub fn bt_save_path(&self) -> PathBuf {
         self.bt
@@ -164,6 +188,17 @@ impl Config {
             .unwrap_or_else(|| self.download.dest_root.clone())
     }
 
+    /// 解析迅雷身份档位名（P1-1）：env `SMART_DL_XUNLEI_TIER` > config > web。
+    /// 只返回名字字符串；合法性校验归 serve（需要报错上下文）。
+    pub fn resolve_xunlei_tier_name(&self) -> String {
+        std::env::var("SMART_DL_XUNLEI_TIER")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.provider_xunlei.tier.clone())
+            .unwrap_or_else(|| "web".to_string())
+    }
+
     /// 精简配置快照（`GET /config` 返回；不含敏感项——proxy 可能带凭据故隐藏；
     /// serve 注入 + 热重载共用）。
     pub fn snapshot_json(&self, tasks_path: &std::path::Path) -> serde_json::Value {
@@ -176,12 +211,22 @@ impl Config {
             "bt_enable_upnp": self.bt.enable_upnp,
             "xunlei_enabled": self.xunlei.enabled,
             "listen_addr": self.server.addr,
+            // 安全修复（V1）：仅暴露是否启用认证（布尔），token 本身绝不出快照
+            "http_token_enabled": self
+                .server
+                .http_token
+                .as_deref()
+                .map(|t| !t.is_empty())
+                .unwrap_or(false),
             "persist_path": tasks_path,
             "max_download_kb_s": self.download.max_download_kb_s,
+            "disk_precheck_strict": self.download.disk_precheck_strict,
             "max_upload_kb_s": self.bt.max_upload_kb_s,
             "proxy_enabled": !self.download.proxy.is_empty(),
             "provider_enabled": self.provider.enabled,
             "provider_xunlei_enabled": self.provider_xunlei.enabled,
+            // 身份档位名（非敏感；无 token 布尔那样有路径泄露风险）。
+            "provider_xunlei_tier": self.resolve_xunlei_tier_name(),
             // 仅暴露「登录态文件是否存在」布尔，不泄露路径字符串本身。
             "provider_xunlei_token_exists": self
                 .provider_xunlei
@@ -196,6 +241,31 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn http_token_not_in_snapshot() {
+        // 安全回归（V1）：快照只给布尔，绝不泄露 token 本身
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(&p, "[server]\nhttp_token = \"s3cret\"\n").unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert_eq!(c.server.http_token.as_deref(), Some("s3cret"));
+        let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap["http_token_enabled"], true);
+        let raw = snap.to_string();
+        assert!(!raw.contains("s3cret"), "token 不得出现在快照: {raw}");
+    }
+
+    #[test]
+    fn loopback_addr_detection() {
+        assert!(Config::is_loopback_addr("127.0.0.1:8787"));
+        assert!(Config::is_loopback_addr("127.9.1.1:80"));
+        assert!(Config::is_loopback_addr("localhost:8787"));
+        assert!(Config::is_loopback_addr("[::1]:8787"));
+        assert!(!Config::is_loopback_addr("0.0.0.0:8787"));
+        assert!(!Config::is_loopback_addr("192.168.1.5:8787"));
+        assert!(!Config::is_loopback_addr(":::8787"));
+    }
 
     #[test]
     fn default_values() {
@@ -359,6 +429,33 @@ path = "/tmp/sd.lock"
         let snap2 = c2.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
         assert_eq!(snap2["provider_xunlei_enabled"], true);
         assert_eq!(snap2["provider_xunlei_token_exists"], false);
+    }
+
+    #[test]
+    fn provider_xunlei_tier_parsing_and_precedence() {
+        // P1-1：tier 字段解析 + env 覆盖 + 默认 web。
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "[provider_xunlei]\nenabled = true\ntier = \"nas\"\n").unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert_eq!(c.provider_xunlei.tier.as_deref(), Some("nas"));
+        // 无 env：config 生效
+        std::env::remove_var("SMART_DL_XUNLEI_TIER");
+        assert_eq!(c.resolve_xunlei_tier_name(), "nas");
+        // 快照暴露档位名（非敏感）
+        let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap["provider_xunlei_tier"], "nas");
+
+        // env 优先于 config
+        std::env::set_var("SMART_DL_XUNLEI_TIER", "web");
+        assert_eq!(c.resolve_xunlei_tier_name(), "web");
+        std::env::remove_var("SMART_DL_XUNLEI_TIER");
+
+        // 默认（无 config 无 env）= web
+        let d = Config::default();
+        assert_eq!(d.resolve_xunlei_tier_name(), "web");
+        let snap_d = d.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap_d["provider_xunlei_tier"], "web");
     }
 
     #[test]

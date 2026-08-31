@@ -40,6 +40,8 @@ smart-dl-provider = { path = "../provider" }
 smart-dl-btcore = { path = "../btcore", optional = true }
 xunlei-convert = { path = "../xunlei-convert", optional = true }
 anyhow = "1"
+parking_lot = { workspace = true }
+uuid = { workspace = true }
 qrcode = "0.14" # 终端二维码（xunlei-login --qr）
 
 [dev-dependencies]

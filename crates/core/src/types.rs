@@ -35,6 +35,87 @@ pub enum Auth {
     Bearer(String),
 }
 
+/// 安全修复（V6，CWE-532）：敏感 query 参数名（值替换为 `***`）。
+const SENSITIVE_QUERY_KEYS: &[&str] = &[
+    "token", "key", "sign", "sig", "signature", "auth", "pwd", "password", "passwd", "secret",
+];
+
+/// 剥 URL userinfo（`scheme://user:pass@host` → `scheme://***@host`）并把敏感
+/// query 参数值替换为 `***`。用于日志/快照等对外展示面，替代 `{:?}` 直通。
+pub fn redact_url(url: &str) -> String {
+    let (scheme_rest, has_scheme) = match url.split_once("://") {
+        Some((_, r)) => (r, true),
+        None => (url, false),
+    };
+    // 1) userinfo：只取最后一个 '@' 之前的部分（userinfo 内不会出现 '/'）
+    let (host_part, query_part) = match scheme_rest.split_once(['?', '#']) {
+        Some((h, rest)) => (h, Some(rest)),
+        None => (scheme_rest, None),
+    };
+    let host_part = match host_part.rsplit_once('@') {
+        Some((_, h)) => format!("***@{h}"),
+        None => host_part.to_string(),
+    };
+    let mut out = String::with_capacity(url.len() + 8);
+    if has_scheme {
+        // 保留原 scheme（含长度）；直接从原文取 scheme:// 前缀
+        let idx = url.find("://").unwrap();
+        out.push_str(&url[..idx + 3]);
+    }
+    out.push_str(&host_part);
+    if let Some(q) = query_part {
+        // 分隔符（? 或 #）保留原样：从原文找第一个 '?'/'#' 的位置
+        let sep_idx = scheme_rest.find(['?', '#']).unwrap();
+        let sep = scheme_rest[sep_idx..].chars().next().unwrap();
+        out.push(sep);
+        let q = q.split('#').next().unwrap_or(q); // 丢弃 fragment
+        let parts: Vec<String> = q
+            .split('&')
+            .map(|kv| match kv.split_once('=') {
+                Some((k, _)) if SENSITIVE_QUERY_KEYS.contains(&k.to_ascii_lowercase().as_str()) => {
+                    format!("{k}=***")
+                }
+                _ => kv.to_string(),
+            })
+            .collect();
+        out.push_str(&parts.join("&"));
+    }
+    out
+}
+
+impl DownloadSource {
+    /// 安全修复（V6）：脱敏 Debug 视图，替代 `format!("{:?}", source)` 直通——
+    /// HTTP headers 值（可含 Cookie/Authorization）、auth 字段、FTP 密码与
+    /// 链接 userinfo/敏感 query 全部替换为 `[REDACTED]`/`***`。
+    pub fn redacted_debug(&self) -> String {
+        match self {
+            DownloadSource::Http {
+                url,
+                headers,
+                auth,
+                backup_url,
+            } => format!(
+                "Http {{ url: {:?}, headers: {:?}, auth: {}, backup_url: {} }}",
+                redact_url(url),
+                headers.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
+                if auth.is_some() { "Some([REDACTED])" } else { "None" },
+                backup_url
+                    .as_deref()
+                    .map(|u| format!("Some({:?})", redact_url(u)))
+                    .unwrap_or_else(|| "None".into()),
+            ),
+            DownloadSource::Ftp { url, user, .. } => format!(
+                "Ftp {{ url: {:?}, user: {:?}, pass: [REDACTED] }}",
+                redact_url(url),
+                user
+            ),
+            DownloadSource::Thunder(s) => format!("Thunder({:?})", redact_url(s)),
+            DownloadSource::XunleiShare(s) => format!("XunleiShare({:?})", redact_url(s)),
+            other => format!("{other:?}"),
+        }
+    }
+}
+
 /// 引擎能力位（§4）。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
 pub enum Capability {
@@ -66,6 +147,8 @@ pub enum EngineKind {
     Http,
     Ftp,
     Provider,
+    /// NAS 版迅雷引擎（xllite/pan-cli 远程托管，daemon feature `nas`，附录 E）。
+    XunleiNas,
 }
 
 /// 引擎任务句柄（v1 用引擎侧生成字符串 id）。
@@ -164,5 +247,59 @@ pub trait DownloadEngine: Send + Sync {
         Err(EngineError::Other(
             "add_xunlei_resume not supported by this engine".into(),
         ))
+    }
+}
+
+#[cfg(test)]
+mod redact_tests {
+    use super::*;
+
+    #[test]
+    fn redact_url_strips_userinfo() {
+        assert_eq!(
+            redact_url("ftp://alice:s3cret@host.example/file.bin"),
+            "ftp://***@host.example/file.bin"
+        );
+        assert_eq!(
+            redact_url("http://u:p@h/x?a=1&token=abc"),
+            "http://***@h/x?a=1&token=***"
+        );
+    }
+
+    #[test]
+    fn redact_url_masks_sensitive_query() {
+        assert_eq!(
+            redact_url("https://pan.example.com/s/xyz?pwd=8888&t=1"),
+            "https://pan.example.com/s/xyz?pwd=***&t=1"
+        );
+        // 无 scheme 的相对形态也要安全（保守不处理 userinfo）
+        assert_eq!(redact_url("/a?signature=zzz&b=2"), "/a?signature=***&b=2");
+    }
+
+    #[test]
+    fn redacted_debug_hides_http_credentials() {
+        let s = DownloadSource::Http {
+            url: "http://u:p@h/file".into(),
+            headers: vec![("Cookie".into(), "SESSION=xyz".into())],
+            auth: Some(Auth::Basic("a".into(), "b".into())),
+            backup_url: None,
+        };
+        let d = s.redacted_debug();
+        assert!(!d.contains("SESSION"), "headers 值不得出现: {d}");
+        assert!(!d.contains(":p@"), "userinfo 不得出现: {d}");
+        assert!(!d.contains("\"b\""), "auth 值不得出现: {d}");
+        assert!(d.contains("[REDACTED]"), "应含 REDACTED 标记: {d}");
+    }
+
+    #[test]
+    fn redacted_debug_hides_ftp_pass() {
+        let s = DownloadSource::Ftp {
+            url: "ftp://h/f".into(),
+            user: "u".into(),
+            pass: "topsecret".into(),
+        };
+        let d = s.redacted_debug();
+        assert!(!d.contains("topsecret"), "pass 不得出现: {d}");
+        assert!(d.contains("[REDACTED]"), "应含 REDACTED 标记: {d}");
     }
 }

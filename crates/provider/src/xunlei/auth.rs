@@ -159,7 +159,26 @@ pub fn save(path: &std::path::Path, state: &AuthState) -> std::io::Result<()> {
     }
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, &serialized)?;
-    std::fs::rename(&tmp, path)
+    // 安全修复（V7，CWE-312/732）：token 含 access/refresh 凭据，落盘必须 0600
+    // （rename 保留权限位）；存量宽松权限文件在写入时顺带收紧。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    // 存量修复：旧版本可能已用 0644 落盘过目标文件。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(md) = std::fs::metadata(path) {
+            let mode = md.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
