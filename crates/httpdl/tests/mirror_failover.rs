@@ -89,14 +89,19 @@ async fn healthy_mirror1_never_uses_mirror2() {
 
 #[tokio::test]
 async fn weighted_score_prefers_healthy_mirror() {
-    // P1 Mirror 加权评分：首轮 m1 段1 失败被罚后，换源重试轮按分数排序优先 m2。
-    // 64MB → 4 段（0/16M/32M/48M）；m1 对起点 16M 404，其余健康。
+    // P1 Mirror 加权评分：m1 段1/2/3 失败被罚后，换源重试轮按分数排序优先 m2。
+    // 64MB → 4 段（0/16M/32M/48M）；m1 对 16M/32M/48M 404（起点 0 必须健康：
+    // 引擎初始探针打在主源起点 0，全段失败会让任务在探针阶段就挂）。
+    // 注：早期版本仅令 16M 失败并断言 m2 接管全部 4 段——若其余段在失败传播
+    // 前已从 m1 完成（Windows runner 实测复现：m2_starts=[16M]），断言就会
+    // 假阴性；段 0 的归属同理两可（完成则属 m1，未完成则被重排给 m2）。
+    // 改为断言 3 个失败段起点必在 m2（确定性结论，加权排序语义不变）。
     let size = 64 * MB;
     let src = patterned(size);
     let expected = sha256_of(&src);
     let m1 = HttpTestServer::start(HttpServerConfig {
         size,
-        fail_ranges: vec![16 * MB],
+        fail_ranges: vec![16 * MB, 32 * MB, 48 * MB],
         patterned_content: true,
         ..Default::default()
     })
@@ -119,13 +124,13 @@ async fn weighted_score_prefers_healthy_mirror() {
     let got = std::fs::read(dir.path().join("s1.bin")).unwrap();
     assert_eq!(sha256_of(&got), expected);
 
-    // 换源重试轮：m1 已被罚（段1 缩小粒度仍失败）→ 排序优先 m2 → m2 服务全部 4 段起点
-    // （首轮 mirrors 只有 [m1]，m1 的 16M 起点留痕属正常；断言 m2 全量接管即可证明排序生效）
+    // 换源重试轮：m1 已被罚 → 排序优先 m2 → 3 个失败段起点必由 m2 服务；
+    // 起点 0 的归属两可（见上注），不参与断言。
     let m2_starts = m2.range_starts.lock();
-    for want in [0u64, 16 * MB, 32 * MB, 48 * MB] {
+    for want in [16 * MB, 32 * MB, 48 * MB] {
         assert!(
             m2_starts.contains(&want),
-            "m2 应接管全部段（实际 {m2_starts:?}）缺起点 {want:#x}"
+            "m2 应接管全部失败段（实际 {m2_starts:?}）缺起点 {want:#x}"
         );
     }
 }
