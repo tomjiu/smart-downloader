@@ -211,6 +211,12 @@ fn stale_magnet_scratch_cleanup_pid_and_mtime_guards() {
     http::cleanup_stale_magnet_scratch_with(std::time::Duration::ZERO);
     assert!(junk.exists(), "不可解析的名字不得删除");
 
+    // 同前缀的散文件（非目录异常残留）→ 兜底 remove_file
+    let stale_file = tmp.join("smart-dl-magnet-fetch-4294967291-7");
+    std::fs::write(&stale_file, b"x").unwrap();
+    http::cleanup_stale_magnet_scratch_with(std::time::Duration::ZERO);
+    assert!(!stale_file.exists(), "同前缀散文件残留应被兜底删除");
+
     // 清理测试自建工件（含被保留的两处）
     let _ = std::fs::remove_dir_all(&stale_foreign);
     let _ = std::fs::remove_dir_all(&active_current);

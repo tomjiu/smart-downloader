@@ -307,7 +307,14 @@ pub fn cleanup_stale_magnet_scratch_with(max_age: std::time::Duration) {
         if age < max_age {
             continue;
         }
-        let _ = std::fs::remove_dir_all(entry.path()); // best-effort
+        // best-effort：目录用 remove_dir_all；同前缀的散文件（异常残留）兜底
+        // remove_file——remove_dir_all 对普通文件会 ENOTDIR 失败。
+        let p = entry.path();
+        if p.is_dir() {
+            let _ = std::fs::remove_dir_all(&p);
+        } else {
+            let _ = std::fs::remove_file(&p);
+        }
     }
 }
 
