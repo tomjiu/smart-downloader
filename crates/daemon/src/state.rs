@@ -78,6 +78,10 @@ pub struct TaskSnapshot {
     /// 文件级进度（实时读引擎 status().files；单文件/无文件引擎为空数组）。
     /// FTP 目录任务与 BT 多文件任务在此处行为一致（都从引擎状态链透出）。
     pub files: Vec<FileProgress>,
+    /// 任务级限速配置（KiB/s；None = 未设置走全局）。set 语义见
+    /// `DaemonState::set_task_limits`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limits: Option<smart_dl_core::task::TaskLimits>,
 }
 
 /// 列表条目。
@@ -627,6 +631,19 @@ impl DaemonState {
             };
             match engine.add(&t).await {
                 Ok(tid) => {
+                    // 限速重放（best-effort）：恢复任务后把持久化的任务级限速
+                    // 重新下发引擎（原样传合并配置：BT 引擎 None 方向=不限的
+                    // 全量快照语义；HTTP 引擎 None up=no-op 不触发方向预拒）。
+                    // 失败仅记事件不阻断恢复（任务可用性优先）。
+                    let limits_replayed = match t.limits.clone() {
+                        Some(l) if !l.is_empty() => {
+                            match engine.set_limits(&tid, l.down_kb_s, l.up_kb_s).await {
+                                Ok(()) => None,
+                                Err(e) => Some(format!("限速重放失败: {e}")),
+                            }
+                        }
+                        _ => None,
+                    };
                     let mut rec = TaskRecord {
                         task: t,
                         engine_tid: Some(tid),
@@ -634,7 +651,11 @@ impl DaemonState {
                         engine_status: None,
                         events: vec![],
                     };
-                    rec.push_event("restored", None);
+                    if let Some(detail) = limits_replayed {
+                        rec.push_event("restored", Some(detail));
+                    } else {
+                        rec.push_event("restored", None);
+                    }
                     self.tasks.lock().insert(rec.task.id.clone(), rec);
                     restored += 1;
                 }
@@ -776,6 +797,7 @@ impl DaemonState {
                 name: None,
                 added_at_unix: 0,
             },
+            limits: None,
         };
 
         let engine_tid = self
@@ -868,6 +890,7 @@ impl DaemonState {
                 name: None,
                 added_at_unix: 0,
             },
+            limits: None,
         };
 
         let engine_tid = self
@@ -1086,6 +1109,7 @@ impl DaemonState {
                 name: Some(meta.name.clone()),
                 added_at_unix: 0,
             },
+            limits: None,
         };
         let mut rec = TaskRecord {
             task,
@@ -1184,6 +1208,7 @@ impl DaemonState {
                 name: None,
                 added_at_unix: 0,
             },
+            limits: None,
         };
 
         let engine_tid = self
@@ -1290,6 +1315,7 @@ impl DaemonState {
                 name: if is_dir { None } else { name },
                 added_at_unix: 0,
             },
+            limits: None,
         };
 
         let engine = self.engine_for(EngineKind::Ftp)?;
@@ -1377,6 +1403,7 @@ impl DaemonState {
             total: status.as_ref().map(|s| s.total).unwrap_or(0),
             error: status.as_ref().and_then(|s| s.error.clone()),
             files: status.as_ref().map(|s| s.files.clone()).unwrap_or_default(),
+            limits: rec.task.limits.clone(),
         })
     }
 
@@ -1463,6 +1490,66 @@ impl DaemonState {
             to: TaskState::Downloading(rec.engine_kind),
         });
         Ok(())
+    }
+
+    /// 任务级限速（P1 能力增强）。合并口径：请求中 `None` 的方向沿用既有值
+    /// （首设即不限）；引擎调用总拿到全量两方向（BT 引擎 None 方向按不限下发，
+    /// 避免 lt_set_limits 全量语义把已设方向清零）。
+    ///
+    /// - `Some(0)` = 该方向不限速；`Some(n)` = 上限 n KiB/s
+    /// - HTTP/FTP：仅 down 方向有意义（up → 引擎报错，HTTP 层映射 409/422）
+    /// - 合并结果持久化（tasks.json）并在恢复时重放；内存中即时生效
+    ///   （HTTP 引擎热调速率；BT 引擎 libtorrent per-torrent limit）
+    pub async fn set_task_limits(
+        &self,
+        id: &str,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<smart_dl_core::task::TaskLimits, DaemonError> {
+        let (engine, tid, merged) = {
+            let mut tasks = self.tasks.lock();
+            let rec = tasks
+                .get_mut(id)
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            let tid = rec
+                .engine_tid
+                .clone()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            // up 方向仅 BT 引擎有意义；其余引擎在此预拒（HTTP 层映射 409，
+            // 避免引擎层 Engine 错误被当成服务端 500）
+            if up_kb_s.is_some() && rec.engine_kind != EngineKind::Bt {
+                return Err(DaemonError::UnsupportedOp(format!(
+                    "任务 {id}（{:?}）无上传方向，up_kb_s 仅对 BT 任务有意义",
+                    rec.engine_kind
+                )));
+            }
+            let old = rec.task.limits.take().unwrap_or_default();
+            let merged = smart_dl_core::task::TaskLimits {
+                down_kb_s: down_kb_s.or(old.down_kb_s),
+                up_kb_s: up_kb_s.or(old.up_kb_s),
+            };
+            // 两方向均为空（从未设置且请求未带）→ 维持 None（快照不出噪声字段）
+            rec.task.limits = if merged.is_empty() {
+                None
+            } else {
+                Some(merged.clone())
+            };
+            rec.push_event(
+                "limits_changed",
+                Some(format!(
+                    "down={:?} up={:?}",
+                    merged.down_kb_s, merged.up_kb_s
+                )),
+            );
+            let engine = self.engine_for(rec.engine_kind)?;
+            (engine, tid, merged)
+        };
+        engine
+            .set_limits(&tid, merged.down_kb_s, merged.up_kb_s)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        self.autosave();
+        Ok(merged)
     }
 
     /// F5 P2SP：给运行中的 BT 任务逐条注入 web seed（云盘直链，BEP-19），
@@ -1709,6 +1796,7 @@ impl HttpSink for FallbackSink {
                 name,
                 added_at_unix: 0,
             },
+            limits: None,
         };
         let tid = self
             .http
@@ -2282,6 +2370,7 @@ mod bt_alert_tests {
                     name: None,
                     added_at_unix: 0,
                 },
+                limits: None,
             },
             engine_tid: Some(ih.to_string()),
             engine_kind: EngineKind::Bt,
@@ -2887,6 +2976,10 @@ mod b10_tests {
     }
 }
 
+/// FakeEngine 限速调用记录：（engine_tid, down_kb_s, up_kb_s）。
+#[cfg(test)]
+type LimitCall = (String, Option<u32>, Option<u32>);
+
 /// 假引擎（持久化恢复测试用）：add 记录输入、可对指定 url 返回错误。
 #[cfg(test)]
 pub struct FakeEngine {
@@ -2897,6 +2990,8 @@ pub struct FakeEngine {
     xunlei: parking_lot::Mutex<Vec<Vec<u8>>>,
     /// 已注入的 web seed（(engine_tid, url)，F5 webseed 注入测试用）。
     url_seeds: parking_lot::Mutex<Vec<(String, String)>>,
+    /// 已下发的任务级限速（LimitCall 记录，限速重放测试用）。
+    limits: parking_lot::Mutex<Vec<LimitCall>>,
     /// status() 额外透出的文件级进度（目录 files 同步测试用；默认空 = 保持旧行为）。
     status_files: parking_lot::Mutex<Vec<FileProgress>>,
 }
@@ -2911,6 +3006,7 @@ impl FakeEngine {
             added: parking_lot::Mutex::new(Vec::new()),
             xunlei: parking_lot::Mutex::new(Vec::new()),
             url_seeds: parking_lot::Mutex::new(Vec::new()),
+            limits: parking_lot::Mutex::new(Vec::new()),
             status_files: parking_lot::Mutex::new(Vec::new()),
         }
     }
@@ -2930,6 +3026,11 @@ impl FakeEngine {
     /// 读取已记录的 web seed 注入（(engine_tid, url)，F5 webseed 测试断言用）。
     pub fn url_seeds(&self) -> Vec<(String, String)> {
         self.url_seeds.lock().clone()
+    }
+
+    /// 读取已下发的任务级限速（LimitCall 记录，限速重放测试断言用）。
+    pub fn limits(&self) -> Vec<LimitCall> {
+        self.limits.lock().clone()
     }
 
     /// 设置 status() 返回的文件级进度（FTP 目录 files 同步测试注入用）。
@@ -3016,6 +3117,17 @@ impl DownloadEngine for FakeEngine {
     ) -> Result<(), smart_dl_core::types::EngineError> {
         // 记录（engine_tid, url）供测试断言逐条转发
         self.url_seeds.lock().push((id.clone(), url.to_string()));
+        Ok(())
+    }
+
+    async fn set_limits(
+        &self,
+        id: &EngineTaskId,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        // 记录（engine_tid, down, up）供限速重放测试断言
+        self.limits.lock().push((id.clone(), down_kb_s, up_kb_s));
         Ok(())
     }
     async fn add_peer(
@@ -3121,6 +3233,52 @@ mod persist_tests {
             .unwrap();
         let num: u64 = new_tid.strip_prefix('t').unwrap().parse().unwrap();
         assert!(num >= 3, "恢复后新任务 id 应跳过已用 id: {new_tid}");
+    }
+
+    #[tokio::test]
+    async fn restore_replays_task_limits_to_engine() {
+        // 限速重放：持久化的 task.limits 在 restore 后原样下发引擎
+        // （FakeEngine set_limits 记录（tid, down, up）三元组）。
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("tasks.json");
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = Arc::new(DaemonState::new(fake.clone(), vec![]).with_storage(store.clone()));
+        let tid = state
+            .add_http_task("https://example.com/limited.bin".into(), None)
+            .await
+            .unwrap();
+        let merged = state.set_task_limits(&tid, Some(128), None).await.unwrap();
+        assert_eq!(merged.down_kb_s, Some(128));
+        assert_eq!(merged.up_kb_s, None, "HTTP 任务 up 方向应保持未设");
+        wait_file(&store, 2000);
+
+        // 新 state（新引擎）恢复 → 引擎收到原样限速下发
+        let fake2 = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state2 = DaemonState::new(fake2.clone(), vec![]);
+        let n = state2.restore_from(&store).await.unwrap();
+        assert_eq!(n, 1);
+        let calls = fake2.limits();
+        assert_eq!(
+            calls.len(),
+            1,
+            "恢复后必须向引擎重放一次 set_limits: {calls:?}"
+        );
+        let (etid, down, up) = &calls[0];
+        assert_eq!(down, &Some(128), "down 方向原样重放");
+        assert_eq!(up, &None, "up 方向 None 原样传递（不触发方向预拒）");
+        // 内存中的 limits 配置也随恢复保留
+        let rec = state2.tasks.lock().get(&tid).cloned().unwrap();
+        assert_eq!(
+            rec.task.limits,
+            Some(smart_dl_core::task::TaskLimits {
+                down_kb_s: Some(128),
+                up_kb_s: None,
+            })
+        );
+        assert!(
+            etid.starts_with("fk"),
+            "engine_tid 应为 FakeEngine 返回的句柄: {etid}"
+        );
     }
 
     #[tokio::test]

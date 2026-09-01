@@ -3,6 +3,7 @@
 //! deadline 向后推 n/rate 秒；落后于时钟（无带宽积压）时从当前时刻重新起算。
 //! 简化实现：速率 0 = 不限（no-op，零开销路径）。
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -14,7 +15,8 @@ pub struct RateLimiter {
 }
 
 struct RateInner {
-    rate: u64,
+    /// 速率 bytes/sec（AtomicU64：运行中可调，per-task 限速即时生效）。
+    rate: AtomicU64,
     /// 下一 chunk 允许完成时刻（跨段共享）。
     next: Mutex<Instant>,
 }
@@ -28,7 +30,7 @@ impl Default for RateLimiter {
 impl Default for RateInner {
     fn default() -> Self {
         RateInner {
-            rate: 0,
+            rate: AtomicU64::new(0),
             next: Mutex::new(Instant::now()),
         }
     }
@@ -39,16 +41,27 @@ impl RateLimiter {
     pub fn new(kb_s: u32) -> Self {
         RateLimiter {
             inner: Arc::new(RateInner {
-                rate: kb_s as u64 * 1024,
+                rate: AtomicU64::new(kb_s as u64 * 1024),
                 next: Mutex::new(Instant::now()),
             }),
         }
     }
 
+    /// 运行中调整速率（KiB/s；0 = 不限）。已持有的 Arc 立即观察到新速率
+    /// —— per-task 限速变更无需重启下载循环。
+    pub fn set_rate_kb_s(&self, kb_s: u32) {
+        self.inner.rate.store(kb_s as u64 * 1024, Ordering::Relaxed);
+    }
+
+    /// 当前速率（KiB/s；0 = 不限）。
+    pub fn rate_kb_s(&self) -> u32 {
+        (self.inner.rate.load(Ordering::Relaxed) / 1024) as u32
+    }
+
     /// 消费 `n` 字节的"时间预算"：若 deadline 在将来则 sleep 至 deadline。
     /// 速率 0 → 立即返回（不限速）。
     pub async fn wait(&self, n: u64) {
-        let rate = self.inner.rate;
+        let rate = self.inner.rate.load(Ordering::Relaxed);
         if rate == 0 || n == 0 {
             return;
         }
@@ -108,5 +121,27 @@ mod tests {
         let el = t0.elapsed();
         assert!(el >= Duration::from_millis(1800), "elapsed {el:?}");
         assert!(el < Duration::from_secs(4), "不应超长 {el:?}");
+    }
+
+    #[tokio::test]
+    async fn set_rate_hot_adjust_observed_by_holders() {
+        // per-task 限速核心语义：已持有的 Arc 热调速率 → 后续 wait 按新速率节流。
+        // 注意 deadline 链的债务（next 绝对时刻）跨速率携带 —— 非零速率的
+        // 时长断言会受先前累积债务干扰；故用 0（早退路径，不受债务影响）
+        // 做" holders 观察到热调"的确定性行为断言，非零值用 getter 回读。
+        let lim = RateLimiter::new(1024);
+        assert_eq!(lim.rate_kb_s(), 1024);
+        // 1MiB/s 下 4MiB 需 ≈3s；热调 0 = 不限 → 立即放行（已持有实例生效）
+        lim.set_rate_kb_s(0);
+        let t0 = Instant::now();
+        lim.wait(4 * 1024 * 1024).await;
+        assert!(
+            t0.elapsed() < Duration::from_millis(50),
+            "热调 0 后必须立即放行（不限速）"
+        );
+        // 读侧证据：速率回读即时反映热调值
+        lim.set_rate_kb_s(4 * 1024);
+        assert_eq!(lim.rate_kb_s(), 4 * 1024);
+        assert_eq!(lim.rate_kb_s(), 4096, "KiB/s 口径换算一致");
     }
 }

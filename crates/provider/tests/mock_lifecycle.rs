@@ -121,6 +121,7 @@ impl HttpSink for EngineSink {
                 name,
                 added_at_unix: 0,
             },
+            limits: None,
         };
         let tid = self
             .engine
@@ -194,6 +195,7 @@ async fn full_flow_transfers_two_files_to_disk() {
             name: None,
             added_at_unix: 0,
         },
+        limits: None,
     };
 
     let outcome = coord.begin_fallback(&task, 0.1, true, &sink).await.unwrap();

@@ -382,6 +382,22 @@ impl DownloadEngine for BtEngine {
             .map_err(|e| EngineError::Other(core_err(&e)))
     }
 
+    /// BT per-torrent 限速（trait 扩展）。`id` = engine_tid = infohash（add 返回
+    /// 口径）。引擎语义：None 方向按 0（不限）下发——daemon state 层负责把既有
+    /// 配置合并成全量两方向快照后调用，避免部分更新把已设方向清零。
+    async fn set_limits(
+        &self,
+        id: &EngineTaskId,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<(), EngineError> {
+        let down = down_kb_s.unwrap_or(0) as i64 * 1024;
+        let up = up_kb_s.unwrap_or(0) as i64 * 1024;
+        self.core
+            .set_limits(id, down, up)
+            .map_err(|e| EngineError::Other(core_err(&e)))
+    }
+
     async fn add_xunlei_resume(&self, data: Vec<u8>) -> Result<EngineTaskId, EngineError> {
         self.core
             .add_torrent_resume(&data, &[])

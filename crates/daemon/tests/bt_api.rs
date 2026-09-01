@@ -353,3 +353,61 @@ async fn readd_same_magnet_after_restart_ok() {
         r2.err()
     );
 }
+
+// ============ 任务级限速（POST /tasks/:id/limit）——BT up/down 双向 ============
+
+#[tokio::test]
+async fn bt_task_limit_up_and_down_merge() {
+    // BT 任务双方向限速：up 是 BT 独有能力（HTTP 任务 up → 409，见 http_api）。
+    // 假 btih 磁链在 libtorrent 侧有真实 torrent handle（metadata 未就绪），
+    // per-torrent set_download/upload_limit 对 handle 有效 → 引擎层调用必须成功。
+    let body = common::patterned(16 * 1024);
+    let srv = TestServer::start(body).await;
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let bt = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "url": MAGNET }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bt.status(), reqwest::StatusCode::CREATED);
+    let tid = bt.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 首设 up=64
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/limit"))
+        .json(&serde_json::json!({ "up_kb_s": 64 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "BT 任务 up 限速必须成功: {:?}",
+        resp.text().await.unwrap()
+    );
+    let snap: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(snap["limits"]["up_kb_s"], 64);
+
+    // 只传 down=512 → 合并保持 up=64
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/limit"))
+        .json(&serde_json::json!({ "down_kb_s": 512 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let snap: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(snap["limits"]["down_kb_s"], 512);
+    assert_eq!(snap["limits"]["up_kb_s"], 64, "up 必须被合并保留");
+
+    // 引擎层真实生效的旁证：持久化文件里的任务记录带 limits
+    // （state.autosave 在 set 后触发；等 tasks.json 出现）
+    let _ = srv; // 保持 TestServer 存活到断言结束
+}

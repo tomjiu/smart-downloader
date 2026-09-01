@@ -255,6 +255,19 @@ pub trait DownloadEngine: Send + Sync {
     async fn ban_peer(&self, id: &EngineTaskId, peer: SocketAddr) -> Result<(), EngineError>;
     async fn read_piece(&self, id: &EngineTaskId, idx: u32) -> Result<Vec<u8>, EngineError>;
 
+    /// 任务级限速（KiB/s）。`None` 方向 = 不调整；`Some(0)` = 不限；
+    /// `Some(n)` = 上限 n KiB/s。引擎无该方向（如 HTTP 无上传）时报
+    /// `EngineError::Other`；整个操作不支持时返回 `EngineError::Unsupported`。
+    /// 默认实现：不支持（FTP 等无限速基础设施的引擎无需覆写）。
+    async fn set_limits(
+        &self,
+        _id: &EngineTaskId,
+        _down_kb_s: Option<u32>,
+        _up_kb_s: Option<u32>,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
     /// 迅雷任务导入（M9）：接受 xunlei-convert 生成的 fastresume bencode。
     /// 默认实现返回 `not supported`；BT 引擎（libtorrent）应Override为 `add_torrent_resume`。
     async fn add_xunlei_resume(&self, _data: Vec<u8>) -> Result<EngineTaskId, EngineError> {
