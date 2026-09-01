@@ -9,6 +9,12 @@ use std::sync::Arc;
 
 const FAKE_IH: &str = "0123456789abcdef0123456789abcdef01234567";
 
+/// 端点测试互斥：/bt/metadata 的单并发门禁是进程级 static，而本文件多个测试
+/// 的断言路径在门禁 acquisition 之后（如坏 magnet 的 parse 在 fetch 内部）——
+/// 并行跑时会互吃 409/400（GitHub runner 双核实测复现：bad_magnet 得 409）。
+/// 所有触达该端点的测试先拿这把锁串行执行，互斥于本地/CI 调度顺序。
+static ENDPOINT_SER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// —— 无 bt 构建：端点恒 400 ——
 #[cfg(not(feature = "bt"))]
 async fn serve() -> std::net::SocketAddr {
@@ -27,6 +33,7 @@ async fn serve() -> std::net::SocketAddr {
 #[cfg(not(feature = "bt"))]
 #[tokio::test]
 async fn metadata_endpoint_disabled_without_bt() {
+    let _ser = ENDPOINT_SER.lock().await;
     let addr = serve().await;
     let client = reqwest::Client::new();
     let resp = client
@@ -95,8 +102,7 @@ fn validate_save_dest_blocks_symlink_escape() {
 async fn serve_with_token() -> std::net::SocketAddr {
     let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
     let state = Arc::new(
-        DaemonState::new(Arc::new(http), vec![])
-            .with_http_token(Some("s3cret-token".to_string())),
+        DaemonState::new(Arc::new(http), vec![]).with_http_token(Some("s3cret-token".to_string())),
     );
     let app = http::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -109,6 +115,7 @@ async fn serve_with_token() -> std::net::SocketAddr {
 
 #[tokio::test]
 async fn metadata_endpoint_requires_auth_when_token_configured() {
+    let _ser = ENDPOINT_SER.lock().await;
     let addr = serve_with_token().await;
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/bt/metadata");
@@ -253,6 +260,7 @@ mod bt_enabled {
 
     #[tokio::test]
     async fn bad_magnet_is_400() {
+        let _ser = ENDPOINT_SER.lock().await;
         let addr = serve_with_bt().await;
         let client = reqwest::Client::new();
         let resp = client
@@ -261,13 +269,18 @@ mod bt_enabled {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "缺 xt → 400");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "缺 xt → 400"
+        );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body["error"].as_str().unwrap().contains("xt"));
     }
 
     #[tokio::test]
     async fn bad_peer_is_400() {
+        let _ser = ENDPOINT_SER.lock().await;
         let addr = serve_with_bt().await;
         let client = reqwest::Client::new();
         let resp = client
@@ -279,69 +292,101 @@ mod bt_enabled {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "peer 解析失败 → 400");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "peer 解析失败 → 400"
+        );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body["error"].as_str().unwrap().contains("peers"));
     }
 
     #[tokio::test]
     async fn busy_gate_409_then_reusable_after_completion() {
+        let _ser = ENDPOINT_SER.lock().await;
         // 门禁语义（V16）：进行中 → 409；完成/取消（RAII permit drop）后端点可再用。
         // 门禁是进程级 static 单例 → 占门禁的 e2e 场景集中在本测试串行验证，
         // 避免与其他测试并行时互抢单并发锁。
-        let addr = serve_with_bt().await;
-        let client = reqwest::Client::new();
-        let url = format!("http://{addr}/bt/metadata");
-        // 第一个请求占门禁（随机 infohash 无任何来源 → 必然超时，5s）
-        let first = tokio::spawn({
-            let client = client.clone();
-            let url = url.clone();
-            async move {
-                client
-                    .post(url)
-                    .json(&serde_json::json!({
-                        "magnet": format!("magnet:?xt=urn:btih:{FAKE_IH}&dn=unreachable"),
-                        "timeout_s": 5,
-                        "dht": false,
-                    }))
-                    .send()
-                    .await
-                    .unwrap()
+        //
+        // CI 稳定性（GitHub runner 实测复现）：盲等 300ms 后断言 409 是开环假设
+        // —— 并行调度下 first 可能在 µs 级窗口被同进程其他测试的短暂持门者
+        // 抢走 409 快速返回，或 fetch 提前错误释放门禁，second 反而持门超时
+        // （408）。改为整场景 3 轮重试：健康产品 + 健康环境第 1 轮即过；
+        // 调度抖动后续轮过；真回归则确定性失败。
+        for attempt in 0..3u32 {
+            let addr = serve_with_bt().await;
+            let client = reqwest::Client::new();
+            let url = format!("http://{addr}/bt/metadata");
+            // 第一个请求占门禁（随机 infohash 无任何来源 → 必然超时，3s）
+            let first = tokio::spawn({
+                let client = client.clone();
+                let url = url.clone();
+                async move {
+                    client
+                        .post(url)
+                        .json(&serde_json::json!({
+                            "magnet": format!("magnet:?xt=urn:btih:{FAKE_IH}&dn=unreachable"),
+                            "timeout_s": 3,
+                            "dht": false,
+                        }))
+                        .send()
+                        .await
+                        .unwrap()
+                }
+            });
+            // 等第一个请求进入抓取段（handler 同步段微秒级，300ms 裕量充足）
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            // 第二个请求：门禁被占 → 409
+            let second = client
+                .post(&url)
+                .json(&serde_json::json!({
+                    "magnet": format!("magnet:?xt=urn:btih:{FAKE_IH}"),
+                    "timeout_s": 3,
+                    "dht": false,
+                }))
+                .send()
+                .await
+                .unwrap();
+            if second.status() != reqwest::StatusCode::CONFLICT {
+                // 本轮 first 没持住门禁（见上注）→ 收尾悬留任务后弃轮重试
+                let _ = first.await;
+                eprintln!(
+                    "busy_gate 第 {attempt} 轮未观察到 409（second={}），弃轮重试",
+                    second.status()
+                );
+                continue;
             }
-        });
-        // 等第一个请求进入抓取段（handler 同步段微秒级，300ms 裕量充足）
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        // 第二个请求：门禁被占 → 409
-        let second = client
-            .post(&url)
-            .json(&serde_json::json!({
-                "magnet": format!("magnet:?xt=urn:btih:{FAKE_IH}"),
-                "timeout_s": 5,
-                "dht": false,
-            }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(second.status(), reqwest::StatusCode::CONFLICT, "占用中 → 409");
-        // 第一个请求完成：超时 → 408（permit 随 handler 结束归还）
-        let first = first.await.unwrap();
-        assert_eq!(first.status(), reqwest::StatusCode::REQUEST_TIMEOUT, "超时 → 408");
-        let body: serde_json::Value = first.json().await.unwrap();
-        assert!(body["error"].as_str().unwrap().contains("超时"));
-        // 门禁已释放：坏 magnet 走到 parse 段 400（先过门禁）→ 证明端点可再用
-        let third = client
-            .post(&url)
-            .json(&serde_json::json!({ "magnet": "magnet:?dn=no-hash" }))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(third.status(), reqwest::StatusCode::BAD_REQUEST, "门禁释放后可再用");
+            // 第一个请求完成：超时 → 408（permit 随 handler 结束归还）
+            let first = first.await.unwrap();
+            assert_eq!(
+                first.status(),
+                reqwest::StatusCode::REQUEST_TIMEOUT,
+                "超时 → 408"
+            );
+            let body: serde_json::Value = first.json().await.unwrap();
+            assert!(body["error"].as_str().unwrap().contains("超时"));
+            // 门禁已释放：坏 magnet 走到 parse 段 400（先过门禁）→ 证明端点可再用
+            let third = client
+                .post(&url)
+                .json(&serde_json::json!({ "magnet": "magnet:?dn=no-hash" }))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                third.status(),
+                reqwest::StatusCode::BAD_REQUEST,
+                "门禁释放后可再用"
+            );
+            return;
+        }
+        panic!("busy_gate 3 轮均未观察到 409 —— 门禁语义回归或测试环境异常");
     }
 
     /// —— V15 e2e：save_to 越界拒绝（bt 构建；校验在抓取前快速失败）——
 
     #[tokio::test]
     async fn save_to_escape_is_400_before_fetch() {
+        let _ser = ENDPOINT_SER.lock().await;
         // V15：越界 save_to 在抓取开始前 400 快速失败（若校验回归，此处会等满
         // 5s 得到 408，断言失败）。不占门禁（校验在 try_acquire 之前）。
         let addr = serve_with_bt().await;

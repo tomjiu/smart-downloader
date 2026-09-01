@@ -17,10 +17,10 @@ pub mod url_class;
 pub mod vip_speedup;
 
 pub use client::{device_code_qr_url, DEVICE_CLIENT_ID};
-pub use login_flow::{LoginMode, DeviceSession};
+pub use login_flow::{DeviceSession, LoginMode};
 pub use tier::{tier_authorize_url, Tier, ALL_TIERS, TIER_NAS, TIER_WEB};
 
 pub use hash::{bcid, cid, gcid};
-pub use share::{parse_share_link, ResolvedLink, SharedFile, SharedLink, Sharer, ShareError};
+pub use share::{parse_share_link, ResolvedLink, ShareError, SharedFile, SharedLink, Sharer};
 pub use sign::{captcha_sign, device_id_32, device_sign};
-pub use url_class::{classify_url, cdn_hosts_by_region, LinkClass};
+pub use url_class::{cdn_hosts_by_region, classify_url, LinkClass};

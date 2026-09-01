@@ -118,7 +118,14 @@ pub(crate) fn classify_envelope(
     if code == Some(32003) {
         return Some(QuarkError::NotLogin);
     }
-    for kw in ["分享已取消", "分享不存在", "分享已失效", "失效", "提取码", "passcode"] {
+    for kw in [
+        "分享已取消",
+        "分享不存在",
+        "分享已失效",
+        "失效",
+        "提取码",
+        "passcode",
+    ] {
         if msg.contains(kw) {
             return Some(QuarkError::ShareExpired);
         }
@@ -139,7 +146,10 @@ mod tests {
     fn auth_roundtrip_and_skip_unchanged_write() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("quark_auth.json");
-        let a = QuarkAuth { cookie: "__pus=x; __puus=y".into(), user_id: "u1".into() };
+        let a = QuarkAuth {
+            cookie: "__pus=x; __puus=y".into(),
+            user_id: "u1".into(),
+        };
         assert!(a.is_valid());
         save_auth(&p, &a).unwrap();
         assert_eq!(load_auth(&p), Some(a.clone()));
@@ -152,13 +162,22 @@ mod tests {
 
     #[test]
     fn load_missing_returns_none() {
-        assert_eq!(load_auth(std::path::Path::new("nonexistent_quark.json")), None);
+        assert_eq!(
+            load_auth(std::path::Path::new("nonexistent_quark.json")),
+            None
+        );
     }
 
     #[test]
     fn envelope_classification() {
-        assert_eq!(classify_envelope(401, None, None), Some(QuarkError::NotLogin));
-        assert_eq!(classify_envelope(200, Some(32003), None), Some(QuarkError::NotLogin));
+        assert_eq!(
+            classify_envelope(401, None, None),
+            Some(QuarkError::NotLogin)
+        );
+        assert_eq!(
+            classify_envelope(200, Some(32003), None),
+            Some(QuarkError::NotLogin)
+        );
         assert_eq!(
             classify_envelope(200, Some(1), Some("分享已失效".into())),
             Some(QuarkError::ShareExpired)
@@ -168,7 +187,10 @@ mod tests {
             Some(QuarkError::QuotaExhausted)
         );
         // 业务失败但无法归类 → None（由调用方给 BadResponse）
-        assert_eq!(classify_envelope(200, Some(99999), Some("unknown".into())), None);
+        assert_eq!(
+            classify_envelope(200, Some(99999), Some("unknown".into())),
+            None
+        );
         // 成功壳不产生错误
         assert_eq!(classify_envelope(200, Some(0), None), None);
     }
@@ -176,8 +198,14 @@ mod tests {
     #[test]
     fn error_maps_to_provider_error() {
         use crate::types::ProviderError;
-        assert_eq!(ProviderError::from(QuarkError::NotLogin), ProviderError::Auth);
-        assert_eq!(ProviderError::from(QuarkError::QuotaExhausted), ProviderError::Quota);
+        assert_eq!(
+            ProviderError::from(QuarkError::NotLogin),
+            ProviderError::Auth
+        );
+        assert_eq!(
+            ProviderError::from(QuarkError::QuotaExhausted),
+            ProviderError::Quota
+        );
         assert!(matches!(
             ProviderError::from(QuarkError::ShareExpired),
             ProviderError::Other(_)

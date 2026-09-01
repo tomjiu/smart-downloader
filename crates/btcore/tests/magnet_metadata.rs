@@ -29,7 +29,10 @@ fn fetch_metadata_from_local_seeder_yields_torrent() {
     let out = fetch_metadata(seeder.magnet(), scratch.path(), &opts).expect("fetch_metadata");
 
     // infohash 交叉校验（fetch 内部已断言，这里再核对外层语义）
-    assert_eq!(out.summary.infohash_v1, out.infohash, "引擎/摘要 infohash 一致");
+    assert_eq!(
+        out.summary.infohash_v1, out.infohash,
+        "引擎/摘要 infohash 一致"
+    );
 
     // 摘要面：seed_main 产 2MB 确定性单文件
     assert!(out.summary.total_size > 0, "total_size > 0");
@@ -48,7 +51,10 @@ fn fetch_metadata_from_local_seeder_yields_torrent() {
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_dir())
         .collect();
-    assert!(leftovers.is_empty(), "scratch 不应残留下载目录: {leftovers:?}");
+    assert!(
+        leftovers.is_empty(),
+        "scratch 不应残留下载目录: {leftovers:?}"
+    );
 }
 
 #[test]
@@ -57,7 +63,8 @@ fn btcore_metadata_api_roundtrip() {
     let save = seed::TempDir::new().expect("tempdir");
     let core = BtCore::new(save.path(), "meta-api").expect("session");
     let _ = core.set_alert_mask(0xFFFF);
-    core.apply_discovery(false, false, false).expect("discovery");
+    core.apply_discovery(false, false, false)
+        .expect("discovery");
 
     let ih = core.add_magnet(seeder.magnet(), &[]).expect("add_magnet");
     core.resume(&ih).expect("resume");
@@ -69,7 +76,10 @@ fn btcore_metadata_api_roundtrip() {
     let bytes = loop {
         let st = core.status(&ih).expect("status");
         if st.metadata_received {
-            break core.metadata(&ih).expect("metadata call").expect("metadata bytes");
+            break core
+                .metadata(&ih)
+                .expect("metadata call")
+                .expect("metadata bytes");
         }
         assert!(Instant::now() < deadline, "60s 内未收到 metadata");
         std::thread::sleep(Duration::from_millis(500));
@@ -81,5 +91,8 @@ fn btcore_metadata_api_roundtrip() {
 
     // 未注册任务 → Ok(None)（metadata 未就绪语义）
     let fake = "0123456789abcdef0123456789abcdef01234567";
-    assert!(matches!(core.metadata(fake), Ok(None)), "未注册 ih → Ok(None)");
+    assert!(
+        matches!(core.metadata(fake), Ok(None)),
+        "未注册 ih → Ok(None)"
+    );
 }

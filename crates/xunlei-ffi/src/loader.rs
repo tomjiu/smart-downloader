@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use crate::bindings::*;
-use crate::error::{XunleiError, Result};
+use crate::error::{Result, XunleiError};
 
 /// SDK 必需的 DLL/EXE 列表（按加载顺序）。
 const REQUIRED_FILES: &[&str] = &[
@@ -134,8 +134,9 @@ fn ensure_dlls_loaded_windows(sdk_dir: &Path) -> Result<()> {
     // 加载 DownloadSDKProxy.dll
     let dll_path = sdk_dir.join("DownloadSDKProxy.dll");
     let lib = unsafe {
-        libloading::Library::new(&dll_path)
-            .map_err(|e| XunleiError::DllLoad(format!("failed to load {}: {}", dll_path.display(), e)))?
+        libloading::Library::new(&dll_path).map_err(|e| {
+            XunleiError::DllLoad(format!("failed to load {}: {}", dll_path.display(), e))
+        })?
     };
 
     // 保持 Library 句柄存活（泄漏到 'static）
@@ -144,36 +145,96 @@ fn ensure_dlls_loaded_windows(sdk_dir: &Path) -> Result<()> {
     // 获取所有函数指针
     let symbols = unsafe {
         Symbols {
-            XL_Init: *lib.get(b"XL_Init\0").map_err(|e| XunleiError::DllLoad(format!("XL_Init not found: {}", e)))?,
-            XL_UnInit: *lib.get(b"XL_UnInit\0").map_err(|e| XunleiError::DllLoad(format!("XL_UnInit not found: {}", e)))?,
-            XL_CreateBTTask_V2: *lib.get(b"XL_CreateBTTask_V2\0").map_err(|e| XunleiError::DllLoad(format!("XL_CreateBTTask_V2 not found: {}", e)))?,
-            XL_CreateMagnetTask: *lib.get(b"XL_CreateMagnetTask\0").map_err(|e| XunleiError::DllLoad(format!("XL_CreateMagnetTask not found: {}", e)))?,
-            XL_CreateP2spTask: *lib.get(b"XL_CreateP2spTask\0").map_err(|e| XunleiError::DllLoad(format!("XL_CreateP2spTask not found: {}", e)))?,
-            XL_StartTask: *lib.get(b"XL_StartTask\0").map_err(|e| XunleiError::DllLoad(format!("XL_StartTask not found: {}", e)))?,
-            XL_StopTask: *lib.get(b"XL_StopTask\0").map_err(|e| XunleiError::DllLoad(format!("XL_StopTask not found: {}", e)))?,
-            XL_DeleteTask: *lib.get(b"XL_DeleteTask\0").map_err(|e| XunleiError::DllLoad(format!("XL_DeleteTask not found: {}", e)))?,
-            XL_QueryTaskInfo: *lib.get(b"XL_QueryTaskInfo\0").map_err(|e| XunleiError::DllLoad(format!("XL_QueryTaskInfo not found: {}", e)))?,
-            XL_AddPeer: *lib.get(b"XL_AddPeer\0").map_err(|e| XunleiError::DllLoad(format!("XL_AddPeer not found: {}", e)))?,
-            XL_BatchAddPeer: *lib.get(b"XL_BatchAddPeer\0").map_err(|e| XunleiError::DllLoad(format!("XL_BatchAddPeer not found: {}", e)))?,
-            XL_BatchAddBTTracker: *lib.get(b"XL_BatchAddBTTracker\0").map_err(|e| XunleiError::DllLoad(format!("XL_BatchAddBTTracker not found: {}", e)))?,
-            XL_DiscardPeer: *lib.get(b"XL_DiscardPeer\0").map_err(|e| XunleiError::DllLoad(format!("XL_DiscardPeer not found: {}", e)))?,
-            XL_BatchDiscardPeer: *lib.get(b"XL_BatchDiscardPeer\0").map_err(|e| XunleiError::DllLoad(format!("XL_BatchDiscardPeer not found: {}", e)))?,
-            XL_EnableFreeDcdn: *lib.get(b"XL_EnableFreeDcdn\0").map_err(|e| XunleiError::DllLoad(format!("XL_EnableFreeDcdn not found: {}", e)))?,
-            XL_DisableFreeDcdn: *lib.get(b"XL_DisableFreeDcdn\0").map_err(|e| XunleiError::DllLoad(format!("XL_DisableFreeDcdn not found: {}", e)))?,
-            XL_QueryTaskFlow: *lib.get(b"XL_QueryTaskFlow\0").map_err(|e| XunleiError::DllLoad(format!("XL_QueryTaskFlow not found: {}", e)))?,
-            XL_SetTaskUserAgent: *lib.get(b"XL_SetTaskUserAgent\0").map_err(|e| XunleiError::DllLoad(format!("XL_SetTaskUserAgent not found: {}", e)))?,
-            XL_AddHttpHeaderField: *lib.get(b"XL_AddHttpHeaderField\0").map_err(|e| XunleiError::DllLoad(format!("XL_AddHttpHeaderField not found: {}", e)))?,
-            XL_SetTaskDownloadSpeedLimit: *lib.get(b"XL_SetTaskDownloadSpeedLimit\0").map_err(|e| XunleiError::DllLoad(format!("XL_SetTaskDownloadSpeedLimit not found: {}", e)))?,
-            XL_SetUserInfo: *lib.get(b"XL_SetUserInfo\0").map_err(|e| XunleiError::DllLoad(format!("XL_SetUserInfo not found: {}", e)))?,
-            XL_SetTokenMode: *lib.get(b"XL_SetTokenMode\0").map_err(|e| XunleiError::DllLoad(format!("XL_SetTokenMode not found: {}", e)))?,
-            XL_SetAppGuid: *lib.get(b"XL_SetAppGuid\0").map_err(|e| XunleiError::DllLoad(format!("XL_SetAppGuid not found: {}", e)))?,
-            XL_SetAccelerateCertification: *lib.get(b"XL_SetAccelerateCertification\0").map_err(|e| XunleiError::DllLoad(format!("XL_SetAccelerateCertification not found: {}", e)))?,
-            XL_SetUserAgent: *lib.get(b"XL_SetUserAgent\0").map_err(|e| XunleiError::DllLoad(format!("XL_SetUserAgent not found: {}", e)))?,
-            XL_SetProxy: *lib.get(b"XL_SetProxy\0").map_err(|e| XunleiError::DllLoad(format!("XL_SetProxy not found: {}", e)))?,
-            XL_SetCacheSize: *lib.get(b"XL_SetCacheSize\0").map_err(|e| XunleiError::DllLoad(format!("XL_SetCacheSize not found: {}", e)))?,
-            XL_SetDownloadWindow: *lib.get(b"XL_SetDownloadWindow\0").map_err(|e| XunleiError::DllLoad(format!("XL_SetDownloadWindow not found: {}", e)))?,
-            XL_SetGlobalConnectionLimit: *lib.get(b"XL_SetGlobalConnectionLimit\0").map_err(|e| XunleiError::DllLoad(format!("XL_SetGlobalConnectionLimit not found: {}", e)))?,
-            XL_AddServer: *lib.get(b"XL_AddServer\0").map_err(|e| XunleiError::DllLoad(format!("XL_AddServer not found: {}", e)))?,
+            XL_Init: *lib
+                .get(b"XL_Init\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_Init not found: {}", e)))?,
+            XL_UnInit: *lib
+                .get(b"XL_UnInit\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_UnInit not found: {}", e)))?,
+            XL_CreateBTTask_V2: *lib.get(b"XL_CreateBTTask_V2\0").map_err(|e| {
+                XunleiError::DllLoad(format!("XL_CreateBTTask_V2 not found: {}", e))
+            })?,
+            XL_CreateMagnetTask: *lib.get(b"XL_CreateMagnetTask\0").map_err(|e| {
+                XunleiError::DllLoad(format!("XL_CreateMagnetTask not found: {}", e))
+            })?,
+            XL_CreateP2spTask: *lib
+                .get(b"XL_CreateP2spTask\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_CreateP2spTask not found: {}", e)))?,
+            XL_StartTask: *lib
+                .get(b"XL_StartTask\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_StartTask not found: {}", e)))?,
+            XL_StopTask: *lib
+                .get(b"XL_StopTask\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_StopTask not found: {}", e)))?,
+            XL_DeleteTask: *lib
+                .get(b"XL_DeleteTask\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_DeleteTask not found: {}", e)))?,
+            XL_QueryTaskInfo: *lib
+                .get(b"XL_QueryTaskInfo\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_QueryTaskInfo not found: {}", e)))?,
+            XL_AddPeer: *lib
+                .get(b"XL_AddPeer\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_AddPeer not found: {}", e)))?,
+            XL_BatchAddPeer: *lib
+                .get(b"XL_BatchAddPeer\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_BatchAddPeer not found: {}", e)))?,
+            XL_BatchAddBTTracker: *lib.get(b"XL_BatchAddBTTracker\0").map_err(|e| {
+                XunleiError::DllLoad(format!("XL_BatchAddBTTracker not found: {}", e))
+            })?,
+            XL_DiscardPeer: *lib
+                .get(b"XL_DiscardPeer\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_DiscardPeer not found: {}", e)))?,
+            XL_BatchDiscardPeer: *lib.get(b"XL_BatchDiscardPeer\0").map_err(|e| {
+                XunleiError::DllLoad(format!("XL_BatchDiscardPeer not found: {}", e))
+            })?,
+            XL_EnableFreeDcdn: *lib
+                .get(b"XL_EnableFreeDcdn\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_EnableFreeDcdn not found: {}", e)))?,
+            XL_DisableFreeDcdn: *lib.get(b"XL_DisableFreeDcdn\0").map_err(|e| {
+                XunleiError::DllLoad(format!("XL_DisableFreeDcdn not found: {}", e))
+            })?,
+            XL_QueryTaskFlow: *lib
+                .get(b"XL_QueryTaskFlow\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_QueryTaskFlow not found: {}", e)))?,
+            XL_SetTaskUserAgent: *lib.get(b"XL_SetTaskUserAgent\0").map_err(|e| {
+                XunleiError::DllLoad(format!("XL_SetTaskUserAgent not found: {}", e))
+            })?,
+            XL_AddHttpHeaderField: *lib.get(b"XL_AddHttpHeaderField\0").map_err(|e| {
+                XunleiError::DllLoad(format!("XL_AddHttpHeaderField not found: {}", e))
+            })?,
+            XL_SetTaskDownloadSpeedLimit: *lib.get(b"XL_SetTaskDownloadSpeedLimit\0").map_err(
+                |e| XunleiError::DllLoad(format!("XL_SetTaskDownloadSpeedLimit not found: {}", e)),
+            )?,
+            XL_SetUserInfo: *lib
+                .get(b"XL_SetUserInfo\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_SetUserInfo not found: {}", e)))?,
+            XL_SetTokenMode: *lib
+                .get(b"XL_SetTokenMode\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_SetTokenMode not found: {}", e)))?,
+            XL_SetAppGuid: *lib
+                .get(b"XL_SetAppGuid\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_SetAppGuid not found: {}", e)))?,
+            XL_SetAccelerateCertification: *lib.get(b"XL_SetAccelerateCertification\0").map_err(
+                |e| XunleiError::DllLoad(format!("XL_SetAccelerateCertification not found: {}", e)),
+            )?,
+            XL_SetUserAgent: *lib
+                .get(b"XL_SetUserAgent\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_SetUserAgent not found: {}", e)))?,
+            XL_SetProxy: *lib
+                .get(b"XL_SetProxy\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_SetProxy not found: {}", e)))?,
+            XL_SetCacheSize: *lib
+                .get(b"XL_SetCacheSize\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_SetCacheSize not found: {}", e)))?,
+            XL_SetDownloadWindow: *lib.get(b"XL_SetDownloadWindow\0").map_err(|e| {
+                XunleiError::DllLoad(format!("XL_SetDownloadWindow not found: {}", e))
+            })?,
+            XL_SetGlobalConnectionLimit: *lib.get(b"XL_SetGlobalConnectionLimit\0").map_err(
+                |e| XunleiError::DllLoad(format!("XL_SetGlobalConnectionLimit not found: {}", e)),
+            )?,
+            XL_AddServer: *lib
+                .get(b"XL_AddServer\0")
+                .map_err(|e| XunleiError::DllLoad(format!("XL_AddServer not found: {}", e)))?,
             XL_EnableDcdnWithToken: lib.get(b"XL_EnableDcdnWithToken\0").ok().map(|f| *f),
             XL_EnableDcdnWithSession: lib.get(b"XL_EnableDcdnWithSession\0").ok().map(|f| *f),
             XL_EnableDcdnWithVipCert: lib.get(b"XL_EnableDcdnWithVipCert\0").ok().map(|f| *f),
@@ -194,7 +255,9 @@ fn ensure_dlls_loaded_windows(sdk_dir: &Path) -> Result<()> {
 
 /// 获取已解析的函数指针。
 pub fn symbols() -> &'static Symbols {
-    SYMBOLS.get().expect("xunlei SDK not loaded; call ensure_dlls_loaded first")
+    SYMBOLS
+        .get()
+        .expect("xunlei SDK not loaded; call ensure_dlls_loaded first")
 }
 
 /// 获取已加载的 SDK 目录。

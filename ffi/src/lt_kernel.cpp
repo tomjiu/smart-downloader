@@ -17,6 +17,8 @@
 #include <libtorrent/file_storage.hpp>
 #include <libtorrent/announce_entry.hpp>
 #include <libtorrent/peer_info.hpp>
+// 版本守卫依据：2.0.x（Debian trixie 2.0.11 / Ubuntu noble 2.0.10）缺 4 个 2.1 API
+#include <libtorrent/version.hpp>
 #include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/write_resume_data.hpp>
 #include <libtorrent/alert.hpp>
@@ -434,8 +436,14 @@ lt_err lt_add_torrent_file(lt_session* s, const uint8_t* meta, size_t len, const
         // 新 API = info-section 构造（from_info_section_t 标签）
         const lt::bdecode_node info = node.dict_find("info");
         if (!info) { set_err(s, "torrent parse: no info section"); return LT_ERR_IO; }
+#if LIBTORRENT_VERSION_NUM >= 20100
         auto ti = std::make_shared<lt::torrent_info>(
             info, ec, lt::load_torrent_limits{}, lt::from_info_section);
+#else
+        // 2.0.x 无 from_info_section：回退全文件 bdecode_node ctor（node 即完整 .torrent）
+        (void)info;
+        auto ti = std::make_shared<lt::torrent_info>(node, ec);
+#endif
         if (ec) { set_err(s, "torrent parse: " + ec.message()); return LT_ERR_IO; }
         lt::add_torrent_params p;
         p.ti = std::move(ti);
@@ -557,7 +565,11 @@ lt_err lt_file_progress(lt_session* s, const char* ih, int64_t* done_arr, int64_
         h.file_progress(prog);
         for (int i = 0; i < nf; ++i) {
             done_arr[i] = prog[i];
+#if LIBTORRENT_VERSION_NUM >= 20100
             size_arr[i] = tf->files_impl().file_size(lt::file_index_t{i}); // ABI100：files() 仅 ABI<4
+#else
+            size_arr[i] = tf->files().file_size(lt::file_index_t{i});
+#endif
         }
         return LT_OK;
     } catch (...) {
@@ -590,8 +602,12 @@ lt_err lt_peers(lt_session* s, const char* ih, lt_peer* buf, size_t cap, size_t*
             const lt::peer_info& pi = v[i];
             lt_peer& o = buf[i];
             std::memset(&o, 0, sizeof(o));
+#if LIBTORRENT_VERSION_NUM >= 20100
             // ABI100：ip 字段由 remote_endpoint() 提供（ip 成员仅 ABI==1）
             const lt::tcp::endpoint ep = pi.remote_endpoint();
+#else
+            const lt::tcp::endpoint ep = pi.ip;
+#endif
             const std::string ipstr = ep.address().to_string();
             std::strncpy(o.ip, ipstr.c_str(), sizeof(o.ip) - 1);
             o.port = ep.port();
@@ -683,11 +699,17 @@ lt_err lt_set_sequential(lt_session* s, const char* ih, int on) {
     try {
         const lt::torrent_handle h = find_handle(s, ih);
         if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+#if LIBTORRENT_VERSION_NUM >= 20100
         // 2.x：set_sequential_download 仅 ABI==1；全局开关由 range API 表达：
         // on → 从第 0 片起顺序下载；off → 无全局解除 API，no-op（等待 range 自然耗尽/寻址策略接管）
         if (on) {
             h.set_sequential_range(lt::piece_index_t{0});
         }
+#else
+        // 2.0.x 无 set_sequential_range：classic sequential_download flag（on/off 均可）
+        if (on) h.set_flags(lt::torrent_flags::sequential_download);
+        else h.unset_flags(lt::torrent_flags::sequential_download);
+#endif
         return LT_OK;
     } catch (...) {
         return LT_ERR_ENGINE;

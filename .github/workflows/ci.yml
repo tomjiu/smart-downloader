@@ -1,9 +1,9 @@
 # CI（D35 扩展）：
 #  - rust: 纯 Rust crates 的 fmt/clippy/test，windows + ubuntu 双平台；
 #    daemon 增补 feature 矩阵（ftp / nas / ftp,nas；nas 语义属 Linux，测试仅在 ubuntu 跑）。
-#  - bt-integration: 依赖 libtorrent native 链接环境（本地配方见 scripts/bt_env.sh 与
-#    docs/nas/WORKSPACE.md；系统包为 2.0.x，ffi 内核按 2.1 API 编写需 shim）。
-#    待配方在 Linux CI 实测一轮后启用（避免盲跑碎 CI）。
+#  - bt-integration: libtorrent native 集成 —— scripts/ci/bt-linux-setup.sh 就位
+#    2.0.x 系统包环境（ffi 源内 2.1/2.0 版本守卫 + fakevcpkg 契约仿真），
+#    btcore + daemon(bt) 的 clippy/test（btcore clippy 由此 job 覆盖）。
 name: ci
 
 on:
@@ -62,14 +62,39 @@ jobs:
         run: cargo test -p smart-dl-daemon --features "ftp,nas"
 
   bt-integration:
-    # 后置独立：需 libtorrent native。本地配方：scripts/bt_env.sh（LT_KERNEL_LIB_DIR +
-    # LT_VCPKG_LIB_DIR + SEED_MAIN 三变量，no-root apt download + dpkg -x + fakevcpkg）。
-    # ffi 内核按 libtorrent 2.1 API 编写，系统包 2.0.x 需 4 处 shim（from_info_section /
-    # files_impl / remote_endpoint / set_sequential_range），待脚本化实测后启用。
+    # libtorrent native 集成测试（此前 if:false 占位，配方已脚本化并本地实测）：
+    # scripts/ci/bt-linux-setup.sh [rootful] → 系统包 libtorrent 2.0.x + fakevcpkg 契约
+    # 仿真 + lt_kernel/seed_main 编译；ffi 源内版本守卫兼容 2.1 API。
+    # 本地 Debian 13 (2.0.11) 全绿基准：btcore 33 + daemon(bt) 162。
     name: bt integration (ubuntu, libtorrent)
     runs-on: ubuntu-latest
-    if: false
     steps:
       - uses: actions/checkout@v4
-      - name: placeholder (enable after scripts/ci/bt-linux-setup.sh is validated)
-        run: echo "BT integration tests run locally — see scripts/bt_env.sh"
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Setup libtorrent native env
+        run: bash scripts/ci/bt-linux-setup.sh "$HOME/bt-native"
+
+      - name: clippy btcore (deny warnings)
+        run: |
+          source "$HOME/bt-native/env.sh"
+          cargo clippy -p smart-dl-btcore --all-targets -- -D warnings
+
+      - name: clippy daemon (bt)
+        run: |
+          source "$HOME/bt-native/env.sh"
+          cargo clippy -p smart-dl-daemon --features bt --all-targets -- -D warnings
+
+      - name: test btcore
+        run: |
+          source "$HOME/bt-native/env.sh"
+          cargo test -p smart-dl-btcore
+
+      - name: test daemon (bt)
+        run: |
+          source "$HOME/bt-native/env.sh"
+          cargo test -p smart-dl-daemon --features bt

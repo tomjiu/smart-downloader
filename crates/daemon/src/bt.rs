@@ -283,7 +283,6 @@ impl DownloadEngine for BtEngine {
             _ => return Err(EngineError::Other("source is not bt".to_string())),
         };
         ih.map_err(|e| EngineError::Other(core_err(&e)))
-            .map(|ih| ih)
     }
 
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError> {

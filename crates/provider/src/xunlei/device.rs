@@ -25,12 +25,19 @@ impl DeviceFlowState {
     /// Some("slow_down")=降速继续等，Some("expired_token")=过期失败。
     pub fn on_poll(&self, error_code: Option<&str>, now: u64) -> DeviceFlowState {
         match error_code {
-            None => DeviceFlowState::Done { access_token: String::new(), refresh_token: String::new() },
-            Some("expired_token") => DeviceFlowState::Failed { reason: "device code expired".into() },
+            None => DeviceFlowState::Done {
+                access_token: String::new(),
+                refresh_token: String::new(),
+            },
+            Some("expired_token") => DeviceFlowState::Failed {
+                reason: "device code expired".into(),
+            },
             Some(_) => match self {
                 DeviceFlowState::AwaitingScan { expires_at, .. } => {
                     if now >= *expires_at {
-                        DeviceFlowState::Failed { reason: "timeout".into() }
+                        DeviceFlowState::Failed {
+                            reason: "timeout".into(),
+                        }
                     } else {
                         self.clone()
                     }
@@ -76,7 +83,10 @@ impl DeviceAuthFlow {
                 access_token: token.access_token,
                 refresh_token: token.refresh_token,
             }),
-            None => Ok(state.on_poll(Some("authorization_pending"), crate::xunlei::client::now_unix())),
+            None => Ok(state.on_poll(
+                Some("authorization_pending"),
+                crate::xunlei::client::now_unix(),
+            )),
         }
     }
 }
@@ -86,28 +96,45 @@ mod tests {
     use super::*;
     fn awaiting(expires_at: u64) -> DeviceFlowState {
         DeviceFlowState::AwaitingScan {
-            device_code: "dc".into(), user_code: "uc".into(),
-            verification_uri: "https://example.com".into(), expires_at,
+            device_code: "dc".into(),
+            user_code: "uc".into(),
+            verification_uri: "https://example.com".into(),
+            expires_at,
         }
     }
     #[test]
     fn pending_keeps_waiting() {
-        assert!(matches!(awaiting(1000).on_poll(Some("authorization_pending"), 500), DeviceFlowState::AwaitingScan { .. }));
+        assert!(matches!(
+            awaiting(1000).on_poll(Some("authorization_pending"), 500),
+            DeviceFlowState::AwaitingScan { .. }
+        ));
     }
     #[test]
     fn slow_down_keeps_waiting() {
-        assert!(matches!(awaiting(1000).on_poll(Some("slow_down"), 500), DeviceFlowState::AwaitingScan { .. }));
+        assert!(matches!(
+            awaiting(1000).on_poll(Some("slow_down"), 500),
+            DeviceFlowState::AwaitingScan { .. }
+        ));
     }
     #[test]
     fn expired_token_fails() {
-        assert!(matches!(awaiting(1000).on_poll(Some("expired_token"), 500), DeviceFlowState::Failed { .. }));
+        assert!(matches!(
+            awaiting(1000).on_poll(Some("expired_token"), 500),
+            DeviceFlowState::Failed { .. }
+        ));
     }
     #[test]
     fn timeout_fails() {
-        assert!(matches!(awaiting(1000).on_poll(Some("authorization_pending"), 1500), DeviceFlowState::Failed { .. }));
+        assert!(matches!(
+            awaiting(1000).on_poll(Some("authorization_pending"), 1500),
+            DeviceFlowState::Failed { .. }
+        ));
     }
     #[test]
     fn success_returns_done() {
-        assert!(matches!(awaiting(1000).on_poll(None, 500), DeviceFlowState::Done { .. }));
+        assert!(matches!(
+            awaiting(1000).on_poll(None, 500),
+            DeviceFlowState::Done { .. }
+        ));
     }
 }

@@ -62,13 +62,17 @@ pub fn web_auth_url_for(tier: &Tier, user_code: &str, scope: &str) -> String {
 
 pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
 }
 
 /// 当前毫秒时间戳（captcha_sign 的 payload）。
 pub(crate) fn now_millis() -> u64 {
     std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 /// 手机号归一化：不以 `+` 开头则补 `+86`（中国大陆默认区号）。
@@ -108,7 +112,12 @@ fn find_info_dict(torrent: &[u8]) -> Option<&[u8]> {
         if &torrent[i..i + marker.len()] == marker {
             let mut p = i + marker.len();
             // 跳过前导空白
-            while p < torrent.len() && (torrent[p] == b' ' || torrent[p] == b'\n' || torrent[p] == b'\r' || torrent[p] == b'\t') {
+            while p < torrent.len()
+                && (torrent[p] == b' '
+                    || torrent[p] == b'\n'
+                    || torrent[p] == b'\r'
+                    || torrent[p] == b'\t')
+            {
                 p += 1;
             }
             if p < torrent.len() && torrent[p] == b'd' {
@@ -124,7 +133,9 @@ fn find_info_dict(torrent: &[u8]) -> Option<&[u8]> {
 
 /// 从 `b'd'` 起始位置找到配对的 `e`，返回其下标（含）。
 fn matching_end(buf: &[u8], start: usize) -> Option<usize> {
-    if buf.get(start)? != &b'd' { return None; }
+    if buf.get(start)? != &b'd' {
+        return None;
+    }
     let mut depth = 0i32;
     let mut i = start;
     while i < buf.len() {
@@ -139,14 +150,22 @@ fn matching_end(buf: &[u8], start: usize) -> Option<usize> {
             // 字符串以 "<len>:" 表达，跳过 "<len>:" 后整段
             c if c.is_ascii_digit() => {
                 let mut j = i;
-                while j < buf.len() && buf[j].is_ascii_digit() { j += 1; }
+                while j < buf.len() && buf[j].is_ascii_digit() {
+                    j += 1;
+                }
                 if j < buf.len() && buf[j] == b':' {
                     let mut len: usize = 0;
                     let mut ok = true;
                     for &digit in &buf[i..j] {
-                        len = match len.checked_mul(10).and_then(|v| v.checked_add((digit - b'0') as usize)) {
+                        len = match len
+                            .checked_mul(10)
+                            .and_then(|v| v.checked_add((digit - b'0') as usize))
+                        {
                             Some(v) => v,
-                            None => { ok = false; break; }
+                            None => {
+                                ok = false;
+                                break;
+                            }
                         };
                     }
                     if !ok || j + 1 + len > buf.len() {
@@ -161,7 +180,9 @@ fn matching_end(buf: &[u8], start: usize) -> Option<usize> {
             // 整数 'i...e'：跳到配对的 'e' 后继续（不计入字典/列表深度）
             b'i' => {
                 let mut j = i + 1;
-                while j < buf.len() && buf[j] != b'e' { j += 1; }
+                while j < buf.len() && buf[j] != b'e' {
+                    j += 1;
+                }
                 if j < buf.len() && buf[j] == b'e' {
                     i = j + 1;
                     continue;
@@ -228,7 +249,9 @@ pub struct Client {
 }
 
 impl Default for Client {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Client {
@@ -271,9 +294,18 @@ impl Client {
     /// 构造 drive API 的三要素请求头（档位版：x-client-id 随档位）。
     pub(crate) fn auth_headers_for(tier: &Tier, state: &AuthState) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert(AUTHORIZATION, HeaderValue::from_str(&format!("Bearer {}", state.access_token)).unwrap());
-        h.insert("x-device-id", HeaderValue::from_str(device_id_32(&state.device_id)).unwrap());
-        h.insert("x-captcha-token", HeaderValue::from_str(&state.captcha_token).unwrap());
+        h.insert(
+            AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {}", state.access_token)).unwrap(),
+        );
+        h.insert(
+            "x-device-id",
+            HeaderValue::from_str(device_id_32(&state.device_id)).unwrap(),
+        );
+        h.insert(
+            "x-captcha-token",
+            HeaderValue::from_str(&state.captcha_token).unwrap(),
+        );
         h.insert("x-client-id", HeaderValue::from_static(tier.client_id));
         h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         h
@@ -281,14 +313,19 @@ impl Client {
 
     /// refresh_token 换新 access_token（已验证可行；client_id 随档位）。
     pub async fn refresh(&self, state: &mut AuthState) -> Result<(), ClientError> {
-        let resp: TokenResp = self.http
+        let resp: TokenResp = self
+            .http
             .post(format!("{}/v1/auth/token", self.xluser_base))
             .json(&serde_json::json!({
                 "grant_type": "refresh_token",
                 "refresh_token": state.refresh_token,
                 "client_id": self.tier.client_id,
             }))
-            .send().await?.error_for_status()?.json().await?;
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         state.access_token = resp.access_token;
         state.refresh_token = resp.refresh_token;
         state.access_token_expires_at = now_unix() + resp.expires_in;
@@ -344,9 +381,11 @@ impl Client {
 
         #[derive(Deserialize)]
         struct CaptchaResp {
-            #[serde(default)] captcha_token: String,
+            #[serde(default)]
+            captcha_token: String,
         }
-        let cap_resp = self.http
+        let cap_resp = self
+            .http
             .post(format!("{}/v1/shield/captcha/init", self.xluser_base))
             .json(&serde_json::json!({
                 "action": action,
@@ -356,7 +395,8 @@ impl Client {
                 "meta": meta,
                 "redirect_uri": "xlaccsdk01://xunlei.com/callback?state=harbor",
             }))
-            .send().await?;
+            .send()
+            .await?;
         let cap_status = cap_resp.status();
         let cap_body = cap_resp.text().await.unwrap_or_default();
         if !cap_status.is_success() {
@@ -378,17 +418,24 @@ impl Client {
         struct SigninResp {
             access_token: String,
             refresh_token: String,
-            #[serde(default)] expires_in: u64,
-            #[serde(default)] user_id: String,
-            #[serde(default)] sub: String,
+            #[serde(default)]
+            expires_in: u64,
+            #[serde(default)]
+            user_id: String,
+            #[serde(default)]
+            sub: String,
         }
         let mut headers = HeaderMap::new();
-        headers.insert("x-captcha-token", HeaderValue::from_str(&captcha_token).unwrap());
+        headers.insert(
+            "x-captcha-token",
+            HeaderValue::from_str(&captcha_token).unwrap(),
+        );
         headers.insert("x-client-id", HeaderValue::from_static(self.tier.client_id));
         headers.insert("x-device-id", HeaderValue::from_str(did32).unwrap());
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!("{}/v1/auth/signin", self.xluser_base))
             .headers(headers)
             .json(&serde_json::json!({
@@ -396,7 +443,8 @@ impl Client {
                 "password": password,
                 "client_id": self.tier.client_id,
             }))
-            .send().await?;
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -434,7 +482,10 @@ impl Client {
     /// 否则服务端返回 `invalid captcha_sign` / `no client info found`。
     pub async fn refresh_captcha(&self, state: &mut AuthState) -> Result<(), ClientError> {
         #[derive(Deserialize)]
-        struct CaptchaResp { captcha_token: String, expires_in: u64 }
+        struct CaptchaResp {
+            captcha_token: String,
+            expires_in: u64,
+        }
 
         let timestamp = now_millis().to_string();
         // captcha_sign 用 32 位 device_id（wdi10. 前缀去掉 + 取前 32 位）。
@@ -448,7 +499,8 @@ impl Client {
             &timestamp,
         );
 
-        let resp: CaptchaResp = self.http
+        let resp: CaptchaResp = self
+            .http
             .post(format!("{}/v1/shield/captcha/init", self.xluser_base))
             .json(&serde_json::json!({
                 "action": "POST:/drive/v1/files",
@@ -464,7 +516,11 @@ impl Client {
                 },
                 "redirect_uri": "xlaccsdk01://xunlei.com/callback?state=harbor",
             }))
-            .send().await?.error_for_status()?.json().await?;
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         state.captcha_token = resp.captcha_token;
         state.captcha_token_expires_at = now_unix() + resp.expires_in;
         Ok(())
@@ -476,19 +532,31 @@ impl Client {
         struct Resp {
             device_code: String,
             user_code: String,
-            #[serde(default)] verification_uri_complete: String,
-            #[serde(default)] verification_url: String,
+            #[serde(default)]
+            verification_uri_complete: String,
+            #[serde(default)]
+            verification_url: String,
             expires_in: u64,
-            #[serde(default)] interval: u64,
+            #[serde(default)]
+            interval: u64,
         }
-        let resp: Resp = self.http
+        let resp: Resp = self
+            .http
             .post(format!("{}/v1/auth/device/code", self.xluser_base))
             .form(&[("scope", scope), ("client_id", self.tier.client_id)])
-            .send().await?.error_for_status()?.json().await?;
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
         Ok(DeviceCode {
             device_code: resp.device_code,
             user_code: resp.user_code,
-            verification_uri: if resp.verification_uri_complete.is_empty() { resp.verification_url } else { resp.verification_uri_complete },
+            verification_uri: if resp.verification_uri_complete.is_empty() {
+                resp.verification_url
+            } else {
+                resp.verification_uri_complete
+            },
             expires_in: resp.expires_in,
             interval: resp.interval,
         })
@@ -496,17 +564,24 @@ impl Client {
 
     /// 轮询设备码是否已被扫码授权（RFC 8628 第二步，已实测端点；client_id 随档位）。
     /// 返回 `Ok(Some(TokenResp))` = 授权成功；`Ok(None)` = 未授权（authorization_pending/slow_down）。
-    pub async fn poll_device_token(&self, device_code: &str) -> Result<Option<TokenResp>, ClientError> {
+    pub async fn poll_device_token(
+        &self,
+        device_code: &str,
+    ) -> Result<Option<TokenResp>, ClientError> {
         #[derive(Deserialize)]
-        struct ErrResp { error: String }
-        let resp = self.http
+        struct ErrResp {
+            error: String,
+        }
+        let resp = self
+            .http
             .post(format!("{}/v1/auth/token", self.xluser_base))
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", device_code),
                 ("client_id", self.tier.client_id),
             ])
-            .send().await?;
+            .send()
+            .await?;
         let status = resp.status();
         if status.is_success() {
             let token: TokenResp = resp.json().await?;
@@ -517,46 +592,75 @@ impl Client {
         match body {
             Ok(e) if e.error == "authorization_pending" || e.error == "slow_down" => Ok(None),
             Ok(e) => Err(ClientError::DeviceFlow(e.error)),
-            Err(_) => Err(ClientError::DeviceFlow(format!("poll failed with status {}", status))),
+            Err(_) => Err(ClientError::DeviceFlow(format!(
+                "poll failed with status {}",
+                status
+            ))),
         }
     }
 
     /// 取直链：调 PLAY API 拿 web_content_link（F2/F3 已验证端点）。
     /// 返回 (name, web_content_link)。size/expires 由调用方从 URL 参数解析（f=/e=）。
-    pub async fn resolve_link(&self, state: &AuthState, file_id: &str) -> Result<PlayResp, ClientError> {
-        let url = format!("{}/drive/v1/files/{}?space=&usage=PLAY", self.pan_base, file_id);
-        let resp: PlayResp = self.http
+    pub async fn resolve_link(
+        &self,
+        state: &AuthState,
+        file_id: &str,
+    ) -> Result<PlayResp, ClientError> {
+        let url = format!(
+            "{}/drive/v1/files/{}?space=&usage=PLAY",
+            self.pan_base, file_id
+        );
+        let resp: PlayResp = self
+            .http
             .get(url)
             .headers(Self::auth_headers(state))
-            .send().await?
+            .send()
+            .await?
             .error_for_status()?
-            .json().await?;
+            .json()
+            .await?;
         Ok(resp)
     }
 
     /// 列云盘目录（`GET /drive/v1/files`，已实测 200）。
     ///
     /// `parent_id` 空 = 根目录；返回条目含 id/name/kind(folder|file)/size。
-    pub async fn list_files(&self, state: &AuthState, parent_id: &str) -> Result<FilesResp, ClientError> {
+    pub async fn list_files(
+        &self,
+        state: &AuthState,
+        parent_id: &str,
+    ) -> Result<FilesResp, ClientError> {
         #[derive(Deserialize)]
         struct Raw {
-            #[serde(default)] files: Vec<RawFile>,
-            #[serde(default)] next_page_token: String,
+            #[serde(default)]
+            files: Vec<RawFile>,
+            #[serde(default)]
+            next_page_token: String,
         }
         #[derive(Deserialize)]
         struct RawFile {
-            #[serde(default)] id: String,
-            #[serde(default)] name: String,
+            #[serde(default)]
+            id: String,
+            #[serde(default)]
+            name: String,
             /// `drive#folder` / `drive#file`
-            #[serde(default, rename = "kind")] kind: String,
-            #[serde(default)] size: String,
-            #[serde(default, rename = "mime_type")] mime_type: String,
+            #[serde(default, rename = "kind")]
+            kind: String,
+            #[serde(default)]
+            size: String,
+            #[serde(default, rename = "mime_type")]
+            mime_type: String,
         }
-        let url = format!("{}/drive/v1/files?parent_id={parent_id}&usage=DISPLAY&with_audit=true&limit=100", self.pan_base);
-        let resp = self.http
+        let url = format!(
+            "{}/drive/v1/files?parent_id={parent_id}&usage=DISPLAY&with_audit=true&limit=100",
+            self.pan_base
+        );
+        let resp = self
+            .http
             .get(&url)
             .headers(Self::auth_headers(state))
-            .send().await?;
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -567,13 +671,17 @@ impl Client {
         let resp: Raw = resp.json().await?;
         Ok(FilesResp {
             next_page_token: resp.next_page_token,
-            files: resp.files.into_iter().map(|f| DriveEntry {
-                id: f.id,
-                name: f.name,
-                is_folder: f.kind.ends_with("folder"),
-                size: f.size.parse().unwrap_or(0),
-                mime_type: f.mime_type,
-            }).collect(),
+            files: resp
+                .files
+                .into_iter()
+                .map(|f| DriveEntry {
+                    id: f.id,
+                    name: f.name,
+                    is_folder: f.kind.ends_with("folder"),
+                    size: f.size.parse().unwrap_or(0),
+                    mime_type: f.mime_type,
+                })
+                .collect(),
         })
     }
 
@@ -614,9 +722,11 @@ impl Client {
         );
         #[derive(Deserialize)]
         struct CapResp {
-            #[serde(default)] captcha_token: String,
+            #[serde(default)]
+            captcha_token: String,
         }
-        let cap_resp = self.http
+        let cap_resp = self
+            .http
             .post(format!("{}/v1/shield/captcha/init", self.xluser_base))
             .json(&serde_json::json!({
                 "action": "POST:/v1/auth/verification",
@@ -633,7 +743,8 @@ impl Client {
                 },
                 "redirect_uri": "xlaccsdk01://xunlei.com/callback?state=harbor",
             }))
-            .send().await?;
+            .send()
+            .await?;
         let cap_status = cap_resp.status();
         let cap_body = cap_resp.text().await.unwrap_or_default();
         if !cap_status.is_success() {
@@ -650,12 +761,16 @@ impl Client {
         }
 
         let mut headers = HeaderMap::new();
-        headers.insert("x-captcha-token", HeaderValue::from_str(&cap.captcha_token).unwrap());
+        headers.insert(
+            "x-captcha-token",
+            HeaderValue::from_str(&cap.captcha_token).unwrap(),
+        );
         headers.insert("x-client-id", HeaderValue::from_static(self.tier.client_id));
         headers.insert("x-device-id", HeaderValue::from_str(did32).unwrap());
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!("{}/v1/auth/verification", self.xluser_base))
             .headers(headers)
             .json(&serde_json::json!({
@@ -665,7 +780,8 @@ impl Client {
                 "usage": "SIGN_IN",
                 "captcha_token": cap.captcha_token,
             }))
-            .send().await?;
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -710,16 +826,23 @@ impl Client {
 
         #[derive(Deserialize)]
         struct VerifyResp {
-            #[serde(default)] verification_token: String,
-            #[serde(default)] access_token: String,
-            #[serde(default)] refresh_token: String,
-            #[serde(default)] expires_in: u64,
-            #[serde(default)] user_id: String,
-            #[serde(default)] sub: String,
+            #[serde(default)]
+            verification_token: String,
+            #[serde(default)]
+            access_token: String,
+            #[serde(default)]
+            refresh_token: String,
+            #[serde(default)]
+            expires_in: u64,
+            #[serde(default)]
+            user_id: String,
+            #[serde(default)]
+            sub: String,
         }
 
         // 1) 校验验证码。
-        let verify = self.http
+        let verify = self
+            .http
             .post(format!("{}/v1/auth/verification/verify", self.xluser_base))
             .json(&serde_json::json!({
                 "client_id": self.tier.client_id,
@@ -727,7 +850,8 @@ impl Client {
                 "verification_id": verification_id,
                 "verification_code": code,
             }))
-            .send().await?;
+            .send()
+            .await?;
         let status = verify.status();
         if !status.is_success() {
             let body = verify.text().await.unwrap_or_default();
@@ -767,9 +891,12 @@ impl Client {
         struct SigninTokenResp {
             access_token: String,
             refresh_token: String,
-            #[serde(default)] expires_in: u64,
-            #[serde(default)] user_id: String,
-            #[serde(default)] sub: String,
+            #[serde(default)]
+            expires_in: u64,
+            #[serde(default)]
+            user_id: String,
+            #[serde(default)]
+            sub: String,
         }
 
         // 3a) signin 动作的 captcha/init（实测 4001 captcha_required 否则）。
@@ -784,9 +911,11 @@ impl Client {
         );
         #[derive(Deserialize)]
         struct CapResp2 {
-            #[serde(default)] captcha_token: String,
+            #[serde(default)]
+            captcha_token: String,
         }
-        let cap2_resp = self.http
+        let cap2_resp = self
+            .http
             .post(format!("{}/v1/shield/captcha/init", self.xluser_base))
             .json(&serde_json::json!({
                 "action": "POST:/v1/auth/signin",
@@ -803,7 +932,8 @@ impl Client {
                 },
                 "redirect_uri": "xlaccsdk01://xunlei.com/callback?state=harbor",
             }))
-            .send().await?;
+            .send()
+            .await?;
         let c2_status = cap2_resp.status();
         let c2_body = cap2_resp.text().await.unwrap_or_default();
         if !c2_status.is_success() {
@@ -820,12 +950,16 @@ impl Client {
         }
 
         let mut headers = HeaderMap::new();
-        headers.insert("x-captcha-token", HeaderValue::from_str(&cap2.captcha_token).unwrap());
+        headers.insert(
+            "x-captcha-token",
+            HeaderValue::from_str(&cap2.captcha_token).unwrap(),
+        );
         headers.insert("x-client-id", HeaderValue::from_static(self.tier.client_id));
         headers.insert("x-device-id", HeaderValue::from_str(did32).unwrap());
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!("{}/v1/auth/signin", self.xluser_base))
             .headers(headers)
             .json(&serde_json::json!({
@@ -834,7 +968,8 @@ impl Client {
                 "verification_token": token,
                 "client_id": self.tier.client_id,
             }))
-            .send().await?;
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -907,8 +1042,10 @@ impl Client {
     ) -> Result<SubmitResp, ClientError> {
         #[derive(Deserialize)]
         struct Raw {
-            #[serde(default)] task: serde_json::Value,
-            #[serde(default)] file: serde_json::Value,
+            #[serde(default)]
+            task: serde_json::Value,
+            #[serde(default)]
+            file: serde_json::Value,
         }
         let body = serde_json::json!({
             "kind": "drive#file",
@@ -917,11 +1054,13 @@ impl Client {
             "upload_type": "UPLOAD_TYPE_URL",
             "url": { "url": url },
         });
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!("{}/drive/v1/files", self.pan_base))
             .headers(Self::auth_headers(state))
             .json(&body)
-            .send().await?;
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -935,7 +1074,11 @@ impl Client {
         };
         Ok(SubmitResp {
             task_id: s(&raw.task, "id"),
-            file_id: if raw.file.is_object() { s(&raw.file, "id") } else { raw.file.as_str().unwrap_or("").to_string() },
+            file_id: if raw.file.is_object() {
+                s(&raw.file, "id")
+            } else {
+                raw.file.as_str().unwrap_or("").to_string()
+            },
         })
     }
 
@@ -943,19 +1086,29 @@ impl Client {
     pub async fn offline_tasks(&self, state: &AuthState) -> Result<Vec<OfflineTask>, ClientError> {
         #[derive(Deserialize)]
         struct Raw {
-            #[serde(default)] tasks: Vec<RawTask>,
+            #[serde(default)]
+            tasks: Vec<RawTask>,
         }
         #[derive(Deserialize)]
         struct RawTask {
-            #[serde(default)] id: String,
-            #[serde(default)] name: String,
-            #[serde(default)] phase: String,
-            #[serde(default)] file_id: String,
+            #[serde(default)]
+            id: String,
+            #[serde(default)]
+            name: String,
+            #[serde(default)]
+            phase: String,
+            #[serde(default)]
+            file_id: String,
         }
-        let resp = self.http
-            .get(format!("{}/drive/v1/tasks?type=offline&limit=50", self.pan_base))
+        let resp = self
+            .http
+            .get(format!(
+                "{}/drive/v1/tasks?type=offline&limit=50",
+                self.pan_base
+            ))
             .headers(Self::auth_headers(state))
-            .send().await?;
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -964,12 +1117,16 @@ impl Client {
             )));
         }
         let raw: Raw = resp.json().await?;
-        Ok(raw.tasks.into_iter().map(|t| OfflineTask {
-            id: t.id,
-            name: t.name,
-            phase: t.phase,
-            file_id: t.file_id,
-        }).collect())
+        Ok(raw
+            .tasks
+            .into_iter()
+            .map(|t| OfflineTask {
+                id: t.id,
+                name: t.name,
+                phase: t.phase,
+                file_id: t.file_id,
+            })
+            .collect())
     }
 
     /// 把 .torrent 字节流上传到迅雷云端离线（torrent 字节直传通道）。
@@ -1062,11 +1219,13 @@ impl Client {
             .mime_str("application/x-bittorrent")
             .unwrap_or_else(|_| reqwest::multipart::Part::bytes(torrent.to_vec()));
         let form = reqwest::multipart::Form::new().part("file", part);
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!("{}/drive/v1/files", self.pan_base))
             .headers(Self::auth_headers(state))
             .multipart(form)
-            .send().await?;
+            .send()
+            .await?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -1076,9 +1235,23 @@ impl Client {
         }
         // 尽力解析 task.id / file.id（与 offline_submit 同构）。
         let raw: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-        let task_id = raw.get("task").and_then(|t| t.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let file_id = raw.get("file").and_then(|t| t.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-        Ok(if !task_id.is_empty() { task_id } else { file_id })
+        let task_id = raw
+            .get("task")
+            .and_then(|t| t.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let file_id = raw
+            .get("file")
+            .and_then(|t| t.get("id"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        Ok(if !task_id.is_empty() {
+            task_id
+        } else {
+            file_id
+        })
     }
 }
 
@@ -1146,10 +1319,13 @@ mod tests {
     use super::*;
     fn state() -> AuthState {
         AuthState {
-            access_token: "at123".into(), refresh_token: "rt".into(),
-            device_id: "dev456".into(), captcha_token: "ck789".into(),
+            access_token: "at123".into(),
+            refresh_token: "rt".into(),
+            device_id: "dev456".into(),
+            captcha_token: "ck789".into(),
             user_id: "860599297".into(),
-            access_token_expires_at: 0, captcha_token_expires_at: 0,
+            access_token_expires_at: 0,
+            captcha_token_expires_at: 0,
         }
     }
     #[test]

@@ -245,34 +245,55 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentSummary, TorrentMetaError> {
     let (s, e) = locate_info_span(bytes).ok_or(TorrentMetaError::MissingInfo)?;
     let mut hasher = Sha1::new();
     hasher.update(&bytes[s..=e]);
-    let infohash_v1: String = hasher.finalize().iter().map(|x| format!("{x:02x}")).collect();
+    let infohash_v1: String = hasher
+        .finalize()
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect();
 
     let info = top.dict_get(b"info").ok_or(TorrentMetaError::MissingInfo)?;
     let Value::Dict(_) = info else {
         return Err(TorrentMetaError::BadType("info"));
     };
 
-    let name_v = info.dict_get(b"name").and_then(as_bytes).ok_or(TorrentMetaError::MissingField("name"))?;
+    let name_v = info
+        .dict_get(b"name")
+        .and_then(as_bytes)
+        .ok_or(TorrentMetaError::MissingField("name"))?;
     let name = bytes_to_string(name_v);
-    let piece_len = as_int(info.dict_get(b"piece length").ok_or(TorrentMetaError::MissingField("piece length"))?)
-        .ok_or(TorrentMetaError::BadType("piece length"))?;
-    let pieces = as_bytes(info.dict_get(b"pieces").ok_or(TorrentMetaError::MissingField("pieces"))?)
-        .ok_or(TorrentMetaError::BadType("pieces"))?;
+    let piece_len = as_int(
+        info.dict_get(b"piece length")
+            .ok_or(TorrentMetaError::MissingField("piece length"))?,
+    )
+    .ok_or(TorrentMetaError::BadType("piece length"))?;
+    let pieces = as_bytes(
+        info.dict_get(b"pieces")
+            .ok_or(TorrentMetaError::MissingField("pieces"))?,
+    )
+    .ok_or(TorrentMetaError::BadType("pieces"))?;
     let num_pieces = pieces.len() as i64 / 20;
 
     let mut files = Vec::new();
     if let Some(len) = info.dict_get(b"length") {
         let size = as_int(len).ok_or(TorrentMetaError::BadType("length"))?;
-        files.push(TorrentFileMeta { path: name.clone(), size: size.max(0) as u64 });
+        files.push(TorrentFileMeta {
+            path: name.clone(),
+            size: size.max(0) as u64,
+        });
     } else if let Some(Value::List(entries)) = info.dict_get(b"files") {
         for entry in entries {
             let Value::Dict(_) = entry else {
                 return Err(TorrentMetaError::BadType("files[]"));
             };
-            let size = as_int(entry.dict_get(b"length").ok_or(TorrentMetaError::MissingField("files[].length"))?)
-                .ok_or(TorrentMetaError::BadType("files[].length"))?;
-            let Value::List(parts) =
-                entry.dict_get(b"path").ok_or(TorrentMetaError::MissingField("files[].path"))?
+            let size = as_int(
+                entry
+                    .dict_get(b"length")
+                    .ok_or(TorrentMetaError::MissingField("files[].length"))?,
+            )
+            .ok_or(TorrentMetaError::BadType("files[].length"))?;
+            let Value::List(parts) = entry
+                .dict_get(b"path")
+                .ok_or(TorrentMetaError::MissingField("files[].path"))?
             else {
                 return Err(TorrentMetaError::BadType("files[].path"));
             };
@@ -302,8 +323,14 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentSummary, TorrentMetaError> {
         total_size,
         trackers: collect_trackers(&top),
         web_seeds: collect_web_seeds(&top),
-        comment: top.dict_get(b"comment").and_then(as_bytes).map(bytes_to_string),
-        created_by: top.dict_get(b"created by").and_then(as_bytes).map(bytes_to_string),
+        comment: top
+            .dict_get(b"comment")
+            .and_then(as_bytes)
+            .map(bytes_to_string),
+        created_by: top
+            .dict_get(b"created by")
+            .and_then(as_bytes)
+            .map(bytes_to_string),
     })
 }
 
@@ -321,7 +348,10 @@ mod tests {
             (b"pieces".to_vec(), Value::Bytes(vec![0xAB; 20])),
         ]);
         Value::Dict(vec![
-            (b"announce".to_vec(), Value::Bytes(b"http://tracker/a".to_vec())),
+            (
+                b"announce".to_vec(),
+                Value::Bytes(b"http://tracker/a".to_vec()),
+            ),
             (b"info".to_vec(), info),
         ])
         .into_bencode()
@@ -330,38 +360,57 @@ mod tests {
     /// 多文件 + announce-list + url-list + comment/created by。
     fn multi_file_torrent() -> Vec<u8> {
         let info = Value::Dict(vec![
-            (b"files".to_vec(), Value::List(vec![
-                Value::Dict(vec![
-                    (b"length".to_vec(), Value::Int(100)),
-                    (b"path".to_vec(), Value::List(vec![
-                        Value::Bytes(b"sub".to_vec()),
-                        Value::Bytes(b"a.txt".to_vec()),
-                    ])),
+            (
+                b"files".to_vec(),
+                Value::List(vec![
+                    Value::Dict(vec![
+                        (b"length".to_vec(), Value::Int(100)),
+                        (
+                            b"path".to_vec(),
+                            Value::List(vec![
+                                Value::Bytes(b"sub".to_vec()),
+                                Value::Bytes(b"a.txt".to_vec()),
+                            ]),
+                        ),
+                    ]),
+                    Value::Dict(vec![
+                        (b"length".to_vec(), Value::Int(250)),
+                        (
+                            b"path".to_vec(),
+                            Value::List(vec![Value::Bytes(b"b.bin".to_vec())]),
+                        ),
+                    ]),
                 ]),
-                Value::Dict(vec![
-                    (b"length".to_vec(), Value::Int(250)),
-                    (b"path".to_vec(), Value::List(vec![
-                        Value::Bytes(b"b.bin".to_vec()),
-                    ])),
-                ]),
-            ])),
+            ),
             (b"name".to_vec(), Value::Bytes(b"pkg".to_vec())),
             (b"piece length".to_vec(), Value::Int(32768)),
             (b"pieces".to_vec(), Value::Bytes(vec![0xCD; 40])),
         ]);
         Value::Dict(vec![
-            (b"announce".to_vec(), Value::Bytes(b"http://tracker/1".to_vec())),
-            (b"announce-list".to_vec(), Value::List(vec![
-                Value::List(vec![Value::Bytes(b"http://tracker/1".to_vec())]),
-                Value::List(vec![Value::Bytes(b"http://tracker/2".to_vec())]),
-            ])),
+            (
+                b"announce".to_vec(),
+                Value::Bytes(b"http://tracker/1".to_vec()),
+            ),
+            (
+                b"announce-list".to_vec(),
+                Value::List(vec![
+                    Value::List(vec![Value::Bytes(b"http://tracker/1".to_vec())]),
+                    Value::List(vec![Value::Bytes(b"http://tracker/2".to_vec())]),
+                ]),
+            ),
             (b"comment".to_vec(), Value::Bytes(b"hello".to_vec())),
-            (b"created by".to_vec(), Value::Bytes(b"smart-dl test".to_vec())),
+            (
+                b"created by".to_vec(),
+                Value::Bytes(b"smart-dl test".to_vec()),
+            ),
             (b"info".to_vec(), info),
-            (b"url-list".to_vec(), Value::List(vec![
-                Value::Bytes(b"https://ws/1".to_vec()),
-                Value::Bytes(b"https://ws/2".to_vec()),
-            ])),
+            (
+                b"url-list".to_vec(),
+                Value::List(vec![
+                    Value::Bytes(b"https://ws/1".to_vec()),
+                    Value::Bytes(b"https://ws/2".to_vec()),
+                ]),
+            ),
         ])
         .into_bencode()
     }
@@ -377,7 +426,13 @@ mod tests {
         let bytes = single_file_torrent();
         let s = parse_torrent(&bytes).unwrap();
         assert_eq!(s.name, "test.iso");
-        assert_eq!(s.files, vec![TorrentFileMeta { path: "test.iso".into(), size: 2048 }]);
+        assert_eq!(
+            s.files,
+            vec![TorrentFileMeta {
+                path: "test.iso".into(),
+                size: 2048
+            }]
+        );
         assert_eq!(s.total_size, 2048);
         assert_eq!(s.piece_len, 16384);
         assert_eq!(s.num_pieces, 1);
@@ -415,7 +470,10 @@ mod tests {
         ]);
         let bytes = Value::Dict(vec![
             (b"info".to_vec(), info),
-            (b"url-list".to_vec(), Value::Bytes(b"https://only/one".to_vec())),
+            (
+                b"url-list".to_vec(),
+                Value::Bytes(b"https://only/one".to_vec()),
+            ),
         ])
         .into_bencode();
         let s = parse_torrent(&bytes).unwrap();
@@ -437,14 +495,24 @@ mod tests {
 
     #[test]
     fn missing_info_rejected() {
-        let bytes = Value::Dict(vec![(b"announce".to_vec(), Value::Bytes(b"x".to_vec()))]).into_bencode();
-        assert_eq!(parse_torrent(&bytes).unwrap_err(), TorrentMetaError::MissingInfo);
+        let bytes =
+            Value::Dict(vec![(b"announce".to_vec(), Value::Bytes(b"x".to_vec()))]).into_bencode();
+        assert_eq!(
+            parse_torrent(&bytes).unwrap_err(),
+            TorrentMetaError::MissingInfo
+        );
     }
 
     #[test]
     fn garbage_rejected() {
-        assert!(matches!(parse_torrent(b"not-bencode"), Err(TorrentMetaError::Decode(_))));
-        assert_eq!(parse_torrent(b"i5e").unwrap_err(), TorrentMetaError::MissingInfo);
+        assert!(matches!(
+            parse_torrent(b"not-bencode"),
+            Err(TorrentMetaError::Decode(_))
+        ));
+        assert_eq!(
+            parse_torrent(b"i5e").unwrap_err(),
+            TorrentMetaError::MissingInfo
+        );
     }
 
     #[test]
@@ -464,16 +532,22 @@ mod tests {
     #[test]
     fn empty_path_rejected() {
         let info = Value::Dict(vec![
-            (b"files".to_vec(), Value::List(vec![Value::Dict(vec![
-                (b"length".to_vec(), Value::Int(1)),
-                (b"path".to_vec(), Value::List(vec![])),
-            ])])),
+            (
+                b"files".to_vec(),
+                Value::List(vec![Value::Dict(vec![
+                    (b"length".to_vec(), Value::Int(1)),
+                    (b"path".to_vec(), Value::List(vec![])),
+                ])]),
+            ),
             (b"name".to_vec(), Value::Bytes(b"d".to_vec())),
             (b"piece length".to_vec(), Value::Int(16384)),
             (b"pieces".to_vec(), Value::Bytes(vec![0u8; 20])),
         ]);
         let bytes = Value::Dict(vec![(b"info".to_vec(), info)]).into_bencode();
-        assert_eq!(parse_torrent(&bytes).unwrap_err(), TorrentMetaError::EmptyPath);
+        assert_eq!(
+            parse_torrent(&bytes).unwrap_err(),
+            TorrentMetaError::EmptyPath
+        );
     }
 
     #[test]

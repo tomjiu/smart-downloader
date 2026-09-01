@@ -67,7 +67,6 @@ fn strip_layout_assertions(src: &str) -> String {
                 let offset_in_rest = after_eq.len() - trimmed.len();
                 let block_start = eq + 1 + offset_in_rest;
                 let mut depth = 0i64;
-                let mut j = block_start;
                 let mut found = None;
                 for (k, c) in rest[block_start..].char_indices() {
                     match c {
@@ -81,16 +80,17 @@ fn strip_layout_assertions(src: &str) -> String {
                         }
                         _ => {}
                     }
-                    let _ = j;
-                    j += 1;
                 }
                 match found {
                     Some(brace_end) => {
                         let semi = rest[brace_end..].find(';').map(|s| brace_end + s);
                         match semi {
-                            Some(s) => (s, rest[block_start..=brace_end].contains("Size of ")
-                                || rest[block_start..=brace_end].contains("Alignment of ")
-                                || rest[block_start..=brace_end].contains("Offset of field:")),
+                            Some(s) => (
+                                s,
+                                rest[block_start..=brace_end].contains("Size of ")
+                                    || rest[block_start..=brace_end].contains("Alignment of ")
+                                    || rest[block_start..=brace_end].contains("Offset of field:"),
+                            ),
                             None => (rest.len() - 1, false),
                         }
                     }
@@ -114,7 +114,9 @@ fn strip_layout_assertions(src: &str) -> String {
             if drop_block {
                 i += end + 1;
                 // 吃掉块后换行
-                while i < rest_src.len() && (rest_src.as_bytes()[i] == b'\n' || rest_src.as_bytes()[i] == b'\r') {
+                while i < rest_src.len()
+                    && (rest_src.as_bytes()[i] == b'\n' || rest_src.as_bytes()[i] == b'\r')
+                {
                     i += 1;
                 }
                 continue;
@@ -135,22 +137,37 @@ fn main() {
     let repo = PathBuf::from(&manifest).join("..").join("..");
 
     let lt_h = repo.join("ffi").join("lt.h");
-    // bindgen 需要 libclang（Linux 环境常缺失，且 bindgen 0.71 缺库时直接 panic
-    // 而非返回 Err）。故先预检测 libclang：找不到且仓库内有已提交的 bindings.rs
-    //（上次 Windows 构建生成物）时直接回退，保证 `cargo check` 在无 libclang
-    // 平台仍可通过（头文件变更时需在有 libclang 的环境重新生成）。
+    // 绑定策略（跨平台确定性优先）：默认一律使用仓库内已提交的 bindings.rs
+    //（净化副本写入 OUT_DIR，见下）。理由：
+    //  ① 仓库内绑定是唯一被全量测试验证过的形状（Windows 生成、Linux 净化后
+    //     实测 33+162 全绿）；
+    //  ② 现场 bindgen 生成的 Linux 绑定与提交版存在常量类型差异（如 LT_ALERT_*
+    //     宏 u32/i32），会使按提交绑定形状编写的 ffi.rs 编译失败
+    //     （CI bt job 首跑实证：runner 带 libclang → 全量 E0308）；
+    //  ③ bindgen 0.71 在缺 libclang 时 panic 而非返回 Err，隐式探测路径脆弱。
+    // 需要重新生成绑定时显式开启（需 libclang；产物回存 crates/btcore/bindings.rs）：
+    //   SMART_DL_REGEN_BINDINGS=1 cargo build -p smart-dl-btcore
     let fallback_bindings = PathBuf::from(&manifest).join("bindings.rs");
-    let use_fallback = !libclang_available() && fallback_bindings.exists();
-    if use_fallback {
+    let regen_requested = env::var("SMART_DL_REGEN_BINDINGS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let libclang_ok = libclang_available();
+    let use_fallback = fallback_bindings.exists() && !(regen_requested && libclang_ok);
+    if regen_requested && !libclang_ok {
         println!(
-            "cargo:warning=未检测到 libclang，回退使用已提交的 bindings.rs；如修改了 ffi/lt.h 请在有 libclang 的环境重新生成绑定"
+            "cargo:warning=SMART_DL_REGEN_BINDINGS=1 但 libclang 不可用，回退使用已提交的 bindings.rs"
         );
+    }
+    // 声明自定义 cfg 名（cargo 1.80+ unexpected_cfgs 检查要求先声明再使用；
+    // 与分支无关 —— ffi.rs 在两种路径下都引用该 cfg）
+    println!("cargo::rustc-check-cfg=cfg(lt_bindings_fallback)");
+    if use_fallback {
         // 净化回退产物：Windows/MSVC 生成的 bindings.rs 含平台相关的布局断言
         //（"Size of/Alignment of/Offset of field"，如 _Mbstatet），在 Linux 上
         // const 求值会越界 panic。剥离这些编译期检查（不影响运行语义），
         // 写入 OUT_DIR 并用 rustc-cfg 让 ffi.rs 切换 include。
-        let raw = std::fs::read_to_string(&fallback_bindings)
-            .expect("read fallback bindings.rs failed");
+        let raw =
+            std::fs::read_to_string(&fallback_bindings).expect("read fallback bindings.rs failed");
         let sanitized = strip_layout_assertions(&raw);
         let out_dir = env::var("OUT_DIR").unwrap();
         let out_path = Path::new(&out_dir).join("bindings_fallback.rs");
@@ -170,9 +187,7 @@ fn main() {
             }
             Err(e) => {
                 if fallback_bindings.exists() {
-                    println!(
-                        "cargo:warning=bindgen 失败（{e}），保留已提交的 bindings.rs"
-                    );
+                    println!("cargo:warning=bindgen 失败（{e}），保留已提交的 bindings.rs");
                 } else {
                     panic!("bindgen failed on ffi/lt.h: {e}，且无回退 bindings.rs");
                 }

@@ -31,15 +31,15 @@
 #![cfg_attr(not(windows), allow(dead_code))]
 
 pub mod bindings;
-pub mod error;
-pub mod loader;
-pub mod handle;
-pub mod task;
-pub mod peer;
-pub mod tracker;
 pub mod dcdn;
+pub mod error;
+pub mod handle;
 pub mod identity;
+pub mod loader;
+pub mod peer;
 pub mod query;
+pub mod task;
+pub mod tracker;
 
-pub use error::{XunleiError, Result};
+pub use error::{Result, XunleiError};
 pub use handle::XunleiHandle;

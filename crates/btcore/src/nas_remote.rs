@@ -26,8 +26,8 @@ use tokio::sync::{Mutex, RwLock};
 
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
-    Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState,
-    EngineStatus, EngineTaskId, FileProgress,
+    Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
+    EngineTaskId, FileProgress,
 };
 
 /// 迅雷任务相位（引擎返回 `PHASE_TYPE_*`）→ 统一 `EngineState`。
@@ -190,7 +190,9 @@ impl NasRemoteEngine {
             .await
             .map_err(|e| EngineError::Other(format!("engine GET / read failed: {e}")))?;
         let jwt = extract_uiauth_jwt(&html).ok_or_else(|| {
-            EngineError::Other("uiauth JWT not found in engine homepage（引擎未就绪或版本不符）".into())
+            EngineError::Other(
+                "uiauth JWT not found in engine homepage（引擎未就绪或版本不符）".into(),
+            )
         })?;
         *self.jwt.write().await = Some(jwt.clone());
         Ok(jwt)
@@ -213,8 +215,8 @@ impl NasRemoteEngine {
         if st != 200 {
             return Err(classify_error(st, &body));
         }
-        let v: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| EngineError::Other(format!("bad json: {e}")))?;
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| EngineError::Other(format!("bad json: {e}")))?;
         v.get("tasks")
             .and_then(|t| t.as_array())
             .and_then(|a| a.first().cloned())
@@ -262,7 +264,9 @@ impl NasRemoteEngine {
         timeout_s: u64,
     ) -> Result<(u16, String), EngineError> {
         let jwt = self.req_jwt().await?;
-        let (st, body) = self.send(method.clone(), url, &jwt, json_body, timeout_s).await?;
+        let (st, body) = self
+            .send(method.clone(), url, &jwt, json_body, timeout_s)
+            .await?;
         if st == 403 {
             let jwt2 = self.ensure_jwt(true).await?;
             return self.send(method, url, &jwt2, json_body, timeout_s).await;
@@ -295,7 +299,11 @@ impl DownloadEngine for NasRemoteEngine {
     }
 
     fn capabilities(&self) -> Vec<Capability> {
-        vec![Capability::Http, Capability::Https, Capability::MultiConnection]
+        vec![
+            Capability::Http,
+            Capability::Https,
+            Capability::MultiConnection,
+        ]
     }
 
     /// 创建 URL 任务（A4 定案载荷）。成功后以 `nas-<xlid>` 为引擎任务句柄。
@@ -318,14 +326,16 @@ impl DownloadEngine for NasRemoteEngine {
         if st != 200 {
             return Err(classify_error(st, &body));
         }
-        let v: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| EngineError::Other(format!("bad json: {e}")))?;
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| EngineError::Other(format!("bad json: {e}")))?;
         let xlid = v
             .get("task")
             .and_then(|t| t.get("id"))
             .or_else(|| v.get("id"))
             .and_then(|i| i.as_str())
-            .ok_or_else(|| EngineError::Other(format!("create 响应缺 task.id: {}", truncate(&body, 120))))?
+            .ok_or_else(|| {
+                EngineError::Other(format!("create 响应缺 task.id: {}", truncate(&body, 120)))
+            })?
             .to_string();
         let handle = format!("nas-{xlid}");
         self.tasks.lock().await.insert(handle.clone(), xlid);
@@ -417,7 +427,11 @@ impl DownloadEngine for NasRemoteEngine {
     }
 
     /// 超速申请（A4：仅 RUNNING 任务生效；body 空对象即可，配额 usage 独立）。
-    async fn update_sources(&self, id: &EngineTaskId, _urls: Vec<String>) -> Result<(), EngineError> {
+    async fn update_sources(
+        &self,
+        id: &EngineTaskId,
+        _urls: Vec<String>,
+    ) -> Result<(), EngineError> {
         let _xlid = self
             .tasks
             .lock()
@@ -441,11 +455,18 @@ impl DownloadEngine for NasRemoteEngine {
         Err(EngineError::Unsupported)
     }
 
-    async fn peers(&self, _id: &EngineTaskId) -> Result<Vec<smart_dl_core::types::PeerInfo>, EngineError> {
+    async fn peers(
+        &self,
+        _id: &EngineTaskId,
+    ) -> Result<Vec<smart_dl_core::types::PeerInfo>, EngineError> {
         Ok(vec![]) // NAS 引擎无 peer 概念暴露
     }
 
-    async fn ban_peer(&self, _id: &EngineTaskId, _peer: std::net::SocketAddr) -> Result<(), EngineError> {
+    async fn ban_peer(
+        &self,
+        _id: &EngineTaskId,
+        _peer: std::net::SocketAddr,
+    ) -> Result<(), EngineError> {
         Err(EngineError::Unsupported)
     }
 
@@ -478,12 +499,18 @@ function uiauth(value){ return "eyJhbGciOiJIUzI1NiJ9.eyJrZXkiOiJVSUF1dGgifQ.sig"
 
     #[test]
     fn phase_mapping() {
-        assert_eq!(map_phase("PHASE_TYPE_PENDING"), EngineState::MetadataPending);
+        assert_eq!(
+            map_phase("PHASE_TYPE_PENDING"),
+            EngineState::MetadataPending
+        );
         assert_eq!(map_phase("PHASE_TYPE_RUNNING"), EngineState::Downloading);
         assert_eq!(map_phase("PHASE_TYPE_COMPLETE"), EngineState::Completed);
         assert_eq!(map_phase("PHASE_TYPE_ERROR"), EngineState::Error);
         assert_eq!(map_phase("PHASE_TYPE_PAUSED"), EngineState::Paused);
-        assert_eq!(map_phase("PHASE_TYPE_WHATEVER"), EngineState::MetadataPending);
+        assert_eq!(
+            map_phase("PHASE_TYPE_WHATEVER"),
+            EngineState::MetadataPending
+        );
     }
 
     #[test]
@@ -494,7 +521,10 @@ function uiauth(value){ return "eyJhbGciOiJIUzI1NiJ9.eyJrZXkiOiJVSUF1dGgifQ.sig"
             "https://proof.ovh.net/files/10Mb.dat",
         );
         // A4 定案：url 必须为对象形；space/params.target 同值
-        assert_eq!(p["url"], serde_json::json!({"url": "https://proof.ovh.net/files/10Mb.dat"}));
+        assert_eq!(
+            p["url"],
+            serde_json::json!({"url": "https://proof.ovh.net/files/10Mb.dat"})
+        );
         assert_eq!(p["space"], "device_id#c7d089aad73f7e2ddd2c263c2956b5a6");
         assert_eq!(p["params"]["target"], p["space"]);
         assert_eq!(p["type"], "user#download-url");
@@ -505,7 +535,10 @@ function uiauth(value){ return "eyJhbGciOiJIUzI1NiJ9.eyJrZXkiOiJVSUF1dGgifQ.sig"
 
     #[test]
     fn name_from_url() {
-        assert_eq!(task_name_from_url("https://x.com/a/b/file.zip?sig=1"), "file.zip");
+        assert_eq!(
+            task_name_from_url("https://x.com/a/b/file.zip?sig=1"),
+            "file.zip"
+        );
         assert_eq!(task_name_from_url("https://x.com/"), "x.com");
         assert_eq!(task_name_from_url("not-a-url"), "not-a-url");
     }

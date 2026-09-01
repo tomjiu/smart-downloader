@@ -94,10 +94,9 @@ pub fn normalize_user_link(link: &str) -> NormalizedSource {
         };
     }
     // 迅雷网盘分享链接（pan.xunlei.com/s/xxx?pwd=yyy）
-    if link.contains("pan.xunlei.com/s/")
-        && parse_xunlei_share(link).is_ok() {
-            return NormalizedSource::XunleiShare(link.to_string());
-        }
+    if link.contains("pan.xunlei.com/s/") && parse_xunlei_share(link).is_ok() {
+        return NormalizedSource::XunleiShare(link.to_string());
+    }
     NormalizedSource::Unsupported(link.to_string())
 }
 
@@ -188,7 +187,9 @@ mod tests {
         // Task 5-a T3：合法 ed2k → Ed2k 分类（结构化解析见 ed2k.rs）
         assert_eq!(
             normalize_user_link("ed2k://|file|a.bin|1|0123456789abcdef0123456789abcdef|/"),
-            NormalizedSource::Ed2k("ed2k://|file|a.bin|1|0123456789abcdef0123456789abcdef|/".into())
+            NormalizedSource::Ed2k(
+                "ed2k://|file|a.bin|1|0123456789abcdef0123456789abcdef|/".into()
+            )
         );
     }
 
@@ -223,7 +224,8 @@ mod tests {
     #[test]
     fn fs2you_decodes_to_http() {
         // 2026-08-30 缺口 #1：fs2you → 直链 HTTP
-        let inner = "cachefile://cache13.zhowta.com/file/a.rar|1048576|d41d8cd98f00b204e9800998ecf8427e";
+        let inner =
+            "cachefile://cache13.zhowta.com/file/a.rar|1048576|d41d8cd98f00b204e9800998ecf8427e";
         let link = format!("fs2you://{}", B64.encode(inner.as_bytes()));
         assert_eq!(
             normalize_user_link(&link),

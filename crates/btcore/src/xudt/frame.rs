@@ -1,46 +1,3 @@
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wrap_and_unwrap_frame_roundtrip() {
-        let payload = vec![1u8, 2, 3];
-        let f = wrap_frame(&payload, TYPE_LOCAL, 0xE4A3CA76, 0xE38B045B, 0x422F7BCE);
-        assert_eq!(f.len(), 24 + 3);
-        let u = unwrap_frame(&f).unwrap();
-        assert_eq!(u.ftype, TYPE_LOCAL);
-        assert_eq!(u.seq, 0xE4A3CA76);
-        assert_eq!(u.aux, 0xE38B045B);
-        assert_eq!(u.fixed, FIXED_CTRL);
-        assert_eq!(u.ctr, 0x422F7BCE);
-        assert_eq!(u.payload, payload);
-    }
-
-    #[test]
-    fn unwrap_frame_too_short_returns_none() {
-        assert!(unwrap_frame(&[0u8; 10]).is_none());
-    }
-
-    #[test]
-    fn wrap_and_unwrap_data_roundtrip() {
-        let block = vec![0xABu8; 1381];
-        let f = wrap_data(&block, 100, 200, 0x1C7695B5);
-        assert_eq!(f.len(), 20 + 1381);
-        let (ftype, seq, sess, fixed, ctr, b) = unwrap_data(&f).unwrap();
-        assert_eq!(ftype, TYPE_PEER);
-        assert_eq!(seq, 100);
-        assert_eq!(sess, 0x1C7695B5);
-        assert_eq!(fixed, FIXED_DATA);
-        assert_eq!(ctr, 200);
-        assert_eq!(b, block);
-    }
-
-    #[test]
-    fn unwrap_data_too_short_returns_none() {
-        assert!(unwrap_data(&[0u8; 5]).is_none());
-    }
-}
-
 // ---- 常量 (抓包实证) ----
 pub const TYPE_LOCAL: u32 = 0x0100_139E;
 pub const TYPE_PEER: u32 = 0x0100_139D;
@@ -83,7 +40,14 @@ pub fn unwrap_frame(data: &[u8]) -> Option<Frame> {
         return None;
     }
     let payload = data[24..24 + plen].to_vec();
-    Some(Frame { ftype, seq, aux, fixed, ctr, payload })
+    Some(Frame {
+        ftype,
+        seq,
+        aux,
+        fixed,
+        ctr,
+        payload,
+    })
 }
 
 pub fn wrap_data(block: &[u8], seq: u32, ctr: u32, sess: u32) -> Vec<u8> {
@@ -108,4 +72,47 @@ pub fn unwrap_data(data: &[u8]) -> Option<(u32, u32, u32, u32, u32, Vec<u8>)> {
     let ctr = u32::from_be_bytes(data[16..20].try_into().unwrap());
     let block = data[20..].to_vec();
     Some((ftype, seq, sess, fixed, ctr, block))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_and_unwrap_frame_roundtrip() {
+        let payload = vec![1u8, 2, 3];
+        let f = wrap_frame(&payload, TYPE_LOCAL, 0xE4A3CA76, 0xE38B045B, 0x422F7BCE);
+        assert_eq!(f.len(), 24 + 3);
+        let u = unwrap_frame(&f).unwrap();
+        assert_eq!(u.ftype, TYPE_LOCAL);
+        assert_eq!(u.seq, 0xE4A3CA76);
+        assert_eq!(u.aux, 0xE38B045B);
+        assert_eq!(u.fixed, FIXED_CTRL);
+        assert_eq!(u.ctr, 0x422F7BCE);
+        assert_eq!(u.payload, payload);
+    }
+
+    #[test]
+    fn unwrap_frame_too_short_returns_none() {
+        assert!(unwrap_frame(&[0u8; 10]).is_none());
+    }
+
+    #[test]
+    fn wrap_and_unwrap_data_roundtrip() {
+        let block = vec![0xABu8; 1381];
+        let f = wrap_data(&block, 100, 200, 0x1C7695B5);
+        assert_eq!(f.len(), 20 + 1381);
+        let (ftype, seq, sess, fixed, ctr, b) = unwrap_data(&f).unwrap();
+        assert_eq!(ftype, TYPE_PEER);
+        assert_eq!(seq, 100);
+        assert_eq!(sess, 0x1C7695B5);
+        assert_eq!(fixed, FIXED_DATA);
+        assert_eq!(ctr, 200);
+        assert_eq!(b, block);
+    }
+
+    #[test]
+    fn unwrap_data_too_short_returns_none() {
+        assert!(unwrap_data(&[0u8; 5]).is_none());
+    }
 }

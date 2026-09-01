@@ -84,9 +84,20 @@ fn main() {
     };
 
     // —— xunlei-login：本地执行（无需 daemon 进程），分发前拦截 ——
-    if let smart_dl_daemon::cli::CliCommand::XunleiLogin { mode, token_path, port, tier } = &cli.command {
+    if let smart_dl_daemon::cli::CliCommand::XunleiLogin {
+        mode,
+        token_path,
+        port,
+        tier,
+    } = &cli.command
+    {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime 创建失败");
-        if let Err(e) = rt.block_on(smart_dl_daemon::xunlei_login::run(*mode, token_path.clone(), *port, tier.clone())) {
+        if let Err(e) = rt.block_on(smart_dl_daemon::xunlei_login::run(
+            *mode,
+            token_path.clone(),
+            *port,
+            tier.clone(),
+        )) {
             eprintln!("xunlei-login 失败: {e}");
             std::process::exit(1);
         }

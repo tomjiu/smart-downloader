@@ -85,9 +85,10 @@ pub fn analyze_cid_store(bytes: &[u8]) -> (CidStoreReport, Vec<CidStoreEntry>) {
         extract_binary_entries(bytes, false, &mut report)
     };
     report.candidate_count = entries.len();
-    report
-        .notes
-        .push(format!("候选条目: {}（候选≠事实，待样本校准）", entries.len()));
+    report.notes.push(format!(
+        "候选条目: {}（候选≠事实，待样本校准）",
+        entries.len()
+    ));
     (report, entries)
 }
 
@@ -107,10 +108,14 @@ fn extract_json_entries(bytes: &[u8], report: &mut CidStoreReport) -> Vec<CidSto
     let mut out = Vec::new();
     let text = String::from_utf8_lossy(bytes);
     let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
-        report.notes.push("JSON 解析失败（截断/非 UTF-8）→ 回退裸二进制启发式".into());
+        report
+            .notes
+            .push("JSON 解析失败（截断/非 UTF-8）→ 回退裸二进制启发式".into());
         return extract_binary_entries(bytes, false, report);
     };
-    const HASH_KEYS: [&str; 8] = ["cid", "gcid", "bcid", "hash", "md5", "sha1", "fileHash", "infohash"];
+    const HASH_KEYS: [&str; 8] = [
+        "cid", "gcid", "bcid", "hash", "md5", "sha1", "fileHash", "infohash",
+    ];
     const PATH_KEYS: [&str; 6] = ["path", "filepath", "file_path", "name", "filename", "url"];
     walk_json(&value, &mut out, &HASH_KEYS, &PATH_KEYS);
     out
@@ -170,7 +175,11 @@ fn looks_like_hash(s: &str) -> bool {
 /// `tlv_mode=true`（XDLCTX 同族）时要求 hash 块前有可读 tag 字节；
 /// 裸模式放宽为纯启发式。两种模式的共同不变量：
 /// **hash 候选必须不可打印且长度 ∈ {16,20,32}；路径候选必须可打印 ≥6 字节**。
-fn extract_binary_entries(bytes: &[u8], tlv_mode: bool, report: &mut CidStoreReport) -> Vec<CidStoreEntry> {
+fn extract_binary_entries(
+    bytes: &[u8],
+    tlv_mode: bool,
+    report: &mut CidStoreReport,
+) -> Vec<CidStoreEntry> {
     let mut out = Vec::new();
     if bytes.len() < 24 {
         report.notes.push("文件过小（<24B），无候选".into());
@@ -201,8 +210,13 @@ fn extract_binary_entries(bytes: &[u8], tlv_mode: bool, report: &mut CidStoreRep
         while i + hlen <= bytes.len() {
             let win = &bytes[i..i + hlen];
             if !is_printable(win) && looks_random(win) {
-                let after = paths.iter().find(|&&(off, _)| off > i && off <= i + 64 + hlen);
-                let before = paths.iter().rev().find(|&&(off, _)| off < i && i <= off + 64);
+                let after = paths
+                    .iter()
+                    .find(|&&(off, _)| off > i && off <= i + 64 + hlen);
+                let before = paths
+                    .iter()
+                    .rev()
+                    .find(|&&(off, _)| off < i && i <= off + 64);
                 let pick = after
                     .map(|&(po, ref s)| (po, s, (po as i64 - (i + hlen) as i64).abs()))
                     .or_else(|| {
@@ -228,10 +242,7 @@ fn extract_binary_entries(bytes: &[u8], tlv_mode: bool, report: &mut CidStoreRep
     let mut taken_windows: Vec<(usize, usize)> = Vec::new();
     for c in cands {
         let win = (c.off, c.off + c.hlen);
-        if taken_windows
-            .iter()
-            .any(|&(s, e)| c.off < e && win.1 > s)
-        {
+        if taken_windows.iter().any(|&(s, e)| c.off < e && win.1 > s) {
             continue; // 与已接受窗口重叠 → 跳过（保最小 gap 的对齐候选）
         }
         taken_windows.push(win);

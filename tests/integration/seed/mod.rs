@@ -1,13 +1,13 @@
 //! tests/integration/seed — 本地测试 seeder（自研 seed_main：生成 2MB 确定性文件并做种）
 //! 约定：seed_main <port> <dir> 启动后输出一行 `SEED <magnet> PORT <port>`，随后常驻。
 
+use fs2::FileExt;
 use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use fs2::FileExt;
 
 #[allow(dead_code)] // 诊断字段保留供排障（无调用方时静默）
 pub struct TestSeeder {
@@ -118,7 +118,13 @@ impl TestSeeder {
 
             let vcpkg_bin = exe
                 .parent()
-                .map(|p| p.join("..").join("..").join("vcpkg_installed").join("x64-windows").join("bin"))
+                .map(|p| {
+                    p.join("..")
+                        .join("..")
+                        .join("vcpkg_installed")
+                        .join("x64-windows")
+                        .join("bin")
+                })
                 .unwrap_or_else(|| PathBuf::from("ffi/vcpkg_installed/x64-windows/bin"));
 
             let mut cmd = Command::new(&exe);
@@ -141,7 +147,12 @@ impl TestSeeder {
             eprintln!("seed_main PATH entries: vcpkg_bin={:?}", vcpkg_bin);
 
             let mut child = cmd.spawn().expect("spawn seed_main");
-            eprintln!("spawned seed_main: pid={} port={} exe={:?}", child.id(), port, exe);
+            eprintln!(
+                "spawned seed_main: pid={} port={} exe={:?}",
+                child.id(),
+                port,
+                exe
+            );
 
             // 30s 内从文件读到 "SEED <magnet> PORT <port>"
             let deadline = Instant::now() + Duration::from_secs(30);
@@ -167,7 +178,11 @@ impl TestSeeder {
                     }
                 }
                 if let Some(status) = child.try_wait().ok().flatten() {
-                    eprintln!("seed_main exited early: pid={} status={}", child.id(), status);
+                    eprintln!(
+                        "seed_main exited early: pid={} status={}",
+                        child.id(),
+                        status
+                    );
                     let _ = child.kill();
                     break; // 子进程提前退出 → 换端口重试
                 }
