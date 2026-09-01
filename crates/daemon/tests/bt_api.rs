@@ -12,15 +12,20 @@ use std::sync::Arc;
 
 use base64::Engine as _;
 
-async fn serve_bt() -> (std::net::SocketAddr, Arc<DaemonState>) {
+/// 返回值第三项 = BT 引擎全局落盘目录（= default_dest_root）。
+/// 生产装配契约（config.bt_save_path）：`[bt] save_path` 缺省 = `[download] dest_root`，
+/// 即引擎 save_path 必须与 `with_dest_root` 注入的默认落盘目录一致。此前测试把两者
+/// 拆开（引擎=独立 tempdir，default=temp_dir()），add_bt_task 落 dest_root=default
+/// ≠ save_path → 引擎 v1 落盘约束 400，5 个用例在 bt 构建下恒失败。
+async fn serve_bt() -> (std::net::SocketAddr, Arc<DaemonState>, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
-    let bt = smart_dl_daemon::bt::BtEngine::new(dir.path(), None, 0, 0, false, false, false).unwrap();
+    let save = dir.path().to_path_buf();
+    let bt = smart_dl_daemon::bt::BtEngine::new(&save, None, 0, 0, false, false, false).unwrap();
     let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
-    // 安全修复（V2）适配：测试 dest 均在系统临时目录下，注入为白名单根
-    // （否则 dest 预检按越界 400，引擎层「全局落盘」约束断言失配）。
+    // 安全修复（V2）适配：save 同时注入为白名单根（with_dest_root 双重语义）。
     let state = Arc::new(
         DaemonState::new(Arc::new(http), vec![])
-            .with_dest_root(std::env::temp_dir())
+            .with_dest_root(save.clone())
             .with_bt(Arc::new(bt)),
     );
     let app = http::router(state.clone());
@@ -29,14 +34,14 @@ async fn serve_bt() -> (std::net::SocketAddr, Arc<DaemonState>) {
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (addr, state)
+    (addr, state, save)
 }
 
 const MAGNET: &str = "magnet:?xt=urn:btih:0d2c9c9d5c2d3e8f9a1b2c3d4e5f6a7b8c9d0e1f&dn=test";
 
 #[tokio::test]
 async fn magnet_add_creates_bt_task() {
-    let (addr, state) = serve_bt().await;
+    let (addr, state, _save) = serve_bt().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
@@ -86,7 +91,7 @@ async fn magnet_add_creates_bt_task() {
 
 #[tokio::test]
 async fn same_magnet_deduped_409() {
-    let (addr, _state) = serve_bt().await;
+    let (addr, _state, _save) = serve_bt().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
@@ -119,7 +124,7 @@ async fn torrent_file_add_creates_task() {
     t.extend_from_slice(b"ee");
     let b64 = base64::engine::general_purpose::STANDARD.encode(&t);
 
-    let (addr, state) = serve_bt().await;
+    let (addr, state, _save) = serve_bt().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
@@ -178,7 +183,7 @@ async fn torrent_file_add_creates_task() {
 
 #[tokio::test]
 async fn invalid_base64_rejected() {
-    let (addr, _state) = serve_bt().await;
+    let (addr, _state, _save) = serve_bt().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
@@ -198,9 +203,9 @@ async fn http_task_with_nested_dest_auto_created() {
     let body = common::patterned(8 * 1024);
     let srv = TestServer::start(body).await;
     let url = srv.url();
-    let dir = tempfile::tempdir().unwrap();
-    let nested = dir.path().join("some/deep/dir");
-    let (addr, _state) = serve_bt().await;
+    let (addr, _state, save) = serve_bt().await;
+    // nested dest 挂在白名单根（= BT 引擎全局落盘目录）下，测 B10 自动创建
+    let nested = save.join("some/deep/dir");
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
@@ -226,7 +231,7 @@ async fn magnet_and_http_coexist() {
     // 同一 daemon 内 BT + HTTP 任务并存（引擎统一抽象）
     let body = common::patterned(16 * 1024);
     let srv = TestServer::start(body).await;
-    let (addr, _state) = serve_bt().await;
+    let (addr, _state, _save) = serve_bt().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
@@ -263,7 +268,7 @@ async fn magnet_and_http_coexist() {
 
 #[tokio::test]
 async fn magnet_remove_ok() {
-    let (addr, _state) = serve_bt().await;
+    let (addr, _state, _save) = serve_bt().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
@@ -295,17 +300,19 @@ async fn magnet_remove_ok() {
 
 #[tokio::test]
 async fn bt_task_with_custom_dest_rejected() {
-    // BT 引擎 v1 全局落盘（serve bt.save_path）：任务级 dest 与全局目录不一致 → 400
-    let (addr, _state) = serve_bt().await;
+    // BT 引擎 v1 全局落盘（serve bt.save_path）：任务级 dest 与全局目录不一致 → 400。
+    // custom 取白名单根（= 引擎 save_path）的子目录：先过 dest 白名单（V2），
+    // 再被引擎层落盘约束拒绝——精确测「全局落盘」文案而非白名单越界文案。
+    let (addr, _state, save) = serve_bt().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
-    let custom = tempfile::tempdir().unwrap();
+    let custom = save.join("custom-dest");
 
     let resp = client
         .post(format!("{base}/tasks"))
         .json(&serde_json::json!({
             "url": MAGNET,
-            "dest": custom.path().to_string_lossy()
+            "dest": custom.to_string_lossy()
         }))
         .send()
         .await

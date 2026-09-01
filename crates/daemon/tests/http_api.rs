@@ -20,11 +20,13 @@ async fn serve() -> (std::net::SocketAddr, Arc<DaemonState>) {
     // bt 构建下注入 BtEngine；非 bt 构建纯 HTTP（双态声明，两个 cfg 均零警告）
     #[cfg(feature = "bt")]
     let state = {
-        let base =
-            DaemonState::new(Arc::new(engine), vec![]).with_dest_root(std::env::temp_dir());
-        let tmp = tempfile::tempdir().expect("tempdir");
+        // 生产契约（config.bt_save_path）：`[bt] save_path` 缺省 = `[download] dest_root`，
+        // 即引擎 save_path 必须与 default_dest_root 一致。本文件大量 HTTP 测试的显式
+        // dest（/tmp/m6-test-*）依赖 temp_dir 白名单根，default 不能改——故把 BT 引擎
+        // save_path 对齐 temp_dir()。测试 magnet 均为假 btih（无 metadata），remove 时
+        // save_fastresume 走未就绪分支不落盘，save_path 零残留。
         let bt = smart_dl_daemon::bt::BtEngine::new(
-            tmp.path(),
+            std::env::temp_dir().as_path(),
             None,
             0,
             0,
@@ -33,7 +35,9 @@ async fn serve() -> (std::net::SocketAddr, Arc<DaemonState>) {
             false,
         )
         .expect("bt engine");
-        base.with_bt(Arc::new(bt))
+        DaemonState::new(Arc::new(engine), vec![])
+            .with_dest_root(std::env::temp_dir())
+            .with_bt(Arc::new(bt))
     };
     #[cfg(not(feature = "bt"))]
     let state =
