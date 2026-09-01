@@ -9,6 +9,12 @@ use std::sync::Arc;
 
 const FAKE_IH: &str = "0123456789abcdef0123456789abcdef01234567";
 
+/// 端点测试互斥：/bt/metadata 的单并发门禁是进程级 static，而本文件多个测试
+/// 的断言路径在门禁 acquisition 之后（如坏 magnet 的 parse 在 fetch 内部）——
+/// 并行跑时会互吃 409/400（GitHub runner 双核实测复现：bad_magnet 得 409）。
+/// 所有触达该端点的测试先拿这把锁串行执行，互斥于本地/CI 调度顺序。
+static ENDPOINT_SER: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// —— 无 bt 构建：端点恒 400 ——
 #[cfg(not(feature = "bt"))]
 async fn serve() -> std::net::SocketAddr {
@@ -27,6 +33,7 @@ async fn serve() -> std::net::SocketAddr {
 #[cfg(not(feature = "bt"))]
 #[tokio::test]
 async fn metadata_endpoint_disabled_without_bt() {
+    let _ser = ENDPOINT_SER.lock().await;
     let addr = serve().await;
     let client = reqwest::Client::new();
     let resp = client
@@ -108,6 +115,7 @@ async fn serve_with_token() -> std::net::SocketAddr {
 
 #[tokio::test]
 async fn metadata_endpoint_requires_auth_when_token_configured() {
+    let _ser = ENDPOINT_SER.lock().await;
     let addr = serve_with_token().await;
     let client = reqwest::Client::new();
     let url = format!("http://{addr}/bt/metadata");
@@ -252,6 +260,7 @@ mod bt_enabled {
 
     #[tokio::test]
     async fn bad_magnet_is_400() {
+        let _ser = ENDPOINT_SER.lock().await;
         let addr = serve_with_bt().await;
         let client = reqwest::Client::new();
         let resp = client
@@ -271,6 +280,7 @@ mod bt_enabled {
 
     #[tokio::test]
     async fn bad_peer_is_400() {
+        let _ser = ENDPOINT_SER.lock().await;
         let addr = serve_with_bt().await;
         let client = reqwest::Client::new();
         let resp = client
@@ -293,6 +303,7 @@ mod bt_enabled {
 
     #[tokio::test]
     async fn busy_gate_409_then_reusable_after_completion() {
+        let _ser = ENDPOINT_SER.lock().await;
         // 门禁语义（V16）：进行中 → 409；完成/取消（RAII permit drop）后端点可再用。
         // 门禁是进程级 static 单例 → 占门禁的 e2e 场景集中在本测试串行验证，
         // 避免与其他测试并行时互抢单并发锁。
@@ -375,6 +386,7 @@ mod bt_enabled {
 
     #[tokio::test]
     async fn save_to_escape_is_400_before_fetch() {
+        let _ser = ENDPOINT_SER.lock().await;
         // V15：越界 save_to 在抓取开始前 400 快速失败（若校验回归，此处会等满
         // 5s 得到 408，断言失败）。不占门禁（校验在 try_acquire 之前）。
         let addr = serve_with_bt().await;
