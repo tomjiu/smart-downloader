@@ -94,11 +94,10 @@ pub fn normalize_user_link(link: &str) -> NormalizedSource {
         };
     }
     // 迅雷网盘分享链接（pan.xunlei.com/s/xxx?pwd=yyy）
-    if link.contains("pan.xunlei.com/s/") {
-        if parse_xunlei_share(link).is_ok() {
+    if link.contains("pan.xunlei.com/s/")
+        && parse_xunlei_share(link).is_ok() {
             return NormalizedSource::XunleiShare(link.to_string());
         }
-    }
     NormalizedSource::Unsupported(link.to_string())
 }
 

@@ -1,5 +1,9 @@
-# 最小 CI（D35）：纯 Rust crates 的 fmt/clippy/test。
-# BT 集成测试（btcore）依赖 vcpkg libtorrent 构建，见 bt-integration job（后置独立）。
+# CI（D35 扩展）：
+#  - rust: 纯 Rust crates 的 fmt/clippy/test，windows + ubuntu 双平台；
+#    daemon 增补 feature 矩阵（ftp / nas / ftp,nas；nas 语义属 Linux，测试仅在 ubuntu 跑）。
+#  - bt-integration: 依赖 libtorrent native 链接环境（本地配方见 scripts/bt_env.sh 与
+#    docs/nas/WORKSPACE.md；系统包为 2.0.x，ffi 内核按 2.1 API 编写需 shim）。
+#    待配方在 Linux CI 实测一轮后启用（避免盲跑碎 CI）。
 name: ci
 
 on:
@@ -9,8 +13,12 @@ on:
 
 jobs:
   rust:
-    name: fmt + clippy + test (pure rust)
-    runs-on: windows-latest
+    name: fmt + clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -27,6 +35,16 @@ jobs:
           cargo clippy --workspace --exclude smart-dl-btcore
           --features smart-dl-httpdl/ftp -- -D warnings
 
+      # daemon feature 矩阵：ftp 全平台编译检查；nas 仅 ubuntu（tar/kill 语义属 Linux）。
+      - name: clippy daemon features (ftp)
+        run: cargo clippy -p smart-dl-daemon --features ftp -- -D warnings
+
+      - name: clippy daemon features (nas + ftp,nas)
+        if: runner.os == 'Linux'
+        run: |
+          cargo clippy -p smart-dl-daemon --features nas -- -D warnings
+          cargo clippy -p smart-dl-daemon --features "ftp,nas" -- -D warnings
+
       - name: test core
         run: cargo test -p smart-dl-core
 
@@ -39,15 +57,19 @@ jobs:
       - name: test daemon
         run: cargo test -p smart-dl-daemon
 
+      - name: test daemon (ftp + nas)
+        if: runner.os == 'Linux'
+        run: cargo test -p smart-dl-daemon --features "ftp,nas"
+
   bt-integration:
-    # 后置独立：需 vcpkg libtorrent（见 scripts/m0/01_vcpkg.ps1）+ PATH 含
-    # ffi/vcpkg_installed/x64-windows/bin。本地验证命令：
-    #   $env:PATH = "<repo>\ffi\vcpkg_installed\x64-windows\bin;" + $env:PATH
-    #   cargo test -p smart-dl-btcore
-    name: bt integration (local, libtorrent)
-    runs-on: windows-latest
+    # 后置独立：需 libtorrent native。本地配方：scripts/bt_env.sh（LT_KERNEL_LIB_DIR +
+    # LT_VCPKG_LIB_DIR + SEED_MAIN 三变量，no-root apt download + dpkg -x + fakevcpkg）。
+    # ffi 内核按 libtorrent 2.1 API 编写，系统包 2.0.x 需 4 处 shim（from_info_section /
+    # files_impl / remote_endpoint / set_sequential_range），待脚本化实测后启用。
+    name: bt integration (ubuntu, libtorrent)
+    runs-on: ubuntu-latest
     if: false
     steps:
       - uses: actions/checkout@v4
-      - name: placeholder (see scripts/m0/01_vcpkg.ps1 for local run)
-        run: echo "BT integration tests run locally with vcpkg libtorrent"
+      - name: placeholder (enable after scripts/ci/bt-linux-setup.sh is validated)
+        run: echo "BT integration tests run locally — see scripts/bt_env.sh"

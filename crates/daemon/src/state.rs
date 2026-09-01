@@ -519,6 +519,7 @@ impl DaemonState {
     /// - 未配置 token（None）→ 放行（serve 已保证该模式仅回环监听可达）；
     /// - 已配置 → `Authorization: Bearer <token>` 必须精确匹配，否则 false
     ///   （比较走 `ct_eq` 常量时间路径，第六轮 9.3.4）。
+    ///
     /// 覆盖全部路由含 /ws 升级握手（同一 Router layer）。
     pub fn verify_http_token(&self, authorization: Option<&str>) -> bool {
         match self.http_token.as_deref() {

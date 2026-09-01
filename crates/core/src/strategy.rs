@@ -180,7 +180,7 @@ impl From<LeechProfile> for AntiLeechAdvice {
 
         // min_share_ratio：r1 默认 0.3；若用户目标分享率更低（<0.3），
         // leech 判定随之下调（不可能要求回报超过自己目标）。
-        let min_share_ratio = p.ratio_target.min(0.3).max(0.05);
+        let min_share_ratio = p.ratio_target.clamp(0.05, 0.3);
         if min_share_ratio != 0.3 {
             notes.push("min_share_ratio = min(ratio_target, 0.3)（r1 默认 0.3，随目标分享率校准）");
         }
