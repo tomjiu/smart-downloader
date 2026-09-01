@@ -137,19 +137,31 @@ fn main() {
     let repo = PathBuf::from(&manifest).join("..").join("..");
 
     let lt_h = repo.join("ffi").join("lt.h");
-    // bindgen 需要 libclang（Linux 环境常缺失，且 bindgen 0.71 缺库时直接 panic
-    // 而非返回 Err）。故先预检测 libclang：找不到且仓库内有已提交的 bindings.rs
-    //（上次 Windows 构建生成物）时直接回退，保证 `cargo check` 在无 libclang
-    // 平台仍可通过（头文件变更时需在有 libclang 的环境重新生成）。
+    // 绑定策略（跨平台确定性优先）：默认一律使用仓库内已提交的 bindings.rs
+    //（净化副本写入 OUT_DIR，见下）。理由：
+    //  ① 仓库内绑定是唯一被全量测试验证过的形状（Windows 生成、Linux 净化后
+    //     实测 33+162 全绿）；
+    //  ② 现场 bindgen 生成的 Linux 绑定与提交版存在常量类型差异（如 LT_ALERT_*
+    //     宏 u32/i32），会使按提交绑定形状编写的 ffi.rs 编译失败
+    //     （CI bt job 首跑实证：runner 带 libclang → 全量 E0308）；
+    //  ③ bindgen 0.71 在缺 libclang 时 panic 而非返回 Err，隐式探测路径脆弱。
+    // 需要重新生成绑定时显式开启（需 libclang；产物回存 crates/btcore/bindings.rs）：
+    //   SMART_DL_REGEN_BINDINGS=1 cargo build -p smart-dl-btcore
     let fallback_bindings = PathBuf::from(&manifest).join("bindings.rs");
-    let use_fallback = !libclang_available() && fallback_bindings.exists();
+    let regen_requested = env::var("SMART_DL_REGEN_BINDINGS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let libclang_ok = libclang_available();
+    let use_fallback = fallback_bindings.exists() && !(regen_requested && libclang_ok);
+    if regen_requested && !libclang_ok {
+        println!(
+            "cargo:warning=SMART_DL_REGEN_BINDINGS=1 但 libclang 不可用，回退使用已提交的 bindings.rs"
+        );
+    }
     // 声明自定义 cfg 名（cargo 1.80+ unexpected_cfgs 检查要求先声明再使用；
     // 与分支无关 —— ffi.rs 在两种路径下都引用该 cfg）
     println!("cargo::rustc-check-cfg=cfg(lt_bindings_fallback)");
     if use_fallback {
-        println!(
-            "cargo:warning=未检测到 libclang，回退使用已提交的 bindings.rs；如修改了 ffi/lt.h 请在有 libclang 的环境重新生成绑定"
-        );
         // 净化回退产物：Windows/MSVC 生成的 bindings.rs 含平台相关的布局断言
         //（"Size of/Alignment of/Offset of field"，如 _Mbstatet），在 Linux 上
         // const 求值会越界 panic。剥离这些编译期检查（不影响运行语义），
@@ -160,7 +172,6 @@ fn main() {
         let out_dir = env::var("OUT_DIR").unwrap();
         let out_path = Path::new(&out_dir).join("bindings_fallback.rs");
         std::fs::write(&out_path, sanitized).expect("write bindings_fallback.rs failed");
-        // 声明自定义 cfg 名（cargo 1.80+ unexpected_cfgs 检查要求先声明再使用）
         println!("cargo:rustc-cfg=lt_bindings_fallback");
     } else {
         match bindgen::Builder::default()
