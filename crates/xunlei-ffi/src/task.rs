@@ -3,10 +3,8 @@
 use std::path::Path;
 use tokio::task;
 
-use crate::bindings::{
-    self,
-};
-use crate::error::{XunleiError, Result};
+use crate::bindings::{self};
+use crate::error::{Result, XunleiError};
 use crate::handle::XunleiHandle;
 
 /// 任务 ID（迅雷引擎返回的 opaque 句柄的 Rust 包装）。
@@ -41,16 +39,10 @@ impl XunleiHandle {
             };
 
             let mut task_id: u32 = 0;
-            let r = (sym.XL_CreateMagnetTask)(
-                magnet_wide.as_ptr(),
-                save_wide.as_ptr(),
-                &mut task_id,
-            );
+            let r =
+                (sym.XL_CreateMagnetTask)(magnet_wide.as_ptr(), save_wide.as_ptr(), &mut task_id);
             if r != 0 {
-                return Err(XunleiError::with_context(
-                    r,
-                    "XL_CreateMagnetTask failed",
-                ));
+                return Err(XunleiError::with_context(r, "XL_CreateMagnetTask failed"));
             }
 
             if task_id == 0 {
@@ -98,8 +90,8 @@ impl XunleiHandle {
             let save_wide = path_to_wide(&save);
             // third_str（+0x14 窄字符串）反汇编铁证**必须非空**（cmp [rcx+0x14], 0; je 失败）。
             // 语义 = 任务显示名（真机验证传任意非空字符串即可成功）。
-            let third_cstr = std::ffi::CString::new("smart-dl-task")
-                .expect("static str has no null byte");
+            let third_cstr =
+                std::ffi::CString::new("smart-dl-task").expect("static str has no null byte");
 
             param.torrent_path = torrent_path_wide.as_ptr();
             param.save_path = save_wide.as_ptr();
@@ -109,10 +101,7 @@ impl XunleiHandle {
                 let mut task_id: u32 = 0;
                 let r = (sym.XL_CreateBTTask_V2)(&mut param, &mut task_id);
                 if r != 0 {
-                    return Err(XunleiError::with_context(
-                        r,
-                        "XL_CreateBTTask_V2 failed",
-                    ));
+                    return Err(XunleiError::with_context(r, "XL_CreateBTTask_V2 failed"));
                 }
 
                 if task_id == 0 {
@@ -134,12 +123,7 @@ impl XunleiHandle {
     ///   `(url, referer, ua, save_path, filename, out)`，5 个宽字符串打包成
     ///   XLP2spParam（56 字节）后调 `XL_CreateP2spTask_V2`。
     /// 真机验证：5 指针全非空时返回 0 + task_id=1。
-    pub async fn create_p2sp_task(
-        &self,
-        url: &str,
-        save: &Path,
-        filename: &str,
-    ) -> Result<TaskId> {
+    pub async fn create_p2sp_task(&self, url: &str, save: &Path, filename: &str) -> Result<TaskId> {
         let sym = self.inner.symbols;
         let url = url.to_string();
         let save = save.to_path_buf();
@@ -161,10 +145,7 @@ impl XunleiHandle {
                 &mut task_id,
             );
             if r != 0 {
-                return Err(XunleiError::with_context(
-                    r,
-                    "XL_CreateP2spTask failed",
-                ));
+                return Err(XunleiError::with_context(r, "XL_CreateP2spTask failed"));
             }
 
             if task_id == 0 {

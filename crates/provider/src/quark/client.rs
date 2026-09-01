@@ -84,7 +84,10 @@ impl QuarkClient {
             .user_agent(USER_AGENT)
             .build()
             .expect("reqwest client build");
-        QuarkClient { http, base: base.trim_end_matches('/').to_string() }
+        QuarkClient {
+            http,
+            base: base.trim_end_matches('/').to_string(),
+        }
     }
 
     /// 公共头：Cookie 登录态 + Referer（pan.quark.cn）。
@@ -129,9 +132,14 @@ impl QuarkClient {
             let body = resp.text().await.unwrap_or_default();
             let message = serde_json::from_str::<serde_json::Value>(&body)
                 .ok()
-                .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(|s| s.to_string()));
-            return Err(classify_envelope(http_status, None, message)
-                .unwrap_or(QuarkError::BadResponse(format!("HTTP {http_status}: {body}"))));
+                .and_then(|v| {
+                    v.get("message")
+                        .and_then(|m| m.as_str())
+                        .map(|s| s.to_string())
+                });
+            return Err(classify_envelope(http_status, None, message).unwrap_or(
+                QuarkError::BadResponse(format!("HTTP {http_status}: {body}")),
+            ));
         }
         let env: Envelope<T> = resp
             .json()
@@ -140,13 +148,17 @@ impl QuarkClient {
         // 业务失败：壳内 status != 2xx → 按 code/message 分类
         if let Some(s) = env.status {
             if !(200..=299).contains(&s) {
-                return Err(classify_envelope(http_status, env.code, env.message.clone())
-                    .unwrap_or(QuarkError::BadResponse(
-                        env.message.unwrap_or_else(|| format!("status {s}")),
-                    )));
+                return Err(
+                    classify_envelope(http_status, env.code, env.message.clone()).unwrap_or(
+                        QuarkError::BadResponse(
+                            env.message.unwrap_or_else(|| format!("status {s}")),
+                        ),
+                    ),
+                );
             }
         }
-        env.data.ok_or(QuarkError::BadResponse("响应缺少 data".into()))
+        env.data
+            .ok_or(QuarkError::BadResponse("响应缺少 data".into()))
     }
 
     /// 1) 分享凭据 stoken：`POST /share/sharepage/token`。
@@ -157,10 +169,19 @@ impl QuarkClient {
         passcode: &str,
     ) -> Result<String, QuarkError> {
         #[derive(Deserialize)]
-        struct Data { #[serde(default)] stoken: String }
+        struct Data {
+            #[serde(default)]
+            stoken: String,
+        }
         let body = serde_json::json!({ "pwd_id": pwd_id, "passcode": passcode });
         let d: Data = self
-            .call(reqwest::Method::POST, "/share/sharepage/token", &[], Some(body), auth)
+            .call(
+                reqwest::Method::POST,
+                "/share/sharepage/token",
+                &[],
+                Some(body),
+                auth,
+            )
             .await?;
         if d.stoken.is_empty() {
             return Err(QuarkError::BadResponse("stoken 为空".into()));
@@ -177,12 +198,21 @@ impl QuarkClient {
         pdir_fid: &str,
     ) -> Result<Vec<ShareFile>, QuarkError> {
         #[derive(Deserialize)]
-        struct Data { #[serde(default)] list: Vec<ShareFile> }
+        struct Data {
+            #[serde(default)]
+            list: Vec<ShareFile>,
+        }
         let d: Data = self
             .call(
                 reqwest::Method::GET,
                 "/share/sharepage/detail",
-                &[("pwd_id", pwd_id), ("stoken", stoken), ("pdir_fid", pdir_fid), ("_page", "1"), ("_size", "100")],
+                &[
+                    ("pwd_id", pwd_id),
+                    ("stoken", stoken),
+                    ("pdir_fid", pdir_fid),
+                    ("_page", "1"),
+                    ("_size", "100"),
+                ],
                 None,
                 auth,
             )
@@ -200,7 +230,10 @@ impl QuarkClient {
         fids: &[String],
     ) -> Result<String, QuarkError> {
         #[derive(Deserialize)]
-        struct Data { #[serde(default)] task_id: String }
+        struct Data {
+            #[serde(default)]
+            task_id: String,
+        }
         let body = serde_json::json!({
             "to_pdir_fid": to_pdir_fid,
             "fid_list": fids,
@@ -208,7 +241,13 @@ impl QuarkClient {
             "stoken": stoken,
         });
         let d: Data = self
-            .call(reqwest::Method::POST, "/share/sharepage/save", &[], Some(body), auth)
+            .call(
+                reqwest::Method::POST,
+                "/share/sharepage/save",
+                &[],
+                Some(body),
+                auth,
+            )
             .await?;
         if d.task_id.is_empty() {
             return Err(QuarkError::BadResponse("转存未返回 task_id".into()));
@@ -223,7 +262,10 @@ impl QuarkClient {
         task_id: &str,
     ) -> Result<SaveTaskState, QuarkError> {
         #[derive(Deserialize)]
-        struct Data { #[serde(default)] status: i64 }
+        struct Data {
+            #[serde(default)]
+            status: i64,
+        }
         let d: Data = self
             .call(
                 reqwest::Method::GET,
@@ -249,7 +291,13 @@ impl QuarkClient {
     ) -> Result<Vec<DownloadLink>, QuarkError> {
         let body = serde_json::json!({ "fids": fids });
         let d: Vec<DownloadLink> = self
-            .call(reqwest::Method::POST, "/file/download", &[], Some(body), auth)
+            .call(
+                reqwest::Method::POST,
+                "/file/download",
+                &[],
+                Some(body),
+                auth,
+            )
             .await?;
         Ok(d)
     }

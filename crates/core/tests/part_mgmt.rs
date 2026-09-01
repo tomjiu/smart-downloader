@@ -123,7 +123,8 @@ fn finalize_idempotent_cleans_residual_part() {
     let dest = dir.path().join("seeded.bin");
     fs::write(&dest, b"seeded-data").unwrap();
 
-    om.finalize("seeded.bin", b"seeded-data".len() as u64).unwrap();
+    om.finalize("seeded.bin", b"seeded-data".len() as u64)
+        .unwrap();
     assert_eq!(fs::read(&dest).unwrap(), b"seeded-data");
     assert!(!part.exists(), "幂等短路应清理残留 .part");
 }

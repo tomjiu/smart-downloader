@@ -23,8 +23,7 @@ use crate::cli::XunleiLoginMode;
 use qrcode::QrCode;
 use smart_dl_provider::xunlei::client::Client;
 use smart_dl_provider::xunlei::login_flow::{
-    open_in_browser, poll_device_session, start_device_session, store_auth_state,
-    DEVICE_SCOPE,
+    open_in_browser, poll_device_session, start_device_session, store_auth_state, DEVICE_SCOPE,
 };
 use smart_dl_provider::xunlei::login_page::{serve_login_page, LoginSession};
 use smart_dl_provider::xunlei::tier::{Tier, ALL_TIERS};
@@ -39,10 +38,16 @@ pub async fn run(
     // 档位解析：未知档直接拒绝（列出可用项），绝不静默回退 web。
     let tier: &'static Tier = match tier_name.as_deref() {
         None => &smart_dl_provider::xunlei::tier::TIER_WEB,
-        Some(name) => Tier::by_name(name).ok_or_else(|| format!(
-            "未知身份档位 '{name}'（可用: {}）",
-            ALL_TIERS.iter().map(|t| t.name).collect::<Vec<_>>().join("/")
-        ))?,
+        Some(name) => Tier::by_name(name).ok_or_else(|| {
+            format!(
+                "未知身份档位 '{name}'（可用: {}）",
+                ALL_TIERS
+                    .iter()
+                    .map(|t| t.name)
+                    .collect::<Vec<_>>()
+                    .join("/")
+            )
+        })?,
     };
     // 登录态按档分文件（防互踢）：显式 --token 优先；否则 web 保持旧文件名
     // （零回归），非 web 档加后缀。
@@ -51,9 +56,7 @@ pub async fn run(
     } else {
         format!("xunlei_auth_{}.json", tier.name)
     };
-    let token_path = std::path::PathBuf::from(
-        token_path.unwrap_or(default_name),
-    );
+    let token_path = std::path::PathBuf::from(token_path.unwrap_or(default_name));
     let client = Client::new().with_tier(tier);
     println!("身份档位: {}（client_id={}）", tier.name, tier.client_id);
     println!("  {}", tier.authorize_note);
@@ -70,7 +73,10 @@ async fn run_qr(client: &Client, token_path: &std::path::Path) -> Result<(), Str
         .await
         .map_err(|e| format!("设备码获取失败: {e}"))?;
     println!();
-    println!("=== 迅雷设备码登录（终端二维码，档位: {}） ===", client.tier().name);
+    println!(
+        "=== 迅雷设备码登录（终端二维码，档位: {}） ===",
+        client.tier().name
+    );
     println!("手机迅雷 App → 右上角「扫一扫」扫描下方二维码：");
     println!("  授权页: {}", session.qr_url);
     println!("  授权码: {}（页面要求手动输入时使用）", session.user_code);
@@ -80,12 +86,19 @@ async fn run_qr(client: &Client, token_path: &std::path::Path) -> Result<(), Str
 }
 
 /// 浏览器跳转官方页模式。
-async fn run_browser(client: &Client, token_path: &std::path::Path, port: u16) -> Result<(), String> {
+async fn run_browser(
+    client: &Client,
+    token_path: &std::path::Path,
+    port: u16,
+) -> Result<(), String> {
     let session = start_device_session(client, smart_dl_provider::xunlei::login_flow::DEVICE_SCOPE)
         .await
         .map_err(|e| format!("设备码获取失败: {e}"))?;
     println!();
-    println!("=== 迅雷登录（跳转官方授权页，档位: {}） ===", client.tier().name);
+    println!(
+        "=== 迅雷登录（跳转官方授权页，档位: {}） ===",
+        client.tier().name
+    );
     // Browser 模式同样本地起一个登录页作备用入口（若浏览器被拦截可手动打开）。
     let sess_state = LoginSession::new_with_client(
         client.clone(),
@@ -160,12 +173,17 @@ async fn wait_loop(
         tokio::time::sleep(std::time::Duration::from_secs(session.interval.max(1))).await;
         match poll_device_session(client, &current).await {
             Ok(Some(auth)) => {
-                store_auth_state(token_path, &auth)
-                    .map_err(|e| format!("登录态保存失败: {e}"))?;
+                store_auth_state(token_path, &auth).map_err(|e| format!("登录态保存失败: {e}"))?;
                 println!();
-                println!("✅ 登录成功！user_id: {}，登录态已写入: {}", 
-                    if auth.user_id.is_empty() { "-" } else { &auth.user_id },
-                    token_path.display());
+                println!(
+                    "✅ 登录成功！user_id: {}，登录态已写入: {}",
+                    if auth.user_id.is_empty() {
+                        "-"
+                    } else {
+                        &auth.user_id
+                    },
+                    token_path.display()
+                );
                 return Ok(());
             }
             Ok(None) => {

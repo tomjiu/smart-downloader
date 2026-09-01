@@ -379,7 +379,14 @@ mod tests {
         let c = VipSpeedupClient::with_bases(ticket_of("tok"), &base, &base, &base);
         let err = c.check_status(1).await.unwrap_err();
         assert!(
-            matches!(err, SpeedupError::Rejected { ret: 16, err: 1101, .. }),
+            matches!(
+                err,
+                SpeedupError::Rejected {
+                    ret: 16,
+                    err: 1101,
+                    ..
+                }
+            ),
             "err={err}"
         );
     }

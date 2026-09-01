@@ -143,18 +143,42 @@ mod tests {
         assert_eq!(XunleiErrCode::from_i32(0), XunleiErrCode::Ok);
         assert_eq!(XunleiErrCode::from_i32(-1), XunleiErrCode::InitFailed);
         assert_eq!(XunleiErrCode::from_i32(-2), XunleiErrCode::InvalidParam);
-        assert_eq!(XunleiErrCode::from_i32(-3), XunleiErrCode::AlreadyInitialized);
+        assert_eq!(
+            XunleiErrCode::from_i32(-3),
+            XunleiErrCode::AlreadyInitialized
+        );
         assert_eq!(XunleiErrCode::from_i32(-1001), XunleiErrCode::TaskNotFound);
-        assert_eq!(XunleiErrCode::from_i32(-1002), XunleiErrCode::TaskAlreadyExists);
-        assert_eq!(XunleiErrCode::from_i32(-1003), XunleiErrCode::TaskInvalidState);
+        assert_eq!(
+            XunleiErrCode::from_i32(-1002),
+            XunleiErrCode::TaskAlreadyExists
+        );
+        assert_eq!(
+            XunleiErrCode::from_i32(-1003),
+            XunleiErrCode::TaskInvalidState
+        );
         assert_eq!(XunleiErrCode::from_i32(-2001), XunleiErrCode::NetworkError);
-        assert_eq!(XunleiErrCode::from_i32(-2002), XunleiErrCode::DnsResolveFailed);
-        assert_eq!(XunleiErrCode::from_i32(-2003), XunleiErrCode::ConnectionFailed);
+        assert_eq!(
+            XunleiErrCode::from_i32(-2002),
+            XunleiErrCode::DnsResolveFailed
+        );
+        assert_eq!(
+            XunleiErrCode::from_i32(-2003),
+            XunleiErrCode::ConnectionFailed
+        );
         assert_eq!(XunleiErrCode::from_i32(-3001), XunleiErrCode::FileNotFound);
-        assert_eq!(XunleiErrCode::from_i32(-3002), XunleiErrCode::FileWriteError);
+        assert_eq!(
+            XunleiErrCode::from_i32(-3002),
+            XunleiErrCode::FileWriteError
+        );
         assert_eq!(XunleiErrCode::from_i32(-3003), XunleiErrCode::DiskFull);
-        assert_eq!(XunleiErrCode::from_i32(-4001), XunleiErrCode::DcdnNotEnabled);
-        assert_eq!(XunleiErrCode::from_i32(-4002), XunleiErrCode::DcdnAuthFailed);
+        assert_eq!(
+            XunleiErrCode::from_i32(-4001),
+            XunleiErrCode::DcdnNotEnabled
+        );
+        assert_eq!(
+            XunleiErrCode::from_i32(-4002),
+            XunleiErrCode::DcdnAuthFailed
+        );
         assert_eq!(XunleiErrCode::from_i32(-5001), XunleiErrCode::Unsupported);
         assert_eq!(XunleiErrCode::from_i32(-9999), XunleiErrCode::Internal);
     }
@@ -176,7 +200,10 @@ mod tests {
     #[test]
     fn from_sdk_code_routes_by_category() {
         // InitFailed → 专用 InitFailed 变体
-        assert!(matches!(XunleiError::from_sdk_code(-1), XunleiError::InitFailed(-1)));
+        assert!(matches!(
+            XunleiError::from_sdk_code(-1),
+            XunleiError::InitFailed(-1)
+        ));
         // TaskNotFound → 专用 TaskNotFound 变体
         assert!(matches!(
             XunleiError::from_sdk_code(-1001),

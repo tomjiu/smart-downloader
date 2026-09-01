@@ -190,7 +190,10 @@ mod sanitize_tests {
     fn sanitize_accepts_normal_rel() {
         assert_eq!(sanitize_rel("a/b.bin").unwrap(), PathBuf::from("a/b.bin"));
         assert_eq!(sanitize_rel("./x.bin").unwrap(), PathBuf::from("./x.bin"));
-        assert_eq!(sanitize_rel("单文件 名.bin").unwrap(), PathBuf::from("单文件 名.bin"));
+        assert_eq!(
+            sanitize_rel("单文件 名.bin").unwrap(),
+            PathBuf::from("单文件 名.bin")
+        );
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
-    Capability, DownloadEngine, EngineError, EngineKind, EngineTaskId, EngineStatus, PeerInfo,
+    Capability, DownloadEngine, EngineError, EngineKind, EngineStatus, EngineTaskId, PeerInfo,
 };
 
 use crate::nas::NasManager;
@@ -54,7 +54,9 @@ impl NasRemoteEngine {
         }
         match st.http_code {
             Some(_) => Ok(()),
-            None => Err(EngineError::Other("nas engine offline/login pending".into())),
+            None => Err(EngineError::Other(
+                "nas engine offline/login pending".into(),
+            )),
         }
     }
 }
@@ -118,17 +120,29 @@ impl DownloadEngine for NasRemoteEngine {
         Err(EngineError::Other("nas peers 端点未校准（#9）".into()))
     }
 
-    async fn update_sources(&self, _id: &EngineTaskId, _urls: Vec<String>) -> Result<(), EngineError> {
+    async fn update_sources(
+        &self,
+        _id: &EngineTaskId,
+        _urls: Vec<String>,
+    ) -> Result<(), EngineError> {
         self.online().await?;
-        Err(EngineError::Other("nas update_sources 端点未校准（#9）".into()))
+        Err(EngineError::Other(
+            "nas update_sources 端点未校准（#9）".into(),
+        ))
     }
 
     async fn add_url_seed(&self, _id: &EngineTaskId, _url: &str) -> Result<(), EngineError> {
         self.online().await?;
-        Err(EngineError::Other("nas add_url_seed 端点未校准（#9）".into()))
+        Err(EngineError::Other(
+            "nas add_url_seed 端点未校准（#9）".into(),
+        ))
     }
 
-    async fn ban_peer(&self, _id: &EngineTaskId, _peer: std::net::SocketAddr) -> Result<(), EngineError> {
+    async fn ban_peer(
+        &self,
+        _id: &EngineTaskId,
+        _peer: std::net::SocketAddr,
+    ) -> Result<(), EngineError> {
         self.online().await?;
         Err(EngineError::Other("nas ban_peer 端点未校准（#9）".into()))
     }

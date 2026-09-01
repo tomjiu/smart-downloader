@@ -37,18 +37,27 @@ async fn main() {
             "    - [{}] {} ({})",
             if e.is_folder { "目录" } else { "文件" },
             e.name,
-            if e.is_folder { "-".into() } else { format!("{} B", e.size) }
+            if e.is_folder {
+                "-".into()
+            } else {
+                format!("{} B", e.size)
+            }
         );
     }
 
     let mut depth = 0;
     while !entries.files.iter().any(|f| !f.is_folder) && depth < 2 {
-        let Some(folder) = entries.files.iter().find(|f| f.is_folder) else { break };
+        let Some(folder) = entries.files.iter().find(|f| f.is_folder) else {
+            break;
+        };
         println!("[1] 进入子目录 {}…", folder.name);
-        entries = client.list_files(&state, &folder.id).await.unwrap_or_else(|e| {
-            eprintln!("列子目录失败: {e}");
-            std::process::exit(1);
-        });
+        entries = client
+            .list_files(&state, &folder.id)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("列子目录失败: {e}");
+                std::process::exit(1);
+            });
         depth += 1;
     }
     let Some(file) = entries.files.iter().find(|f| !f.is_folder) else {
@@ -59,10 +68,13 @@ async fn main() {
 
     // 2) PLAY API 取直链
     println!("[2] 调 PLAY API 取直链…");
-    let play = client.resolve_link(&state, &file.id).await.unwrap_or_else(|e| {
-        eprintln!("取链失败: {e}");
-        std::process::exit(1);
-    });
+    let play = client
+        .resolve_link(&state, &file.id)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("取链失败: {e}");
+            std::process::exit(1);
+        });
     let url = &play.web_content_link;
     if url.is_empty() {
         eprintln!("web_content_link 为空（可能需要会员或该类型不支持 PLAY）");
@@ -72,10 +84,16 @@ async fn main() {
     let host = url.split('/').nth(2).unwrap_or("?").to_string();
     let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
     let get_param = |k: &str| {
-        query.split('&').find_map(|kv| kv.strip_prefix(&format!("{k}=")))
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(&format!("{k}=")))
     };
     println!("    直链 host: {host}");
-    println!("    过期(e=): {:?}  大小(f=): {:?}", get_param("e"), get_param("f"));
+    println!(
+        "    过期(e=): {:?}  大小(f=): {:?}",
+        get_param("e"),
+        get_param("f")
+    );
 
     // 3) Range 下载前 1KB 验证可下性
     println!("[3] Range GET 验证可下性…");
@@ -96,7 +114,9 @@ async fn main() {
         println!();
         println!("✅ 云端直链可被普通 HTTP 客户端消费——httpdl 引擎可直接下载该类链接。");
         match get_param("e") {
-            Some(e) => println!("   注意：链接带过期时间(e={e})，过期后需重新 resolve（UrlRefresh 能力已建模）。"),
+            Some(e) => println!(
+                "   注意：链接带过期时间(e={e})，过期后需重新 resolve（UrlRefresh 能力已建模）。"
+            ),
             None => println!("   注意：链接未显式携带过期参数。"),
         }
     } else {

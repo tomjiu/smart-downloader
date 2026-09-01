@@ -242,7 +242,11 @@ mod tests {
 
     #[test]
     fn disk_cache_baseline_scales_with_ram() {
-        let a = DiskCacheAdvice::from(CacheProfile { ram_mb: 8192, disk_speed_mb: 150, is_ssd: false });
+        let a = DiskCacheAdvice::from(CacheProfile {
+            ram_mb: 8192,
+            disk_speed_mb: 150,
+            is_ssd: false,
+        });
         // 8192/8 = 1024 → HDD 封顶 256
         assert_eq!(a.cache_size_mb, 256);
         assert_eq!(a.max_dirty_ratio, 0.5);
@@ -254,7 +258,11 @@ mod tests {
 
     #[test]
     fn disk_cache_ssd_fast_gets_quarter_ram() {
-        let a = DiskCacheAdvice::from(CacheProfile { ram_mb: 8192, disk_speed_mb: 550, is_ssd: true });
+        let a = DiskCacheAdvice::from(CacheProfile {
+            ram_mb: 8192,
+            disk_speed_mb: 550,
+            is_ssd: true,
+        });
         assert_eq!(a.cache_size_mb, 2048, "ram/4 = 2048，恰触全局上限");
         assert_eq!(a.max_dirty_ratio, 0.6);
         assert!(a.coalesce_writes);
@@ -262,7 +270,11 @@ mod tests {
 
     #[test]
     fn disk_cache_slow_disk_shrinks() {
-        let a = DiskCacheAdvice::from(CacheProfile { ram_mb: 4096, disk_speed_mb: 40, is_ssd: false });
+        let a = DiskCacheAdvice::from(CacheProfile {
+            ram_mb: 4096,
+            disk_speed_mb: 40,
+            is_ssd: false,
+        });
         // 4096/8 = 512 → HDD 封顶 256 → 慢盘 ×3/4 = 192
         assert_eq!(a.cache_size_mb, 192);
     }
@@ -270,18 +282,30 @@ mod tests {
     #[test]
     fn disk_cache_floor_and_ceiling_hold() {
         // 512MB 内存：基准 64MB
-        let small = DiskCacheAdvice::from(CacheProfile { ram_mb: 512, disk_speed_mb: 150, is_ssd: true });
+        let small = DiskCacheAdvice::from(CacheProfile {
+            ram_mb: 512,
+            disk_speed_mb: 150,
+            is_ssd: true,
+        });
         assert_eq!(small.cache_size_mb, 64);
         assert!(!small.auto_resize, "小内存不开自适应");
         assert_eq!(small.min_free_memory_mb, 128);
         // 32GB 内存：基准 4096 → 封顶 2048
-        let big = DiskCacheAdvice::from(CacheProfile { ram_mb: 32_768, disk_speed_mb: 550, is_ssd: true });
+        let big = DiskCacheAdvice::from(CacheProfile {
+            ram_mb: 32_768,
+            disk_speed_mb: 550,
+            is_ssd: true,
+        });
         assert_eq!(big.cache_size_mb, 2048);
     }
 
     #[test]
     fn lt_cache_size_unit_conversion() {
-        let a = DiskCacheAdvice::from(CacheProfile { ram_mb: 1024, disk_speed_mb: 150, is_ssd: false });
+        let a = DiskCacheAdvice::from(CacheProfile {
+            ram_mb: 1024,
+            disk_speed_mb: 150,
+            is_ssd: false,
+        });
         // 1024/8=128 → HDD 128MB → 128*64 = 8192 块（16KiB/块）
         assert_eq!(a.cache_size_mb, 128);
         assert_eq!(a.lt_cache_size_blocks(), 8192);
@@ -289,12 +313,19 @@ mod tests {
 
     #[test]
     fn anti_leech_defaults_align_r1() {
-        let a = AntiLeechAdvice::from(LeechProfile { upload_slots: 8, ratio_target: 1.0, ban_window_secs: 1800 });
+        let a = AntiLeechAdvice::from(LeechProfile {
+            upload_slots: 8,
+            ratio_target: 1.0,
+            ban_window_secs: 1800,
+        });
         assert_eq!(a.choking_algorithm, "rate_based");
         assert_eq!(a.unchoke_slots_limit, 8);
         assert_eq!(a.optimistic_unchoke_slots, 1);
         assert_eq!(a.leech_rate_percent, 25);
-        assert_eq!(a.min_share_ratio, 0.3, "ratio_target=1.0 > 0.3 → 取默认 0.3");
+        assert_eq!(
+            a.min_share_ratio, 0.3,
+            "ratio_target=1.0 > 0.3 → 取默认 0.3"
+        );
         assert_eq!(a.score_threshold, 30.0);
         assert_eq!(a.snub_threshold, 3);
         assert_eq!(a.ban_window_secs, 1800);
@@ -314,14 +345,32 @@ mod tests {
     #[test]
     fn anti_leech_slots_clamped_and_ratio_calibrated() {
         // 极端槽位 clamp
-        let a = AntiLeechAdvice::from(LeechProfile { upload_slots: 100, ratio_target: 1.0, ban_window_secs: 0 });
+        let a = AntiLeechAdvice::from(LeechProfile {
+            upload_slots: 100,
+            ratio_target: 1.0,
+            ban_window_secs: 0,
+        });
         assert_eq!(a.unchoke_slots_limit, 32);
-        assert!(a.ban_window_secs == 0 && !a.settings_pack_hints.iter().any(|(k, _)| k.contains("ban_window")));
+        assert!(
+            a.ban_window_secs == 0
+                && !a
+                    .settings_pack_hints
+                    .iter()
+                    .any(|(k, _)| k.contains("ban_window"))
+        );
         // 低目标分享率 → leech 判定阈值随之下调
-        let b = AntiLeechAdvice::from(LeechProfile { upload_slots: 8, ratio_target: 0.2, ban_window_secs: 0 });
+        let b = AntiLeechAdvice::from(LeechProfile {
+            upload_slots: 8,
+            ratio_target: 0.2,
+            ban_window_secs: 0,
+        });
         assert_eq!(b.min_share_ratio, 0.2);
         // 零目标（不设）→ 下限 0.05
-        let c = AntiLeechAdvice::from(LeechProfile { upload_slots: 8, ratio_target: 0.0, ban_window_secs: 0 });
+        let c = AntiLeechAdvice::from(LeechProfile {
+            upload_slots: 8,
+            ratio_target: 0.0,
+            ban_window_secs: 0,
+        });
         assert_eq!(c.min_share_ratio, 0.05);
         // 乐观槽随 clamp 后槽位走
         assert_eq!(a.optimistic_unchoke_slots, 4);

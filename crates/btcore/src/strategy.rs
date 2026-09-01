@@ -8,6 +8,4 @@
 //! 接入点（libtorrent settings_pack / btcore 现有钩子）说明见
 //! `smart_dl_core::strategy` 模块尾部注释。
 
-pub use smart_dl_core::strategy::{
-    AntiLeechAdvice, CacheProfile, DiskCacheAdvice, LeechProfile,
-};
+pub use smart_dl_core::strategy::{AntiLeechAdvice, CacheProfile, DiskCacheAdvice, LeechProfile};

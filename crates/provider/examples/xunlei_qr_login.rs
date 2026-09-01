@@ -19,7 +19,7 @@
 //! 注册的，第三方生成的二维码微信不认；而官方授权页自带微信扫码入口，
 //! 打开链接即等价于扫码（见 docs/research/2026-08-22-xunlei-login-reverse-status.md）。
 
-use qrcode::{QrCode, render::unicode};
+use qrcode::{render::unicode, QrCode};
 use smart_dl_provider::xunlei::client::device_code_qr_url;
 use smart_dl_provider::xunlei::device::DeviceFlowState;
 use smart_dl_provider::xunlei::provider::XunleiProvider;
@@ -46,7 +46,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    let DeviceFlowState::AwaitingScan { user_code, verification_uri, expires_at, .. } = &state else {
+    let DeviceFlowState::AwaitingScan {
+        user_code,
+        verification_uri,
+        expires_at,
+        ..
+    } = &state
+    else {
         unreachable!("start 只返回 AwaitingScan");
     };
     // 本地构造官方授权页 URL（PROJECT_STATUS「QR 构造」对齐项：
@@ -107,7 +113,11 @@ async fn main() {
 
     // 4. 取 token 并持久化完整登录态
     // store_login 内部：JWT 解 user_id + refresh_captcha 拉取 captcha_token + 原子写盘。
-    let DeviceFlowState::Done { access_token, refresh_token } = current else {
+    let DeviceFlowState::Done {
+        access_token,
+        refresh_token,
+    } = current
+    else {
         unreachable!("break 只发生在 Done");
     };
     if let Err(e) = provider.store_login(access_token, refresh_token).await {
@@ -121,7 +131,14 @@ async fn main() {
             let left = st.access_token_expires_at.saturating_sub(now_unix());
             println!();
             println!("✅ 登录成功！");
-            println!("  user_id: {}", if st.user_id.is_empty() { "(未知)" } else { &st.user_id });
+            println!(
+                "  user_id: {}",
+                if st.user_id.is_empty() {
+                    "(未知)"
+                } else {
+                    &st.user_id
+                }
+            );
             println!("  access_token 剩余 ~{left} 秒");
             println!("  登录态已写入: {}", token_path.display());
             println!();

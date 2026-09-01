@@ -112,7 +112,9 @@ pub struct Sniffer {
 
 impl Default for Sniffer {
     fn default() -> Self {
-        Sniffer { rules: default_rules() }
+        Sniffer {
+            rules: default_rules(),
+        }
     }
 }
 
@@ -124,15 +126,69 @@ impl Default for Sniffer {
 /// 3. http(s) 最后兜底，命中后再做网盘分享 / `.torrent` 后缀二次推断。
 pub fn default_rules() -> Vec<SniffRule> {
     let mut rules = vec![
-        SniffRule { name: "thunder_link", kind: SniffKind::Thunder, prefix: "thunder://", priority: 10, enabled: true },
-        SniffRule { name: "qqdl_link", kind: SniffKind::QqDl, prefix: "qqdl://", priority: 11, enabled: true },
-        SniffRule { name: "flashget_link", kind: SniffKind::FlashGet, prefix: "flashget://", priority: 12, enabled: true },
-        SniffRule { name: "fs2you_link", kind: SniffKind::Fs2You, prefix: "fs2you://", priority: 13, enabled: true },
-        SniffRule { name: "magnet_link", kind: SniffKind::Magnet, prefix: "magnet:?", priority: 20, enabled: true },
-        SniffRule { name: "ed2k_link", kind: SniffKind::Ed2k, prefix: "ed2k://", priority: 21, enabled: true },
-        SniffRule { name: "ftp_link", kind: SniffKind::Ftp, prefix: "ftp://", priority: 22, enabled: true },
-        SniffRule { name: "http_link", kind: SniffKind::Http, prefix: "https://", priority: 30, enabled: true },
-        SniffRule { name: "http_link", kind: SniffKind::Http, prefix: "http://", priority: 31, enabled: true },
+        SniffRule {
+            name: "thunder_link",
+            kind: SniffKind::Thunder,
+            prefix: "thunder://",
+            priority: 10,
+            enabled: true,
+        },
+        SniffRule {
+            name: "qqdl_link",
+            kind: SniffKind::QqDl,
+            prefix: "qqdl://",
+            priority: 11,
+            enabled: true,
+        },
+        SniffRule {
+            name: "flashget_link",
+            kind: SniffKind::FlashGet,
+            prefix: "flashget://",
+            priority: 12,
+            enabled: true,
+        },
+        SniffRule {
+            name: "fs2you_link",
+            kind: SniffKind::Fs2You,
+            prefix: "fs2you://",
+            priority: 13,
+            enabled: true,
+        },
+        SniffRule {
+            name: "magnet_link",
+            kind: SniffKind::Magnet,
+            prefix: "magnet:?",
+            priority: 20,
+            enabled: true,
+        },
+        SniffRule {
+            name: "ed2k_link",
+            kind: SniffKind::Ed2k,
+            prefix: "ed2k://",
+            priority: 21,
+            enabled: true,
+        },
+        SniffRule {
+            name: "ftp_link",
+            kind: SniffKind::Ftp,
+            prefix: "ftp://",
+            priority: 22,
+            enabled: true,
+        },
+        SniffRule {
+            name: "http_link",
+            kind: SniffKind::Http,
+            prefix: "https://",
+            priority: 30,
+            enabled: true,
+        },
+        SniffRule {
+            name: "http_link",
+            kind: SniffKind::Http,
+            prefix: "http://",
+            priority: 31,
+            enabled: true,
+        },
     ];
     rules.sort_by_key(|r| r.priority);
     rules
@@ -286,15 +342,17 @@ impl SniffedSource {
             },
             SniffKind::Thunder => DownloadSource::Thunder(self.payload.clone()),
             SniffKind::XunleiShare => DownloadSource::XunleiShare(self.payload.clone()),
-            SniffKind::Http | SniffKind::TorrentFile | SniffKind::QuarkShare
-            | SniffKind::QqDl | SniffKind::FlashGet | SniffKind::Fs2You => {
-                DownloadSource::Http {
-                    url: self.payload.clone(),
-                    headers: vec![],
-                    auth: None,
-                    backup_url: None,
-                }
-            }
+            SniffKind::Http
+            | SniffKind::TorrentFile
+            | SniffKind::QuarkShare
+            | SniffKind::QqDl
+            | SniffKind::FlashGet
+            | SniffKind::Fs2You => DownloadSource::Http {
+                url: self.payload.clone(),
+                headers: vec![],
+                auth: None,
+                backup_url: None,
+            },
         }
     }
 }
@@ -305,8 +363,15 @@ impl SniffedSource {
 
 /// 剥离包裹符与首尾空白（`<url>`、`"url"`、`url。` 等）。
 fn trim_wrappers(s: &str) -> String {
-    let mut out = s.trim().trim_start_matches('<').trim_end_matches('>').to_string();
-    out = out.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+    let mut out = s
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_string();
+    out = out
+        .trim()
+        .trim_matches(|c| c == '"' || c == '\'')
+        .to_string();
     // 词尾标点循环剥离：URL 不会以这些字符合法结尾；
     // "…/d.torrent."（句末点）剥掉最后一个点后恰保留合法的 .torrent 后缀。
     while let Some(last) = out.chars().last() {
@@ -321,14 +386,13 @@ fn trim_wrappers(s: &str) -> String {
 /// 文本切词：链接边界字符集（空白 + 常见引号/括号/书名号/全角标点）。
 fn tokenize(text: &str) -> Vec<String> {
     const BOUND: &[char] = &[
-        ' ', '\t', '\r', '\n', '"', '\'', '`', '<', '>', '(', ')', '[', ']', '{', '}',
-        '《', '》', '“', '”', '‘', '’', '（', '）', '【', '】',
+        ' ', '\t', '\r', '\n', '"', '\'', '`', '<', '>', '(', ')', '[', ']', '{', '}', '《', '》',
+        '“', '”', '‘', '’', '（', '）', '【', '】',
     ];
     text.split(|c: char| BOUND.contains(&c))
         .map(|t| {
             // 词内尾部标点清理（保留 scheme 内合法字符）
-            t.trim_end_matches([',', ';', '。', '，', '；'])
-                .to_string()
+            t.trim_end_matches([',', ';', '。', '，', '；']).to_string()
         })
         .filter(|t| !t.is_empty())
         .collect()
@@ -377,9 +441,16 @@ fn decode_wrapped(
         None => return degraded("base64 解码失败，保留原文待上游处理"),
     };
     let inner = unwrap(&decoded);
-    let ok = ["http://", "https://", "ftp://", "magnet:?", "ed2k://", "cachefile://"]
-        .iter()
-        .any(|p| inner.to_ascii_lowercase().starts_with(p));
+    let ok = [
+        "http://",
+        "https://",
+        "ftp://",
+        "magnet:?",
+        "ed2k://",
+        "cachefile://",
+    ]
+    .iter()
+    .any(|p| inner.to_ascii_lowercase().starts_with(p));
     if !ok {
         return degraded("内层非已知协议，保留原文待上游处理");
     }
@@ -394,7 +465,9 @@ fn decode_wrapped(
 
 /// http(s) 特征推断：网盘分享链接。
 fn infer_share(raw: &str, lower: &str) -> Option<SniffedSource> {
-    if lower.starts_with("https://pan.xunlei.com/s/") || lower.starts_with("http://pan.xunlei.com/s/") {
+    if lower.starts_with("https://pan.xunlei.com/s/")
+        || lower.starts_with("http://pan.xunlei.com/s/")
+    {
         return Some(SniffedSource {
             kind: SniffKind::XunleiShare,
             raw: raw.to_string(),
@@ -419,7 +492,11 @@ fn infer_share(raw: &str, lower: &str) -> Option<SniffedSource> {
 fn has_torrent_suffix(lower: &str) -> bool {
     let no_frag = lower.split('#').next().unwrap_or(lower);
     let no_query = no_frag.split('?').next().unwrap_or(no_frag);
-    no_query.rsplit('/').next().map(|seg| seg.ends_with(".torrent")).unwrap_or(false)
+    no_query
+        .rsplit('/')
+        .next()
+        .map(|seg| seg.ends_with(".torrent"))
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +511,9 @@ mod tests {
     fn thunder_decodes_to_inner_url() {
         // "AAhttps://example.com/file.zipZZ" 的 base64
         let b64 = "QUFodHRwczovL2V4YW1wbGUuY29tL2ZpbGUuemlwWlo=";
-        let s = Sniffer::new().sniff_url(&format!("thunder://{b64}")).unwrap();
+        let s = Sniffer::new()
+            .sniff_url(&format!("thunder://{b64}"))
+            .unwrap();
         assert_eq!(s.kind, SniffKind::Thunder);
         assert_eq!(s.payload, "https://example.com/file.zip");
         assert_eq!(s.note, None);
@@ -458,7 +537,9 @@ mod tests {
     fn fs2you_decodes_cachefile_inner() {
         // "cachefile://fs2.example.com/data/file.rar" 的 base64
         let b64 = "Y2FjaGVmaWxlOi8vZnMyLmV4YW1wbGUuY29tL2RhdGEvZmlsZS5yYXI=";
-        let s = Sniffer::new().sniff_url(&format!("fs2you://{b64}")).unwrap();
+        let s = Sniffer::new()
+            .sniff_url(&format!("fs2you://{b64}"))
+            .unwrap();
         assert_eq!(s.kind, SniffKind::Fs2You);
         assert_eq!(s.payload, "cachefile://fs2.example.com/data/file.rar");
         assert_eq!(s.note, None);
@@ -466,7 +547,9 @@ mod tests {
 
     #[test]
     fn wrapped_scheme_decode_failure_degrades() {
-        let s = Sniffer::new().sniff_url("thunder://!!!not-base64!!!").unwrap();
+        let s = Sniffer::new()
+            .sniff_url("thunder://!!!not-base64!!!")
+            .unwrap();
         assert_eq!(s.kind, SniffKind::Thunder);
         assert!(s.note.is_some(), "解码失败应降级并给 note");
         assert_eq!(s.payload, "thunder://!!!not-base64!!!");
@@ -478,31 +561,54 @@ mod tests {
         let m = sn.sniff_url("magnet:?xt=urn:btih:DEADBEEF&dn=iso").unwrap();
         assert_eq!(m.kind, SniffKind::Magnet);
         assert_eq!(m.payload, "magnet:?xt=urn:btih:DEADBEEF&dn=iso");
-        assert_eq!(sn.sniff_url("ed2k://|file|a.bin|1024|abcd|").unwrap().kind, SniffKind::Ed2k);
-        assert_eq!(sn.sniff_url("ftp://host/pub/x.zip").unwrap().kind, SniffKind::Ftp);
-        assert_eq!(sn.sniff_url("https://cdn.example.com/x.iso").unwrap().kind, SniffKind::Http);
+        assert_eq!(
+            sn.sniff_url("ed2k://|file|a.bin|1024|abcd|").unwrap().kind,
+            SniffKind::Ed2k
+        );
+        assert_eq!(
+            sn.sniff_url("ftp://host/pub/x.zip").unwrap().kind,
+            SniffKind::Ftp
+        );
+        assert_eq!(
+            sn.sniff_url("https://cdn.example.com/x.iso").unwrap().kind,
+            SniffKind::Http
+        );
     }
 
     #[test]
     fn share_links_inferred() {
         let sn = Sniffer::new();
-        let x = sn.sniff_url("https://pan.xunlei.com/s/ABC123?pwd=abcd").unwrap();
+        let x = sn
+            .sniff_url("https://pan.xunlei.com/s/ABC123?pwd=abcd")
+            .unwrap();
         assert_eq!(x.kind, SniffKind::XunleiShare);
-        let q = sn.sniff_url("https://pan.quark.cn/s/8a7b6c5d#/list/share").unwrap();
+        let q = sn
+            .sniff_url("https://pan.quark.cn/s/8a7b6c5d#/list/share")
+            .unwrap();
         assert_eq!(q.kind, SniffKind::QuarkShare);
         assert!(q.note.as_deref().unwrap().contains("provider::quark"));
         // 普通站点不误判
-        assert_eq!(sn.sniff_url("https://github.com/s/repo").unwrap().kind, SniffKind::Http);
+        assert_eq!(
+            sn.sniff_url("https://github.com/s/repo").unwrap().kind,
+            SniffKind::Http
+        );
     }
 
     #[test]
     fn torrent_suffix_inferred() {
         let sn = Sniffer::new();
-        let t = sn.sniff_url("https://tracker.example.org/dl/BigFile.iso.torrent?token=1").unwrap();
+        let t = sn
+            .sniff_url("https://tracker.example.org/dl/BigFile.iso.torrent?token=1")
+            .unwrap();
         assert_eq!(t.kind, SniffKind::TorrentFile);
-        assert_eq!(t.payload, "https://tracker.example.org/dl/BigFile.iso.torrent?token=1");
+        assert_eq!(
+            t.payload,
+            "https://tracker.example.org/dl/BigFile.iso.torrent?token=1"
+        );
         // query 里的 .torrent 不算后缀（最后一段是路径段）
-        let n = sn.sniff_url("https://a.com/torrent.list?url=x.torrent").unwrap();
+        let n = sn
+            .sniff_url("https://a.com/torrent.list?url=x.torrent")
+            .unwrap();
         assert_eq!(n.kind, SniffKind::Http);
     }
 
@@ -530,7 +636,12 @@ mod tests {
             "链接① thunder://{b64} 链接② https://pan.quark.cn/s/qk42#/list/share?pwd=7777 完"
         );
         let out = Sniffer::new().sniff_text(&text);
-        assert_eq!(out.len(), 2, "应恰 2 条：{:?}", out.iter().map(|s| &s.payload).collect::<Vec<_>>());
+        assert_eq!(
+            out.len(),
+            2,
+            "应恰 2 条：{:?}",
+            out.iter().map(|s| &s.payload).collect::<Vec<_>>()
+        );
         assert_eq!(out[0].kind, SniffKind::Thunder);
         assert_eq!(out[0].payload, "https://example.com/inner.zip");
         assert_eq!(out[1].kind, SniffKind::QuarkShare);
@@ -547,7 +658,10 @@ mod tests {
         assert!(sn.sniff_url("").is_none());
         assert!(sn.sniff_url("   ").is_none());
         assert!(sn.sniff_url("随便说点什么 not a link").is_none());
-        assert!(sn.sniff_url("www.example.com/file.zip").is_none(), "无 scheme 不嗅探");
+        assert!(
+            sn.sniff_url("www.example.com/file.zip").is_none(),
+            "无 scheme 不嗅探"
+        );
         assert!(sn.sniff_url("file:///C:/x.exe").is_none());
     }
 
@@ -555,7 +669,10 @@ mod tests {
     fn rules_are_configurable() {
         let mut sn = Sniffer::new();
         sn.set_enabled("ed2k_link", false);
-        assert!(sn.sniff_url("ed2k://|file|a.bin|1|aa|").is_none(), "停用规则后不再命中");
+        assert!(
+            sn.sniff_url("ed2k://|file|a.bin|1|aa|").is_none(),
+            "停用规则后不再命中"
+        );
         // 自定义规则表：只保留 magnet
         let sn2 = Sniffer::with_rules(vec![SniffRule {
             name: "magnet_link",
@@ -575,7 +692,10 @@ mod tests {
     fn to_download_source_mapping() {
         let sn = Sniffer::new();
         let m = sn.sniff_url("magnet:?xt=urn:btih:CC33").unwrap();
-        assert_eq!(m.to_download_source(), DownloadSource::Magnet("magnet:?xt=urn:btih:CC33".into()));
+        assert_eq!(
+            m.to_download_source(),
+            DownloadSource::Magnet("magnet:?xt=urn:btih:CC33".into())
+        );
         let f = sn.sniff_url("ftp://h/x.iso").unwrap();
         match f.to_download_source() {
             DownloadSource::Ftp { url, user, .. } => {
@@ -594,9 +714,18 @@ mod tests {
     #[test]
     fn wrappers_and_punctuation_trimmed() {
         let sn = Sniffer::new();
-        assert_eq!(sn.sniff_url("<https://a.com/a.zip>").unwrap().payload, "https://a.com/a.zip");
-        assert_eq!(sn.sniff_url("\"https://a.com/b.zip\"").unwrap().payload, "https://a.com/b.zip");
-        assert_eq!(sn.sniff_url("https://a.com/c.zip。").unwrap().payload, "https://a.com/c.zip");
+        assert_eq!(
+            sn.sniff_url("<https://a.com/a.zip>").unwrap().payload,
+            "https://a.com/a.zip"
+        );
+        assert_eq!(
+            sn.sniff_url("\"https://a.com/b.zip\"").unwrap().payload,
+            "https://a.com/b.zip"
+        );
+        assert_eq!(
+            sn.sniff_url("https://a.com/c.zip。").unwrap().payload,
+            "https://a.com/c.zip"
+        );
         // .torrent 结尾的句点不能剥掉合法后缀
         let t = sn.sniff_url("https://a.com/d.torrent.").unwrap();
         assert_eq!(t.kind, SniffKind::TorrentFile);

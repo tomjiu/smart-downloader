@@ -23,9 +23,7 @@
 
 use crate::xunlei::auth::AuthState;
 use crate::xunlei::client::{Client, ClientError};
-use crate::xunlei::login_flow::{
-    self, poll_device_session, start_device_session, DeviceSession,
-};
+use crate::xunlei::login_flow::{self, poll_device_session, start_device_session, DeviceSession};
 use axum::extract::State;
 use axum::http::{header, StatusCode};
 use axum::response::IntoResponse;
@@ -126,13 +124,14 @@ async fn qr_svg(State(sess): State<Arc<LoginSession>>) -> axum::response::Respon
                 .light_color(svg::Color("#ffffff"))
                 .min_dimensions(196, 196)
                 .build();
-            (StatusCode::OK, [(header::CONTENT_TYPE, "image/svg+xml")], svg).into_response()
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "image/svg+xml")],
+                svg,
+            )
+                .into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("qr: {e}"),
-        )
-            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("qr: {e}")).into_response(),
     }
 }
 
@@ -150,7 +149,11 @@ async fn start(State(sess): State<Arc<LoginSession>>) -> axum::response::Respons
         }
         Err(e) => {
             *sess.last_error.lock().await = Some(e.to_string());
-            (StatusCode::BAD_GATEWAY, Json(json!({ "ok": false, "message": e.to_string() }))).into_response()
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({ "ok": false, "message": e.to_string() })),
+            )
+                .into_response()
         }
     }
 }
@@ -190,7 +193,11 @@ async fn status(State(sess): State<Arc<LoginSession>>) -> impl IntoResponse {
         }
         Err(e) => {
             let s = e.to_string();
-            let state = if s.contains("过期") { "expired" } else { "error" };
+            let state = if s.contains("过期") {
+                "expired"
+            } else {
+                "error"
+            };
             Json(json!({ "state": state, "message": s }))
         }
     }
@@ -202,7 +209,10 @@ struct PwdReq {
     password: String,
 }
 
-async fn pwd_login(State(sess): State<Arc<LoginSession>>, Json(req): Json<PwdReq>) -> impl IntoResponse {
+async fn pwd_login(
+    State(sess): State<Arc<LoginSession>>,
+    Json(req): Json<PwdReq>,
+) -> impl IntoResponse {
     match login_flow::login_with_password(&sess.client, &req.username, &req.password).await {
         Ok(auth) => finalize(sess, auth).await,
         Err(e) => err_resp(&e),
@@ -214,7 +224,10 @@ struct SmsSendReq {
     phone: String,
 }
 
-async fn sms_send(State(sess): State<Arc<LoginSession>>, Json(req): Json<SmsSendReq>) -> axum::response::Response {
+async fn sms_send(
+    State(sess): State<Arc<LoginSession>>,
+    Json(req): Json<SmsSendReq>,
+) -> axum::response::Response {
     match login_flow::send_sms_code(&sess.client, &req.phone).await {
         Ok(vid) => {
             // 服务端记住会话 id：前端断链/刷新丢失时 verify 兜底（Task 25）。
@@ -234,11 +247,19 @@ struct SmsVerifyReq {
     verification_id: String,
 }
 
-async fn sms_verify(State(sess): State<Arc<LoginSession>>, Json(req): Json<SmsVerifyReq>) -> axum::response::Response {
+async fn sms_verify(
+    State(sess): State<Arc<LoginSession>>,
+    Json(req): Json<SmsVerifyReq>,
+) -> axum::response::Response {
     // 兜底链：前端没带 verification_id（旧版页面/刷新丢失）时用 send 时记住的。
     let mut vid = req.verification_id;
     if vid.is_empty() {
-        vid = sess.sms_verification_id.lock().await.clone().unwrap_or_default();
+        vid = sess
+            .sms_verification_id
+            .lock()
+            .await
+            .clone()
+            .unwrap_or_default();
     }
     match login_flow::verify_sms_code(&sess.client, &req.phone, &req.code, &vid).await {
         Ok(auth) => finalize(sess, auth).await,
@@ -268,10 +289,9 @@ fn err_resp(e: &ClientError) -> axum::response::Response {
             StatusCode::UNAUTHORIZED,
             "账号或密码错误（或触发风控，请改用扫码）".to_string(),
         ),
-        ClientError::Http(re) if re.status().map(|s| s.as_u16()) == Some(401) => (
-            StatusCode::UNAUTHORIZED,
-            "验证码错误或已过期".to_string(),
-        ),
+        ClientError::Http(re) if re.status().map(|s| s.as_u16()) == Some(401) => {
+            (StatusCode::UNAUTHORIZED, "验证码错误或已过期".to_string())
+        }
         other => (StatusCode::BAD_GATEWAY, other.to_string()),
     };
     (status, Json(json!({ "ok": false, "message": msg }))).into_response()
@@ -340,7 +360,9 @@ mod tests {
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
         format!("http://{addr}")
     }
 
@@ -355,7 +377,9 @@ mod tests {
         let app = login_router(sess.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
         let base = format!("http://{addr}");
 
         let http = reqwest::Client::new();
@@ -364,7 +388,9 @@ mod tests {
         assert!(html.status().is_success());
         let body = html.text().await.unwrap();
         assert!(body.contains("迅雷"));
-        assert!(body.contains("扫码登录") && body.contains("密码登录") && body.contains("短信登录"));
+        assert!(
+            body.contains("扫码登录") && body.contains("密码登录") && body.contains("短信登录")
+        );
         assert!(body.contains("第三方") && body.contains("微信") && body.contains("微博"));
 
         // 2) start → pending → （mock 第 3 次 poll 放行）→ authorized
@@ -383,8 +409,14 @@ mod tests {
 
         let mut authorized = false;
         for _ in 0..6 {
-            let st: serde_json::Value =
-                http.get(format!("{base}/api/status")).send().await.unwrap().json().await.unwrap();
+            let st: serde_json::Value = http
+                .get(format!("{base}/api/status"))
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
             if st["state"] == "authorized" {
                 assert_eq!(st["user_id"], "999");
                 authorized = true;
@@ -410,7 +442,9 @@ mod tests {
         let app = login_router(sess);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
         let base = format!("http://{addr}");
 
         let http = reqwest::Client::new();
@@ -424,7 +458,10 @@ mod tests {
         let j: serde_json::Value = r.json().await.unwrap();
         assert_eq!(j["ok"], true);
         assert_eq!(j["user_id"], "777");
-        assert_eq!(crate::xunlei::auth::load(&token_path).unwrap().user_id, "777");
+        assert_eq!(
+            crate::xunlei::auth::load(&token_path).unwrap().user_id,
+            "777"
+        );
     }
 
     #[tokio::test]
@@ -439,7 +476,9 @@ mod tests {
         let app = login_router(sess);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { let _ = axum::serve(listener, app).await; });
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
         let base = format!("http://{addr}");
 
         let http = reqwest::Client::new();
@@ -463,6 +502,9 @@ mod tests {
         assert!(r.status().is_success(), "verify 兜底失败: {}", r.status());
         let j: serde_json::Value = r.json().await.unwrap();
         assert_eq!(j["ok"], true);
-        assert!(crate::xunlei::auth::load(&token_path).is_some(), "短信登录态未落盘");
+        assert!(
+            crate::xunlei::auth::load(&token_path).is_some(),
+            "短信登录态未落盘"
+        );
     }
 }

@@ -1,9 +1,11 @@
 //! HTTP API（axum，M6）：任务 CRUD + 快照 + Provider 运行态 + WS 升级端点（M7）。
 
-use crate::state::{DaemonError, DaemonState};
 #[cfg(feature = "nas")]
 use crate::nas;
+use crate::state::{DaemonError, DaemonState};
 use crate::ws::Throttler;
+#[cfg(feature = "nas")]
+use axum::response::Response;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -15,8 +17,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-#[cfg(feature = "nas")]
-use axum::response::Response;
 use base64::Engine as _;
 use serde::Deserialize;
 use std::sync::Arc;
@@ -222,10 +222,7 @@ async fn bt_magnet_metadata(
 ///
 /// 纯路径校验（仅 std，无 btcore 依赖）：不挂 cfg(bt)——无 bt 构建的测试
 /// 同样覆盖，亦可供其他落盘端点复用。
-pub fn validate_save_dest(
-    root: &std::path::Path,
-    raw: &str,
-) -> Result<std::path::PathBuf, String> {
+pub fn validate_save_dest(root: &std::path::Path, raw: &str) -> Result<std::path::PathBuf, String> {
     let rel = std::path::PathBuf::from(raw);
     if rel.as_os_str().is_empty() {
         return Err("save_to 为空".into());
@@ -290,20 +287,20 @@ pub fn cleanup_stale_magnet_scratch_with(max_age: std::time::Duration) {
         };
         // 名字格式 {pid}-{nanos}：只处理可归属的条目——解析失败视为非本程序
         // 产物（或未来格式变更），一律不动。
-        let Some(pid) = rest
-            .split('-')
-            .next()
-            .and_then(|p| p.parse::<u32>().ok())
-        else {
+        let Some(pid) = rest.split('-').next().and_then(|p| p.parse::<u32>().ok()) else {
             continue;
         };
         if pid == current_pid {
             continue; // 本进程的 scratch（活跃抓取）永不清理
         }
         let Ok(meta) = entry.metadata() else { continue };
-        let Ok(modified) = meta.modified() else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
         // 时钟回拨（duration_since 失败）→ 视为新鲜，不动
-        let Ok(age) = now.duration_since(modified) else { continue };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
         if age < max_age {
             continue;
         }
@@ -349,7 +346,12 @@ async fn run_magnet_fetch(
     let scratch_for_task = scratch.clone();
     let res = tokio::task::spawn_blocking(move || fetch_metadata(&m, &scratch_for_task, &o))
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("抓取任务 join 失败: {e}")))
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("抓取任务 join 失败: {e}"),
+            )
+        })
         .and_then(|r| {
             r.map_err(|e| match e {
                 FetchError::Magnet(_) | FetchError::Summary(_) => {
@@ -407,7 +409,9 @@ async fn bt_magnet_metadata(
     let _ = req; // 参数不校验：无 BT 引擎的构建里该端点恒不可用
     (
         StatusCode::BAD_REQUEST,
-        Json(serde_json::json!({ "error": "metadata 抓取需 BT 引擎（编译时启用 --features daemon/bt）" })),
+        Json(
+            serde_json::json!({ "error": "metadata 抓取需 BT 引擎（编译时启用 --features daemon/bt）" }),
+        ),
     )
 }
 
@@ -665,8 +669,7 @@ async fn providers(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
 
 macro_rules! router_base {
     ($app:expr) => {
-        $app
-            .route("/tasks", get(list_tasks).post(add_task))
+        $app.route("/tasks", get(list_tasks).post(add_task))
             .route("/tasks/:id", get(task_snapshot).delete(remove_task))
             .route("/tasks/:id/pause", post(pause_task))
             .route("/tasks/:id/resume", post(resume_task))
@@ -697,7 +700,9 @@ async fn auth_mw(
     } else {
         (
             StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({ "error": "unauthorized: 需要 Authorization: Bearer <token>" })),
+            Json(
+                serde_json::json!({ "error": "unauthorized: 需要 Authorization: Bearer <token>" }),
+            ),
         )
             .into_response()
     }
@@ -706,11 +711,7 @@ async fn auth_mw(
 #[cfg(feature = "nas")]
 macro_rules! router_nas {
     ($app:expr) => {
-        $app
-            .route(
-                "/nas/install",
-                post(nas_install),
-            )
+        $app.route("/nas/install", post(nas_install))
             .route("/nas/start", post(nas_start))
             .route("/nas/stop", post(nas_stop))
             .route("/nas/status", get(nas_status))
@@ -782,7 +783,9 @@ async fn nas_install(
             "engine": info.engine,
         }))
         .into_response(),
-        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e))
+        Err(NasError::Install(e))
+        | Err(NasError::Io(e))
+        | Err(NasError::Start(e))
         | Err(NasError::Token(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": e })),
@@ -796,7 +799,9 @@ async fn nas_start(State(_): State<Arc<DaemonState>>) -> Response {
     use nas::NasError;
     match nas::manager().start().await {
         Ok(pid) => Json(serde_json::json!({ "ok": true, "pid": pid })).into_response(),
-        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e))
+        Err(NasError::Install(e))
+        | Err(NasError::Io(e))
+        | Err(NasError::Start(e))
         | Err(NasError::Token(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": e })),
@@ -824,14 +829,13 @@ pub struct NasTokenReq {
 }
 
 #[cfg(feature = "nas")]
-async fn nas_token(
-    State(_): State<Arc<DaemonState>>,
-    Json(req): Json<NasTokenReq>,
-) -> Response {
+async fn nas_token(State(_): State<Arc<DaemonState>>, Json(req): Json<NasTokenReq>) -> Response {
     use nas::NasError;
     match nas::put_auth_token(nas::manager(), &req.token_json).await {
         Ok(p) => Json(serde_json::json!({ "ok": true, "path": p })).into_response(),
-        Err(NasError::Install(e)) | Err(NasError::Io(e)) | Err(NasError::Start(e))
+        Err(NasError::Install(e))
+        | Err(NasError::Io(e))
+        | Err(NasError::Start(e))
         | Err(NasError::Token(e)) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "ok": false, "error": e })),

@@ -9,7 +9,7 @@ use std::net::SocketAddr;
 use tokio::task;
 
 use crate::bindings::{self, XLPeerInfo};
-use crate::error::{XunleiError, Result};
+use crate::error::{Result, XunleiError};
 use crate::handle::XunleiHandle;
 use crate::task::TaskId;
 
@@ -45,11 +45,8 @@ impl XunleiHandle {
         let task_id_u32 = id.0 as u32;
 
         task::spawn_blocking(move || unsafe {
-            let r = (sym.XL_BatchAddPeer)(
-                task_id_u32,
-                peer_infos.len() as u32,
-                peer_infos.as_ptr(),
-            );
+            let r =
+                (sym.XL_BatchAddPeer)(task_id_u32, peer_infos.len() as u32, peer_infos.as_ptr());
             if r != 0 {
                 return Err(XunleiError::with_context(r, "XL_BatchAddPeer failed"));
             }
@@ -96,10 +93,7 @@ impl XunleiHandle {
                 peer_infos.as_ptr(),
             );
             if r != 0 {
-                return Err(XunleiError::with_context(
-                    r,
-                    "XL_BatchDiscardPeer failed",
-                ));
+                return Err(XunleiError::with_context(r, "XL_BatchDiscardPeer failed"));
             }
             Ok(())
         })

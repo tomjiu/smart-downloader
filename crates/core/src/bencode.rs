@@ -133,7 +133,9 @@ fn decode_at_d(data: &[u8], pos: usize, depth: usize) -> Result<(Value, usize), 
 }
 
 fn byte_at(data: &[u8], pos: usize) -> Result<u8, DecodeError> {
-    data.get(pos).copied().ok_or(DecodeError::UnexpectedEof(pos))
+    data.get(pos)
+        .copied()
+        .ok_or(DecodeError::UnexpectedEof(pos))
 }
 
 fn decode_int(data: &[u8], pos: usize) -> Result<(Value, usize), DecodeError> {
@@ -255,10 +257,7 @@ mod tests {
 
     #[test]
     fn encode_dict_sorts_keys() {
-        let v = Value::Dict(vec![
-            (b("b"), Value::Int(2)),
-            (b("a"), Value::Int(1)),
-        ]);
+        let v = Value::Dict(vec![(b("b"), Value::Int(2)), (b("a"), Value::Int(1))]);
         assert_eq!(encode(&v), b"d1:ai1e1:bi2ee");
     }
 
@@ -292,10 +291,7 @@ mod tests {
     fn roundtrip_nested() {
         let v = Value::Dict(vec![
             (b("e"), Value::Int(0)),
-            (
-                b("m"),
-                Value::Dict(vec![(b("ut_pex"), Value::Int(1)),]),
-            ),
+            (b("m"), Value::Dict(vec![(b("ut_pex"), Value::Int(1))])),
             (b("v"), Value::Bytes(b("XunLei 0019"))),
         ]);
         let encoded = encode(&v);
@@ -336,10 +332,7 @@ mod tests {
     fn decode_nested_list() {
         assert_eq!(
             decode(b"lli1eei2ee").unwrap(),
-            Value::List(vec![
-                Value::List(vec![Value::Int(1)]),
-                Value::Int(2),
-            ])
+            Value::List(vec![Value::List(vec![Value::Int(1)]), Value::Int(2),])
         );
     }
 

@@ -12,14 +12,20 @@ use smart_dl_provider::xunlei::client::Client;
 
 #[tokio::main]
 async fn main() {
-    let path = std::env::args().nth(1).unwrap_or_else(|| "xunlei_auth_web.json".into());
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "xunlei_auth_web.json".into());
     let path = std::path::PathBuf::from(path);
 
     let Some(mut state) = load_auth(&path) else {
         eprintln!("❌ 无法加载凭证 {path:?}——确认文件存在且为 AuthState 或网页导出格式");
         std::process::exit(1);
     };
-    println!("[0] 凭证加载 OK：user_id={} did32={}", state.user_id, &state.device_id[..8.min(state.device_id.len())]);
+    println!(
+        "[0] 凭证加载 OK：user_id={} did32={}",
+        state.user_id,
+        &state.device_id[..8.min(state.device_id.len())]
+    );
 
     let client = Client::new();
     let now = std::time::SystemTime::now()
@@ -32,7 +38,10 @@ async fn main() {
         client.refresh(&mut state).await.expect("refresh");
         println!("    新 expires_at={}", state.access_token_expires_at);
     } else {
-        println!("[1] access 仍有效（剩 {}s）", state.access_token_expires_at - now);
+        println!(
+            "[1] access 仍有效（剩 {}s）",
+            state.access_token_expires_at - now
+        );
     }
     if state.captcha_token_expiring(now) || state.captcha_token.is_empty() {
         println!("[2] captcha 取新 …");
@@ -46,7 +55,11 @@ async fn main() {
     let files = client.list_files(&state, "").await.expect("list_files");
     println!("    根目录 {} 项", files.files.len());
     for f in files.files.iter().take(5) {
-        println!("    - [{}] {}", if f.is_folder { "DIR" } else { "FILE" }, f.name);
+        println!(
+            "    - [{}] {}",
+            if f.is_folder { "DIR" } else { "FILE" },
+            f.name
+        );
     }
 
     // 找一个真实文件（跳过文件夹；根目录没有则进第一个文件夹）
@@ -72,12 +85,18 @@ async fn main() {
     };
 
     println!("[4] PLAY → {fname}");
-    let play = client.resolve_link(&state, &fid).await.expect("resolve_link");
+    let play = client
+        .resolve_link(&state, &fid)
+        .await
+        .expect("resolve_link");
     if play.web_content_link.is_empty() {
         println!("    web_content_link 为空（可能文件类型不支持直链）——列表/鉴权段已验证 ✅");
         return;
     }
-    println!("    LINK: {}…", &play.web_content_link[..play.web_content_link.len().min(90)]);
+    println!(
+        "    LINK: {}…",
+        &play.web_content_link[..play.web_content_link.len().min(90)]
+    );
 
     println!("[5] Range 下载首块 …");
     let resp = reqwest::Client::new()

@@ -152,7 +152,10 @@ mod tests {
 
     #[test]
     fn device_id_32_handles_no_prefix() {
-        assert_eq!(device_id_32("adb1a76709f6584a13b58baaf6e1d871"), "adb1a76709f6584a13b58baaf6e1d871");
+        assert_eq!(
+            device_id_32("adb1a76709f6584a13b58baaf6e1d871"),
+            "adb1a76709f6584a13b58baaf6e1d871"
+        );
     }
 
     #[test]

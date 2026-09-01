@@ -44,7 +44,11 @@ impl SegmentManager {
         let offset = offset.min(total);
         SegmentManager {
             total,
-            min_split: if min_split == 0 { DEFAULT_MIN_SPLIT } else { min_split },
+            min_split: if min_split == 0 {
+                DEFAULT_MIN_SPLIT
+            } else {
+                min_split
+            },
             next: offset,
             done_bytes: offset,
         }
@@ -92,10 +96,34 @@ mod tests {
         let mut m = SegmentManager::new(64 * MB, 0, 16 * MB);
         assert_eq!(m.done_bytes(), 0);
         assert_eq!(m.pending_bytes(), 64 * MB);
-        assert_eq!(m.take_segment(), Some(Segment { start: 0, end: 16 * MB - 1 }));
-        assert_eq!(m.take_segment(), Some(Segment { start: 16 * MB, end: 32 * MB - 1 }));
-        assert_eq!(m.take_segment(), Some(Segment { start: 32 * MB, end: 48 * MB - 1 }));
-        assert_eq!(m.take_segment(), Some(Segment { start: 48 * MB, end: 64 * MB - 1 }));
+        assert_eq!(
+            m.take_segment(),
+            Some(Segment {
+                start: 0,
+                end: 16 * MB - 1
+            })
+        );
+        assert_eq!(
+            m.take_segment(),
+            Some(Segment {
+                start: 16 * MB,
+                end: 32 * MB - 1
+            })
+        );
+        assert_eq!(
+            m.take_segment(),
+            Some(Segment {
+                start: 32 * MB,
+                end: 48 * MB - 1
+            })
+        );
+        assert_eq!(
+            m.take_segment(),
+            Some(Segment {
+                start: 48 * MB,
+                end: 64 * MB - 1
+            })
+        );
         assert_eq!(m.take_segment(), None);
     }
 
@@ -120,9 +148,27 @@ mod tests {
         let mut m = SegmentManager::new(64 * MB, 24 * MB, 16 * MB);
         assert_eq!(m.done_bytes(), 24 * MB, "续传偏移计入已完成");
         assert_eq!(m.pending_bytes(), 40 * MB);
-        assert_eq!(m.take_segment(), Some(Segment { start: 24 * MB, end: 40 * MB - 1 }));
-        assert_eq!(m.take_segment(), Some(Segment { start: 40 * MB, end: 56 * MB - 1 }));
-        assert_eq!(m.take_segment(), Some(Segment { start: 56 * MB, end: 64 * MB - 1 }));
+        assert_eq!(
+            m.take_segment(),
+            Some(Segment {
+                start: 24 * MB,
+                end: 40 * MB - 1
+            })
+        );
+        assert_eq!(
+            m.take_segment(),
+            Some(Segment {
+                start: 40 * MB,
+                end: 56 * MB - 1
+            })
+        );
+        assert_eq!(
+            m.take_segment(),
+            Some(Segment {
+                start: 56 * MB,
+                end: 64 * MB - 1
+            })
+        );
         assert_eq!(m.take_segment(), None);
     }
 

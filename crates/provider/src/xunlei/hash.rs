@@ -102,10 +102,7 @@ mod tests {
 
     #[test]
     fn gcid_empty_data() {
-        assert_eq!(
-            gcid(&[]),
-            "da39a3ee5e6b4b0d3255bfef95601890afd80709"
-        );
+        assert_eq!(gcid(&[]), "da39a3ee5e6b4b0d3255bfef95601890afd80709");
     }
 
     #[test]
@@ -161,7 +158,9 @@ mod tests {
         // 每块应为 40 位小写 hex（20 字节 SHA1）
         for h in &out {
             assert_eq!(h.len(), 40);
-            assert!(h.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+            assert!(h
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
         }
 
         // 逐块与独立 SHA1 计算一致（来源：#L192 sha1(block)）

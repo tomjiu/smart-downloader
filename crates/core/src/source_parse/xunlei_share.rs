@@ -63,10 +63,7 @@ pub fn parse_xunlei_share(link: &str) -> Result<XunleiShareInfo, XunleiShareErro
         .find(|(k, _)| k == "pwd")
         .map(|(_, v)| v.to_string());
 
-    Ok(XunleiShareInfo {
-        share_id,
-        password,
-    })
+    Ok(XunleiShareInfo { share_id, password })
 }
 
 #[cfg(test)]
@@ -82,8 +79,7 @@ mod tests {
 
     #[test]
     fn parse_share_with_password() {
-        let info =
-            parse_xunlei_share("https://pan.xunlei.com/s/abc123?pwd=1234").unwrap();
+        let info = parse_xunlei_share("https://pan.xunlei.com/s/abc123?pwd=1234").unwrap();
         assert_eq!(info.share_id, "abc123");
         assert_eq!(info.password, Some("1234".to_string()));
     }
