@@ -274,11 +274,7 @@ impl TorrentMeta {
                             "pieces 长度不是 20 的倍数".into(),
                         ));
                     }
-                    pieces_hash = pieces_data
-                        .0
-                        .chunks_exact(20)
-                        .map(|ch| <[u8; 20]>::try_from(ch).unwrap())
-                        .collect();
+                    pieces_hash = pieces_data.0.as_chunks::<20>().0.to_vec();
                     i = value_skip(b, i, 0).ok_or_else(|| {
                         DaemonError::InvalidSource(".torrent info dict 解析失败".into())
                     })?;
@@ -414,7 +410,7 @@ fn parse_file_list(data: &[u8], piece_length: u32) -> Result<Vec<FileMeta>, Daem
             // 计算 piece 偏移和数量（按文件在 torrent 中的累计字节偏移）
             let total_size: u64 = files.iter().map(|f: &FileMeta| f.size).sum();
             let piece_offset = (total_size / plen) as usize;
-            let piece_count = ((length + plen - 1) / plen) as usize;
+            let piece_count = length.div_ceil(plen) as usize;
             files.push(FileMeta {
                 path,
                 size: length,
@@ -2807,14 +2803,14 @@ mod b10_tests {
         // 白名单内的子目录 → 放行
         assert!(ensure_dest_root(
             Some(root.join("sub").to_string_lossy().into_owned()),
-            &[root.clone()]
+            std::slice::from_ref(&root)
         )
         .is_ok());
         // 白名单外的目录 → 拒绝
         let outside = dir.path().join("elsewhere");
         let r = ensure_dest_root(
             Some(outside.to_string_lossy().into_owned()),
-            &[root.clone()],
+            std::slice::from_ref(&root),
         );
         assert!(matches!(r, Err(DaemonError::InvalidSource(m)) if m.contains("越界")));
         // 绝对路径穿越到白名单外 → 拒绝
@@ -2942,9 +2938,10 @@ impl DownloadEngine for FakeEngine {
         &self,
         _id: &EngineTaskId,
     ) -> Result<EngineStatus, smart_dl_core::types::EngineError> {
-        let mut es = EngineStatus::default();
-        es.files = self.status_files.lock().clone();
-        Ok(es)
+        Ok(EngineStatus {
+            files: self.status_files.lock().clone(),
+            ..EngineStatus::default()
+        })
     }
     async fn remove(
         &self,

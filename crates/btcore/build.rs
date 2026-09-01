@@ -67,7 +67,6 @@ fn strip_layout_assertions(src: &str) -> String {
                 let offset_in_rest = after_eq.len() - trimmed.len();
                 let block_start = eq + 1 + offset_in_rest;
                 let mut depth = 0i64;
-                let mut j = block_start;
                 let mut found = None;
                 for (k, c) in rest[block_start..].char_indices() {
                     match c {
@@ -81,16 +80,17 @@ fn strip_layout_assertions(src: &str) -> String {
                         }
                         _ => {}
                     }
-                    let _ = j;
-                    j += 1;
                 }
                 match found {
                     Some(brace_end) => {
                         let semi = rest[brace_end..].find(';').map(|s| brace_end + s);
                         match semi {
-                            Some(s) => (s, rest[block_start..=brace_end].contains("Size of ")
-                                || rest[block_start..=brace_end].contains("Alignment of ")
-                                || rest[block_start..=brace_end].contains("Offset of field:")),
+                            Some(s) => (
+                                s,
+                                rest[block_start..=brace_end].contains("Size of ")
+                                    || rest[block_start..=brace_end].contains("Alignment of ")
+                                    || rest[block_start..=brace_end].contains("Offset of field:"),
+                            ),
                             None => (rest.len() - 1, false),
                         }
                     }
@@ -114,7 +114,9 @@ fn strip_layout_assertions(src: &str) -> String {
             if drop_block {
                 i += end + 1;
                 // 吃掉块后换行
-                while i < rest_src.len() && (rest_src.as_bytes()[i] == b'\n' || rest_src.as_bytes()[i] == b'\r') {
+                while i < rest_src.len()
+                    && (rest_src.as_bytes()[i] == b'\n' || rest_src.as_bytes()[i] == b'\r')
+                {
                     i += 1;
                 }
                 continue;
@@ -141,6 +143,9 @@ fn main() {
     // 平台仍可通过（头文件变更时需在有 libclang 的环境重新生成）。
     let fallback_bindings = PathBuf::from(&manifest).join("bindings.rs");
     let use_fallback = !libclang_available() && fallback_bindings.exists();
+    // 声明自定义 cfg 名（cargo 1.80+ unexpected_cfgs 检查要求先声明再使用；
+    // 与分支无关 —— ffi.rs 在两种路径下都引用该 cfg）
+    println!("cargo::rustc-check-cfg=cfg(lt_bindings_fallback)");
     if use_fallback {
         println!(
             "cargo:warning=未检测到 libclang，回退使用已提交的 bindings.rs；如修改了 ffi/lt.h 请在有 libclang 的环境重新生成绑定"
@@ -149,12 +154,13 @@ fn main() {
         //（"Size of/Alignment of/Offset of field"，如 _Mbstatet），在 Linux 上
         // const 求值会越界 panic。剥离这些编译期检查（不影响运行语义），
         // 写入 OUT_DIR 并用 rustc-cfg 让 ffi.rs 切换 include。
-        let raw = std::fs::read_to_string(&fallback_bindings)
-            .expect("read fallback bindings.rs failed");
+        let raw =
+            std::fs::read_to_string(&fallback_bindings).expect("read fallback bindings.rs failed");
         let sanitized = strip_layout_assertions(&raw);
         let out_dir = env::var("OUT_DIR").unwrap();
         let out_path = Path::new(&out_dir).join("bindings_fallback.rs");
         std::fs::write(&out_path, sanitized).expect("write bindings_fallback.rs failed");
+        // 声明自定义 cfg 名（cargo 1.80+ unexpected_cfgs 检查要求先声明再使用）
         println!("cargo:rustc-cfg=lt_bindings_fallback");
     } else {
         match bindgen::Builder::default()
@@ -170,9 +176,7 @@ fn main() {
             }
             Err(e) => {
                 if fallback_bindings.exists() {
-                    println!(
-                        "cargo:warning=bindgen 失败（{e}），保留已提交的 bindings.rs"
-                    );
+                    println!("cargo:warning=bindgen 失败（{e}），保留已提交的 bindings.rs");
                 } else {
                     panic!("bindgen failed on ffi/lt.h: {e}，且无回退 bindings.rs");
                 }
