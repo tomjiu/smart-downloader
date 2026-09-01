@@ -108,8 +108,8 @@ impl XunleiProvider {
         T: std::fmt::Debug,
     {
         let result = f.await;
-        if result.is_err() {
-            self.mark_failure(result.as_ref().unwrap_err());
+        if let Err(e) = &result {
+            self.mark_failure(e);
         }
         result
     }
@@ -306,11 +306,10 @@ impl crate::RemoteProvider for XunleiProvider {
             Ok(verdict)
         })
         .await
-        .map(|v| {
+        .inspect(|&v| {
             if matches!(v, ProviderStatus::Ready | ProviderStatus::Failed) {
                 self.clear_backoff();
             }
-            v
         })
     }
     async fn resolve(&self, id: &ProviderTaskId) -> Result<Vec<ResolvedRemoteFile>, ProviderError> {

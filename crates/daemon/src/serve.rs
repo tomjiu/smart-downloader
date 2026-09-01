@@ -54,7 +54,7 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     // 2. dest_root 预检（缺失目录自动创建）；白名单 = [dest_root]（V2）
     crate::state::ensure_dest_root(
         Some(cfg.download.dest_root.to_string_lossy().into_owned()),
-        &[cfg.download.dest_root.clone()],
+        std::slice::from_ref(&cfg.download.dest_root),
     )
     .map_err(|e| ServeError::Engine(format!("dest_root 预检失败: {e}")))?;
 
@@ -339,7 +339,7 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
 
 /// 解析生效 HTTP token（第六轮 9.3.5）：env `SMART_DL_HTTP_TOKEN`（空串视为未设）
 /// > config `[server] http_token`；值为 `auto` → 生成强随机临时 token
-/// （uuid v4，122 位随机，getrandom 支撑），`generated=true` 由调用方负责打印。
+/// > （uuid v4，122 位随机，getrandom 支撑），`generated=true` 由调用方负责打印。
 fn resolve_http_token(env_val: Option<String>, cfg_val: Option<String>) -> (Option<String>, bool) {
     let raw = env_val.filter(|t| !t.is_empty()).or(cfg_val);
     match raw.as_deref() {

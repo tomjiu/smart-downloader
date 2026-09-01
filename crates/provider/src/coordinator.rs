@@ -107,11 +107,7 @@ impl FallbackCoordinator {
         }
         let mut last_err = None;
         let mut tried: HashSet<String> = HashSet::new();
-        loop {
-            let name = match self.select_provider() {
-                Some(n) => n,
-                None => break,
-            };
+        while let Some(name) = self.select_provider() {
             if tried.contains(&name) {
                 break;
             }

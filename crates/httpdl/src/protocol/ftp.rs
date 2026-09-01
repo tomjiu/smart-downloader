@@ -465,6 +465,8 @@ async fn download_segment(
 /// 单文件下载核心（单文件/目录任务共用）：串行段下载 + 退避重试 + .part 落位。
 /// 续传：.part 存在（>0 且 < total）→ 单段 REST 从 part 大小续到文件尾；
 /// 无 .part（或已满）→ 正常分块下载。每段完成经 `on_progress(len)` 上报增量。
+// 参数即协议会话要素（主机/凭据/路径/目标/退避/进度回调），拆 struct 反而模糊调用点语义。
+#[allow(clippy::too_many_arguments)]
 async fn download_file<F: Fn(u64)>(
     host: &str,
     port: u16,

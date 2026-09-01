@@ -192,7 +192,6 @@ fn extract_binary_entries(bytes: &[u8], tlv_mode: bool, report: &mut CidStoreRep
     struct Cand {
         off: usize,
         hlen: usize,
-        path_off: usize,
         path: String,
         gap: i64,
     }
@@ -209,14 +208,13 @@ fn extract_binary_entries(bytes: &[u8], tlv_mode: bool, report: &mut CidStoreRep
                     .or_else(|| {
                         before.map(|&(po, ref s)| (po, s, (i as i64 - (po + s.len()) as i64).abs()))
                     });
-                if let Some((po, s, gap)) = pick {
+                if let Some((_po, s, gap)) = pick {
                     let tag_ok = !tlv_mode
                         || i >= 2 && bytes[i - 2..i].iter().any(|&b| (0x01..0x40).contains(&b));
                     if tag_ok {
                         cands.push(Cand {
                             off: i,
                             hlen,
-                            path_off: po,
                             path: s.clone(),
                             gap,
                         });
@@ -304,10 +302,12 @@ fn utf16le_strings(bytes: &[u8]) -> Vec<(usize, String)> {
             buf.push(u);
             i += 2;
         } else {
-            if start.is_some() && buf.len() >= 6 {
-                let s: String = String::from_utf16_lossy(&buf);
-                if s.contains('/') || s.contains('\\') || s.contains('.') {
-                    out.push((start.unwrap(), s));
+            if let Some(off) = start {
+                if buf.len() >= 6 {
+                    let s: String = String::from_utf16_lossy(&buf);
+                    if s.contains('/') || s.contains('\\') || s.contains('.') {
+                        out.push((off, s));
+                    }
                 }
             }
             start = None;
@@ -315,10 +315,12 @@ fn utf16le_strings(bytes: &[u8]) -> Vec<(usize, String)> {
             i += 2;
         }
     }
-    if start.is_some() && buf.len() >= 6 {
-        let s = String::from_utf16_lossy(&buf);
-        if s.contains('/') || s.contains('\\') || s.contains('.') {
-            out.push((start.unwrap(), s));
+    if let Some(off) = start {
+        if buf.len() >= 6 {
+            let s = String::from_utf16_lossy(&buf);
+            if s.contains('/') || s.contains('\\') || s.contains('.') {
+                out.push((off, s));
+            }
         }
     }
     out

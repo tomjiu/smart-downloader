@@ -302,8 +302,8 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentSummary, TorrentMetaError> {
         total_size,
         trackers: collect_trackers(&top),
         web_seeds: collect_web_seeds(&top),
-        comment: top.dict_get(b"comment").and_then(as_bytes).map(|b| bytes_to_string(b)),
-        created_by: top.dict_get(b"created by").and_then(as_bytes).map(|b| bytes_to_string(b)),
+        comment: top.dict_get(b"comment").and_then(as_bytes).map(bytes_to_string),
+        created_by: top.dict_get(b"created by").and_then(as_bytes).map(bytes_to_string),
     })
 }
 

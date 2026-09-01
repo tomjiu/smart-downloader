@@ -77,11 +77,11 @@ pub fn ensure_dlls_loaded(sdk_dir: &Path) -> Result<()> {
     #[cfg(not(windows))]
     {
         let _ = sdk_dir; // 非 Windows 不消费路径
-        return Err(XunleiError::Other(
+        Err(XunleiError::Other(
             "xunlei-ffi 仅支持 Windows（需要 DownloadSDKProxy.dll + DownloadSDKServer.exe）；\
              当前平台仅提供类型/解析能力，SDK 运行时不可用"
                 .into(),
-        ));
+        ))
     }
 
     #[cfg(windows)]

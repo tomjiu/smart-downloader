@@ -309,8 +309,7 @@ fn trim_wrappers(s: &str) -> String {
     out = out.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
     // 词尾标点循环剥离：URL 不会以这些字符合法结尾；
     // "…/d.torrent."（句末点）剥掉最后一个点后恰保留合法的 .torrent 后缀。
-    loop {
-        let Some(last) = out.chars().last() else { break };
+    while let Some(last) = out.chars().last() {
         if !matches!(last, '.' | ',' | ';' | '。' | '，' | '；' | '！' | '？') {
             break;
         }
@@ -328,7 +327,7 @@ fn tokenize(text: &str) -> Vec<String> {
     text.split(|c: char| BOUND.contains(&c))
         .map(|t| {
             // 词内尾部标点清理（保留 scheme 内合法字符）
-            t.trim_end_matches(|c: char| matches!(c, ',' | ';' | '。' | '，' | '；'))
+            t.trim_end_matches([',', ';', '。', '，', '；'])
                 .to_string()
         })
         .filter(|t| !t.is_empty())

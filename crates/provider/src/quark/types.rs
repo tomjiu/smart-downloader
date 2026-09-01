@@ -2,7 +2,7 @@
 //!
 //! 来源：`docs/research/clients/multi_downloader/analysis/05_quark/
 //! quark_architecture.md`（installer 逆向：UA/Referer/阿里系组件清单）
-//! + 通用网盘 REST 形状（`pr=ucpro&fr=pc` 公共参数与端点路径对齐
+//! 与通用网盘 REST 形状（`pr=ucpro&fr=pc` 公共参数与端点路径对齐
 //! 夸克 PC Web API 的公开互操作实现，**端点形状待真机验证**——本任务
 //! 的 05_quark 分析只覆盖 installer stub，未含分享 API 抓包）。
 
