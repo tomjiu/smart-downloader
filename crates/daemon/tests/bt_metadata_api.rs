@@ -88,6 +88,129 @@ fn validate_save_dest_blocks_symlink_escape() {
     assert!(http::validate_save_dest(root, "out/evil.torrent").is_err());
 }
 
+/// —— S1（V17 回归）：/bt/metadata 必须在 auth_mw 覆盖内 ——
+/// 端点在 router_base! 内，auth_mw 挂 router 末尾覆盖全部路由（merge b6c408f
+/// 已实证）。本测试锁定「认证优先于 handler 语义」契约：若日后路由被挪出
+/// 认证层，此处会以 400/408 取代 401 而失败。双构建（有/无 bt）均跑。
+async fn serve_with_token() -> std::net::SocketAddr {
+    let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
+    let state = Arc::new(
+        DaemonState::new(Arc::new(http), vec![])
+            .with_http_token(Some("s3cret-token".to_string())),
+    );
+    let app = http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+#[tokio::test]
+async fn metadata_endpoint_requires_auth_when_token_configured() {
+    let addr = serve_with_token().await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/bt/metadata");
+    // 坏 magnet：认证放行后 handler 应快速 400（而非 401/408）
+    let body = serde_json::json!({ "magnet": "magnet:?dn=no-hash" });
+
+    // 1) 无 Authorization 头 → 401（认证层固定文案；handler 未执行）
+    let r = client.post(&url).json(&body).send().await.unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let b: serde_json::Value = r.json().await.unwrap();
+    assert!(
+        b["error"].as_str().unwrap().contains("unauthorized"),
+        "401 应来自认证层: {b}"
+    );
+
+    // 2) 错误 token → 401
+    let r = client
+        .post(&url)
+        .header("Authorization", "Bearer wrong-token")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 3) Bearer 前缀大小写敏感（规范要求，verify_http_token 用 ct_eq）
+    let r = client
+        .post(&url)
+        .header("Authorization", "bearer s3cret-token")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 4) 正确 token → 认证放行，走到 handler 400（双构建语义分别断言）
+    let r = client
+        .post(&url)
+        .header("Authorization", "Bearer s3cret-token")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "正确 token 应通过认证并到达 handler"
+    );
+    let b: serde_json::Value = r.json().await.unwrap();
+    let msg = b["error"].as_str().unwrap_or_default();
+    #[cfg(not(feature = "bt"))]
+    assert!(
+        msg.contains("BT 引擎"),
+        "无 bt 构建：handler 400 语义（BT 引擎未编译），得到: {msg}"
+    );
+    #[cfg(feature = "bt")]
+    assert!(
+        msg.contains("xt"),
+        "bt 构建：magnet 解析 400 语义（缺 xt），得到: {msg}"
+    );
+}
+
+/// —— S2：magnet 抓取 scratch 遗留清理（纯 fs，双构建可跑）——
+
+#[test]
+fn stale_magnet_scratch_cleanup_pid_and_mtime_guards() {
+    let tmp = std::env::temp_dir();
+    let pid = std::process::id();
+    // 外来 PID 残骸（模拟 kill -9；PID 取 u32 高位段，不会是真实存活进程）
+    let stale_foreign = tmp.join("smart-dl-magnet-fetch-4294967290-42");
+    // 本进程 scratch（模拟活跃抓取）：任何情况下不得删除
+    let active_current = tmp.join(format!("smart-dl-magnet-fetch-{pid}-42"));
+    std::fs::create_dir_all(&stale_foreign).unwrap();
+    std::fs::create_dir_all(&active_current).unwrap();
+    std::fs::write(stale_foreign.join("session"), b"x").unwrap();
+    std::fs::write(active_current.join("session"), b"x").unwrap();
+
+    // max_age=0：外来 PID 遗留必删；本进程 scratch 必留
+    http::cleanup_stale_magnet_scratch_with(std::time::Duration::ZERO);
+    assert!(!stale_foreign.exists(), "外来 PID 遗留应被删除");
+    assert!(active_current.exists(), "本进程活跃 scratch 必须保留");
+
+    // 大阈值：新鲜的外来 PID scratch 受 mtime 保护（并发实例/跨进程活跃抓取）
+    std::fs::create_dir_all(&stale_foreign).unwrap();
+    http::cleanup_stale_magnet_scratch_with(std::time::Duration::from_secs(3600));
+    assert!(
+        stale_foreign.exists(),
+        "新鲜外来 scratch 应受 max_age 阈值保护"
+    );
+
+    // 不可归属的名字（PID 解析失败）→ 视为非本程序产物，不动
+    let junk = tmp.join("smart-dl-magnet-fetch-notapid");
+    std::fs::create_dir_all(&junk).unwrap();
+    http::cleanup_stale_magnet_scratch_with(std::time::Duration::ZERO);
+    assert!(junk.exists(), "不可解析的名字不得删除");
+
+    // 清理测试自建工件（含被保留的两处）
+    let _ = std::fs::remove_dir_all(&stale_foreign);
+    let _ = std::fs::remove_dir_all(&active_current);
+    let _ = std::fs::remove_dir_all(&junk);
+}
+
 #[cfg(feature = "bt")]
 mod bt_enabled {
     use super::*;

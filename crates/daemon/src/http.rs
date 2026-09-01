@@ -261,6 +261,56 @@ pub fn validate_save_dest(
     Ok(dest)
 }
 
+/// S2（第五轮复审非阻断项收尾）：magnet 抓取 scratch 目录遗留清理。
+/// `run_magnet_fetch` 的 best-effort 清理覆盖正常返回与客户端断连（`spawn_blocking`
+/// 任务不随 handler future 取消，尾部清理必然执行）；唯进程级死亡（kill -9 /
+/// 断电）会留下 `smart-dl-magnet-fetch-{pid}-{nanos}` 残骸。daemon 启动时
+/// （serve.rs）与每次抓取前各清扫一次：仅删除「PID ≠ 本进程 且 目录 mtime
+/// 距今超过阈值」的遗留——阈值（30 分钟）大于单次抓取上限（600s）的两倍
+/// 裕量，任何活跃抓取的 scratch 都不可能命中。
+/// 并发安全假设：生产单实例部署（lockfile 保证）；测试并行时同进程 PID 相同
+/// 天然跳过，跨进程的活跃 scratch 因 mtime 新鲜被阈值保护。
+pub fn cleanup_stale_magnet_scratch() {
+    cleanup_stale_magnet_scratch_with(std::time::Duration::from_secs(30 * 60));
+}
+
+/// `cleanup_stale_magnet_scratch` 的可调阈值版本（供测试注入 max_age=0 /
+/// 大阈值分别验证删除与保护两条分支）。
+pub fn cleanup_stale_magnet_scratch_with(max_age: std::time::Duration) {
+    const PREFIX: &str = "smart-dl-magnet-fetch-";
+    let now = std::time::SystemTime::now();
+    let current_pid = std::process::id();
+    let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(rest) = name.to_str().and_then(|n| n.strip_prefix(PREFIX)) else {
+            continue;
+        };
+        // 名字格式 {pid}-{nanos}：只处理可归属的条目——解析失败视为非本程序
+        // 产物（或未来格式变更），一律不动。
+        let Some(pid) = rest
+            .split('-')
+            .next()
+            .and_then(|p| p.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == current_pid {
+            continue; // 本进程的 scratch（活跃抓取）永不清理
+        }
+        let Ok(meta) = entry.metadata() else { continue };
+        let Ok(modified) = meta.modified() else { continue };
+        // 时钟回拨（duration_since 失败）→ 视为新鲜，不动
+        let Ok(age) = now.duration_since(modified) else { continue };
+        if age < max_age {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path()); // best-effort
+    }
+}
+
 /// 抓取执行体（spawn_blocking 包装阻塞流程 + 临时 scratch 目录管理）。
 #[cfg(feature = "bt")]
 async fn run_magnet_fetch(
@@ -270,6 +320,8 @@ async fn run_magnet_fetch(
 ) -> Result<serde_json::Value, (StatusCode, String)> {
     use smart_dl_btcore::magnet::{fetch_metadata, FetchError};
 
+    // S2：先清扫历史遗留（进程死亡残骸），再建本进程 scratch
+    cleanup_stale_magnet_scratch();
     let scratch = std::env::temp_dir().join(format!(
         "smart-dl-magnet-fetch-{}-{}",
         std::process::id(),
