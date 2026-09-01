@@ -397,6 +397,39 @@ impl Session {
         call(code, || Ok(done.into_iter().zip(size).collect()))
     }
 
+    /// 子文件优先级批量设置（P1 任务级能力）。`prio` = (文件下标, 0..=7)，
+    /// 内核两段式（全量校验→应用）。需要 metadata（否则 NOT_FOUND）。
+    pub fn set_file_priorities(&self, ih: &str, prio: &[(i32, i32)]) -> Result<()> {
+        if prio.is_empty() {
+            return Ok(());
+        }
+        let i = self.ih(ih)?;
+        let idxs: Vec<i32> = prio.iter().map(|(idx, _)| *idx).collect();
+        let prios: Vec<i32> = prio.iter().map(|(_, p)| *p).collect();
+        let code = unsafe {
+            lt_set_file_priorities(
+                self.raw,
+                i.as_ptr(),
+                idxs.as_ptr(),
+                prios.as_ptr(),
+                idxs.len() as c_int,
+            )
+        };
+        call(code, || Ok(()))
+    }
+
+    /// 读取当前各文件优先级（下标即文件序）。需要 metadata。
+    pub fn file_priorities(&self, ih: &str) -> Result<Vec<i32>> {
+        let n = self.file_count(ih)?;
+        if n <= 0 {
+            return Ok(Vec::new());
+        }
+        let i = self.ih(ih)?;
+        let mut out = vec![0 as c_int; n as usize];
+        let code = unsafe { lt_get_file_priorities(self.raw, i.as_ptr(), out.as_mut_ptr(), n) };
+        call(code, || Ok(out))
+    }
+
     /// 富 peer 列表；尺寸查询 → 分配 → 填充（查询阶段恒传 null/0，避免 !buf 恒真空转）
     pub fn peers(&self, ih: &str) -> Result<Vec<lt_peer>> {
         let i = self.ih(ih)?;

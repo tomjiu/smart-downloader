@@ -1552,6 +1552,70 @@ impl DaemonState {
         Ok(merged)
     }
 
+    /// 任务级子文件优先级（P1 能力增强，BT 多文件）。设置后返回当前各文件
+    /// 优先级快照（下标 = 文件序，与 TaskSnapshot.files 对齐）。
+    ///
+    /// - 仅 BT 任务（其余 → UnsupportedOp，HTTP 层映射 409）
+    /// - 文件数锚定与 metadata 就绪性探测合一：先 readback 当前优先级表
+    ///   （engine 侧真实文件数），metadata 未就绪/句柄缺失 → UnsupportedOp（409）
+    /// - 下标越界 / 优先级 >7 → InvalidSource（400）；内核侧两段式校验兜底
+    /// - 运行时配置（不入库不重放）：重启后回到 libtorrent 默认 4
+    pub async fn set_task_file_priorities(
+        &self,
+        id: &str,
+        priorities: &[(usize, u32)],
+    ) -> Result<Vec<Option<u32>>, DaemonError> {
+        let (engine, tid) = {
+            let rec = self
+                .tasks
+                .lock()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            if rec.engine_kind != EngineKind::Bt {
+                return Err(DaemonError::UnsupportedOp(format!(
+                    "仅 BT 任务支持子文件优先级（{id} 为 {:?}）",
+                    rec.engine_kind
+                )));
+            }
+            let tid = rec
+                .engine_tid
+                .clone()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            (self.engine_for(rec.engine_kind)?, tid)
+        };
+        // metadata 就绪探测 + 文件数锚定（当前优先级表长度 = 引擎侧文件数）。
+        // 引擎 NotFound（torrent/metadata 缺失）→ 409「metadata 未就绪」，
+        // 与任务记录级 404（tasks 表无此 id）语义分离。
+        let current = engine.file_priorities(&tid).await.map_err(|e| match e {
+            smart_dl_core::types::EngineError::NotFound => DaemonError::UnsupportedOp(
+                "BT 任务 metadata 未就绪（或引擎句柄不存在），无法设置子文件优先级".into(),
+            ),
+            other => DaemonError::Engine(other.to_string()),
+        })?;
+        let nf = current.len();
+        for (idx, prio) in priorities {
+            if *idx >= nf {
+                return Err(DaemonError::InvalidSource(format!(
+                    "文件下标 {idx} 越界（任务 {id} 引擎侧共 {nf} 个文件）"
+                )));
+            }
+            if *prio > 7 {
+                return Err(DaemonError::InvalidSource(format!(
+                    "优先级 {prio} 越界（0..=7：0=不下载 1=低 4=默认 7=最高）"
+                )));
+            }
+        }
+        engine
+            .set_file_priorities(&tid, priorities)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        engine
+            .file_priorities(&tid)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))
+    }
+
     /// F5 P2SP：给运行中的 BT 任务逐条注入 web seed（云盘直链，BEP-19），
     /// 返回成功注入条数。仅 BT 任务可注入（其余 → UnsupportedOp，HTTP 层映射
     /// 409）；engine_tid 缺失（尚未入引擎/恢复失败）→ NotFound。

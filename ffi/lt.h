@@ -72,6 +72,13 @@ lt_err lt_bitfield(lt_session* s, const char* ih, uint8_t* buf, size_t cap, size
 lt_err lt_file_count(lt_session* s, const char* ih, int* out);
 lt_err lt_file_progress(lt_session* s, const char* ih, int64_t* done_arr, int64_t* size_arr, int n);
 
+/* —— 子文件优先级（BT 多文件；P1 任务级能力）——
+   priority 语义同 libtorrent：0 = 不下载（skip）、1 = 低、4 = 默认、7 = 最高。
+   idx_arr/prio_arr 等长（n 项，逐条 set）；n/容量必须 >= 文件数（与
+   lt_file_progress 同口径，否则 BUFFER_TOO_SMALL）。需要 metadata。 */
+lt_err lt_set_file_priorities(lt_session* s, const char* ih, const int* idx_arr, const int* prio_arr, int n);
+lt_err lt_get_file_priorities(lt_session* s, const char* ih, int* out_arr, int n);
+
 /* —— 富 peer（1）—— */
 typedef struct {
     char     ip[64];

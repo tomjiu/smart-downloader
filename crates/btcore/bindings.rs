@@ -337,6 +337,23 @@ unsafe extern "C" {
         n: ::std::os::raw::c_int,
     ) -> lt_err;
 }
+unsafe extern "C" {
+    pub fn lt_set_file_priorities(
+        s: *mut lt_session,
+        ih: *const ::std::os::raw::c_char,
+        idx_arr: *const ::std::os::raw::c_int,
+        prio_arr: *const ::std::os::raw::c_int,
+        n: ::std::os::raw::c_int,
+    ) -> lt_err;
+}
+unsafe extern "C" {
+    pub fn lt_get_file_priorities(
+        s: *mut lt_session,
+        ih: *const ::std::os::raw::c_char,
+        out_arr: *mut ::std::os::raw::c_int,
+        n: ::std::os::raw::c_int,
+    ) -> lt_err;
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct lt_peer {

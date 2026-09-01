@@ -256,6 +256,16 @@ impl BtCore {
         self.sess.set_limits(ih, down, up)
     }
 
+    /// 子文件优先级批量设置（(文件下标, 0..=7)，P1 任务级能力；需 metadata）。
+    pub fn set_file_priorities(&self, ih: &str, prio: &[(i32, i32)]) -> ffi::Result<()> {
+        self.sess.set_file_priorities(ih, prio)
+    }
+
+    /// 读取当前各文件优先级（下标即文件序；需 metadata）。
+    pub fn file_priorities(&self, ih: &str) -> ffi::Result<Vec<i32>> {
+        self.sess.file_priorities(ih)
+    }
+
     // —— 块读取（v2 轮询） ——
 
     pub fn read_piece(&self, ih: &str, idx: i32) -> ffi::Result<Option<Vec<u8>>> {

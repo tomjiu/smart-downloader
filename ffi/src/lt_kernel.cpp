@@ -577,6 +577,49 @@ lt_err lt_file_progress(lt_session* s, const char* ih, int64_t* done_arr, int64_
     }
 }
 
+lt_err lt_set_file_priorities(lt_session* s, const char* ih, const int* idx_arr, const int* prio_arr, int n) {
+    if (!s || !ih || !idx_arr || !prio_arr || n <= 0) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        const std::shared_ptr<const lt::torrent_info> tf = h.torrent_file();
+        if (!tf) { set_err(s, "metadata not available"); return LT_ERR_NOT_FOUND; }
+        const int nf = tf->num_files();
+        // 两段式：先全量校验再逐条 file_priority(index, prio) 应用
+        //（注意 libtorrent 异步记账：设后立即查可能读到旧值，以 file_prio_alert 为准）
+        for (int i = 0; i < n; ++i) {
+            if (idx_arr[i] < 0 || idx_arr[i] >= nf) { set_err(s, "file index out of range"); return LT_ERR_ARG; }
+            if (prio_arr[i] < 0 || prio_arr[i] > 7) { set_err(s, "priority out of range (0..=7)"); return LT_ERR_ARG; }
+        }
+        for (int i = 0; i < n; ++i) {
+            h.file_priority(lt::file_index_t{idx_arr[i]},
+                            lt::download_priority_t{static_cast<std::uint8_t>(prio_arr[i])});
+        }
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+lt_err lt_get_file_priorities(lt_session* s, const char* ih, int* out_arr, int n) {
+    if (!s || !ih || !out_arr || n <= 0) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        const std::shared_ptr<const lt::torrent_info> tf = h.torrent_file();
+        if (!tf) { set_err(s, "metadata not available"); return LT_ERR_NOT_FOUND; }
+        const std::vector<lt::download_priority_t> prios = h.get_file_priorities();
+        const int nf = static_cast<int>(prios.size());
+        if (n < nf) return LT_ERR_BUFFER_TOO_SMALL;
+        for (int i = 0; i < nf; ++i) {
+            out_arr[i] = static_cast<int>(static_cast<std::uint8_t>(prios[i]));
+        }
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
 static void hex_encode_20(const char* data, char* out, size_t cap) {
     static const char* hex = "0123456789abcdef";
     for (int i = 0; i < 20 && static_cast<size_t>(i * 2 + 2) <= cap; ++i) {

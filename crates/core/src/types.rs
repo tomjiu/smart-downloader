@@ -268,6 +268,22 @@ pub trait DownloadEngine: Send + Sync {
         Err(EngineError::Unsupported)
     }
 
+    /// 任务级子文件优先级批量设置（BT 多文件）。`priorities` =
+    /// (文件下标, 0..=7)，0=不下载 / 1=低 / 4=默认 / 7=最高（libtorrent 语义）。
+    /// 需要 metadata 的引擎（BT）在 metadata 未就绪时返回 `EngineError::Other`。
+    async fn set_file_priorities(
+        &self,
+        _id: &EngineTaskId,
+        _priorities: &[(usize, u32)],
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// 读取当前各文件优先级（下标即文件序）。非 BT / 不支持 → `Unsupported`。
+    async fn file_priorities(&self, _id: &EngineTaskId) -> Result<Vec<Option<u32>>, EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
     /// 迅雷任务导入（M9）：接受 xunlei-convert 生成的 fastresume bencode。
     /// 默认实现返回 `not supported`；BT 引擎（libtorrent）应Override为 `add_torrent_resume`。
     async fn add_xunlei_resume(&self, _data: Vec<u8>) -> Result<EngineTaskId, EngineError> {

@@ -97,6 +97,55 @@ async fn task_limit(
     }
 }
 
+/// 任务级子文件优先级（`POST /tasks/:id/files/priority`，P1 能力增强，仅 BT）。
+/// priority 语义同 libtorrent：0=不下载 / 1=低 / 4=默认 / 7=最高。
+#[derive(Deserialize)]
+pub struct FilePriorityReq {
+    pub priorities: Vec<FilePriorityEntry>,
+}
+
+#[derive(Deserialize)]
+pub struct FilePriorityEntry {
+    pub index: usize,
+    pub priority: u32,
+}
+
+/// `POST /tasks/:id/files/priority`：批量设置子文件优先级，响应 = 当前各文件
+/// 优先级快照（下标 = 文件序，与快照 files 对齐）。
+async fn task_file_priority(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<FilePriorityReq>,
+) -> impl IntoResponse {
+    let prio: Vec<(usize, u32)> = req
+        .priorities
+        .into_iter()
+        .map(|e| (e.index, e.priority))
+        .collect();
+    match state.set_task_file_priorities(&id, &prio).await {
+        Ok(prios) => {
+            let list: Vec<serde_json::Value> = prios
+                .into_iter()
+                .map(|p| match p {
+                    Some(v) => serde_json::json!(v),
+                    None => serde_json::Value::Null,
+                })
+                .collect();
+            Json(serde_json::json!({ "priorities": list })).into_response()
+        }
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
 async fn task_webseeds(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -767,6 +816,7 @@ macro_rules! router_base {
             .route("/tasks/:id/logs", get(task_logs))
             .route("/tasks/:id/fallback", post(task_fallback))
             .route("/tasks/:id/limit", post(task_limit))
+            .route("/tasks/:id/files/priority", post(task_file_priority))
             .route("/tasks/:id/webseeds", post(task_webseeds))
             .route("/bt/metadata", post(bt_magnet_metadata))
             .route("/config", get(config_endpoint))
