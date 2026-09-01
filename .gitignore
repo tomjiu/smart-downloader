@@ -54,3 +54,11 @@ scripts/research/xunlei/extracted/
 # NAS 校准证据（含个人元数据，不入库；结论已写入 docs/nas/*.md）
 docs/nas/evidence/
 /.cargo/
+
+# daemon 运行时状态（V9 类）：任务记录 daemon 启动会真实恢复（个人任务数据入库），
+# lock 为 PID 文件——均属本机运行状态，严禁入库
+/tasks.json
+/daemon.lock
+
+# 本地调试运行产物（bugb 复现环境：日志/配置/二进制/任务快照，含本机路径）
+/out/
