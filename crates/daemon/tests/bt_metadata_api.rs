@@ -144,11 +144,17 @@ async fn metadata_endpoint_requires_auth_when_token_configured() {
         .unwrap();
     assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
 
-    // 4) 正确 token → 认证放行，走到 handler 400（双构建语义分别断言）
+    // 4) 正确 token → 认证放行，走到 handler 400（双构建语义分别断言）。
+    // 注意：用「非法 save_to」这条 handler 内门禁之前的快速失败路径——magnet
+    // 解析在门禁之后，bt 构建下并行跑的 busy_gate 测试持有进程级单并发门禁
+    // 时，正常 magnet 请求会先吃 409（与认证无关），会污染本断言。
     let r = client
         .post(&url)
         .header("Authorization", "Bearer s3cret-token")
-        .json(&body)
+        .json(&serde_json::json!({
+            "magnet": format!("magnet:?xt=urn:btih:{FAKE_IH}"),
+            "save_to": "../escape.torrent",
+        }))
         .send()
         .await
         .unwrap();
@@ -166,8 +172,8 @@ async fn metadata_endpoint_requires_auth_when_token_configured() {
     );
     #[cfg(feature = "bt")]
     assert!(
-        msg.contains("xt"),
-        "bt 构建：magnet 解析 400 语义（缺 xt），得到: {msg}"
+        msg.contains("save_to"),
+        "bt 构建：save_to 前置校验 400 语义（门禁前路径），得到: {msg}"
     );
 }
 
