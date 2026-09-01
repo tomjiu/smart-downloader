@@ -420,6 +420,32 @@ async fn config_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResp
     Json(state.config_snapshot())
 }
 
+/// 全局统计（任务按状态/引擎聚合 + 聚合速率，速率口径 1s 快照）。
+async fn stats_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    Json(state.stats())
+}
+
+/// 版本与编译特性（对齐部署矩阵：二进制是哪个 feature 组合的构建）。
+async fn version_endpoint() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "name": "smart-dl-daemon",
+        "version": env!("CARGO_PKG_VERSION"),
+        "features": {
+            "bt": cfg!(feature = "bt"),
+            "ftp": cfg!(feature = "ftp"),
+            "nas": cfg!(feature = "nas"),
+            "xunlei": cfg!(feature = "xunlei"),
+        },
+    }))
+}
+
+/// 存活探针（liveness）：200 = 进程可达且路由栈就绪。引擎故障属任务级
+/// 状态（见 /tasks 与 /stats），不在此反映。与全端点一致受 auth_mw 保护
+/// —— 配置 token 时探针需携带 Bearer（V1/V13 fail-closed 姿态，不设例外）。
+async fn health_endpoint() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
 /// 删除任务（引擎 remove + 目录记录移除；delete_data=false 保留已下载文件）。
 async fn remove_task(
     Path(id): Path<String>,
@@ -678,6 +704,9 @@ macro_rules! router_base {
             .route("/tasks/:id/webseeds", post(task_webseeds))
             .route("/bt/metadata", post(bt_magnet_metadata))
             .route("/config", get(config_endpoint))
+            .route("/stats", get(stats_endpoint))
+            .route("/version", get(version_endpoint))
+            .route("/health", get(health_endpoint))
             .route("/providers", get(providers))
             .route("/ws", get(ws_handler))
     };

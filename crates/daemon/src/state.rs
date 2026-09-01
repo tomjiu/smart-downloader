@@ -89,6 +89,34 @@ pub struct TaskSummary {
     pub source: String,
 }
 
+/// 全局统计（`GET /stats`）：任务按状态/引擎聚合 + 聚合速率。
+/// 速率来自引擎快照缓存（`engine_status`，1s 轮询口径），非实时值。
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+pub struct DaemonStats {
+    /// 任务总数。
+    pub total: usize,
+    /// 按状态聚合（键同 `TaskSummary.state` 口径，如 `Downloading`/`Paused`）。
+    pub by_state: std::collections::BTreeMap<String, usize>,
+    /// 按引擎种类聚合（bt/http/ftp/provider/xunlei-nas）。
+    pub by_engine: std::collections::BTreeMap<&'static str, usize>,
+    /// 聚合下行速率（B/s）。
+    pub down_bytes_s: u64,
+    /// 聚合上行速率（B/s；仅 BT 等双向引擎非零）。
+    pub up_bytes_s: u64,
+}
+
+/// 引擎种类 → 统计标签（`/stats` by_engine 键；与引擎 `id()` 不同，
+/// 这里是稳定的分类口径，不随引擎实例变化）。
+fn kind_label(k: &EngineKind) -> &'static str {
+    match k {
+        EngineKind::Bt => "bt",
+        EngineKind::Http => "http",
+        EngineKind::Ftp => "ftp",
+        EngineKind::Provider => "provider",
+        EngineKind::XunleiNas => "xunlei-nas",
+    }
+}
+
 /// 快照用状态标签：取枚举 Debug 的变体名部分。
 pub fn state_label(s: &TaskState) -> String {
     let d = format!("{s:?}");
@@ -1363,6 +1391,24 @@ impl DaemonState {
                 source: rec.task.source.redacted_debug(),
             })
             .collect()
+    }
+
+    /// 全局统计快照（`GET /stats`）：总数 + 按状态/引擎聚合 + 速率求和。
+    pub fn stats(&self) -> DaemonStats {
+        let mut st = DaemonStats::default();
+        let tasks = self.tasks.lock();
+        st.total = tasks.len();
+        for rec in tasks.values() {
+            *st.by_state.entry(state_label(&rec.task.state)).or_insert(0) += 1;
+            *st.by_engine
+                .entry(kind_label(&rec.engine_kind))
+                .or_insert(0) += 1;
+            if let Some(s) = &rec.engine_status {
+                st.down_bytes_s += s.down_rate;
+                st.up_bytes_s += s.up_rate;
+            }
+        }
+        st
     }
 
     pub async fn pause(&self, id: &str) -> Result<(), DaemonError> {

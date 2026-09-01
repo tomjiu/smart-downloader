@@ -711,3 +711,83 @@ fn verify_http_token_unit() {
     assert!(!secured.verify_http_token(Some("t-abc"))); // 必须带 Bearer 前缀
     assert!(secured.verify_http_token(Some("Bearer t-abc")));
 }
+
+/// P2 运维 API：/health 存活探针 + /version 构建信息。
+#[tokio::test]
+async fn health_and_version_report_build_info() {
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let health: serde_json::Value = client
+        .get(format!("{base}/health"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(health["status"], "ok");
+
+    let version: serde_json::Value = client
+        .get(format!("{base}/version"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(version["name"], "smart-dl-daemon");
+    // 集成测试与 daemon 同包，CARGO_PKG_VERSION 一致
+    assert_eq!(version["version"], env!("CARGO_PKG_VERSION"));
+    // features 是布尔对象（部署矩阵对齐：构建组合一目了然）
+    let feats = version["features"].as_object().expect("features 对象");
+    assert!(!feats.is_empty());
+    assert!(feats.values().all(|v| v.is_boolean()));
+}
+
+/// P2 运维 API：/stats 聚合（初始 0 → 加 1 任务后 total=1 且 by_state/by_engine 有值）。
+#[tokio::test]
+async fn stats_reflect_task_counts() {
+    let body = patterned(64 * 1024);
+    let srv = TestServer::start(body).await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 初始：total = 0
+    let stats: serde_json::Value = client
+        .get(format!("{base}/stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["total"], 0);
+    assert_eq!(stats["down_bytes_s"], 0);
+
+    // 添加 1 个 HTTP 任务 → total=1，by_state/by_engine 各有 1 个键
+    let resp = add_task(&client, &base, &srv.url()).await;
+    assert_eq!(resp.0, reqwest::StatusCode::CREATED);
+
+    let stats: serde_json::Value = client
+        .get(format!("{base}/stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(stats["total"], 1);
+    let by_state = stats["by_state"].as_object().expect("by_state 对象");
+    assert_eq!(
+        by_state.values().filter_map(|v| v.as_u64()).sum::<u64>(),
+        1,
+        "by_state 聚合必须覆盖全部任务"
+    );
+    let by_engine = stats["by_engine"].as_object().expect("by_engine 对象");
+    assert_eq!(by_engine.get("http"), Some(&serde_json::json!(1)));
+    // bt 构建下该测试也可能有 BT 引擎注册，但无 BT 任务 → by_engine 无 bt 键
+    assert!(by_engine.get("bt").is_none());
+}
