@@ -31,6 +31,12 @@ pub struct AddTaskReq {
     /// .torrent 文件内容（标准 base64）。与 `url` 二选一，优先 torrent。
     #[serde(default)]
     pub torrent_b64: Option<String>,
+    /// 任务级下载限速 KiB/s（0 = 不限；缺省 = 走全局）。任务创建成功后应用。
+    #[serde(default)]
+    pub down_kb_s: Option<u32>,
+    /// 任务级上传限速 KiB/s（仅 BT 任务；0 = 不限）。
+    #[serde(default)]
+    pub up_kb_s: Option<u32>,
 }
 
 #[cfg(feature = "xunlei-import")]
@@ -51,6 +57,44 @@ pub struct AddXunleiImportReq {
 #[derive(Deserialize)]
 pub struct WebseedReq {
     pub urls: Vec<String>,
+}
+
+/// 任务级限速（`POST /tasks/:id/limit`，P1 能力增强）。
+/// 字段语义：`None` = 不调整该方向；`0` = 不限速；`n` = 上限 n KiB/s。
+/// 合并口径见 `DaemonState::set_task_limits`（快照返回合并后全量配置）。
+#[derive(Deserialize)]
+pub struct LimitReq {
+    #[serde(default)]
+    pub down_kb_s: Option<u32>,
+    #[serde(default)]
+    pub up_kb_s: Option<u32>,
+}
+
+/// `POST /tasks/:id/limit`：设置/调整任务级限速，返回合并后的快照。
+async fn task_limit(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<LimitReq>,
+) -> impl IntoResponse {
+    match state.set_task_limits(&id, req.down_kb_s, req.up_kb_s).await {
+        Ok(_merged) => match state.task_snapshot(&id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
 }
 
 async fn task_webseeds(
@@ -554,10 +598,31 @@ async fn add_task(
         state.add_link_task(url, req.dest).await
     };
     match result {
-        Ok(task_id) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({ "task_id": task_id })),
-        ),
+        Ok(task_id) => {
+            // 建任务时可选任务级限速：复用 set_task_limits 全链（合并/持久化/重放）。
+            // 任务已存在 → 限速失败不回滚任务，返回错误体提示单独重试 limit 调用。
+            let limits_err = if req.down_kb_s.is_some() || req.up_kb_s.is_some() {
+                state
+                    .set_task_limits(&task_id, req.down_kb_s, req.up_kb_s)
+                    .await
+                    .err()
+            } else {
+                None
+            };
+            match limits_err {
+                None => (
+                    StatusCode::CREATED,
+                    Json(serde_json::json!({ "task_id": task_id })),
+                ),
+                Some(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "task_id": task_id,
+                        "error": format!("任务已创建但限速设置失败: {e}（可单独重试 POST /tasks/:id/limit）")
+                    })),
+                ),
+            }
+        }
         Err(e) => match e {
             crate::state::DaemonError::Duplicate(existing) => (
                 StatusCode::CONFLICT,
@@ -701,6 +766,7 @@ macro_rules! router_base {
             .route("/tasks/:id/resume", post(resume_task))
             .route("/tasks/:id/logs", get(task_logs))
             .route("/tasks/:id/fallback", post(task_fallback))
+            .route("/tasks/:id/limit", post(task_limit))
             .route("/tasks/:id/webseeds", post(task_webseeds))
             .route("/bt/metadata", post(bt_magnet_metadata))
             .route("/config", get(config_endpoint))

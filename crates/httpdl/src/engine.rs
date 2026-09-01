@@ -51,12 +51,18 @@ struct HttpTask {
     /// 换源代次：etag 变化 → gen+1 → 旧下载循环退出、新循环启动。
     /// .part 路径随 gen 隔离（`dest.<gen>.part`），避免新旧循环并发写同一文件。
     gen: u64,
+    /// 任务级下载限速（KiB/s 配置回显；None = 走全局）。实际生效速在
+    /// limiters 表的 RateLimiter 上（set_limits 运行中即时改率）。
+    limit_kb_s: Option<u32>,
 }
 
 struct EngineInner {
     tasks: Mutex<HashMap<EngineTaskId, HttpTask>>,
     /// Mirror 加权评分（URL → 分数）：跨任务持久，成功 +1 / 失败 -2，clamp [-4, +4]。
     mirror_scores: Arc<Mutex<HashMap<String, i64>>>,
+    /// 任务级限速器（tid → limiter）；未登记的任务走引擎全局 limiter。
+    /// 与全局不同：任务条目内的 RateLimiter 速率可运行中热调（set_rate_kb_s）。
+    limiters: Mutex<HashMap<EngineTaskId, Arc<RateLimiter>>>,
 }
 
 /// HTTP 引擎：reqwest 传输 + 自研调度层（D29）。
@@ -82,6 +88,7 @@ impl HttpEngine {
             inner: Arc::new(EngineInner {
                 tasks: Mutex::new(HashMap::new()),
                 mirror_scores: Arc::new(Mutex::new(HashMap::new())),
+                limiters: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -92,7 +99,14 @@ impl HttpEngine {
     /// 永停 Downloading、无 Failed 事件、无收尸路径）。
     fn spawn_download(&self, tid: EngineTaskId, gen: u64) {
         let client = self.client.clone();
-        let limiter = self.limiter.clone();
+        // 任务级限速优先，未登记回退全局（跨段共享口径不变）。
+        let limiter = self
+            .inner
+            .limiters
+            .lock()
+            .get(&tid)
+            .cloned()
+            .unwrap_or_else(|| self.limiter.clone());
         let inner = self.inner.clone();
         let inner_mon = self.inner.clone();
         let tid_mon = tid.clone();
@@ -431,6 +445,7 @@ impl DownloadEngine for HttpEngine {
                     backup_md5,
                     backup_used: false,
                     gen: 0,
+                    limit_kb_s: None,
                 },
             );
         }
@@ -472,6 +487,45 @@ impl DownloadEngine for HttpEngine {
     async fn remove(&self, id: &EngineTaskId, _delete_data: bool) -> Result<(), EngineError> {
         let mut tasks = self.inner.tasks.lock();
         tasks.remove(id).ok_or(EngineError::NotFound)?;
+        drop(tasks);
+        // 限速器条目随任务清理（防泄漏）。
+        self.inner.limiters.lock().remove(id);
+        Ok(())
+    }
+
+    /// 任务级下载限速（trait 扩展）。任务专属 limiter 登记进 limiters 表，
+    /// 已持有的 Arc 热调速率 → 运行中的 chunk 立即按新速率节流，无需重启循环。
+    /// 仅 down 方向有意义：up 请求被显式拒绝（HTTP/FTP 无上传概念）。
+    async fn set_limits(
+        &self,
+        id: &EngineTaskId,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<(), EngineError> {
+        if up_kb_s.is_some() {
+            return Err(EngineError::Other(
+                "HTTP/FTP 引擎无上传方向，up_kb_s 不适用".to_string(),
+            ));
+        }
+        let Some(kb) = down_kb_s else { return Ok(()) }; // 双 None = no-op
+                                                         // 任务必须存在（不存在 → NotFound；remove 后迟到请求同理）
+        {
+            let mut tasks = self.inner.tasks.lock();
+            if !tasks.contains_key(id) {
+                return Err(EngineError::NotFound);
+            }
+            // 配置回显记到任务快照上（审计/透出口径）
+            if let Some(t) = tasks.get_mut(id) {
+                t.limit_kb_s = Some(kb);
+            }
+        }
+        let mut limiters = self.inner.limiters.lock();
+        match limiters.get(id) {
+            Some(lim) => lim.set_rate_kb_s(kb), // 已有限速器 → 原地热调
+            None => {
+                limiters.insert(id.clone(), Arc::new(RateLimiter::new(kb)));
+            }
+        }
         Ok(())
     }
 

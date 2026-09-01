@@ -28,6 +28,27 @@ pub struct DownloadTask {
     #[serde(skip, default = "instant_now")]
     pub created_at: std::time::Instant,
     pub metadata: TaskMetadata,
+    /// 任务级限速（None = 未设置，走全局配置；旧 tasks.json 无此字段自动补 None）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<TaskLimits>,
+}
+
+/// 任务级限速（KiB/s）。语义：`None` = 不调整（保持现状/走全局）；
+/// `Some(0)` = 不限速；`Some(n)` = 上限 n KiB/s。仅对传输方向有意义的一侧生效：
+/// HTTP/FTP 仅 down（up 会被引擎拒绝），BT 双向均可。
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskLimits {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub down_kb_s: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub up_kb_s: Option<u32>,
+}
+
+impl TaskLimits {
+    /// 两方向均未设置。
+    pub fn is_empty(&self) -> bool {
+        self.down_kb_s.is_none() && self.up_kb_s.is_none()
+    }
 }
 
 fn instant_now() -> std::time::Instant {

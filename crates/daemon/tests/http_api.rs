@@ -791,3 +791,139 @@ async fn stats_reflect_task_counts() {
     // bt 构建下该测试也可能有 BT 引擎注册，但无 BT 任务 → by_engine 无 bt 键
     assert!(by_engine.get("bt").is_none());
 }
+
+// ============ 任务级限速（POST /tasks/:id/limit，P1 能力增强）============
+
+#[tokio::test]
+async fn task_limit_set_then_merge_and_snapshot_echo() {
+    let body = patterned(64 * 1024);
+    let srv = TestServer::start(body).await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let (status, created) = add_task(&client, &base, &srv.url()).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED);
+    let tid = created["task_id"].as_str().unwrap().to_string();
+
+    // 快照初始无 limits 字段（None → 序列化跳过）
+    let snap: serde_json::Value = client
+        .get(format!("{base}/tasks/{tid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(snap.get("limits").is_none(), "未设置时快照不出 limits");
+
+    // 首设 down=128
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/limit"))
+        .json(&serde_json::json!({ "down_kb_s": 128 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let snap: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(snap["limits"]["down_kb_s"], 128);
+    assert!(snap["limits"].get("up_kb_s").is_none(), "up 未设置不回显");
+
+    // 合并语义：只传 down=0（显式不限）→ down 覆盖、其余保持
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/limit"))
+        .json(&serde_json::json!({ "down_kb_s": 0 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let snap: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(snap["limits"]["down_kb_s"], 0, "0 = 显式不限");
+
+    // 空请求体（两方向都缺省）→ 合并保持既有配置，200
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/limit"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let snap: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(snap["limits"]["down_kb_s"], 0, "空请求沿用既有值");
+}
+
+#[tokio::test]
+async fn task_limit_up_direction_rejected_for_http_task() {
+    // HTTP 任务无上传方向 → 409（state 层预拒，非 500）
+    let body = patterned(16 * 1024);
+    let srv = TestServer::start(body).await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let (_status, created) = add_task(&client, &base, &srv.url()).await;
+    let tid = created["task_id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/limit"))
+        .json(&serde_json::json!({ "up_kb_s": 64 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("up_kb_s"),
+        "错误信息应指明 up_kb_s 不适用: {body}"
+    );
+}
+
+#[tokio::test]
+async fn task_limit_unknown_task_404() {
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/tasks/t-nope/limit"))
+        .json(&serde_json::json!({ "down_kb_s": 128 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn add_task_with_down_kb_s_applies_limit() {
+    // 建任务请求携带 down_kb_s → 创建即生效（快照回显）
+    let body = patterned(16 * 1024);
+    let srv = TestServer::start(body).await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let dest = std::env::temp_dir().join(format!("m6-limit-{}", std::process::id()));
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "url": srv.url(),
+            "dest": dest.to_str().unwrap(),
+            "down_kb_s": 256
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let created: serde_json::Value = resp.json().await.unwrap();
+    let tid = created["task_id"].as_str().unwrap().to_string();
+
+    let snap: serde_json::Value = client
+        .get(format!("{base}/tasks/{tid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(snap["limits"]["down_kb_s"], 256, "建任务时限速即生效");
+}
