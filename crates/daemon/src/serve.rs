@@ -305,6 +305,9 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     }
 
     // 5. 路由 + 监听
+    // S2：清扫上次运行遗留的 magnet 抓取 scratch（kill -9/断电残骸，best-effort；
+    // PID+mtime 双重保护，活跃抓取与并发实例不受影响）。
+    http::cleanup_stale_magnet_scratch();
     let app = http::router(state_arc.clone());
     let listener = tokio::net::TcpListener::bind(&cfg.server.addr)
         .await
