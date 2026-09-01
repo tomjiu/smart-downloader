@@ -411,3 +411,168 @@ async fn bt_task_limit_up_and_down_merge() {
     // （state.autosave 在 set 后触发；等 tasks.json 出现）
     let _ = srv; // 保持 TestServer 存活到断言结束
 }
+
+// ============ 任务级子文件优先级（POST /tasks/:id/files/priority）============
+
+fn minimal_torrent_b64() -> String {
+    // 最小单文件 .torrent（手写 bencode，与 torrent_file_add_creates_task 同款）
+    let mut t = b"d4:infod6:lengthi123e4:name4:test12:piece lengthi16384e6:pieces20:".to_vec();
+    t.extend_from_slice(&[0xAB; 20]);
+    t.extend_from_slice(b"ee");
+    base64::engine::general_purpose::STANDARD.encode(&t)
+}
+
+#[tokio::test]
+async fn torrent_file_task_sets_and_readbacks_priority() {
+    // 真实 torrent（metadata 即时就绪）→ file 0 设为 0（skip）→ 回显当前优先级表
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "torrent_b64": minimal_torrent_b64() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/files/priority"))
+        .json(&serde_json::json!({ "priorities": [ { "index": 0, "priority": 0 } ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "设置子文件优先级必须 200: {:?}",
+        resp.text().await.unwrap()
+    );
+
+    // libtorrent 文件优先级为异步记账（设后立即查可能读旧值，file_prio_alert
+    // 为准）——轮询到收敛（空 priorities 列表 = 纯 readback）。
+    let mut applied = None;
+    for _ in 0..40 {
+        let resp = client
+            .post(format!("{base}/tasks/{tid}/files/priority"))
+            .json(&serde_json::json!({ "priorities": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = resp.json().await.unwrap();
+        if body["priorities"] == serde_json::json!([0]) {
+            applied = Some(body.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        applied.expect("3s 内优先级必须收敛为 [0] (skip)")["priorities"],
+        serde_json::json!([0]),
+        "回显 = 当前各文件优先级（下标 = 文件序）"
+    );
+
+    // 恢复默认 4 → 轮询收敛 [4]
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/files/priority"))
+        .json(&serde_json::json!({ "priorities": [ { "index": 0, "priority": 4 } ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let mut restored = None;
+    for _ in 0..40 {
+        let resp = client
+            .post(format!("{base}/tasks/{tid}/files/priority"))
+            .json(&serde_json::json!({ "priorities": [] }))
+            .send()
+            .await
+            .unwrap();
+        let body: serde_json::Value = resp.json().await.unwrap();
+        if body["priorities"] == serde_json::json!([4]) {
+            restored = Some(body.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        restored.expect("3s 内优先级必须收敛回 [4]")["priorities"],
+        serde_json::json!([4])
+    );
+}
+
+#[tokio::test]
+async fn magnet_task_file_priority_metadata_pending_409() {
+    // magnet 任务 metadata 未就绪 → files 未规划 → 409（明确语义，非 500）
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let bt = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "url": MAGNET }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bt.status(), reqwest::StatusCode::CREATED);
+    let tid = bt.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/files/priority"))
+        .json(&serde_json::json!({ "priorities": [ { "index": 0, "priority": 0 } ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("metadata"),
+        "错误应指明 metadata 未就绪: {body}"
+    );
+}
+
+#[tokio::test]
+async fn file_priority_index_out_of_range_400() {
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "torrent_b64": minimal_torrent_b64() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 单文件 torrent → index 5 越界 → 400
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/files/priority"))
+        .json(&serde_json::json!({ "priorities": [ { "index": 5, "priority": 4 } ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // priority 8 越界（0..=7）→ 400
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/files/priority"))
+        .json(&serde_json::json!({ "priorities": [ { "index": 0, "priority": 8 } ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}

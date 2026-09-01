@@ -227,6 +227,15 @@ fn core_err(e: &smart_dl_btcore::Error) -> String {
     format!("{:?}", e)
 }
 
+/// ffi 错误分类：NotFound（torrent/metadata 缺失）→ EngineError::NotFound，
+/// 其余 → Other（供子文件优先级链路区分 404 与「metadata 未就绪」409）。
+fn bt_engine_err(e: smart_dl_btcore::Error) -> EngineError {
+    match e {
+        smart_dl_btcore::Error::NotFound(_) => EngineError::NotFound,
+        other => EngineError::Other(core_err(&other)),
+    }
+}
+
 /// 从任务 source 提取 infohash hint（fastresume 定位用）：magnet → btih；.torrent → SHA1(info)。
 fn btih_hint(task: &DownloadTask) -> Option<String> {
     match &task.source {
@@ -396,6 +405,29 @@ impl DownloadEngine for BtEngine {
         self.core
             .set_limits(id, down, up)
             .map_err(|e| EngineError::Other(core_err(&e)))
+    }
+
+    /// BT 子文件优先级批量设置（trait 扩展；需 metadata 就绪）。
+    /// NotFound（torrent/metadata 缺失）按 `EngineError::NotFound` 透传，
+    /// 供 state 层区分「任务不存在」与「metadata 未就绪」。
+    async fn set_file_priorities(
+        &self,
+        id: &EngineTaskId,
+        priorities: &[(usize, u32)],
+    ) -> Result<(), EngineError> {
+        let prio: Vec<(i32, i32)> = priorities
+            .iter()
+            .map(|(idx, p)| (*idx as i32, *p as i32))
+            .collect();
+        self.core
+            .set_file_priorities(id, &prio)
+            .map_err(bt_engine_err)
+    }
+
+    /// 读取当前各文件优先级（下标即文件序；需 metadata 就绪）。
+    async fn file_priorities(&self, id: &EngineTaskId) -> Result<Vec<Option<u32>>, EngineError> {
+        let prios = self.core.file_priorities(id).map_err(bt_engine_err)?;
+        Ok(prios.into_iter().map(|p| Some(p as u32)).collect())
     }
 
     async fn add_xunlei_resume(&self, data: Vec<u8>) -> Result<EngineTaskId, EngineError> {

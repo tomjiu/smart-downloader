@@ -927,3 +927,24 @@ async fn add_task_with_down_kb_s_applies_limit() {
         .unwrap();
     assert_eq!(snap["limits"]["down_kb_s"], 256, "建任务时限速即生效");
 }
+
+#[tokio::test]
+async fn http_task_file_priority_conflict() {
+    // 子文件优先级仅 BT 任务：HTTP 任务 → 409（双构建通用，不依赖 bt feature）
+    let body = patterned(16 * 1024);
+    let srv = TestServer::start(body).await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let (_status, created) = add_task(&client, &base, &srv.url()).await;
+    let tid = created["task_id"].as_str().unwrap().to_string();
+
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/files/priority"))
+        .json(&serde_json::json!({ "priorities": [ { "index": 0, "priority": 0 } ] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+}
