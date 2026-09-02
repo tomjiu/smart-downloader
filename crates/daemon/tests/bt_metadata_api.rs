@@ -95,6 +95,47 @@ fn validate_save_dest_blocks_symlink_escape() {
     assert!(http::validate_save_dest(root, "out/evil.torrent").is_err());
 }
 
+/// H-2（CWE-59）：末段 symlink 写穿逃逸——parent canonicalize 只覆盖中间
+/// 分量，dest 本身为链接时此前全部检查照过、后续 fs::write 写到根外。
+#[cfg(unix)]
+#[test]
+fn validate_save_dest_blocks_final_component_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let outside = tempfile::tempdir().unwrap();
+    let victim = outside.path().join("victim.txt");
+    std::fs::write(&victim, b"do-not-touch").unwrap();
+
+    // 形态 1：单分量 —— root/evil.torrent → 根外文件（父目录 = 根，canonicalize 必过）
+    std::os::unix::fs::symlink(&victim, root.join("evil.torrent")).unwrap();
+    assert!(
+        http::validate_save_dest(root, "evil.torrent").is_err(),
+        "末段 symlink 必须拒绝"
+    );
+    // 链接目标未被触碰（校验层不写文件；防未来误改成 follow 写）
+    assert_eq!(std::fs::read(&victim).unwrap(), b"do-not-touch");
+
+    // 形态 2：多级相对路径的末段 —— 父目录链真实存在（canonicalize 通过），
+    // 仅最后一段是链接
+    std::fs::create_dir_all(root.join("sub/dir")).unwrap();
+    std::os::unix::fs::symlink(&victim, root.join("sub/dir/x.torrent")).unwrap();
+    assert!(
+        http::validate_save_dest(root, "sub/dir/x.torrent").is_err(),
+        "多级路径的末段 symlink 同样必须拒绝"
+    );
+}
+
+/// H-2 非回归：dest 已存在且为普通文件（非链接）→ 语义不变（放行，
+/// 与既有 fs::write 覆盖写契约一致）。
+#[test]
+fn validate_save_dest_allows_regular_existing_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    std::fs::write(root.join("existing.torrent"), b"old").unwrap();
+    let p = http::validate_save_dest(root, "existing.torrent").unwrap();
+    assert_eq!(p, root.join("existing.torrent"));
+}
+
 /// —— S1（V17 回归）：/bt/metadata 必须在 auth_mw 覆盖内 ——
 /// 端点在 router_base! 内，auth_mw 挂 router 末尾覆盖全部路由（merge b6c408f
 /// 已实证）。本测试锁定「认证优先于 handler 语义」契约：若日后路由被挪出
