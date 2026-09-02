@@ -390,7 +390,11 @@ fn bdecode_bytes(data: &[u8], pos: usize) -> Result<(Vec<u8>, usize), BencodeErr
     let len: usize = len_str
         .parse()
         .map_err(|e| BencodeError::InvalidData(format!("invalid len at pos {}: {}", pos, e)))?;
-    let end = colon + 1 + len;
+    // 安全修复（H-3 同型）：colon+1+len 裸加法回绕可绕过截断检查 → 切片 panic。
+    let end = colon
+        .checked_add(1)
+        .and_then(|s| s.checked_add(len))
+        .ok_or_else(|| BencodeError::InvalidData(format!("len overflow at pos {pos}")))?;
     if end > data.len() {
         return Err(BencodeError::InvalidData("bytes truncated".into()));
     }

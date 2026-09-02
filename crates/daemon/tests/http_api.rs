@@ -382,6 +382,45 @@ async fn config_endpoint_returns_injected_snapshot() {
 }
 
 #[tokio::test]
+async fn task_logs_source_is_redacted() {
+    // H-1 回归：`GET /tasks/:id/logs` 的 source 快照必须经 redacted_debug()——
+    // 源 URL 中的 userinfo 凭据不得明文外溢（state.rs 曾漏改一处裸 format!(\"{:?}\")）。
+    let body = patterned(1024);
+    let srv = TestServer::start(body).await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let cred_url = format!("http://alice:sup3rs3cret@{}/file", srv.addr);
+    let resp = add_task(&client, &base, &cred_url).await;
+    assert_eq!(
+        resp.0,
+        reqwest::StatusCode::CREATED,
+        "带凭据的 URL 应可建任务: {:?}",
+        resp.1
+    );
+    let tid = resp.1["task_id"].as_str().unwrap().to_string();
+
+    let logs: serde_json::Value = client
+        .get(format!("{base}/tasks/{tid}/logs"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let source = logs["source"].as_str().unwrap_or_default();
+    assert!(
+        !source.contains("sup3rs3cret"),
+        "userinfo 密码不得出现在 logs source: {source}"
+    );
+    assert!(
+        source.contains("***@"),
+        "source 应为脱敏形态（***@host）: {source}"
+    );
+}
+
+#[tokio::test]
 async fn task_logs_returns_add_event() {
     // add 任务 → GET /tasks/:id/logs → events 含 add 操作
     let body = patterned(8 * 1024);

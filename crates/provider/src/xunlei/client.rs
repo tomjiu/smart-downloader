@@ -168,10 +168,13 @@ fn matching_end(buf: &[u8], start: usize) -> Option<usize> {
                             }
                         };
                     }
-                    if !ok || j + 1 + len > buf.len() {
-                        return None;
+                    // 安全修复（H-3 同型）：len 本身已 checked 解析（可达 usize::MAX），
+                    // j+1+len 裸加法回绕会绕过界检查 → i 回跳死循环。改 checked 链。
+                    let next = j.checked_add(1).and_then(|k| k.checked_add(len));
+                    match next {
+                        Some(v) if ok && v <= buf.len() => i = v,
+                        _ => return None,
                     }
-                    i = j + 1 + len;
                     continue;
                 } else {
                     return None;

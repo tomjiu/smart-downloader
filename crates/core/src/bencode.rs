@@ -187,10 +187,14 @@ fn decode_bytes(data: &[u8], pos: usize) -> Result<(Value, usize), DecodeError> 
         .parse()
         .map_err(|_| DecodeError::InvalidByte(len_str[0], pos))?;
     let start = colon + 1;
-    if start + len > data.len() {
-        return Err(DecodeError::UnexpectedEof(colon));
-    }
-    Ok((Value::Bytes(data[start..start + len].to_vec()), start + len))
+    // 安全修复（H-3）：start + len 必须用 checked_add——裸加法在 release
+    // （overflow-checks=off）下回绕可绕过界检查，切片 start..start+len 因
+    // end < start 直接 panic（恶意 bencode 输入可远程触发 DoS）。
+    let end = match start.checked_add(len) {
+        Some(e) if e <= data.len() => e,
+        _ => return Err(DecodeError::UnexpectedEof(colon)),
+    };
+    Ok((Value::Bytes(data[start..end].to_vec()), end))
 }
 
 fn decode_list_d(data: &[u8], pos: usize, depth: usize) -> Result<(Value, usize), DecodeError> {
@@ -372,5 +376,21 @@ mod tests {
         let mut data = vec![b'd'; 200];
         data.extend(std::iter::repeat_n(b'e', 200));
         assert!(matches!(decode(&data), Err(DecodeError::TooDeep(_, _))));
+    }
+
+    // 安全回归（H-3）：超大长度字段在 release（overflow-checks=off）下曾因
+    // start+len 回绕绕过界检查 → 切片 panic（slice index starts at X but ends at Y）。
+    // 修复后必须优雅报错而非 panic。
+    #[test]
+    fn decode_huge_length_rejected() {
+        // len = usize::MAX：start+len 必然回绕
+        let mut data = b"18446744073709551615:".to_vec();
+        data.extend_from_slice(b"payload");
+        assert!(matches!(decode(&data), Err(DecodeError::UnexpectedEof(_))));
+        // len = usize::MAX - 20：start(21)+len 恰好回绕到 0，旧检查 0 > 28 不成立
+        // → 越界切片 panic；修复后走 checked_add → UnexpectedEof。
+        let mut data2 = b"18446744073709551595:".to_vec();
+        data2.extend_from_slice(b"payload");
+        assert!(matches!(decode(&data2), Err(DecodeError::UnexpectedEof(_))));
     }
 }

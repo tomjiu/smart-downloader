@@ -60,7 +60,12 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
 
     // 3. 引擎组装：HTTP（必需）+ BT（feature bt 且配置开启）
     // 全局代理（config `[download] proxy`，启动时生效）：http/socks5/socks4，可带凭据
-    let mut client_builder = reqwest::Client::builder();
+    // 安全修复（H-9）：connect/read 超时兜底——connect_timeout 防黑洞地址挂死，
+    // read_timeout 防对端断流挂死（idle 语义，单次读超时即断）；刻意不设总超时，
+    // 避免误杀正常的长耗时大文件下载。
+    let mut client_builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(30));
     if !cfg.download.proxy.is_empty() {
         let proxy = reqwest::Proxy::all(&cfg.download.proxy)
             .map_err(|e| ServeError::Engine(format!("代理解析失败: {e}")))?;
