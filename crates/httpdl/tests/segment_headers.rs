@@ -147,6 +147,7 @@ fn task_with_headers(
         headers,
         auth: None,
         backup_url: None,
+        proxy: None,
     };
     t
 }

@@ -41,6 +41,11 @@ pub struct AddTaskReq {
     /// flag；缺省 = 默认并行策略。
     #[serde(default)]
     pub sequential: bool,
+    /// 任务级代理 URL（E5，仅 HTTP 任务生效）：`http(s)://` / `socks5://` /
+    /// `socks4://`，可带 `user:pass@`；缺省 = 走全局 `[download] proxy`（若有）。
+    /// 非法代理 URL → 400；BT/FTP 任务携带此字段被忽略。
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 #[cfg(feature = "xunlei-import")]
@@ -701,7 +706,7 @@ async fn add_task(
             );
         };
         state
-            .add_link_task_opts(url, req.dest, req.sequential)
+            .add_link_task_opts(url, req.dest, req.sequential, req.proxy)
             .await
     };
     match result {

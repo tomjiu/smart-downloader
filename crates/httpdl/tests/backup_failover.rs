@@ -247,6 +247,7 @@ async fn backup_without_sha256_still_fails_over_on_content_mismatch() {
         headers: vec![],
         auth: None,
         backup_url: Some(srv_backup.url("/file")),
+        proxy: None,
     };
     let tid = engine.add(&task).await.unwrap();
     let st = wait_terminal(&engine, &tid).await;

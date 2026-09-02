@@ -793,21 +793,24 @@ impl DaemonState {
         link: String,
         dest_root: Option<String>,
     ) -> Result<TaskId, DaemonError> {
-        self.add_link_task_opts(link, dest_root, false).await
+        self.add_link_task_opts(link, dest_root, false, None).await
     }
 
     /// 顺序下载变体：`sequential` 写入任务（HTTP=在飞窗口；BT=sequential
     /// flag；其余引擎忽略）。引擎 add 后对 BT 任务立即下发（handle 级 flag，
     /// metadata 未就绪也可设）。
+    /// 任务级代理（E5）：仅 HTTP 任务生效；magnet/ed2k 等任务忽略该字段。
     pub async fn add_link_task_opts(
         &self,
         link: String,
         dest_root: Option<String>,
         sequential: bool,
+        proxy: Option<String>,
     ) -> Result<TaskId, DaemonError> {
         match normalize_user_link(&link) {
             NormalizedSource::Http(real) => {
-                self.add_http_task_opts(real, dest_root, sequential).await
+                self.add_http_task_opts(real, dest_root, sequential, proxy)
+                    .await
             }
             NormalizedSource::Magnet(m) => {
                 #[cfg(feature = "bt")]
@@ -1289,18 +1292,31 @@ impl DaemonState {
         url: String,
         dest_root: Option<String>,
     ) -> Result<TaskId, DaemonError> {
-        self.add_http_task_opts(url, dest_root, false).await
+        self.add_http_task_opts(url, dest_root, false, None).await
     }
 
     /// 顺序下载变体：`sequential` 写入任务（HTTP 引擎在飞段窗口收紧）。
+    /// 任务级代理（E5）：`proxy` = `http(s)://` / `socks5://` / `socks4://`，可带
+    /// `user:pass@`；None = 走引擎共享 client（可能含全局 `[download] proxy`）。
+    /// 非法代理 URL（reqwest 无法解析）在入队前即拒（InvalidSource → 400）。
     pub async fn add_http_task_opts(
         &self,
         url: String,
         dest_root: Option<String>,
         sequential: bool,
+        proxy: Option<String>,
     ) -> Result<TaskId, DaemonError> {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Err(DaemonError::InvalidSource(url));
+        }
+        // E5：任务级代理 URL 校验（构建一次 client 试水，成功即合法）。
+        // 校验在探测/建任务之前——远端不可达≠代理非法，两者分开定性。
+        if let Some(p) = &proxy {
+            if p.is_empty() {
+                return Err(DaemonError::InvalidSource("proxy 不能为空字符串".into()));
+            }
+            smart_dl_httpdl::build_proxied_client(p)
+                .map_err(|e| DaemonError::InvalidSource(format!("proxy 非法 {p:?}: {e}")))?;
         }
         // B10：目标目录预检（创建/可写）；HTTP 大小在响应头才知 → 空间预检跳过
         // dest 未指定 → 默认落盘目录（serve 配置 dest_root；未注入时为 daemon cwd）
@@ -1337,6 +1353,7 @@ impl DaemonState {
                 headers: vec![],
                 auth: None,
                 backup_url: None,
+                proxy: proxy.clone(),
             },
             identity: ContentIdentity::SingleFile {
                 size: 0,
@@ -2119,6 +2136,7 @@ impl HttpSink for FallbackSink {
                 headers: vec![],
                 auth: None,
                 backup_url: None,
+                proxy: None,
             },
             identity: ContentIdentity::SingleFile {
                 size: 0,
@@ -4547,5 +4565,70 @@ mod ct_eq_tests {
         assert!(!st.verify_http_token(Some("Bearer ")));
         assert!(!st.verify_http_token(Some("Basic s3cret")));
         assert!(!st.verify_http_token(None));
+    }
+}
+
+/// E5 任务级代理：add 入口校验 + source.proxy 持久化回显（FakeEngine 不联网）。
+#[cfg(test)]
+mod task_proxy_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn add_rejects_invalid_proxy_url() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        for bad in ["", "http://127.0.0.1:70000"] {
+            let r = state
+                .add_http_task_opts(
+                    "https://example.com/f.bin".into(),
+                    None,
+                    false,
+                    Some(bad.to_string()),
+                )
+                .await;
+            match r {
+                Err(DaemonError::InvalidSource(m)) => {
+                    assert!(m.contains("proxy"), "错误信息应定性 proxy: {m}");
+                }
+                other => panic!("非法 proxy {bad:?} 必须在入队前拒绝: {other:?}"),
+            }
+        }
+        assert!(fake.added().is_empty(), "被拒任务不得进入引擎");
+    }
+
+    #[tokio::test]
+    async fn add_persists_wellformed_proxy_in_source() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task_opts(
+                "https://example.com/f.bin".into(),
+                None,
+                false,
+                Some("http://127.0.0.1:8080".into()),
+            )
+            .await
+            .unwrap();
+        let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+        match &rec.task.source {
+            DownloadSource::Http { proxy, .. } => {
+                assert_eq!(
+                    proxy.as_deref(),
+                    Some("http://127.0.0.1:8080"),
+                    "proxy 应在 source 持久化回显"
+                );
+            }
+            other => panic!("source 应为 Http: {other:?}"),
+        }
+        // 默认路径：proxy=None 正常建任务
+        let tid2 = state
+            .add_http_task("https://example.com/g.bin".into(), None)
+            .await
+            .unwrap();
+        let rec2 = state.tasks.lock().get(&tid2).cloned().unwrap();
+        match &rec2.task.source {
+            DownloadSource::Http { proxy, .. } => assert!(proxy.is_none()),
+            other => panic!("source 应为 Http: {other:?}"),
+        }
     }
 }

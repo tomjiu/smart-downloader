@@ -613,6 +613,7 @@ mod tests {
             headers: vec![],
             auth: None,
             backup_url: None,
+            proxy: None,
         };
         let res = p.submit(&source).await;
         assert!(res.is_err());

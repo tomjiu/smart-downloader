@@ -337,6 +337,7 @@ mod ready_delay_tests {
                 headers: vec![],
                 auth: None,
                 backup_url: None,
+                proxy: None,
             })
             .await
             .unwrap();
@@ -355,6 +356,7 @@ mod ready_delay_tests {
                 headers: vec![],
                 auth: None,
                 backup_url: None,
+                proxy: None,
             })
             .await
             .unwrap();

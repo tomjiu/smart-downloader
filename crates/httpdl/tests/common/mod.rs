@@ -34,6 +34,7 @@ pub fn make_http_task_to(
             headers: vec![],
             auth: None,
             backup_url: None,
+            proxy: None,
         },
         identity: ContentIdentity::SingleFile {
             size: 0,
@@ -92,6 +93,7 @@ pub fn make_http_task_backup(
         headers: vec![],
         auth: None,
         backup_url: Some(backup_url.to_string()),
+        proxy: None,
     };
     t.identity = ContentIdentity::SingleFile {
         size: 0,
