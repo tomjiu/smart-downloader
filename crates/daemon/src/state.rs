@@ -82,6 +82,10 @@ pub struct TaskSnapshot {
     /// `DaemonState::set_task_limits`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limits: Option<smart_dl_core::task::TaskLimits>,
+    /// 任务名（E7 透出：E6 显式名 / FTP URL 派生 / xunlei import；None = 引擎
+    /// 派生链未回填，序列化时省略）。与列表 `TaskSummary::name` 同口径。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     /// BT 子文件优先级表（None = 未设置走 libtorrent 默认 4；Some = 持久化
     /// 全量快照，下标 = 文件序）。set 语义见 `DaemonState::set_task_file_priorities`。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -99,6 +103,93 @@ pub struct TaskSummary {
     /// 状态字符串（同上）。
     pub state: String,
     pub source: String,
+    /// 引擎种类标签（E7：`http`/`bt`/`ftp`/`provider`/`xunlei-nas`）。建任务时即定，
+    /// 恒有值——列表侧栏分组与 `?engine=` 过滤的回显依据。
+    pub engine: &'static str,
+    /// 任务名（E6 显式名 / FTP 单文件 URL 派生 / xunlei import；None = 引擎派生链
+    /// （E4 CD → URL 末段）尚未回填，序列化时省略）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+/// 列表过滤/分页查询（E7）。`states`/`engines` 空 = 不过滤；匹配均大小写不敏感。
+/// `limit`/`offset` 由 HTTP 层校验（limit 1..=500，offset ≥ 0 由类型保证）后下推。
+#[derive(Clone, Debug, Default)]
+pub struct ListQuery {
+    pub states: Vec<String>,
+    pub engines: Vec<String>,
+    pub limit: Option<usize>,
+    pub offset: usize,
+}
+
+/// 合法状态标签全集（E7 `?state=` 校验依据；与 `state_label` 输出同步——
+/// 显式列举全部 TaskState 变体，新增变体时编译期漏项由测试锁定）。
+pub fn known_state_labels() -> Vec<String> {
+    use smart_dl_core::state_machine::{EvalPhase, TaskState};
+    use smart_dl_core::types::EngineKind;
+    [
+        TaskState::Queued,
+        TaskState::Evaluating(EvalPhase::MetadataPending),
+        TaskState::Evaluating(EvalPhase::PeerDiscovery),
+        TaskState::Evaluating(EvalPhase::HeatEvaluating),
+        TaskState::Downloading(EngineKind::Http),
+        TaskState::Downloading(EngineKind::Bt),
+        TaskState::Downloading(EngineKind::Ftp),
+        TaskState::Downloading(EngineKind::Provider),
+        TaskState::Downloading(EngineKind::XunleiNas),
+        TaskState::Paused,
+        TaskState::FallbackProvider,
+        TaskState::Transferring,
+        TaskState::Completed,
+        TaskState::Stopped,
+        TaskState::Seeding,
+        TaskState::Failed,
+    ]
+    .iter()
+    .map(state_label)
+    .collect()
+}
+
+/// 合法引擎标签全集（E7 `?engine=` 校验依据；与 `kind_label` 输出同步）。
+pub fn known_engine_labels() -> Vec<String> {
+    [
+        EngineKind::Bt,
+        EngineKind::Http,
+        EngineKind::Ftp,
+        EngineKind::Provider,
+        EngineKind::XunleiNas,
+    ]
+    .iter()
+    .map(|k| kind_label(k).to_string())
+    .collect()
+}
+
+/// 批量操作语义（E7 `POST /tasks/batch`）：逐任务独立执行，单项失败不短路。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BatchAction {
+    Pause,
+    Resume,
+    /// 删除任务；`delete_data = true` 时引擎侧同步删除已下载数据。
+    Remove {
+        delete_data: bool,
+    },
+}
+
+/// 批量操作单项结果（ok = false 时 error 带原因，如 `not found: t9`）。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct BatchItemResult {
+    pub id: String,
+    pub ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// 批量操作汇总：`succeeded + failed == results.len()`（去重后）。
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct BatchOutcome {
+    pub results: Vec<BatchItemResult>,
+    pub succeeded: usize,
+    pub failed: usize,
 }
 
 /// 全局统计（`GET /stats`）：任务按状态/引擎聚合 + 聚合速率。
@@ -1663,20 +1754,97 @@ impl DaemonState {
             limits: rec.task.limits.clone(),
             file_priorities: rec.task.file_priorities.clone(),
             sequential: rec.task.sequential,
+            name: rec.task.metadata.name.clone(),
         })
     }
 
+    /// 全量列表（兼容入口：无过滤无分页，形状与 E7 之前一致）。
     pub fn list(&self) -> Vec<TaskSummary> {
-        self.tasks
-            .lock()
-            .iter()
-            .map(|(id, rec)| TaskSummary {
-                task_id: id.clone(),
+        self.list_filtered(&ListQuery::default()).0
+    }
+
+    /// 过滤 + 排序 + 分页列表（E7）：
+    /// - 排序：task_id 数值后缀升序（创建序；HashMap 迭代序不稳定，分页必须
+    ///   确定性排序。task_id = `t{u64}` 自增序号，parse 失败兜底排序键 u64::MAX）。
+    /// - 过滤：states/engines 任一命中即保留（OR 语义）；空集合 = 该维度跳过；
+    ///   两维度间 AND；匹配大小写不敏感（查询方可写小写）。
+    /// - 返回 `(当前页, 过滤后总数)`——总数供 `X-Total-Count`，客户端算页数。
+    pub fn list_filtered(&self, q: &ListQuery) -> (Vec<TaskSummary>, usize) {
+        let tasks = self.tasks.lock();
+        let mut rows: Vec<(&String, &TaskRecord)> = tasks.iter().collect();
+        rows.sort_by_cached_key(|(id, _)| {
+            id.strip_prefix('t')
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(u64::MAX)
+        });
+        let filtered: Vec<&TaskRecord> = rows
+            .into_iter()
+            .filter(|(_, rec)| {
+                let st = state_label(&rec.task.state);
+                let en = kind_label(&rec.engine_kind);
+                (q.states.is_empty() || q.states.iter().any(|s| s.eq_ignore_ascii_case(&st)))
+                    && (q.engines.is_empty()
+                        || q.engines.iter().any(|e| e.eq_ignore_ascii_case(en)))
+            })
+            .map(|(_, rec)| rec)
+            .collect();
+        let total = filtered.len();
+        let page = filtered
+            .into_iter()
+            .skip(q.offset)
+            .take(q.limit.unwrap_or(usize::MAX))
+            .map(|rec| TaskSummary {
+                task_id: rec.task.id.clone(),
                 state: state_label(&rec.task.state),
                 // 安全修复（V6）：同快照，source 脱敏
                 source: rec.task.source.redacted_debug(),
+                engine: kind_label(&rec.engine_kind),
+                name: rec.task.metadata.name.clone(),
             })
-            .collect()
+            .collect();
+        (page, total)
+    }
+
+    /// 批量操作（E7）：按入参顺序逐任务执行；重复 id 静默去重（保留首次出现序，
+    /// 避免同一任务被 pause 两次产生假失败）；单项失败（NotFound/引擎错误）
+    /// 记入该项结果后继续，绝不短路。永远返回 BatchOutcome（HTTP 层恒 200）。
+    pub async fn batch(&self, ids: &[String], action: BatchAction) -> BatchOutcome {
+        let mut seen = std::collections::HashSet::new();
+        let mut results = Vec::new();
+        let (mut ok, mut bad) = (0usize, 0usize);
+        for id in ids {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let r = match action {
+                BatchAction::Pause => self.pause(id).await,
+                BatchAction::Resume => self.resume(id).await,
+                BatchAction::Remove { delete_data } => self.remove_with(id, delete_data).await,
+            };
+            match r {
+                Ok(()) => {
+                    ok += 1;
+                    results.push(BatchItemResult {
+                        id: id.clone(),
+                        ok: true,
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    bad += 1;
+                    results.push(BatchItemResult {
+                        id: id.clone(),
+                        ok: false,
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+        BatchOutcome {
+            results,
+            succeeded: ok,
+            failed: bad,
+        }
     }
 
     /// 全局统计快照（`GET /stats`）：总数 + 按状态/引擎聚合 + 速率求和。
@@ -2036,7 +2204,15 @@ impl DaemonState {
         Ok(added)
     }
 
+    /// 删除任务（E7 前 semantics：保留已下载数据）。
     pub async fn remove(&self, id: &str) -> Result<(), DaemonError> {
+        self.remove_with(id, false).await
+    }
+
+    /// 删除任务 + 数据处置开关（E7）：`delete_data = true` 时引擎侧同步删除
+    /// 已下载数据（BT 删种子数据 / HTTP 删落盘文件）。引擎删除失败不阻塞
+    /// 记录移除（引擎 remove 本就是尽力而为——任务可能已不在引擎侧）。
+    pub async fn remove_with(&self, id: &str, delete_data: bool) -> Result<(), DaemonError> {
         let rec = self
             .tasks
             .lock()
@@ -2044,7 +2220,7 @@ impl DaemonState {
             .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
         if let Some(tid) = rec.engine_tid {
             if let Ok(engine) = self.engine_for(rec.engine_kind) {
-                let _ = engine.remove(&tid, false).await;
+                let _ = engine.remove(&tid, delete_data).await;
             }
         }
         self.autosave();
@@ -3463,6 +3639,8 @@ pub struct FakeEngine {
     paused: parking_lot::Mutex<Vec<String>>,
     /// 已下发的 resume 调用（P4 G5 运行态恢复重放测试用）。
     resumed: parking_lot::Mutex<Vec<String>>,
+    /// 已下发的 remove 调用（(engine_tid, delete_data)，E7 数据处置断言用）。
+    removed: parking_lot::Mutex<Vec<(String, bool)>>,
 }
 
 #[cfg(test)]
@@ -3481,6 +3659,7 @@ impl FakeEngine {
             prio_readback: parking_lot::Mutex::new(None),
             paused: parking_lot::Mutex::new(Vec::new()),
             resumed: parking_lot::Mutex::new(Vec::new()),
+            removed: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -3509,6 +3688,11 @@ impl FakeEngine {
     /// 读取已下发的 pause 调用（P4 G5 重放测试断言用）。
     pub fn paused_calls(&self) -> Vec<String> {
         self.paused.lock().clone()
+    }
+
+    /// 读取已下发的 remove 调用（(engine_tid, delete_data)，E7 数据处置断言用）。
+    pub fn removed_calls(&self) -> Vec<(String, bool)> {
+        self.removed.lock().clone()
     }
 
     /// 读取已下发的 resume 调用（P4 G5 重放测试断言用）。
@@ -3591,9 +3775,10 @@ impl DownloadEngine for FakeEngine {
     }
     async fn remove(
         &self,
-        _id: &EngineTaskId,
-        _delete_data: bool,
+        id: &EngineTaskId,
+        delete_data: bool,
     ) -> Result<(), smart_dl_core::types::EngineError> {
+        self.removed.lock().push((id.to_string(), delete_data));
         Ok(())
     }
     async fn peers(
@@ -4886,5 +5071,208 @@ mod add_opts_tests {
             }
         }
         assert!(fake.added().is_empty(), "被拒任务不得进入引擎");
+    }
+}
+
+/// E7 任务管理面：列表过滤/分页/确定性排序 + 批量操作 + remove delete_data
+/// 透传（FakeEngine 不联网；状态直接改记录白盒构造，避免真实下载竞态）。
+#[cfg(test)]
+mod list_batch_tests {
+    use super::*;
+
+    /// 造 n 个不同 URL 的 HTTP 任务（dest 走默认路径），返回 task_id 列表。
+    async fn add_n(state: &DaemonState, n: usize) -> Vec<String> {
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let tid = state
+                .add_http_task(format!("https://example.com/f{i}.bin"), None)
+                .await
+                .unwrap();
+            ids.push(tid);
+        }
+        ids
+    }
+
+    #[tokio::test]
+    async fn list_filtered_orders_by_creation_and_paginates() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let ids = add_n(&state, 5).await;
+
+        // 无过滤：全量，创建序（HashMap 迭代序不稳定 → 排序必须确定性）
+        let (all, total) = state.list_filtered(&ListQuery::default());
+        assert_eq!(total, 5);
+        assert_eq!(
+            all.iter().map(|r| r.task_id.clone()).collect::<Vec<_>>(),
+            ids,
+            "默认列表必须按创建序（task_id 数值后缀）"
+        );
+
+        // 分页：limit=2 offset=1 → 第 2、3 个；total 是过滤后总数而非页长
+        let (page, total) = state.list_filtered(&ListQuery {
+            limit: Some(2),
+            offset: 1,
+            ..Default::default()
+        });
+        assert_eq!(total, 5);
+        assert_eq!(
+            page.iter().map(|r| r.task_id.clone()).collect::<Vec<_>>(),
+            ids[1..3].to_vec()
+        );
+
+        // offset 越界 → 空页但 total 不丢
+        let (page, total) = state.list_filtered(&ListQuery {
+            offset: 99,
+            ..Default::default()
+        });
+        assert!(page.is_empty());
+        assert_eq!(total, 5);
+    }
+
+    #[tokio::test]
+    async fn list_filtered_by_state_and_engine() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let ids = add_n(&state, 3).await;
+        // 白盒改状态：t1 → Paused，t2 → Failed（t3 保持 Queued）
+        {
+            let mut tasks = state.tasks.lock();
+            tasks.get_mut(&ids[0]).unwrap().task.state = TaskState::Paused;
+            tasks.get_mut(&ids[1]).unwrap().task.state = TaskState::Failed;
+        }
+
+        // 单状态过滤 + 大小写不敏感
+        let (rows, total) = state.list_filtered(&ListQuery {
+            states: vec!["paused".into()],
+            ..Default::default()
+        });
+        assert_eq!((rows.len(), total), (1, 1));
+        assert_eq!(rows[0].task_id, ids[0]);
+
+        // 多状态 OR
+        let (rows, _) = state.list_filtered(&ListQuery {
+            states: vec!["Paused".into(), "Failed".into()],
+            ..Default::default()
+        });
+        assert_eq!(rows.len(), 2);
+
+        // 引擎过滤（大小写不敏感）+ 维度间 AND
+        let (rows, total) = state.list_filtered(&ListQuery {
+            engines: vec!["HTTP".into()],
+            ..Default::default()
+        });
+        assert_eq!((rows.len(), total), (3, 3));
+        assert!(
+            rows.iter().all(|r| r.engine == "http"),
+            "engine 标签必须回显"
+        );
+        let (rows, _) = state.list_filtered(&ListQuery {
+            states: vec!["Paused".into()],
+            engines: vec!["bt".into()],
+            ..Default::default()
+        });
+        assert!(rows.is_empty(), "状态命中但引擎不命中 → AND 过滤为空");
+
+        // 列表条目 name 字段：未显式命名 → 省略（E4 派生链未回填）
+        let (rows, _) = state.list_filtered(&ListQuery::default());
+        assert!(rows.iter().all(|r| r.name.is_none()));
+    }
+
+    #[tokio::test]
+    async fn batch_pause_resume_remove_semantics() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let ids = add_n(&state, 3).await;
+
+        // 批量 pause：2 存在 + 1 不存在 + 1 重复 id（静默去重，不产生假失败）
+        let mut req = ids[..2].to_vec();
+        req.push("t999".into());
+        req.push(ids[0].clone());
+        let out = state.batch(&req, BatchAction::Pause).await;
+        assert_eq!(out.results.len(), 3, "重复 id 去重后仅 3 项");
+        assert_eq!((out.succeeded, out.failed), (2, 1));
+        assert_eq!(
+            out.results.iter().filter(|r| r.ok).count(),
+            2,
+            "逐项结果形状完整"
+        );
+        let missing = out.results.iter().find(|r| !r.ok).unwrap();
+        assert_eq!(missing.id, "t999");
+        assert!(
+            missing.error.as_deref().unwrap_or("").contains("not found"),
+            "单项失败必须带原因: {:?}",
+            missing.error
+        );
+        assert_eq!(fake.paused_calls().len(), 2, "引擎 pause 恰好 2 次");
+        for tid in &ids[..2] {
+            let rec = state.tasks.lock().get(tid).cloned().unwrap();
+            assert!(matches!(rec.task.state, TaskState::Paused));
+        }
+
+        // 批量 resume：1 存在 + 1 不存在
+        let out = state
+            .batch(&[ids[0].clone(), "tX".into()], BatchAction::Resume)
+            .await;
+        assert_eq!((out.succeeded, out.failed), (1, 1));
+        assert_eq!(fake.resumed_calls().len(), 1);
+
+        // 批量 remove：3 全成功（引擎侧 delete_data=false）
+        let out = state
+            .batch(
+                &[ids[0].clone(), ids[1].clone(), ids[2].clone()],
+                BatchAction::Remove { delete_data: false },
+            )
+            .await;
+        assert_eq!((out.succeeded, out.failed), (3, 0));
+        assert_eq!(fake.removed_calls().len(), 3);
+        assert!(
+            fake.removed_calls().iter().all(|(_, dd)| !dd),
+            "delete_data=false 必须原样透传"
+        );
+        assert!(state.list().is_empty(), "批量 remove 后任务表必须清空");
+    }
+
+    #[tokio::test]
+    async fn remove_with_forwards_delete_data_to_engine() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let ids = add_n(&state, 1).await;
+        let engine_tid = state.tasks.lock().get(&ids[0]).unwrap().engine_tid.clone();
+
+        // 不存在的 id → NotFound，且引擎零调用
+        assert!(state.remove_with("t404", true).await.is_err());
+        assert!(fake.removed_calls().is_empty());
+
+        state.remove_with(&ids[0], true).await.unwrap();
+        assert_eq!(
+            fake.removed_calls(),
+            vec![(engine_tid.unwrap(), true)],
+            "delete_data=true 必须透传到引擎"
+        );
+        assert!(state.list().is_empty());
+    }
+
+    #[test]
+    fn known_labels_cover_all_variants() {
+        let states = known_state_labels();
+        for s in [
+            "Queued",
+            "Evaluating",
+            "Downloading",
+            "Paused",
+            "FallbackProvider",
+            "Transferring",
+            "Completed",
+            "Stopped",
+            "Seeding",
+            "Failed",
+        ] {
+            assert!(
+                states.iter().any(|k| k == s),
+                "state 合法值全集缺 {s}: {states:?}"
+            );
+        }
+        let engines = known_engine_labels();
+        assert_eq!(engines, vec!["bt", "http", "ftp", "provider", "xunlei-nas"]);
     }
 }

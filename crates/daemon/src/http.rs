@@ -9,9 +9,9 @@ use axum::response::Response;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Query, State,
     },
-    http::{header, StatusCode},
+    http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
@@ -21,6 +21,8 @@ use base64::Engine as _;
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use crate::state::{known_engine_labels, known_state_labels, BatchAction, ListQuery};
 
 #[derive(Deserialize)]
 pub struct AddTaskReq {
@@ -624,12 +626,20 @@ async fn health_endpoint() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
-/// 删除任务（引擎 remove + 目录记录移除；delete_data=false 保留已下载文件）。
+/// 删除任务（引擎 remove + 目录记录移除；`?delete_data=true` 同步删除已下载
+/// 数据（E7：BT 删种子数据 / HTTP 删落盘文件），缺省 false 保留文件）。
+#[derive(Deserialize, Default)]
+struct RemoveTaskQuery {
+    #[serde(default)]
+    delete_data: bool,
+}
+
 async fn remove_task(
     Path(id): Path<String>,
+    Query(q): Query<RemoveTaskQuery>,
     State(state): State<Arc<DaemonState>>,
 ) -> impl IntoResponse {
-    match state.remove(&id).await {
+    match state.remove_with(&id, q.delete_data).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     }
@@ -861,8 +871,139 @@ async fn task_snapshot(
     }
 }
 
-async fn list_tasks(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
-    Json(state.list())
+/// `GET /tasks` 查询参数（E7，全部可选；无参数时行为/形状与 E7 之前一致）。
+/// `state`/`engine` 逗号分隔多值（大小写不敏感）；`limit`/`offset` 分页，
+/// 提供分页参数时响应附 `X-Total-Count`（过滤后总数）。
+#[derive(Deserialize, Default)]
+struct ListTasksQuery {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    engine: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+}
+
+/// `limit` 上限（防一次性拉全表打爆内存；UI 每页 50 量级，500 留足余量）。
+const LIST_LIMIT_CAP: usize = 500;
+
+/// 逗号分隔标签解析 + 合法性校验（大小写不敏感；空段/空白段忽略）。
+/// 非法值 → Err(错误信息，含合法值全集)。
+fn parse_label_list(
+    raw: &Option<String>,
+    known: &[String],
+    dim: &str,
+) -> Result<Vec<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(vec![]);
+    };
+    let labels: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    for l in &labels {
+        if !known.iter().any(|k| k.eq_ignore_ascii_case(l)) {
+            return Err(format!(
+                "未知 {dim} 值 {l:?}（合法值: {}）",
+                known.join(", ")
+            ));
+        }
+    }
+    Ok(labels)
+}
+
+/// 校验查询参数 → ListQuery（400 语义：state/engine 值非法或 limit 越界）。
+fn validate_list_query(q: &ListTasksQuery) -> Result<ListQuery, String> {
+    let states = parse_label_list(&q.state, &known_state_labels(), "state")?;
+    let engines = parse_label_list(&q.engine, &known_engine_labels(), "engine")?;
+    if let Some(l) = q.limit {
+        if l == 0 || l > LIST_LIMIT_CAP {
+            return Err(format!("limit 须在 1..={LIST_LIMIT_CAP}"));
+        }
+    }
+    Ok(ListQuery {
+        states,
+        engines,
+        limit: q.limit,
+        offset: q.offset.unwrap_or(0),
+    })
+}
+
+/// 任务列表（E7 过滤/分页）：无参数 → 全量数组（兼容不变）；有分页参数 →
+/// 附 `X-Total-Count`（过滤后总数）。排序恒为创建序（task_id 数值后缀）。
+async fn list_tasks(
+    Query(q): Query<ListTasksQuery>,
+    State(state): State<Arc<DaemonState>>,
+) -> impl IntoResponse {
+    match validate_list_query(&q) {
+        Ok(lq) => {
+            let paged = q.limit.is_some() || q.offset.is_some();
+            let (items, total) = state.list_filtered(&lq);
+            let mut resp = Json(items).into_response();
+            if paged {
+                if let Ok(v) = HeaderValue::from_str(&total.to_string()) {
+                    resp.headers_mut().insert("x-total-count", v);
+                }
+            }
+            resp
+        }
+        Err(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+    }
+}
+
+/// 批量操作请求（E7）：action ∈ {pause, resume, remove}；`delete_data` 仅
+/// remove 生效；ids 上限 100、非空；逐项执行单项失败不短路（恒 200 + 逐项结果）。
+#[derive(Deserialize)]
+struct BatchTaskReq {
+    action: String,
+    #[serde(default)]
+    ids: Vec<String>,
+    #[serde(default)]
+    delete_data: bool,
+}
+
+/// 批量 id 上限（批量语义是便利入口不是全表操作入口；防误传全量 id 集合）。
+const BATCH_IDS_CAP: usize = 100;
+
+async fn batch_tasks(
+    State(state): State<Arc<DaemonState>>,
+    axum::Json(body): axum::Json<BatchTaskReq>,
+) -> impl IntoResponse {
+    let action = match body.action.to_ascii_lowercase().as_str() {
+        "pause" => BatchAction::Pause,
+        "resume" => BatchAction::Resume,
+        "remove" => BatchAction::Remove {
+            delete_data: body.delete_data,
+        },
+        _ => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("未知 action {:?}（合法值: pause, resume, remove）", body.action)
+            })),
+        )
+            .into_response(),
+    };
+    if body.ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "ids 不能为空" })),
+        )
+            .into_response();
+    }
+    if body.ids.len() > BATCH_IDS_CAP {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("ids 数量超上限（{} > {BATCH_IDS_CAP}）", body.ids.len())
+            })),
+        )
+            .into_response();
+    }
+    Json(state.batch(&body.ids, action).await).into_response()
 }
 
 async fn pause_task(
@@ -915,6 +1056,7 @@ async fn providers(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
 macro_rules! router_base {
     ($app:expr) => {
         $app.route("/tasks", get(list_tasks).post(add_task))
+            .route("/tasks/batch", post(batch_tasks))
             .route("/tasks/:id", get(task_snapshot).delete(remove_task))
             .route("/tasks/:id/pause", post(pause_task))
             .route("/tasks/:id/resume", post(resume_task))
