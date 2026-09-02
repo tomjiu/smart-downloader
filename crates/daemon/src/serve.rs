@@ -283,6 +283,24 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         Duration::from_secs(2),
     );
 
+    // 4c+++ 周期 fastresume 保存（P4 G4）：crash/断电时进度凭据最多丢一个
+    // 间隔（5min），不再依赖 pause/remove 两个显式时机。逐任务 spawn_blocking
+    //（save_resume_now 同步轮询 alert ≤3s），顺序保存避免 alert 消费竞态放大。
+    #[cfg(feature = "bt")]
+    if let Some(bt) = bt_typed.clone() {
+        let st = state_arc.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                for tid in st.active_bt_tids() {
+                    let b = bt.clone();
+                    let t = tid.clone();
+                    let _ = tokio::task::spawn_blocking(move || b.save_resume_now(&t)).await;
+                }
+            }
+        });
+    }
+
     // 4d. #6 TOML 热重载：5s 轮询配置文件内容变更 → 解析 → refresh_config
     // （默认落盘目录 + /config 快照刷新；解析失败保留旧配置并告警）。
     if let Some(path) = cfg_path {
@@ -341,6 +359,16 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     #[cfg(feature = "bt")]
     if let Some(h) = alert_handle {
         h.abort(); // 进程退出前停止 alert 轮询（锁随 _lock drop 释放）
+    }
+
+    // G4：优雅退出前保存活跃 BT 任务 fastresume（crash 时凭据尽可能新）。
+    // alert 循环已 abort → save 内部 pop_alerts 无消费竞态；同步直调阻塞
+    // 主线程 ≤3s/任务——进程正在退出，可接受。逐任务 best-effort，失败不阻断退出。
+    #[cfg(feature = "bt")]
+    if let Some(bt) = &bt_typed {
+        for tid in state_arc.active_bt_tids() {
+            let _ = bt.save_resume_now(&tid);
+        }
     }
 
     Ok(())

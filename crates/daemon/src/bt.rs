@@ -217,6 +217,13 @@ impl BtEngine {
         Ok(Some(p))
     }
 
+    /// 保存指定任务的 fastresume（公开入口：daemon 周期/退出时机保存，P4 G4）。
+    /// 返回落盘路径；未就绪（无 metadata）/超时/失败 → None（best-effort）。
+    /// 同步轮询 alert（≤3s），调用方应放 spawn_blocking 或退出路径直调。
+    pub fn save_resume_now(&self, ih: &str) -> Option<PathBuf> {
+        self.save_fastresume(ih).ok().flatten()
+    }
+
     /// 删除 .fastresume（delete_data 时清理）。
     fn remove_fastresume(&self, ih: &str) {
         let _ = std::fs::remove_file(self.fastresume_path(ih));
