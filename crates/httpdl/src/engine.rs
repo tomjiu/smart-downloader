@@ -68,6 +68,10 @@ struct HttpTask {
     /// 顺序下载（边下边播）：true = download_loop 每轮传给 download_dynamic，
     /// 在飞段窗口收紧。set_sequential 运行中改写 → 下一次重下轮拾取。
     sequential: bool,
+    /// 任务级代理 URL（E5 配置回显）：Some = 该任务专用 client 仅装此代理
+    /// （覆盖全局）；None = 引擎共享 client。实际生效 client 在 spawn/
+    /// update_sources/add 探测时按此字段构建。
+    proxy: Option<String>,
 }
 
 struct EngineInner {
@@ -86,6 +90,35 @@ pub struct HttpEngine {
     /// 跨段共享限速器（0 = 不限）。
     limiter: Arc<RateLimiter>,
     inner: Arc<EngineInner>,
+}
+
+/// 从代理 URL 提取 `user:pass@`（E5：任务级代理 reqwest basic_auth 用；
+/// 与 daemon serve.rs 全局代理同一格式约定，BT 引擎由 btcore::parse_proxy
+/// 解析同一格式）。无凭据 → None。
+pub fn proxy_auth_of(url: &str) -> Option<(String, String)> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let (auth, _) = rest.rsplit_once('@')?;
+    let (u, p) = auth.split_once(':').unwrap_or((auth, ""));
+    Some((u.to_string(), p.to_string()))
+}
+
+/// 任务级代理 client 构建（E5）：配置与 serve.rs 全局 client 同口径——
+/// connect 10s + read 30s（H-9：不设总超时护长下载）；proxy URL 非法返回 Err
+/// （daemon add 时调用本函数校验，spawn 时重建失败则任务标 Error）。
+pub fn build_proxied_client(proxy_url: &str) -> Result<reqwest::Client, String> {
+    let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| e.to_string())?;
+    // 凭据与代理体合成同一个 Proxy（ClientBuilder.proxy() 为追加语义：
+    // 先 push 无凭据再 push 带凭据会由前者先命中，凭据丢失 → 条件单次）
+    let proxy = match proxy_auth_of(proxy_url) {
+        Some((u, p)) => proxy.basic_auth(&u, &p),
+        None => proxy,
+    };
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(30))
+        .proxy(proxy)
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 impl HttpEngine {
@@ -112,7 +145,30 @@ impl HttpEngine {
     /// 下载循环 panic，把任务标 Error（修复前 panic 任务静默变僵尸：状态
     /// 永停 Downloading、无 Failed 事件、无收尸路径）。
     fn spawn_download(&self, tid: EngineTaskId, gen: u64, epoch: u64) {
-        let client = self.client.clone();
+        // E5 任务级代理：Some(proxy) → 构建任务专用 client（仅装该代理，覆盖
+        // 全局）；None → 引擎共享 client（可能含全局 [download] proxy）。
+        // 构建失败（add 时已校验过，此处兜底）→ 任务标 Error 不 spawn。
+        let (client, spawn_err) = {
+            let tasks = self.inner.tasks.lock();
+            match tasks.get(&tid).and_then(|t| t.proxy.as_deref()) {
+                Some(p) => match build_proxied_client(p) {
+                    Ok(c) => (c, None),
+                    Err(e) => (
+                        self.client.clone(),
+                        Some(format!("任务级 proxy client 构建失败: {e}")),
+                    ),
+                },
+                None => (self.client.clone(), None),
+            }
+        };
+        if let Some(msg) = spawn_err {
+            let mut tasks = self.inner.tasks.lock();
+            if let Some(t) = tasks.get_mut(&tid) {
+                t.state = EngineState::Error;
+                t.error = Some(msg);
+            }
+            return;
+        }
         // 任务级限速优先，未登记回退全局（跨段共享口径不变）。
         let limiter = self
             .inner
@@ -503,21 +559,36 @@ impl DownloadEngine for HttpEngine {
     }
 
     async fn add(&self, task: &DownloadTask) -> Result<EngineTaskId, EngineError> {
-        let (url, headers, backup_url) = match &task.source {
+        let (url, headers, backup_url, proxy) = match &task.source {
             DownloadSource::Http {
                 url,
                 headers,
                 backup_url,
+                proxy,
                 ..
-            } => (url.clone(), headers.clone(), backup_url.clone()),
+            } => (
+                url.clone(),
+                headers.clone(),
+                backup_url.clone(),
+                proxy.clone(),
+            ),
             _ => return Err(EngineError::Other("source is not http".to_string())),
+        };
+        // E5 任务级代理：探测/下载全链均走任务专用 client（Some(proxy) 时）。
+        // 任务级代理的意义正是「只有代理可达源」——探测若用共享 client 直连，
+        // 代理专属源会在 add 时误判死亡。client 构建失败 → 任务拒绝（daemon
+        // 层已校验，此处同一函数再拦，双保险）。
+        let client = match &proxy {
+            Some(p) => build_proxied_client(p)
+                .map_err(|e| EngineError::Other(format!("任务级 proxy client 构建失败: {e}")))?,
+            None => self.client.clone(),
         };
         // 探测韧性（与 update_sources 并发探测同批）：主源探测失败且配置了备用源
         // → 改用备用源建任务（身份切换与运行时“主源校验失败切备用源”同语义：
         // sha256 → None、md5 ← backup_md5、backup_used = true 防运行时重复切换）。
         // 双源均失败 → 返回双错（任务拒绝，同原语义）；无备用源 → 原样返回首错。
         let mut fell_back_to: Option<String> = None;
-        let probe = match probe_range(&self.client, &url, &headers).await {
+        let probe = match probe_range(&client, &url, &headers).await {
             Ok(p) => p,
             Err(primary_err) => match &backup_url {
                 Some(bu) => {
@@ -525,7 +596,7 @@ impl DownloadEngine for HttpEngine {
                         "[httpdl] {}: 主源探测失败（{primary_err}），尝试备用源",
                         task.id
                     );
-                    match probe_range(&self.client, bu, &headers).await {
+                    match probe_range(&client, bu, &headers).await {
                         Ok(p) => {
                             fell_back_to = Some(bu.clone());
                             p
@@ -638,6 +709,7 @@ impl DownloadEngine for HttpEngine {
                     pause: Arc::new(AtomicBool::new(false)),
                     limit_kb_s: None,
                     sequential: task.sequential,
+                    proxy,
                 },
             );
         }
@@ -767,9 +839,16 @@ impl DownloadEngine for HttpEngine {
             return Err(EngineError::Other("empty source list".to_string()));
         }
         // 锁外探测（锁不跨 await：parking_lot guard 跨 await 会阻塞执行器）
-        let headers = {
+        // E5：探测 client 按任务级代理构建（与 add/下载循环同口径——代理专属
+        // 候选源只有经代理才可达，用共享 client 探测会误判死亡）。
+        let (headers, task_client) = {
             let tasks = self.inner.tasks.lock();
-            tasks.get(id).ok_or(EngineError::NotFound)?.headers.clone()
+            let t = tasks.get(id).ok_or(EngineError::NotFound)?;
+            let client = match &t.proxy {
+                Some(p) => build_proxied_client(p).map_err(EngineError::Other)?,
+                None => self.client.clone(),
+            };
+            (t.headers.clone(), client)
         };
         // 并发探测全部候选源（源探测韧性）：原实现只探 urls[0]，首个候选死即
         // 整表拒绝——尽管下载循环本可逐段轮换到其余存活源。现改为：任一候选
@@ -779,7 +858,7 @@ impl DownloadEngine for HttpEngine {
         // （分数降序稳定排序）自动优先存活/健康源，死源沉底。
         let mut probes = tokio::task::JoinSet::new();
         for u in &urls {
-            let client = self.client.clone();
+            let client = task_client.clone();
             let u = u.clone();
             let headers = headers.clone();
             probes.spawn(async move {

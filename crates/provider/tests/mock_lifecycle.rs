@@ -103,6 +103,7 @@ impl HttpSink for EngineSink {
                 headers: vec![],
                 auth: None,
                 backup_url: None,
+                proxy: None,
             },
             identity: smart_dl_core::identity::ContentIdentity::SingleFile {
                 size: 0,

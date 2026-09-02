@@ -69,7 +69,8 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     if !cfg.download.proxy.is_empty() {
         let proxy = reqwest::Proxy::all(&cfg.download.proxy)
             .map_err(|e| ServeError::Engine(format!("代理解析失败: {e}")))?;
-        if let Some(auth) = proxy_auth_of(&cfg.download.proxy) {
+        // E5：proxy_auth_of 提升至 httpdl（任务级代理同源同实现），此处复用
+        if let Some(auth) = smart_dl_httpdl::engine::proxy_auth_of(&cfg.download.proxy) {
             client_builder = client_builder.proxy(proxy.basic_auth(&auth.0, &auth.1));
         } else {
             client_builder = client_builder.proxy(proxy);
@@ -388,15 +389,6 @@ fn resolve_http_token(env_val: Option<String>, cfg_val: Option<String>) -> (Opti
         Some("auto") => (Some(uuid::Uuid::new_v4().simple().to_string()), true),
         _ => (raw, false),
     }
-}
-
-/// 从代理 URL 提取 `user:pass@`（HTTP 引擎 reqwest basic_auth 用；BT 引擎由
-/// btcore::parse_proxy 解析同一格式）。无凭据 → None。
-fn proxy_auth_of(url: &str) -> Option<(String, String)> {
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let (auth, _) = rest.rsplit_once('@')?;
-    let (u, p) = auth.split_once(':').unwrap_or((auth, ""));
-    Some((u.to_string(), p.to_string()))
 }
 
 /// 进程参数：`serve [--config <path>]`。

@@ -516,6 +516,7 @@ mod tests {
             headers: vec![],
             auth: None,
             backup_url: None,
+            proxy: None,
         }
     }
 

@@ -16,6 +16,11 @@ pub enum DownloadSource {
         /// 备用源 URL（夸克 backup_url 机制：主源失败后切换；None = 无备用源）。
         #[serde(default)]
         backup_url: Option<String>,
+        /// 任务级代理 URL（E5）：`http(s)://` / `socks5://` / `socks4://`，可带
+        /// `user:pass@`。None = 走引擎共享 client（可能含全局 `[download] proxy`）；
+        /// Some = 该任务专用 client 仅装此代理（覆盖全局）。仅 HTTP 任务生效。
+        #[serde(default)]
+        proxy: Option<String>,
     },
     Ftp {
         url: String,
@@ -103,8 +108,9 @@ impl DownloadSource {
                 headers,
                 auth,
                 backup_url,
+                proxy,
             } => format!(
-                "Http {{ url: {:?}, headers: {:?}, auth: {}, backup_url: {} }}",
+                "Http {{ url: {:?}, headers: {:?}, auth: {}, backup_url: {}, proxy: {} }}",
                 redact_url(url),
                 headers.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
                 if auth.is_some() {
@@ -113,6 +119,11 @@ impl DownloadSource {
                     "None"
                 },
                 backup_url
+                    .as_deref()
+                    .map(|u| format!("Some({:?})", redact_url(u)))
+                    .unwrap_or_else(|| "None".into()),
+                // E5：proxy URL 可含 user:pass@ 凭据，同 url/backup_url 口径脱敏
+                proxy
                     .as_deref()
                     .map(|u| format!("Some({:?})", redact_url(u)))
                     .unwrap_or_else(|| "None".into()),
@@ -333,12 +344,39 @@ mod redact_tests {
             headers: vec![("Cookie".into(), "SESSION=xyz".into())],
             auth: Some(Auth::Basic("a".into(), "b".into())),
             backup_url: None,
+            proxy: None,
         };
         let d = s.redacted_debug();
         assert!(!d.contains("SESSION"), "headers 值不得出现: {d}");
         assert!(!d.contains(":p@"), "userinfo 不得出现: {d}");
         assert!(!d.contains("\"b\""), "auth 值不得出现: {d}");
         assert!(d.contains("[REDACTED]"), "应含 REDACTED 标记: {d}");
+    }
+
+    /// E5 任务级代理：proxy URL（可含 user:pass@）参与 serde 往返，
+    /// redacted_debug 按同口径脱敏（凭据不得出现）。
+    #[test]
+    fn http_proxy_field_roundtrip_and_redaction() {
+        let s = DownloadSource::Http {
+            url: "http://h/file".into(),
+            headers: vec![],
+            auth: None,
+            backup_url: None,
+            proxy: Some("http://alice:secret123@proxy.lan:8080".into()),
+        };
+        // serde 往返：旧数据（无 proxy 字段）反序列化 → None 已由 serde(default) 保证
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("proxy"), "proxy 应序列化: {json}");
+        let back: DownloadSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s, "serde 往返应保真");
+
+        // redacted_debug：凭据脱敏，代理主机保留（可运维定位）
+        let d = s.redacted_debug();
+        assert!(
+            !d.contains("alice") && !d.contains("secret123"),
+            "proxy 凭据不得出现: {d}"
+        );
+        assert!(d.contains("proxy.lan"), "proxy 主机应保留: {d}");
     }
 
     #[test]
