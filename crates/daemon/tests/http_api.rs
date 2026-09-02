@@ -1259,3 +1259,302 @@ async fn add_task_with_name_and_backup_url_e2e() {
     let got = std::fs::read(dest.join("renamed-by-api.bin")).unwrap();
     assert_eq!(got.len(), 64 * 1024, "落盘应为备用源内容（显式名落位）");
 }
+
+/// E7 建 n 个不同 canonical 的任务（n 个独立 TestServer 各供一个 URL）。
+async fn add_n_tasks(client: &reqwest::Client, base: &str, n: usize, body: &[u8]) -> Vec<String> {
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let srv = TestServer::start(body.to_vec()).await;
+        let dest = std::env::temp_dir().join(format!(
+            "e7-batch-{}-{i}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let resp = client
+            .post(format!("{base}/tasks"))
+            .json(&serde_json::json!({ "url": srv.url(), "dest": dest.to_str().unwrap() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED, "第 {i} 个任务");
+        ids.push(
+            resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+    ids
+}
+
+/// E7 列表查询：分页 + X-Total-Count + engine 过滤回显 + 非法参数 400。
+/// 状态过滤不在此赌真实下载竞态（state 层单测覆盖语义），只验证合法值 200。
+#[tokio::test]
+async fn list_tasks_query_filter_pagination_e2e() {
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let ids = add_n_tasks(&client, &base, 3, &patterned(16 * 1024)).await;
+
+    // 兼容不变：无参数 → 全量数组；新字段 engine 恒回显
+    let resp = client.get(format!("{base}/tasks")).send().await.unwrap();
+    assert!(
+        !resp.headers().contains_key("x-total-count"),
+        "无分页参数不加 header"
+    );
+    let list: serde_json::Value = resp.json().await.unwrap();
+    let arr = list.as_array().unwrap();
+    assert_eq!(arr.len(), 3);
+    assert!(
+        arr.iter().all(|r| r["engine"] == "http"),
+        "engine 标签必须回显: {arr:?}"
+    );
+
+    // 分页：limit=2&offset=1 → 第 2、3 个 + X-Total-Count=3（创建序确定性）
+    let resp = client
+        .get(format!("{base}/tasks?limit=2&offset=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("x-total-count")
+            .and_then(|v| v.to_str().ok()),
+        Some("3"),
+        "X-Total-Count = 过滤后总数"
+    );
+    let page: serde_json::Value = resp.json().await.unwrap();
+    let got: Vec<&str> = page
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["task_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(got, &ids[1..3], "分页必须按创建序切片");
+
+    // engine 过滤：http 命中全部；bt 为空
+    let list: serde_json::Value = client
+        .get(format!("{base}/tasks?engine=http"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 3);
+    let list: serde_json::Value = client
+        .get(format!("{base}/tasks?engine=bt"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(list.as_array().unwrap().is_empty());
+
+    // 合法 state 值 200（数量不赌下载竞态）
+    let status = client
+        .get(format!("{base}/tasks?state=Paused,Completed"))
+        .send()
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(status, reqwest::StatusCode::OK);
+
+    // 非法参数逐个 400（错误信息带合法值提示）
+    for bad in ["state=Bogus", "engine=Excel", "limit=0", "limit=501"] {
+        let resp = client
+            .get(format!("{base}/tasks?{bad}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "{bad}");
+        let text = resp.text().await.unwrap();
+        assert!(!text.is_empty(), "{bad} 的 400 必须带错误说明");
+    }
+}
+
+/// E7 批量 remove e2e + 请求校验：2 存在 + 1 不存在 → 200 逐项结果（部分失败
+/// 不影响全局 200）；malformed 请求 400；全删后列表为空。
+#[tokio::test]
+async fn batch_remove_e2e_and_validation() {
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let ids = add_n_tasks(&client, &base, 3, &patterned(8 * 1024)).await;
+
+    let resp = client
+        .post(format!("{base}/tasks/batch"))
+        .json(&serde_json::json!({
+            "action": "remove",
+            "ids": [ids[0], ids[1], ids[2], "t999"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "单项失败不改变全局 200"
+    );
+    let out: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(out["succeeded"], 3);
+    assert_eq!(out["failed"], 1);
+    let results = out["results"].as_array().unwrap();
+    assert_eq!(results.len(), 4);
+    let bad = results.iter().find(|r| r["id"] == "t999").unwrap();
+    assert_eq!(bad["ok"], false);
+    assert!(
+        bad["error"].as_str().unwrap_or("").contains("not found"),
+        "失败项必须带原因: {bad}"
+    );
+
+    // 全删后列表为空
+    let list: serde_json::Value = client
+        .get(format!("{base}/tasks"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(list.as_array().unwrap().is_empty());
+
+    // malformed：未知 action / 空 ids / 超 100 上限 → 400
+    let resp = client
+        .post(format!("{base}/tasks/batch"))
+        .json(&serde_json::json!({ "action": "explode", "ids": ["t1"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let resp = client
+        .post(format!("{base}/tasks/batch"))
+        .json(&serde_json::json!({ "action": "pause", "ids": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let many: Vec<String> = (0..101).map(|i| format!("t{i}")).collect();
+    let resp = client
+        .post(format!("{base}/tasks/batch"))
+        .json(&serde_json::json!({ "action": "pause", "ids": many }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+/// E7 批量 pause/resume e2e（幸福路径走一遍 HTTP 线；单项失败语义在 state 层
+/// 与 batch_remove e2e 覆盖）。对存在任务 batch pause → succeeded=2。
+#[tokio::test]
+async fn batch_pause_resume_e2e() {
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let ids = add_n_tasks(&client, &base, 2, &patterned(8 * 1024)).await;
+
+    let resp = client
+        .post(format!("{base}/tasks/batch"))
+        .json(&serde_json::json!({ "action": "pause", "ids": ids }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let out: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(out["succeeded"], 2, "两任务均存在 → 全成功: {out}");
+    assert_eq!(out["failed"], 0);
+
+    let resp = client
+        .post(format!("{base}/tasks/batch"))
+        .json(&serde_json::json!({ "action": "resume", "ids": ids }))
+        .send()
+        .await
+        .unwrap();
+    let out: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(out["succeeded"], 2, "resume 回来: {out}");
+}
+
+/// E7 DELETE ?delete_data=true 透传：引擎侧同步删数据（204）；无参数兼容
+/// （同样 204，数据处置语义由 state 层单测断言）。
+#[tokio::test]
+async fn delete_task_query_delete_data_e2e() {
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let ids = add_n_tasks(&client, &base, 2, &patterned(8 * 1024)).await;
+
+    let resp = client
+        .delete(format!("{base}/tasks/{}?delete_data=true", ids[0]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT);
+    let resp = client
+        .delete(format!("{base}/tasks/{}", ids[1]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NO_CONTENT, "无参数兼容");
+}
+
+/// E7 任务名透出：E6 显式名 → 列表条目与快照都带 name 字段。
+#[tokio::test]
+async fn task_name_exposed_in_list_and_snapshot_e2e() {
+    let body = patterned(8 * 1024);
+    let srv = TestServer::start(body).await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let dest = std::env::temp_dir().join(format!("e7-name-{}", std::process::id()));
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "url": srv.url(),
+            "dest": dest.to_str().unwrap(),
+            "name": "named-by-api.bin",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 快照 name
+    let snap: serde_json::Value = client
+        .get(format!("{base}/tasks/{tid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        snap["name"], "named-by-api.bin",
+        "快照必须透出任务名: {snap}"
+    );
+
+    // 列表 name
+    let list: serde_json::Value = client
+        .get(format!("{base}/tasks"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["task_id"] == tid.as_str())
+        .unwrap();
+    assert_eq!(row["name"], "named-by-api.bin", "列表必须透出任务名: {row}");
+}
