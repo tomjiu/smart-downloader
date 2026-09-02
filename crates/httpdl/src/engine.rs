@@ -1,10 +1,10 @@
 //! HttpEngine（§14，impl DownloadEngine）：M4a 骨架 + M4b 多连接并行下载/镜像/换源/校验。
 //! add = 探测 → 规划 → 登记 → 后台下载循环（主源探测失败自动落备用源）；段失败 → 镜像轮换；
-//! 校验失败 → 重下 1 次 → 降级接受。update_sources 并发探测全部候选源 + 评分播种，
+//! 校验失败 → 重下 1 次 → 隔离试错轮换（备用源优先，多候选逐一隔离）→ 降级接受。update_sources 并发探测全部候选源 + 评分播种，
 //! 任一存活即换源成功（不再首源死即拒）。P4 续传：段账本（`<part>.progress`）为唯一进度真源；
 //! pause 真停（段边界退出）；epoch 单写者模型（resume 无条件新 epoch 循环，旧循环在检查点自杀且永不 finalize）。
 
-use crate::download::{download_dynamic, update_score, DynamicLedger, DynamicOutcome};
+use crate::download::{download_dynamic, update_score, DynamicLedger, DynamicOutcome, SCORE_MIN};
 use crate::ledger;
 use crate::range::{probe_range, Probe};
 use crate::rate::RateLimiter;
@@ -50,6 +50,10 @@ struct HttpTask {
     backup_md5: Option<String>,
     /// 备用源是否已使用（避免无限切换）。
     backup_used: bool,
+    /// 校验失败轮换池（E3 隔离试错）：多候选表两次校验失败后，逐一以唯一源
+    /// 身份重下重校验的候选队列（评分降序；backup_url 除外——它走专属优先
+    /// 分支）。空池且当前表单源 = 无隔离试错价值 → 走降级接受（Q-B5 保留）。
+    rotate_pool: Vec<String>,
     /// 换源代次：etag 变化 → gen+1 → 旧下载循环退出、新循环启动。
     /// .part 路径随 gen 隔离（`dest.<gen>.part`），避免新旧循环并发写同一文件。
     gen: u64,
@@ -286,6 +290,25 @@ async fn download_loop(
                         if let (Some(bu), false) = (&backup_url, backup_used) {
                             let mut tasks = inner.tasks.lock();
                             let t = tasks.get_mut(&tid).unwrap();
+                            // 归因评分（E3）：唯一源两次校验失败 → 中毒直达下限（比段
+                            // 传输失败更强的证据，跨任务避雷）；多候选集体失败无法
+                            // 归因单一源（段可能混流）→ 不评分。
+                            if t.mirrors.len() == 1 {
+                                let bad = t.mirrors[0].clone();
+                                update_score(&inner.mirror_scores, &bad, SCORE_MIN);
+                            }
+                            // 播种轮换池（E3）：旧表多候选 → 备用源也失败后仍可逐一
+                            // 隔离试错（评分降序，排除备用源自身）；单候选表无隔离
+                            // 价值——它刚以唯一源身份整体失败两次。
+                            if t.rotate_pool.is_empty() && t.mirrors.len() > 1 {
+                                let mut pool: Vec<String> =
+                                    t.mirrors.iter().filter(|u| *u != bu).cloned().collect();
+                                {
+                                    let scores = inner.mirror_scores.lock();
+                                    pool.sort_by_key(|u| -scores.get(u).copied().unwrap_or(0));
+                                }
+                                t.rotate_pool = pool;
+                            }
                             t.backup_used = true;
                             t.mirrors = vec![bu.clone()];
                             t.sha256 = None;
@@ -298,7 +321,43 @@ async fn download_loop(
                             remove_part(&part);
                             continue;
                         }
-                        // 备用源也失败（或未配置）→ 降级接受 + 告警（Q-B5）
+                        // 隔离试错轮换（E3）：池空且当前表多候选 → 播种（评分降序）；
+                        // 池非空 → 弹出下一候选，以唯一源身份完整重下重校验。
+                        // 归因评分同上：唯一源两次校验失败 → 中毒直达下限。
+                        let rotated = {
+                            let mut tasks = inner.tasks.lock();
+                            let t = tasks.get_mut(&tid).unwrap();
+                            if t.mirrors.len() == 1 {
+                                let bad = t.mirrors[0].clone();
+                                update_score(&inner.mirror_scores, &bad, SCORE_MIN);
+                            }
+                            if t.rotate_pool.is_empty() && t.mirrors.len() > 1 {
+                                let mut pool = t.mirrors.clone();
+                                {
+                                    let scores = inner.mirror_scores.lock();
+                                    pool.sort_by_key(|u| -scores.get(u).copied().unwrap_or(0));
+                                }
+                                t.rotate_pool = pool;
+                            }
+                            if t.rotate_pool.is_empty() {
+                                None
+                            } else {
+                                Some(t.rotate_pool.remove(0))
+                            }
+                        };
+                        if let Some(cand) = rotated {
+                            let mut tasks = inner.tasks.lock();
+                            let t = tasks.get_mut(&tid).unwrap();
+                            t.mirrors = vec![cand.clone()];
+                            t.verify_attempts = 0;
+                            t.error = None;
+                            t.state = EngineState::Downloading;
+                            drop(tasks);
+                            println!("ttpdl] {}: 校验失败，隔离试错轮换 → {cand}", tid);
+                            remove_part(&part);
+                            continue;
+                        }
+                        // 备用源与轮换池均耗尽（或未配置）→ 降级接受 + 告警（Q-B5）
                         let warn = if md5.is_some() {
                             "md5 mismatch, accepted downgrade".to_string()
                         } else {
@@ -547,6 +606,7 @@ impl DownloadEngine for HttpEngine {
                     backup_url,
                     backup_md5,
                     backup_used: init_backup_used,
+                    rotate_pool: Vec::new(),
                     gen: 0,
                     epoch: 1,
                     pause: Arc::new(AtomicBool::new(false)),
@@ -747,6 +807,8 @@ impl DownloadEngine for HttpEngine {
             t.gen += 1; // 废弃旧下载循环
         }
         t.mirrors = urls.clone();
+        // 新候选宇宙 → 轮换池重置（E3：旧池候选集合已过时）
+        t.rotate_pool.clear();
         if let Some(e) = &probe.etag {
             t.etag = Some(e.clone());
         }

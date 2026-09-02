@@ -21,8 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Mirror 评分 clamp 边界（防单个坏源被无限惩罚/好源无限膨胀）。
+/// `pub(crate)`：engine 校验失败隔离试错的归因中毒评分复用同一口径。
 const SCORE_MAX: i64 = 4;
-const SCORE_MIN: i64 = -4;
+pub(crate) const SCORE_MIN: i64 = -4;
 
 /// 顺序下载（边下边播）在飞段窗口：限制同时在飞的段数，前缀完成速率不再被
 /// 后段乱序完成拖累（FIFO 领取语义不变，只是收紧 lookahead）。窗口 2 =
