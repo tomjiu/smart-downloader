@@ -3179,6 +3179,7 @@ pub struct FakeEngine {
     /// status() 额外透出的文件级进度（目录 files 同步测试用；默认空 = 保持旧行为）。
     status_files: parking_lot::Mutex<Vec<FileProgress>>,
     /// 已下发的子文件优先级（(engine_tid, pairs)，优先级重放测试用）。
+    #[allow(clippy::type_complexity)] // (tid, [(下标, 优先级)]) 记录类型，测试专用
     prio_calls: parking_lot::Mutex<Vec<(String, Vec<(usize, u32)>)>>,
     /// file_priorities() 的可编程行为：None = 默认成功返回空表；
     /// Some(Err(e)) = 返回该错误（metadata 未就绪模拟）；Some(Ok(v)) = 返回 v。
@@ -3231,6 +3232,7 @@ impl FakeEngine {
     }
 
     /// 读取已下发的子文件优先级调用记录（优先级重放测试断言用）。
+    #[allow(clippy::type_complexity)]
     pub fn prio_calls(&self) -> Vec<(String, Vec<(usize, u32)>)> {
         self.prio_calls.lock().clone()
     }
