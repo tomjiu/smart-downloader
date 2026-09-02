@@ -37,6 +37,10 @@ pub struct AddTaskReq {
     /// 任务级上传限速 KiB/s（仅 BT 任务；0 = 不限）。
     #[serde(default)]
     pub up_kb_s: Option<u32>,
+    /// 顺序下载（边下边播）。HTTP = 在飞段窗口收紧；BT = sequential_download
+    /// flag；缺省 = 默认并行策略。
+    #[serde(default)]
+    pub sequential: bool,
 }
 
 #[cfg(feature = "xunlei-import")]
@@ -78,6 +82,40 @@ async fn task_limit(
 ) -> impl IntoResponse {
     match state.set_task_limits(&id, req.down_kb_s, req.up_kb_s).await {
         Ok(_merged) => match state.task_snapshot(&id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+/// 任务级顺序下载（`POST /tasks/:id/sequential`，边下边播）。
+/// HTTP = 在飞段窗口收紧（运行中任务下轮拾取）；BT = sequential_download flag
+/// （即时生效）；FTP = 不支持（409）。
+#[derive(Deserialize)]
+pub struct SequentialReq {
+    pub sequential: bool,
+}
+
+async fn task_sequential(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SequentialReq>,
+) -> impl IntoResponse {
+    match state.set_task_sequential(&id, req.sequential).await {
+        Ok(()) => match state.task_snapshot(&id).await {
             Some(snap) => Json(snap).into_response(),
             None => (
                 StatusCode::NOT_FOUND,
@@ -623,7 +661,9 @@ async fn add_task(
             Ok(bytes) => {
                 #[cfg(feature = "bt")]
                 {
-                    state.add_torrent_task(bytes, req.dest).await
+                    state
+                        .add_torrent_task_opts(bytes, req.dest, req.sequential)
+                        .await
                 }
                 #[cfg(not(feature = "bt"))]
                 {
@@ -644,7 +684,9 @@ async fn add_task(
                 Json(serde_json::json!({ "error": "需要 url 或 torrent_b64" })),
             );
         };
-        state.add_link_task(url, req.dest).await
+        state
+            .add_link_task_opts(url, req.dest, req.sequential)
+            .await
     };
     match result {
         Ok(task_id) => {
@@ -816,6 +858,7 @@ macro_rules! router_base {
             .route("/tasks/:id/logs", get(task_logs))
             .route("/tasks/:id/fallback", post(task_fallback))
             .route("/tasks/:id/limit", post(task_limit))
+            .route("/tasks/:id/sequential", post(task_sequential))
             .route("/tasks/:id/files/priority", post(task_file_priority))
             .route("/tasks/:id/webseeds", post(task_webseeds))
             .route("/bt/metadata", post(bt_magnet_metadata))

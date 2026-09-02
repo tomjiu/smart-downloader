@@ -430,6 +430,13 @@ impl DownloadEngine for BtEngine {
         Ok(prios.into_iter().map(|p| Some(p as u32)).collect())
     }
 
+    /// 任务级顺序下载（trait 扩展）：libtorrent sequential_download flag。
+    /// 2.0.x = torrent_flags（on/off 均可）；2.1 = set_sequential_range（仅 on）。
+    /// metadata 未就绪也可设（handle 级 flag，随 metadata 到达持续生效）。
+    async fn set_sequential(&self, id: &EngineTaskId, on: bool) -> Result<(), EngineError> {
+        self.core.set_sequential(id, on).map_err(bt_engine_err)
+    }
+
     async fn add_xunlei_resume(&self, data: Vec<u8>) -> Result<EngineTaskId, EngineError> {
         self.core
             .add_torrent_resume(&data, &[])

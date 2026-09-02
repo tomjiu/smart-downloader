@@ -302,3 +302,43 @@ daemon `bt_metadata_api.rs`（无 bt：恒 400；有 bt：坏 magnet 400 / 坏 p
 
 **验证**：core 124 / provider 115 全绿；daemon 四 feature 组合（默认 / bt / nas,ftp,xunlei-import /
 webseed）编译零新增警告；非 bt daemon 测试 17 全绿。
+
+### 20. 任务级顺序下载（sequential / 边下边播，2026-09-02）
+
+**背景**：CAPABILITY_MAP 净增量 N3 的 httpdl/BT 侧落地。此前 HTTP 引擎 FIFO 领取段但
+worker 无限并发在飞（clamp(total/64MB,2,8)），前缀完成速率被后段乱序完成拖累；BT 侧
+FFI `lt_set_sequential` 已备但 daemon 层零接线（无入口、无持久化）。用户建任务后无法
+表达「边下边播」意图。
+
+**行为契约**：
+- **任务字段**：`DownloadTask.sequential: bool`（serde default false；旧 tasks.json 零
+  迁移；false 不序列化）。持久化 + 恢复重放（restore_from ③：sequential=true 原样下发，
+  失败记事件不阻断恢复；flag 幂等）。
+- **HTTP 引擎**：`download_dynamic` 新增 `sequential` 参数 → 在飞段窗口收紧到
+  `SEQUENTIAL_WINDOW=2`（tokio Semaphore，permit 从领取前持有到 complete 后，RAII
+  无泄漏；先拿 permit 再领取段）。FIFO 领取语义不变，仅收紧 lookahead。生效时机：
+  新建任务立即；运行中任务下一次重下轮（换源/校验失败/续传轮）拾取。
+- **BT 引擎**：daemon `BtEngine`（trait impl）新增 `set_sequential` → btcore（已备）
+  → FFI `lt_set_sequential`（2.0.x = torrent_flags on/off；2.1 = set_sequential_range
+  仅 on）。handle 级 flag：metadata 未就绪也可设；add_bt_task_opts/add_torrent_task_opts
+  在引擎 add 后立即下发（失败仅记日志不回滚，与限速同口径）。
+- **API**：① `POST /tasks` 请求体新增 `sequential: bool`（缺省 false；HTTP/FTP/magnet/
+  .torrent 全链路）；② `POST /tasks/:id/sequential {"sequential": bool}` 任务级切换
+  （404 任务不存在 / 409 引擎不支持即 FTP / 500 引擎错误；成功返回快照）。
+  快照新增 `sequential`（false 不序列化）。
+- **FTP**：不支持（Unsupported → 409），FtpEngine 走 trait 默认实现。
+
+**测试**（8 新增）：
+- httpdl `sequential_window.rs` 3 测：①自包含流式服务器（公式内容 i%251 现算，192MB
+  仅落盘不驻内存——规避沙盒/CI OOM）直调 download_dynamic：顺序模式在飞峰值 ≤2；
+  ②默认并行峰值 ≥3（worker 数）；③engine 接线冒烟（task.sequential → 完成 + 内容一致）。
+- daemon `sequential_api.rs` 4 测：add 带 sequential 快照透出；端点切换 + tasks.json
+  持久化（轮询落盘）+ 切回 false 字段缺失；404；恢复重放 e2e（restore_from 后
+  sequential 保持 true）。
+- daemon `bt_api.rs` 2 测（feature bt）：真实 torrent FFI flag 往返（端点 200 = 
+  lt_set_sequential 真实生效，错误上抛 500）+ add 带 sequential 双任务（不同 name 防
+  409 撞车）；magnet 假 btih（metadata 永不到达）flag 可设 → 200。
+
+**验证**：非 bt workspace **631/631**（基线 624 + 7）；bt 构建 daemon **183/183**
+（含 bt_api 16）；btcore 33 全绿；fmt 全清；clippy 非 bt workspace 与 daemon(bt)
+--all-targets 零新增警告。

@@ -15,11 +15,17 @@ use std::sync::Arc;
 const SCORE_MAX: i64 = 4;
 const SCORE_MIN: i64 = -4;
 
+/// 顺序下载（边下边播）在飞段窗口：限制同时在飞的段数，前缀完成速率不再被
+/// 后段乱序完成拖累（FIFO 领取语义不变，只是收紧 lookahead）。窗口 2 =
+/// 在单连接流式与多连接吞吐间取平衡（TCP 窗口填充仍有余量）。
+pub const SEQUENTIAL_WINDOW: usize = 2;
+
 /// 动态分段下载：worker 数 N=clamp(total/64MB, 2, 8)，段粒度 min_split。
 /// `offset` = 续传起点（跳过 [0, offset)，由调用方续传决策给出）。
 /// 任一段全源失败 → Err（调用方决定重试/报错）。`limiter` 跨段共享（0 = 不限）。
 /// `scores` = 可选 Mirror 加权评分表（None = 不评分，纯按 mirrors 顺序）。
-/// 参数均为同层语义字段，聚合结构体反而增加调用方样板 → 允许 8 参。
+/// `sequential` = 顺序下载：在飞段数收紧到 `SEQUENTIAL_WINDOW`（false = 不限）。
+/// 参数均为同层语义字段，聚合结构体反而增加调用方样板 → 允许 9 参。
 #[allow(clippy::too_many_arguments)]
 pub async fn download_dynamic(
     client: &reqwest::Client,
@@ -30,6 +36,7 @@ pub async fn download_dynamic(
     mirrors: &[String],
     limiter: Arc<RateLimiter>,
     scores: Option<Arc<Mutex<HashMap<String, i64>>>>,
+    sequential: bool,
 ) -> Result<(), String> {
     // 预分配 .part（续传场景：旧 .part 保留，只写缺失段；不截断）
     let f = std::fs::OpenOptions::new()
@@ -42,6 +49,13 @@ pub async fn download_dynamic(
     drop(f);
 
     let manager = Arc::new(Mutex::new(SegmentManager::new(total, offset, min_split)));
+    // 顺序模式在飞闸门：permit 从领取前持有到 complete 后释放（RAII），
+    // 失败/panic 退出路径同样随作用域释放，无泄漏。
+    let seq_gate: Option<Arc<tokio::sync::Semaphore>> = if sequential {
+        Some(Arc::new(tokio::sync::Semaphore::new(SEQUENTIAL_WINDOW)))
+    } else {
+        None
+    };
     let n_workers = segment_count(total);
     let mut workers = tokio::task::JoinSet::new();
     for _ in 0..n_workers {
@@ -51,8 +65,20 @@ pub async fn download_dynamic(
         let limiter = limiter.clone();
         let manager = manager.clone();
         let scores = scores.clone();
+        let seq_gate = seq_gate.clone();
         workers.spawn(async move {
             loop {
+                // 顺序模式：先拿 permit 再领取段，保证「在飞段数 ≤ 窗口」
+                // （先领后等会导致窗口外表内的段已占用 FIFO 游标）。
+                let _permit = match &seq_gate {
+                    Some(g) => Some(
+                        g.clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| "sequential gate closed".to_string())?,
+                    ),
+                    None => None,
+                };
                 let seg = {
                     let mut m = manager.lock();
                     match m.take_segment() {
@@ -85,6 +111,7 @@ pub async fn download_dynamic(
                     ));
                 }
                 manager.lock().complete(seg);
+                drop(_permit); // 显式释放：permit 生命周期必须覆盖 complete
             }
         });
     }
