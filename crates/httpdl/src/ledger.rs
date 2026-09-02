@@ -261,6 +261,7 @@ mod tests {
             range_supported: true,
             etag: Some("e".into()),
             total: Some(100),
+            filename: None,
         };
         assert_eq!(decide(100, None, &probe), ResumeDecision::Restart);
     }
@@ -272,6 +273,7 @@ mod tests {
             range_supported: true,
             etag: Some("new".into()),
             total: Some(4096),
+            filename: None,
         };
         let l = ledger(4096, 1024, vec![(0, 1023)]);
         assert_eq!(
@@ -287,6 +289,7 @@ mod tests {
             range_supported: true,
             etag: Some("e".into()),
             total: Some(4096),
+            filename: None,
         };
         let l = ledger(4096, 1024, vec![(0, 1023)]);
         assert_eq!(
@@ -307,6 +310,7 @@ mod tests {
             range_supported: true,
             etag: Some("fresh".into()),
             total: Some(4096),
+            filename: None,
         };
         assert!(matches!(
             decide(4096, Some(&l), &probe),
@@ -320,6 +324,7 @@ mod tests {
             range_supported: true,
             etag: Some("e".into()),
             total: Some(4096),
+            filename: None,
         };
         // 账本 total 不同
         let l = ledger(8192, 1024, vec![]);
@@ -337,6 +342,7 @@ mod tests {
             range_supported: false,
             etag: Some("e".into()),
             total: Some(4096),
+            filename: None,
         };
         let l = ledger(4096, 1024, vec![(0, 1023)]);
         assert_eq!(decide(4096, Some(&l), &probe), ResumeDecision::Restart);
@@ -348,6 +354,7 @@ mod tests {
             range_supported: true,
             etag: Some("e".into()),
             total: Some(4096),
+            filename: None,
         };
         // 篡改账本：未对齐段
         let l = ledger(4096, 1024, vec![(7, 1023)]);

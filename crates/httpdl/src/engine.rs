@@ -424,6 +424,19 @@ fn finish(inner: &Arc<EngineInner>, tid: &str, state: EngineState, error: Option
     }
 }
 
+/// URL 路径末段（E4 弱信号文件名候选）：剥 query/hash，空段（目录型 URL）
+/// → None。不做 percent-decode（避免双重解码；服务端真名由 CD 路径负责）。
+fn url_basename(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let base = path.trim_end_matches('/').rsplit('/').next()?;
+    let base = base.trim();
+    if base.is_empty() {
+        None
+    } else {
+        Some(base.to_string())
+    }
+}
+
 /// .part → 目标落位。换源/重下场景 dest 可能已有旧内容且大小相同
 /// （OutputManager::finalize_to 的幂等短路会直接 Ok 不覆盖）→ 先删 dest 强制落位。
 fn finalize_part(part: &Path, dest: &Path, total: u64) -> Result<(), String> {
@@ -529,15 +542,28 @@ impl DownloadEngine for HttpEngine {
         };
         let total = probe.total.unwrap_or(0);
 
-        let rel = task
-            .metadata
-            .name
-            .clone()
-            .unwrap_or_else(|| "download.bin".to_string());
-        // 安全修复（V3）：任务名可能来自恶意 torrent/远端，join 前必须净化
-        // （拒 `..` / 绝对路径 / 盘符前缀），非法即拒任务。
-        let rel_pb = smart_dl_core::session::output::sanitize_rel(&rel)
-            .map_err(|e| EngineError::Other(e.to_string()))?;
+        // 落盘名决策（E4）：
+        // - 用户显式名（metadata.name）→ 权威，非法即拒任务（V3 语义不变）；
+        // - 未提供 → 自动派生链：探测响应 Content-Disposition 文件名（服务端
+        //   声明最权威，含 RFC 5987 解码与目录成分剥离）→ URL 末段（弱信号，
+        //   与 FTP 引擎同语义）→ "download.bin" 兜底。派生候选经 sanitize_rel
+        //   终审，失败则逐级跳过（远端可控字段不得拒杀任务/制造穿越）。
+        let rel_pb = match &task.metadata.name {
+            Some(rel) => smart_dl_core::session::output::sanitize_rel(rel)
+                .map_err(|e| EngineError::Other(e.to_string()))?,
+            None => {
+                let mut chosen = std::path::PathBuf::from("download.bin");
+                let url_cand = url_basename(&url);
+                let candidates = probe.filename.iter().chain(url_cand.iter());
+                for cand in candidates {
+                    if let Ok(pb) = smart_dl_core::session::output::sanitize_rel(cand) {
+                        chosen = pb;
+                        break;
+                    }
+                }
+                chosen
+            }
+        };
         let dest = task.dest_root.join(&rel_pb);
         // 断点续传（P4 段账本版）：`<dest>.part` + `<dest>.part.progress` 账本为
         // 唯一可信进度凭据。预分配 .part 的文件长度恒等于 total，不可作为进度

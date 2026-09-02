@@ -11,6 +11,7 @@ fn probe(range: bool, etag: Option<&str>, total: u64) -> Probe {
         range_supported: range,
         etag: etag.map(str::to_string),
         total: Some(total),
+        filename: None,
     }
 }
 
