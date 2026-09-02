@@ -2044,7 +2044,7 @@ impl DaemonState {
         Ok(serde_json::json!({
             "task_id": rec.task.id,
             "state": state_label(&rec.task.state),
-            "source": format!("{:?}", rec.task.source),
+            "source": rec.task.source.redacted_debug(),
             "error": rec.engine_status.as_ref().and_then(|s| s.error.clone()),
             "events": rec.events,
         }))
@@ -2560,7 +2560,13 @@ fn be_str(b: &[u8], at: usize) -> Option<(&[u8], usize)> {
     let colon = b[at..].iter().position(|&c| c == b':')? + at;
     let len: usize = std::str::from_utf8(&b[at..colon]).ok()?.parse().ok()?;
     let start = colon + 1;
-    Some((&b[start..start + len], start + len))
+    // 安全修复（H-3 同型）：start+len 裸加法——恶意 fastresume/torrent 的超大
+    // 长度字段在 release 下回绕或直接越界 → 切片 panic。checked_add + 界检查。
+    let end = start.checked_add(len)?;
+    if end > b.len() {
+        return None;
+    }
+    Some((&b[start..end], end))
 }
 
 /// bencode 整数 `i<digits>e` → 值。

@@ -76,10 +76,13 @@ pub fn parse_handshake(payload: &[u8]) -> Option<(u16, u32, Vec<u8>)> {
         .ok()?
         .parse::<usize>()
         .ok()?;
-    if v_rest.len() < colon + 1 + len {
+    // 安全修复（H-3 同型）：colon+1+len 裸加法在 release 下可回绕绕过检查 →
+    // 切片 panic（恶意 xudt 握手 peer）。
+    let end = colon.checked_add(1)?.checked_add(len)?;
+    if v_rest.len() < end {
         return None;
     }
-    let version = v_rest[colon + 1..colon + 1 + len].to_vec();
+    let version = v_rest[colon + 1..end].to_vec();
 
     Some((port, reqq, version))
 }
