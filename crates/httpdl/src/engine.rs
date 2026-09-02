@@ -154,7 +154,7 @@ async fn download_loop(
 ) {
     loop {
         // 快照任务参数（不跨 await 持锁）；gen/epoch 失配 → 本循环作废
-        let (part, mirrors_raw, total, sha256, md5, sequential, etag, pause_flag) = {
+        let (part, mirrors_raw, total, sha256, md5, sequential, etag, pause_flag, headers) = {
             let tasks = inner.tasks.lock();
             let t = match tasks.get(&tid) {
                 Some(t) if t.gen == gen && t.epoch == epoch => t,
@@ -169,6 +169,7 @@ async fn download_loop(
                 t.sequential,
                 t.etag.clone(),
                 t.pause.clone(),
+                t.headers.clone(),
             )
         };
 
@@ -216,6 +217,7 @@ async fn download_loop(
             total,
             min_split,
             &mirrors,
+            &headers,
             limiter.clone(),
             Some(inner.mirror_scores.clone()),
             sequential,

@@ -65,7 +65,10 @@ enum WorkerExit {
 /// 任一段全源失败 → Err（调用方决定重试/报错）。`limiter` 跨段共享（0 = 不限）。
 /// `scores` = 可选 Mirror 加权评分表（None = 不评分，纯按 mirrors 顺序）。
 /// `sequential` = 顺序下载：在飞段数收紧到 `SEQUENTIAL_WINDOW`（false = 不限）。
-/// 参数均为同层语义字段，聚合结构体反而增加调用方样板 → 允许 11 参。
+/// `headers` = 任务级自定义头（H-8 修复）：随每个段请求下发（与探测一致语义），
+/// 否则鉴权型源（Cookie/Token）段请求 403 不可用。任务头中的 `range`（大小写
+/// 不敏感）跳过——段区间由段参数生成，任务头不得劫持/制造重复 Range。
+/// 参数均为同层语义字段，聚合结构体反而增加调用方样板 → 允许 12 参。
 #[allow(clippy::too_many_arguments)]
 pub async fn download_dynamic(
     client: &reqwest::Client,
@@ -73,6 +76,7 @@ pub async fn download_dynamic(
     total: u64,
     min_split: u64,
     mirrors: &[String],
+    headers: &[(String, String)],
     limiter: Arc<RateLimiter>,
     scores: Option<Arc<Mutex<HashMap<String, i64>>>>,
     sequential: bool,
@@ -114,6 +118,7 @@ pub async fn download_dynamic(
         let client = client.clone();
         let part = part.to_path_buf();
         let mirrors = mirrors.to_vec();
+        let headers = headers.to_vec();
         let limiter = limiter.clone();
         let manager = manager.clone();
         let scores = scores.clone();
@@ -147,7 +152,9 @@ pub async fn download_dynamic(
                 };
                 let mut ok = false;
                 for url in &mirrors {
-                    match download_segment_with_retry(&client, url, &part, seg, &limiter).await {
+                    match download_segment_with_retry(&client, url, &part, seg, &headers, &limiter)
+                        .await
+                    {
                         Ok(()) => {
                             if let Some(sc) = &scores {
                                 update_score(sc, url, 1);
@@ -232,11 +239,12 @@ async fn download_segment_with_retry(
     url: &str,
     part: &Path,
     seg: crate::segment_manager::Segment,
+    headers: &[(String, String)],
     limiter: &RateLimiter,
 ) -> Result<(), String> {
     let mut stack: Vec<crate::segment_manager::Segment> = vec![seg];
     while let Some(cur) = stack.pop() {
-        match download_segment_streaming(client, url, part, cur, limiter).await {
+        match download_segment_streaming(client, url, part, cur, headers, limiter).await {
             Ok(()) => {}
             Err(_) if cur.len() / 2 >= MIN_RETRY_GRANULARITY => {
                 let mid = cur.start + cur.len() / 2;
@@ -258,15 +266,24 @@ async fn download_segment_with_retry(
 
 /// 单段流式下载：Range: bytes=start-end，chunk 边收边写 .part
 /// （段内顺序写，seek 一次定位；段不相交 → 与其它 worker 无写冲突）。
+/// `headers` = 任务级自定义头（H-8）：逐个追加；同名 `range` 头（大小写
+/// 不敏感）跳过——段区间由段参数生成，任务头不得劫持/制造重复 Range。
 async fn download_segment_streaming(
     client: &reqwest::Client,
     url: &str,
     part: &Path,
     seg: crate::segment_manager::Segment,
+    headers: &[(String, String)],
     limiter: &RateLimiter,
 ) -> Result<(), String> {
-    let mut resp = client
-        .get(url)
+    let mut req = client.get(url);
+    for (k, v) in headers {
+        if k.eq_ignore_ascii_case("range") {
+            continue;
+        }
+        req = req.header(k, v);
+    }
+    let mut resp = req
         .header(
             reqwest::header::RANGE,
             format!("bytes={}-{}", seg.start, seg.end),

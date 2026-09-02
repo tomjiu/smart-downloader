@@ -349,7 +349,11 @@ async fn bt_magnet_metadata(
 ///   盘符（与 fix/security-p0（PR #5）`sanitize_rel` 同构，合并后两处一致）；
 /// - 最终落盘点 = `<default_dest_root>/save_to`，不再接受任意绝对目标；
 /// - 父目录须已存在（保留原契约），且 canonicalize 后必须仍在根目录内——
-///   拦截已存在的 symlink 指向根外（写穿逃逸）。
+///   拦截已存在的 symlink 指向根外（写穿逃逸）；
+/// - 末段 symlink 设防（H-2，CWE-59）：parent canonicalize 只覆盖中间分量，
+///   dest 本身若为 symlink，`fs::write` 将写穿到链接目标（可越出根目录）。
+///   `symlink_metadata` 不跟随末段链接 → 恰好检测链接本体；末段为 symlink
+///   一律拒绝（含指向根内的链接——语义简单不留旁门）。
 ///
 /// 纯路径校验（仅 std，无 btcore 依赖）：不挂 cfg(bt)——无 bt 构建的测试
 /// 同样覆盖，亦可供其他落盘端点复用。
@@ -385,6 +389,18 @@ pub fn validate_save_dest(root: &std::path::Path, raw: &str) -> Result<std::path
         .map_err(|e| format!("下载根目录不可达: {}: {e}", root.display()))?;
     if !parent_canon.starts_with(&root_canon) {
         return Err(format!("save_to 越界（解析后不在下载根目录内）: {raw}"));
+    }
+    // 末段 symlink 设防（H-2，CWE-59）：parent canonicalize 只解析中间分量；
+    // dest 本身是 symlink 时（如 save_to="evil.torrent" 且 root/evil.torrent
+    // → /etc/crontab），上面全部检查照过，后续 fs::write 却写穿到根外。
+    // symlink_metadata 读链接本体不读目标 → 恰好识别末段链接；
+    // 目标不存在（首次写入）→ Err 分支跳过，原语义不变。
+    if let Ok(md) = std::fs::symlink_metadata(&dest) {
+        if md.file_type().is_symlink() {
+            return Err(format!(
+                "save_to 目标已存在且为符号链接（拒绝写穿逃逸）: {raw}"
+            ));
+        }
     }
     Ok(dest)
 }
