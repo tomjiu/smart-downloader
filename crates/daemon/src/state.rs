@@ -210,10 +210,13 @@ pub struct DaemonState {
 
 /// 持久化任务记录：`task`（含 source 原文：url/magnet/torrent 字节）+ 引擎种类。
 /// 运行态字段（engine_tid/engine_status）不落盘——恢复时重新向引擎 add。
+/// `paused`（P4 G5）：用户暂停意图——重启后保持暂停而非重新入队自动开跑。
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct PersistedTask {
     pub task: DownloadTask,
     pub engine_kind: EngineKind,
+    #[serde(default)]
+    pub paused: bool,
 }
 
 /// 原子写任务文件（tmp + rename，防半写）。
@@ -598,7 +601,8 @@ impl DaemonState {
         self
     }
 
-    /// 序列化当前任务目录（持久化用）。
+    /// 序列化当前任务目录（持久化用）。`paused` 取自任务缓存态
+    /// （pause/resume 处理器同步改写并 autosave，落盘时态准确）。
     fn persisted_tasks(&self) -> Vec<PersistedTask> {
         self.tasks
             .lock()
@@ -606,6 +610,7 @@ impl DaemonState {
             .map(|r| PersistedTask {
                 task: r.task.clone(),
                 engine_kind: r.engine_kind,
+                paused: matches!(r.task.state, TaskState::Paused),
             })
             .collect()
     }
@@ -633,6 +638,7 @@ impl DaemonState {
         let mut failed = 0usize;
         for pt in pts {
             let mut t = pt.task.clone();
+            let was_paused = pt.paused; // 用户暂停意图（P4 G5，旧文件无此字段 = false）
             t.state = TaskState::Queued; // 重启后重新入队
             let engine = match self.engine_for(pt.engine_kind) {
                 Ok(e) => e,
@@ -682,6 +688,22 @@ impl DaemonState {
                             replay_details.push(format!("顺序下载重放失败: {e}"));
                         }
                     }
+                    // ④ 暂停意图重放 + 运行态恢复（P4 G5）：
+                    // - was_paused → engine.pause：BT（内核暂停 + 意图登记持续压制
+                    //   + fastresume）；HTTP（暂停标志置位，循环段边界退出）。
+                    //   记录态同步回写 Paused（否则缓存显示 Queued 与内核错位）。
+                    // - 非 paused 且 BT → engine.resume：所有 add 路径内核侧强制
+                    //   paused（lt_kernel 统一语义），不 resume 则恢复任务永不下载。
+                    //   HTTP add 已自启下载循环（epoch 语义），不得重复 resume。
+                    if was_paused {
+                        if let Err(e) = engine.pause(&tid).await {
+                            replay_details.push(format!("暂停意图重放失败: {e}"));
+                        }
+                    } else if pt.engine_kind == EngineKind::Bt {
+                        if let Err(e) = engine.resume(&tid).await {
+                            replay_details.push(format!("恢复运行重放失败: {e}"));
+                        }
+                    }
                     let mut rec = TaskRecord {
                         task: t,
                         engine_tid: Some(tid),
@@ -689,6 +711,9 @@ impl DaemonState {
                         engine_status: None,
                         events: vec![],
                     };
+                    if was_paused {
+                        rec.task.state = TaskState::Paused;
+                    }
                     if replay_details.is_empty() {
                         rec.push_event("restored", None);
                     } else {
@@ -730,6 +755,31 @@ impl DaemonState {
         self.engines.get(&kind).cloned().ok_or_else(|| {
             DaemonError::InvalidSource(format!("引擎未加载: {:?}（编译时启用对应 feature）", kind))
         })
+    }
+
+    /// 活跃 BT 任务的 engine_tid 列表（fastresume 周期/退出保存范围，P4 G4）。
+    /// 非终态即保存（Queued/Evaluating/Downloading/Paused/FallbackProvider/
+    /// Transferring/Seeding——做种中也保存，防"部分校验进度丢失"）；
+    /// Completed/Failed/Stopped 跳过。
+    #[cfg(feature = "bt")]
+    pub fn active_bt_tids(&self) -> Vec<String> {
+        self.tasks
+            .lock()
+            .values()
+            .filter(|r| r.engine_kind == EngineKind::Bt)
+            .filter(|r| {
+                !matches!(
+                    r.task.state,
+                    TaskState::Completed | TaskState::Failed | TaskState::Stopped
+                )
+            })
+            .filter_map(|r| r.engine_tid.clone())
+            .collect()
+    }
+
+    /// 任务当前 engine_tid（引擎侧 id；BT=infohash）。未注册/任务不存在 → None。
+    pub fn engine_tid_of(&self, id: &str) -> Option<String> {
+        self.tasks.lock().get(id).and_then(|r| r.engine_tid.clone())
     }
 
     pub fn hub(&self) -> &WsHub {
@@ -1560,6 +1610,8 @@ impl DaemonState {
             rec.push_event("pause", None);
             rec.task.state = TaskState::Paused; // 记录缓存同步（alert 流不迁移 pause）
         }
+        // 暂停意图必须立刻持久化（P4 G5）：否则重启后暂停任务被当作运行任务恢复
+        self.autosave();
         self.hub.publish(SchedulerEvent::StateChanged {
             task_id: id.to_string(),
             from: TaskState::Downloading(rec.engine_kind),
@@ -1587,6 +1639,8 @@ impl DaemonState {
             rec.push_event("resume", None);
             rec.task.state = TaskState::Downloading(rec.engine_kind);
         }
+        // 恢复态同步持久化（P4 G5：与 pause 对称）
+        self.autosave();
         self.hub.publish(SchedulerEvent::StateChanged {
             task_id: id.to_string(),
             from: TaskState::Paused,
@@ -3292,6 +3346,10 @@ pub struct FakeEngine {
     /// Some(Err(e)) = 返回该错误（metadata 未就绪模拟）；Some(Ok(v)) = 返回 v。
     prio_readback:
         parking_lot::Mutex<Option<Result<Vec<Option<u32>>, smart_dl_core::types::EngineError>>>,
+    /// 已下发的 pause 调用（P4 G5 暂停意图重放测试用）。
+    paused: parking_lot::Mutex<Vec<String>>,
+    /// 已下发的 resume 调用（P4 G5 运行态恢复重放测试用）。
+    resumed: parking_lot::Mutex<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -3308,6 +3366,8 @@ impl FakeEngine {
             status_files: parking_lot::Mutex::new(Vec::new()),
             prio_calls: parking_lot::Mutex::new(Vec::new()),
             prio_readback: parking_lot::Mutex::new(None),
+            paused: parking_lot::Mutex::new(Vec::new()),
+            resumed: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -3331,6 +3391,16 @@ impl FakeEngine {
     /// 读取已下发的任务级限速（LimitCall 记录，限速重放测试断言用）。
     pub fn limits(&self) -> Vec<LimitCall> {
         self.limits.lock().clone()
+    }
+
+    /// 读取已下发的 pause 调用（P4 G5 重放测试断言用）。
+    pub fn paused_calls(&self) -> Vec<String> {
+        self.paused.lock().clone()
+    }
+
+    /// 读取已下发的 resume 调用（P4 G5 重放测试断言用）。
+    pub fn resumed_calls(&self) -> Vec<String> {
+        self.resumed.lock().clone()
     }
 
     /// 设置 status() 返回的文件级进度（FTP 目录 files 同步测试注入用）。
@@ -3389,10 +3459,12 @@ impl DownloadEngine for FakeEngine {
         ))
     }
 
-    async fn pause(&self, _id: &EngineTaskId) -> Result<(), smart_dl_core::types::EngineError> {
+    async fn pause(&self, id: &EngineTaskId) -> Result<(), smart_dl_core::types::EngineError> {
+        self.paused.lock().push(id.clone());
         Ok(())
     }
-    async fn resume(&self, _id: &EngineTaskId) -> Result<(), smart_dl_core::types::EngineError> {
+    async fn resume(&self, id: &EngineTaskId) -> Result<(), smart_dl_core::types::EngineError> {
+        self.resumed.lock().push(id.clone());
         Ok(())
     }
     async fn status(
@@ -3667,6 +3739,7 @@ mod persist_tests {
         let pts = vec![PersistedTask {
             task: bt_prio_task("t1", Some(vec![0, 7])),
             engine_kind: EngineKind::Bt,
+            paused: false,
         }];
         std::fs::write(&store, serde_json::to_vec(&pts).unwrap()).unwrap();
 
@@ -3697,6 +3770,7 @@ mod persist_tests {
         let pts = vec![PersistedTask {
             task: bt_prio_task("t1", Some(vec![0, 7])),
             engine_kind: EngineKind::Bt,
+            paused: false,
         }];
         std::fs::write(&store, serde_json::to_vec(&pts).unwrap()).unwrap();
         let n = state.restore_from(&store).await.unwrap();
@@ -3722,6 +3796,78 @@ mod persist_tests {
         assert!(!state.pending_file_prio.lock().contains("t1"));
         assert!(state.replay_pending_file_priorities().await.is_empty());
         assert_eq!(fake.prio_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn restore_replays_pause_intent_and_marks_paused() {
+        // P4 G5：用户暂停的任务持久化 paused=true → 重启恢复后重放 engine.pause
+        // 且记录态回写 Paused（不再被当作运行任务重新入队）。
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("tasks.json");
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = Arc::new(DaemonState::new(fake.clone(), vec![]).with_storage(store.clone()));
+        let tid = state
+            .add_http_task("https://example.com/paused.bin".into(), None)
+            .await
+            .unwrap();
+        state.pause(&tid).await.unwrap();
+        // pause 处理器应立即 autosave（否则暂停意图丢失）；轮询到 paused=true 落盘
+        //（文件可能在 add 时已存在，不能只等文件存在）
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                let persisted = std::fs::read_to_string(&store)
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<Vec<PersistedTask>>(&s).ok())
+                    .map(|pts| pts.first().map(|p| p.paused).unwrap_or(false))
+                    .unwrap_or(false);
+                if persisted {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "暂停意图必须落盘 paused=true"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        }
+
+        // "重启"：新引擎 + restore → 引擎收到 pause 重放，记录态 Paused
+        let fake2 = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state2 = DaemonState::new(fake2.clone(), vec![]);
+        state2.restore_from(&store).await.unwrap();
+        assert_eq!(
+            fake2.paused_calls(),
+            vec!["fk1".to_string()],
+            "暂停意图必须重放到引擎"
+        );
+        assert!(fake2.resumed_calls().is_empty(), "暂停任务不得 resume");
+        let rec = state2.tasks.lock().get(&tid).cloned().unwrap();
+        assert_eq!(rec.task.state, TaskState::Paused, "记录态应回写 Paused");
+    }
+
+    #[tokio::test]
+    async fn running_task_restored_without_pause_replay_on_non_bt() {
+        // P4 G5 对称面：非暂停任务恢复不重放 pause；HTTP 引擎不得 resume
+        //（add 已自启下载循环，重复 resume 会产生多余 epoch 循环）。
+        // BT 的 resume 重放由 fastresume e2e（真实内核）覆盖。
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("tasks.json");
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = Arc::new(DaemonState::new(fake.clone(), vec![]).with_storage(store.clone()));
+        state
+            .add_http_task("https://example.com/running.bin".into(), None)
+            .await
+            .unwrap();
+        wait_file(&store, 2000);
+
+        let fake2 = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state2 = DaemonState::new(fake2.clone(), vec![]);
+        state2.restore_from(&store).await.unwrap();
+        assert!(fake2.paused_calls().is_empty());
+        assert!(fake2.resumed_calls().is_empty(), "HTTP 恢复不得重复 resume");
+        let rec = state2.tasks.lock().values().next().cloned().unwrap();
+        assert_eq!(rec.task.state, TaskState::Queued);
     }
 
     #[tokio::test]
