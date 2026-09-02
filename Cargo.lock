@@ -1515,6 +1515,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "sha2",
  "smart-dl-btcore",
  "smart-dl-core",
  "smart-dl-httpdl",

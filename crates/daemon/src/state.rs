@@ -9,7 +9,7 @@ use smart_dl_core::task::{DownloadTask, TaskId, TaskMetadata};
 #[cfg(any(feature = "ftp", feature = "xunlei-import"))]
 use smart_dl_core::task::{FileState, TaskFile};
 use smart_dl_core::types::{
-    DownloadEngine, DownloadSource, EngineKind, EngineState, EngineStatus, EngineTaskId,
+    Auth, DownloadEngine, DownloadSource, EngineKind, EngineState, EngineStatus, EngineTaskId,
     FileProgress,
 };
 use smart_dl_provider::{
@@ -177,6 +177,83 @@ pub enum DaemonError {
 impl From<anyhow::Error> for DaemonError {
     fn from(value: anyhow::Error) -> Self {
         DaemonError::Engine(value.to_string())
+    }
+}
+
+/// HTTP 任务创建参数（E6）：daemon API → 引擎能力的对齐收口。
+/// 散参签名在 sequential/proxy 之后已到极限（E5 时 4 参），headers/auth/
+/// 校验目标/备用源/显式名继续散参不可维护 → 收敛为结构体。
+/// `add_link_task_opts` 复用本结构：magnet/ftp 分支仅取 `sequential`
+/// （其余字段对非 HTTP 任务无语义，与 AddTaskReq 一字段多引擎口径一致）。
+#[derive(Clone, Debug, Default)]
+pub struct AddHttpOpts {
+    /// 顺序下载（HTTP = 在飞段窗口收紧；BT = sequential flag）。
+    pub sequential: bool,
+    /// 任务级代理 URL（E5：Some = 任务专用 client 覆盖全局；非法 add 即拒）。
+    pub proxy: Option<String>,
+    /// 任务级自定义请求头（H-8 全链透传：探测 + 段下载）。
+    pub headers: Vec<(String, String)>,
+    /// HTTP Basic 认证（username 必填，password 可空串）。
+    pub basic_auth: Option<(String, String)>,
+    /// 主源内容校验目标（64 位十六进制 sha256）。传入后校验失败走既有处置链
+    /// （重下 1 次 → 备用源 → 隔离试错轮换 → 降级，E3）。
+    pub sha256: Option<String>,
+    /// 备用源 URL（主源探测/校验失败兕底，E2/E3）。http(s):// 前缀校验同主源。
+    pub backup_url: Option<String>,
+    /// 备用源 md5 校验目标（32 位十六进制）。必须与 backup_url 成对（单独给 md5
+    /// 无处安放）；主源校验失败切备用源时由引擎既有身份切换逻辑接管。
+    pub backup_md5: Option<String>,
+    /// 用户显式落盘名（V3 语义：非法即拒；None = 引擎派生链 E4：CD → URL 末段 → 兕底）。
+    pub name: Option<String>,
+}
+
+/// 校验和归一：小写化（引擎端 sha256/md5 摘要格式化为小写 hex，入参大写需归一后参与比较）。
+fn normalize_digest(s: &str) -> String {
+    s.trim().to_ascii_lowercase()
+}
+
+fn is_hex_digest(s: &str, len: usize) -> bool {
+    s.len() == len && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+impl AddHttpOpts {
+    /// 入参校验（add 入队前，错误定性 InvalidSource → 400）：
+    /// 校验和格式 / 备用源前缀 / header 名值合法性 / 显式名 V3 终审。
+    fn validate(&self) -> Result<(), String> {
+        if let Some(s) = &self.sha256 {
+            let s = normalize_digest(s);
+            if !is_hex_digest(&s, 64) {
+                return Err(format!("sha256 必须是 64 位十六进制: {s:?}"));
+            }
+        }
+        if let Some(m) = &self.backup_md5 {
+            if self.backup_url.is_none() {
+                return Err("backup_md5 必须与 backup_url 成对提供".into());
+            }
+            let m = normalize_digest(m);
+            if !is_hex_digest(&m, 32) {
+                return Err(format!("backup_md5 必须是 32 位十六进制: {m:?}"));
+            }
+        }
+        if let Some(u) = &self.backup_url {
+            if !u.starts_with("http://") && !u.starts_with("https://") {
+                return Err(format!("backup_url 仅支持 http(s)://: {u:?}"));
+            }
+        }
+        for (k, v) in &self.headers {
+            if k.is_empty() || k.contains(':') || k.contains('\r') || k.contains('\n') {
+                return Err(format!("header 名非法: {k:?}"));
+            }
+            if v.contains('\r') || v.contains('\n') {
+                return Err(format!("header 值不得含换行: {k:?}"));
+            }
+        }
+        if let Some(n) = &self.name {
+            // V3 终审提前：引擎同函数拒，这里先拒避免错误信息隔着 Engine 包装
+            smart_dl_core::session::output::sanitize_rel(n)
+                .map_err(|e| format!("name 非法: {e}"))?;
+        }
+        Ok(())
     }
 }
 
@@ -793,33 +870,33 @@ impl DaemonState {
         link: String,
         dest_root: Option<String>,
     ) -> Result<TaskId, DaemonError> {
-        self.add_link_task_opts(link, dest_root, false, None).await
+        self.add_link_task_opts(link, dest_root, AddHttpOpts::default())
+            .await
     }
 
     /// 顺序下载变体：`sequential` 写入任务（HTTP=在飞窗口；BT=sequential
     /// flag；其余引擎忽略）。引擎 add 后对 BT 任务立即下发（handle 级 flag，
     /// metadata 未就绪也可设）。
     /// 任务级代理（E5）：仅 HTTP 任务生效；magnet/ed2k 等任务忽略该字段。
+    /// 链接任务创建（E6 opts 收口）：HTTP 分支整体透传 `AddHttpOpts`；
+    /// magnet 分支仅取 `sequential`（其余字段对 BT 无语义，静默忽略）；
+    /// ed2k/ftp/xunlei 分支不受影响。
     pub async fn add_link_task_opts(
         &self,
         link: String,
         dest_root: Option<String>,
-        sequential: bool,
-        proxy: Option<String>,
+        opts: AddHttpOpts,
     ) -> Result<TaskId, DaemonError> {
         match normalize_user_link(&link) {
-            NormalizedSource::Http(real) => {
-                self.add_http_task_opts(real, dest_root, sequential, proxy)
-                    .await
-            }
+            NormalizedSource::Http(real) => self.add_http_task_opts(real, dest_root, opts).await,
             NormalizedSource::Magnet(m) => {
                 #[cfg(feature = "bt")]
                 {
-                    return self.add_bt_task_opts(m, dest_root, sequential).await;
+                    return self.add_bt_task_opts(m, dest_root, opts.sequential).await;
                 }
                 #[cfg(not(feature = "bt"))]
                 {
-                    let _ = sequential;
+                    let _ = opts.sequential;
                     Err(DaemonError::InvalidSource(format!(
                         "magnet 需 BT 引擎（编译时启用 --features daemon/bt）: {m}"
                     )))
@@ -1292,25 +1369,34 @@ impl DaemonState {
         url: String,
         dest_root: Option<String>,
     ) -> Result<TaskId, DaemonError> {
-        self.add_http_task_opts(url, dest_root, false, None).await
+        self.add_http_task_opts(url, dest_root, AddHttpOpts::default())
+            .await
     }
 
-    /// 顺序下载变体：`sequential` 写入任务（HTTP 引擎在飞段窗口收紧）。
-    /// 任务级代理（E5）：`proxy` = `http(s)://` / `socks5://` / `socks4://`，可带
-    /// `user:pass@`；None = 走引擎共享 client（可能含全局 `[download] proxy`）。
-    /// 非法代理 URL（reqwest 无法解析）在入队前即拒（InvalidSource → 400）。
+    /// 创建 HTTP 任务（E6 opts 收口）：sequential/proxy（E5）+ headers/auth/
+    /// sha256/backup_url+backup_md5/name（E6 新暴露）。入参校验（E6 validate +
+    /// E5 代理构建试水）在探测/建任务之前——远端不可达 ≠ 入参非法，分开定性。
     pub async fn add_http_task_opts(
         &self,
         url: String,
         dest_root: Option<String>,
-        sequential: bool,
-        proxy: Option<String>,
+        opts: AddHttpOpts,
     ) -> Result<TaskId, DaemonError> {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Err(DaemonError::InvalidSource(url));
         }
+        opts.validate().map_err(DaemonError::InvalidSource)?;
+        let AddHttpOpts {
+            sequential,
+            proxy,
+            headers,
+            basic_auth,
+            sha256,
+            backup_url,
+            backup_md5,
+            name,
+        } = opts;
         // E5：任务级代理 URL 校验（构建一次 client 试水，成功即合法）。
-        // 校验在探测/建任务之前——远端不可达≠代理非法，两者分开定性。
         if let Some(p) = &proxy {
             if p.is_empty() {
                 return Err(DaemonError::InvalidSource("proxy 不能为空字符串".into()));
@@ -1318,6 +1404,9 @@ impl DaemonState {
             smart_dl_httpdl::build_proxied_client(p)
                 .map_err(|e| DaemonError::InvalidSource(format!("proxy 非法 {p:?}: {e}")))?;
         }
+        // 校验和归一（引擎端摘要为小写 hex；trim 防复制粘贴带空白）
+        let sha256 = sha256.map(|s| normalize_digest(&s));
+        let backup_md5 = backup_md5.map(|s| normalize_digest(&s));
         // B10：目标目录预检（创建/可写）；HTTP 大小在响应头才知 → 空间预检跳过
         // dest 未指定 → 默认落盘目录（serve 配置 dest_root；未注入时为 daemon cwd）
         let def = self.default_dest_root.lock().to_string_lossy().into_owned();
@@ -1350,16 +1439,16 @@ impl DaemonState {
             canonical_id: canonical,
             source: DownloadSource::Http {
                 url: url.clone(),
-                headers: vec![],
-                auth: None,
-                backup_url: None,
+                headers,
+                auth: basic_auth.map(|(u, p)| Auth::Basic(u, p)),
+                backup_url,
                 proxy: proxy.clone(),
             },
             identity: ContentIdentity::SingleFile {
                 size: 0,
                 etag: None,
-                sha256: None,
-                backup_md5: None,
+                sha256,
+                backup_md5,
             },
             dest_root: dest_root.clone(),
             files: vec![],
@@ -1371,7 +1460,7 @@ impl DaemonState {
             file_priorities: None,
             sequential,
             metadata: TaskMetadata {
-                name: None,
+                name,
                 added_at_unix: 0,
             },
             limits: None,
@@ -4582,8 +4671,10 @@ mod task_proxy_tests {
                 .add_http_task_opts(
                     "https://example.com/f.bin".into(),
                     None,
-                    false,
-                    Some(bad.to_string()),
+                    AddHttpOpts {
+                        proxy: Some(bad.to_string()),
+                        ..Default::default()
+                    },
                 )
                 .await;
             match r {
@@ -4604,8 +4695,10 @@ mod task_proxy_tests {
             .add_http_task_opts(
                 "https://example.com/f.bin".into(),
                 None,
-                false,
-                Some("http://127.0.0.1:8080".into()),
+                AddHttpOpts {
+                    proxy: Some("http://127.0.0.1:8080".into()),
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -4630,5 +4723,168 @@ mod task_proxy_tests {
             DownloadSource::Http { proxy, .. } => assert!(proxy.is_none()),
             other => panic!("source 应为 Http: {other:?}"),
         }
+    }
+}
+
+/// E6 AddHttpOpts：API 新暴露字段（headers/auth/sha256/backup/name）落任务
+/// 记录 + 入参校验（FakeEngine 不联网）。
+#[cfg(test)]
+mod add_opts_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn add_opts_fields_land_in_task_record() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task_opts(
+                "https://example.com/f.bin".into(),
+                None,
+                AddHttpOpts {
+                    sequential: true,
+                    proxy: Some("socks5://127.0.0.1:1080".into()),
+                    headers: vec![
+                        ("Referer".into(), "https://ref.example".into()),
+                        ("X-Token".into(), "abc".into()),
+                    ],
+                    basic_auth: Some(("user".into(), "pass".into())),
+                    // 大写 + 首尾空白：断言小写归一
+                    sha256: Some(
+                        " ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789 ".into(),
+                    ),
+                    backup_url: Some("https://backup.example/f.bin".into()),
+                    backup_md5: Some("ABCDEF0123456789ABCDEF0123456789".into()),
+                    name: Some("explicit-name.bin".into()),
+                },
+            )
+            .await
+            .unwrap();
+        let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+        assert!(rec.task.sequential, "sequential 应落任务");
+        match &rec.task.source {
+            DownloadSource::Http {
+                headers,
+                auth,
+                backup_url,
+                proxy,
+                ..
+            } => {
+                assert_eq!(headers.len(), 2, "headers 应原序落 source");
+                assert_eq!(headers[0].0, "Referer");
+                assert_eq!(
+                    auth.as_ref(),
+                    Some(&Auth::Basic("user".into(), "pass".into()))
+                );
+                assert_eq!(backup_url.as_deref(), Some("https://backup.example/f.bin"));
+                assert_eq!(proxy.as_deref(), Some("socks5://127.0.0.1:1080"));
+            }
+            other => panic!("source 应为 Http: {other:?}"),
+        }
+        match &rec.task.identity {
+            ContentIdentity::SingleFile {
+                sha256, backup_md5, ..
+            } => {
+                assert_eq!(
+                    sha256.as_deref(),
+                    Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"),
+                    "sha256 大写+空白应小写归一"
+                );
+                assert_eq!(
+                    backup_md5.as_deref(),
+                    Some("abcdef0123456789abcdef0123456789"),
+                    "backup_md5 大写应小写归一"
+                );
+            }
+            other => panic!("identity 应为 SingleFile: {other:?}"),
+        }
+        assert_eq!(
+            rec.task.metadata.name.as_deref(),
+            Some("explicit-name.bin"),
+            "显式名应落 metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn add_opts_validation_rejects_bad_input() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = Arc::new(DaemonState::new(fake.clone(), vec![]));
+        let cases: Vec<(AddHttpOpts, &str)> = vec![
+            (
+                AddHttpOpts {
+                    sha256: Some("ab".repeat(31)), // 63 hex
+                    ..Default::default()
+                },
+                "sha256",
+            ),
+            (
+                AddHttpOpts {
+                    sha256: Some("g".repeat(64)), // 非 hex
+                    ..Default::default()
+                },
+                "sha256",
+            ),
+            (
+                AddHttpOpts {
+                    backup_md5: Some("a".repeat(32)), // 无 backup_url
+                    ..Default::default()
+                },
+                "成对",
+            ),
+            (
+                AddHttpOpts {
+                    backup_url: Some("https://b.example/f".into()),
+                    backup_md5: Some("a".repeat(31)),
+                    ..Default::default()
+                },
+                "backup_md5",
+            ),
+            (
+                AddHttpOpts {
+                    backup_url: Some("ftp://b.example/f".into()),
+                    ..Default::default()
+                },
+                "backup_url",
+            ),
+            (
+                AddHttpOpts {
+                    headers: vec![("X-Bad:Header".into(), "v".into())],
+                    ..Default::default()
+                },
+                "header",
+            ),
+            (
+                AddHttpOpts {
+                    headers: vec![("".into(), "v".into())],
+                    ..Default::default()
+                },
+                "header",
+            ),
+            (
+                AddHttpOpts {
+                    headers: vec![("X-Ok".into(), "v\ninjected".into())],
+                    ..Default::default()
+                },
+                "换行",
+            ),
+            (
+                AddHttpOpts {
+                    name: Some("../escape.bin".into()),
+                    ..Default::default()
+                },
+                "name",
+            ),
+        ];
+        for (opts, tag) in cases {
+            let r = state
+                .add_http_task_opts("https://example.com/f.bin".into(), None, opts)
+                .await;
+            match r {
+                Err(DaemonError::InvalidSource(m)) => {
+                    assert!(m.contains(tag), "错误信息应定性 {tag}: {m}");
+                }
+                other => panic!("非法入参（{tag}）必须 InvalidSource 拒绝: {other:?}"),
+            }
+        }
+        assert!(fake.added().is_empty(), "被拒任务不得进入引擎");
     }
 }
