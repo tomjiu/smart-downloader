@@ -576,3 +576,167 @@ async fn file_priority_index_out_of_range_400() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
+
+// ============ 持久化 + 恢复重放（P1-3：file_priorities 生命周期）============
+
+/// serve_bt 的外置目录变体：save = dir（调用方持有 tempdir 保活），可选注入
+/// tasks.json 持久化路径——重启恢复 e2e 用（serve_bt 的内嵌 tempdir 会随函数
+/// 返回被删除，无法跨"重启"复用落盘目录）。
+async fn serve_bt_in(
+    dir: &std::path::Path,
+    store: Option<std::path::PathBuf>,
+) -> (std::net::SocketAddr, Arc<DaemonState>, std::path::PathBuf) {
+    let save = dir.to_path_buf();
+    let bt = smart_dl_daemon::bt::BtEngine::new(&save, None, 0, 0, false, false, false).unwrap();
+    let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
+    let mut state = smart_dl_daemon::state::DaemonState::new(Arc::new(http), vec![])
+        .with_dest_root(save.clone())
+        .with_bt(Arc::new(bt));
+    if let Some(p) = store {
+        state = state.with_storage(p);
+    }
+    let state = Arc::new(state);
+    let app = http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (addr, state, save)
+}
+
+#[tokio::test]
+async fn file_priority_persisted_and_replayed_after_restart() {
+    // 全生命周期 e2e：设置优先级 → tasks.json 落盘 file_priorities →
+    // "重启"（新 BtEngine + restore_from）→ metadata 就绪任务立即重放 →
+    // 引擎侧 readback 收敛到持久化值。
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("tasks.json");
+    let client = reqwest::Client::new();
+    let tid;
+
+    // —— 第一次"运行"：add torrent（metadata 即时就绪）→ 设 file 0 = 0（skip）
+    {
+        let (addr, _state, _save) = serve_bt_in(dir.path(), Some(store.clone())).await;
+        let base = format!("http://{addr}");
+
+        let resp = client
+            .post(format!("{base}/tasks"))
+            .json(&serde_json::json!({ "torrent_b64": minimal_torrent_b64() }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+        tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let resp = client
+            .post(format!("{base}/tasks/{tid}/files/priority"))
+            .json(&serde_json::json!({ "priorities": [ { "index": 0, "priority": 0 } ] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+        // 异步记账 → 轮询收敛 [0]
+        let mut converged = false;
+        for _ in 0..40 {
+            let resp = client
+                .post(format!("{base}/tasks/{tid}/files/priority"))
+                .json(&serde_json::json!({ "priorities": [] }))
+                .send()
+                .await
+                .unwrap();
+            if resp.json::<serde_json::Value>().await.unwrap()["priorities"]
+                == serde_json::json!([0])
+            {
+                converged = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(converged, "首设优先级必须收敛为 [0]");
+
+        // tasks.json 落盘 file_priorities（autosave 在 set 后触发；pretty JSON → 解析断言）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            if let Ok(text) = std::fs::read_to_string(&store) {
+                let persisted = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| {
+                        v.as_array().map(|a| {
+                            a.iter()
+                                .any(|t| t["task"]["file_priorities"] == serde_json::json!([0]))
+                        })
+                    })
+                    .unwrap_or(false);
+                if persisted {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "tasks.json 必须持久化 file_priorities"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        // client/_state 在块尾 drop：模拟进程退出（session 关闭）
+    }
+
+    // —— "重启"：新 session（同 save 目录）+ restore_from → 立即重放
+    let bt2 =
+        smart_dl_daemon::bt::BtEngine::new(dir.path(), None, 0, 0, false, false, false).unwrap();
+    let http2 = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
+    let state2 = Arc::new(
+        smart_dl_daemon::state::DaemonState::new(Arc::new(http2), vec![])
+            .with_dest_root(dir.path().to_path_buf())
+            .with_bt(Arc::new(bt2)),
+    );
+    let n = state2.restore_from(&store).await.unwrap();
+    assert_eq!(n, 1, "应恢复 1 条任务");
+
+    // 重启后的 state2 拉起 HTTP（快照/readback 走公开 API）
+    let app = http::router(state2.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr2 = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base2 = format!("http://{addr2}");
+
+    // 快照透出恢复记录的持久化优先级表（TaskSnapshot.file_priorities）
+    let snap: serde_json::Value = client
+        .get(format!("{base2}/tasks/{tid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        snap["file_priorities"],
+        serde_json::json!([0]),
+        "恢复记录必须保留持久化的优先级表: {snap}"
+    );
+
+    // 引擎侧 readback 收敛到持久化值 [0]（file priority 异步记账 → 轮询；
+    // 空 priorities 列表 = 纯 readback）
+    let mut replayed = false;
+    for _ in 0..40 {
+        let resp = client
+            .post(format!("{base2}/tasks/{tid}/files/priority"))
+            .json(&serde_json::json!({ "priorities": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        if resp.json::<serde_json::Value>().await.unwrap()["priorities"] == serde_json::json!([0]) {
+            replayed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(replayed, "重启后优先级必须重放收敛为 [0]");
+}

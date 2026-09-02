@@ -274,6 +274,15 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     let _http_events_handle =
         crate::http_events::spawn_http_events(state_arc.clone(), Duration::from_secs(2));
 
+    // 4c++. 子文件优先级重放循环（P1-3）：magnet 恢复任务 metadata 就绪后
+    // 延迟下发持久化的 file_priorities（pending 集合收敛；非 bt 构建无 BT 任务
+    // 挂起，空转无害——但仍按 feature 门控避免无谓任务）
+    #[cfg(feature = "bt")]
+    let _prio_replay_handle = crate::bt_events::spawn_file_priority_replay_loop(
+        state_arc.clone(),
+        Duration::from_secs(2),
+    );
+
     // 4d. #6 TOML 热重载：5s 轮询配置文件内容变更 → 解析 → refresh_config
     // （默认落盘目录 + /config 快照刷新；解析失败保留旧配置并告警）。
     if let Some(path) = cfg_path {

@@ -86,3 +86,18 @@ pub fn spawn_alert_loop(
         }
     })
 }
+
+/// 子文件优先级重放循环：周期性收敛「恢复时 metadata 未就绪」挂起的优先级
+/// 任务（`DaemonState::replay_pending_file_priorities`）。pending 为空时为
+/// 纯空转检查（锁一次即返回），默认 2s 粒度对恢复场景足够。
+pub fn spawn_file_priority_replay_loop(
+    state: Arc<DaemonState>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            state.replay_pending_file_priorities().await;
+        }
+    })
+}

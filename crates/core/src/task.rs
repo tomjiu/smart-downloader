@@ -31,6 +31,13 @@ pub struct DownloadTask {
     /// 任务级限速（None = 未设置，走全局配置；旧 tasks.json 无此字段自动补 None）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limits: Option<TaskLimits>,
+    /// BT 子文件优先级表（None = 从未设置，走 libtorrent 默认 4；旧 tasks.json
+    /// 无此字段自动补 None）。Some = 用户显式设置后的**全量**优先级快照
+    /// （下标 = 文件序，与引擎侧 file storage 顺序对齐；值 0..=7，libtorrent
+    /// 语义 0=不下载 / 1=低 / 4=默认 / 7=最高）。持久化 + 恢复重放：
+    /// metadata 未就绪（magnet 恢复）时由 daemon 延迟到就绪后下发。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_priorities: Option<Vec<u32>>,
 }
 
 /// 任务级限速（KiB/s）。语义：`None` = 不调整（保持现状/走全局）；
