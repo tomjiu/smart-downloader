@@ -81,10 +81,16 @@ async fn healthy_mirror1_never_uses_mirror2() {
         .update_sources(&tid, vec![m1.url("/file"), m2.url("/file")])
         .await
         .unwrap();
-    wait_terminal(&engine, &tid).await;
+    let st = wait_terminal(&engine, &tid).await;
 
+    // 源探测韧性更新：update_sources 现并发探测全部候选 → mirror2 必然收到
+    // 1 次 Range: bytes=0-0 探测请求。本测试锁定的契约收窄为「无段数据流量」：
+    // mirror1 全好时，mirror2 除探测外不得收到任何请求（request_count ≤ 1）。
     let m2_requests = m2.request_count.load(std::sync::atomic::Ordering::SeqCst);
-    assert_eq!(m2_requests, 0, "mirror1 全好时不应触碰 mirror2");
+    assert!(
+        m2_requests <= 1,
+        "mirror1 全好时 mirror2 只允许 1 次探测请求（实际 {m2_requests}）"
+    );
 }
 
 #[tokio::test]

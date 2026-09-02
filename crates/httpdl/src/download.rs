@@ -222,7 +222,8 @@ pub async fn download_dynamic(
 }
 
 /// 更新 mirror 评分（成功 +delta / 失败惩罚，clamp [SCORE_MIN, SCORE_MAX]）。
-fn update_score(scores: &Mutex<HashMap<String, i64>>, url: &str, delta: i64) {
+/// `pub(crate)`：engine 的 update_sources 探测评分播种复用同一 clamp 口径。
+pub(crate) fn update_score(scores: &Mutex<HashMap<String, i64>>, url: &str, delta: i64) {
     let mut m = scores.lock();
     let s = m.entry(url.to_string()).or_insert(0);
     *s = (*s + delta).clamp(SCORE_MIN, SCORE_MAX);
