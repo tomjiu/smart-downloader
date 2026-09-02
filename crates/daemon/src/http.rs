@@ -46,6 +46,32 @@ pub struct AddTaskReq {
     /// 非法代理 URL → 400；BT/FTP 任务携带此字段被忽略。
     #[serde(default)]
     pub proxy: Option<String>,
+    /// 任务级自定义请求头（E6，仅 HTTP 任务生效）：随探测与全部段请求下发
+    /// （H-8 链路）；典型用途 Referer/Cookie 反防盗链。BT/FTP 任务忽略。
+    #[serde(default)]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+    /// HTTP Basic 认证用户名（E6，仅 HTTP 任务生效）。与 `password` 组合成
+    /// Basic 凭据；`password` 缺省 = 空串。BT/FTP 任务忽略。
+    #[serde(default)]
+    pub username: Option<String>,
+    /// HTTP Basic 认证密码（E6，仅 HTTP 任务生效；可空串）。
+    #[serde(default)]
+    pub password: Option<String>,
+    /// 主源内容校验目标（E6，仅 HTTP 任务生效）：64 位十六进制 sha256。
+    /// 传入后内容校验失败走既有处置链（重下 → 备用源 → 隔离试错 → 降级）。
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// 备用源 URL（E6，仅 HTTP 任务生效）：主源探测/校验失败自动兜底。
+    #[serde(default)]
+    pub backup_url: Option<String>,
+    /// 备用源 md5（E6，32 位十六进制）：必须与 `backup_url` 成对提供，
+    /// 备用源内容校验目标。
+    #[serde(default)]
+    pub backup_md5: Option<String>,
+    /// 用户显式落盘名（E6，仅 HTTP 任务生效）：非法路径 → 400；
+    /// 缺省 = 引擎派生链（Content-Disposition → URL 末段 → download.bin）。
+    #[serde(default)]
+    pub name: Option<String>,
 }
 
 #[cfg(feature = "xunlei-import")]
@@ -706,7 +732,23 @@ async fn add_task(
             );
         };
         state
-            .add_link_task_opts(url, req.dest, req.sequential, req.proxy)
+            .add_link_task_opts(
+                url,
+                req.dest,
+                crate::state::AddHttpOpts {
+                    sequential: req.sequential,
+                    proxy: req.proxy,
+                    headers: req
+                        .headers
+                        .map(|m| m.into_iter().collect())
+                        .unwrap_or_default(),
+                    basic_auth: req.username.map(|u| (u, req.password.unwrap_or_default())),
+                    sha256: req.sha256,
+                    backup_url: req.backup_url,
+                    backup_md5: req.backup_md5,
+                    name: req.name,
+                },
+            )
             .await
     };
     match result {

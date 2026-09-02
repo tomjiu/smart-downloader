@@ -987,3 +987,275 @@ async fn http_task_file_priority_conflict() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
 }
+
+// ==================== E6 add API 能力对齐（sha256/headers/name+backup） ====================
+
+use sha2::{Digest, Sha256};
+
+/// 轮询快照到终态（Completed/Error，30s 超时）。
+async fn poll_terminal(client: &reqwest::Client, base: &str, tid: &str) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let snap: serde_json::Value = client
+            .get(format!("{base}/tasks/{tid}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let st = snap["state"].as_str().unwrap_or("");
+        if st == "Completed" || st == "Failed" || st == "Error" {
+            return snap;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "任务 30s 未到终态: {snap}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// E6 主例：API 传入 sha256 → 引擎校验链生效。正确校验和 → Completed 无告警；
+/// 错误校验和 → 降级接受仍 Completed + 告警含 sha256（Q-B5 语义经 API 保持）。
+#[tokio::test]
+async fn add_task_with_sha256_e2e() {
+    let body = patterned(64 * 1024);
+    let mut hasher = Sha256::new();
+    hasher.update(&body);
+    let good = format!("{:x}", hasher.finalize());
+    let srv = TestServer::start(body).await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 正确 sha256 → Completed 无告警
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "url": srv.url(),
+            "dest": std::env::temp_dir().join(format!("e6-sha-ok-{}", std::process::id())),
+            "sha256": good,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let snap = poll_terminal(&client, &base, &tid).await;
+    assert_eq!(snap["state"], "Completed", "正确 sha256 必须完成: {snap}");
+    assert!(snap["error"].is_null(), "正确 sha256 不得告警: {snap}");
+
+    // 错误 sha256 → 降级接受（Completed）+ 告警含 sha256
+    // （第二个服务实例：同 URL 二次添加会被 canonical 查重 409）
+    let srv2 = TestServer::start(patterned(64 * 1024)).await;
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "url": srv2.url(),
+            "dest": std::env::temp_dir().join(format!("e6-sha-bad-{}", std::process::id())),
+            "sha256": "ab".repeat(32),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let snap = poll_terminal(&client, &base, &tid).await;
+    assert_eq!(
+        snap["state"], "Completed",
+        "降级接受语义（Q-B5）经 API 保持: {snap}"
+    );
+    let err = snap["error"].as_str().unwrap_or_default();
+    assert!(err.contains("sha256"), "告警应定性 sha256: {err}");
+}
+
+/// E6 headers：API 传入自定义头 → 探测/段下载全链下发（强校验服务端：缺头
+/// 即 403）。带正确头 → Completed；不带 → 任务 Failed（探测即拒）。
+#[tokio::test]
+async fn add_task_with_headers_forwarded_e2e() {
+    use axum::extract::Request;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    use axum::routing;
+    use axum::Router;
+
+    let app = Router::new().fallback(routing::any(|req: Request| async move {
+        let ok = req
+            .headers()
+            .get("x-test-token")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "s3cret-token")
+            .unwrap_or(false);
+        if !ok {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        let body = vec![0x5Au8; 256 * 1024];
+        let total = body.len() as u64;
+        // Range 支持（206）：引擎段请求带 bytes=start-end，必须切回 206
+        let range = req
+            .headers()
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("bytes="))
+            .and_then(|v| v.split_once('-'))
+            .and_then(|(s, e)| Some((s.parse::<u64>().ok()?, e.parse::<u64>().ok()?)));
+        if let Some((s, e)) = range {
+            let e = e.min(total - 1);
+            let payload = body[s as usize..=(e as usize)].to_vec();
+            return axum::response::Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header("content-range", format!("bytes {s}-{e}/{total}"))
+                .body(axum::body::Body::from(payload))
+                .unwrap()
+                .into_response();
+        }
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-length", body.len())
+            .body(axum::body::Body::from(body))
+            .unwrap()
+            .into_response()
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let url = format!("http://{addr}/guarded.bin");
+
+    let (saddr, _state) = serve().await;
+    let base = format!("http://{saddr}");
+    let client = reqwest::Client::new();
+
+    // 带正确头 → 完成
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "url": url,
+            "dest": std::env::temp_dir().join(format!("e6-hdr-ok-{}", std::process::id())),
+            "headers": { "X-Test-Token": "s3cret-token" },
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let snap = poll_terminal(&client, &base, &tid).await;
+    assert_eq!(snap["state"], "Completed", "带正确头必须完成: {snap}");
+
+    // 不带头 → 探测 403 → 任务失败（第二个服务实例：同 URL 二次添加会 canonical 409）
+    let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr2 = listener2.local_addr().unwrap();
+    let app2 = Router::new().fallback(routing::any(|req: Request| async move {
+        let ok = req
+            .headers()
+            .get("x-test-token")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v == "s3cret-token")
+            .unwrap_or(false);
+        if !ok {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        let body = vec![0x5Au8; 4096];
+        let total = body.len() as u64;
+        let range = req
+            .headers()
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("bytes="))
+            .and_then(|v| v.split_once('-'))
+            .and_then(|(s, e)| Some((s.parse::<u64>().ok()?, e.parse::<u64>().ok()?)));
+        if let Some((s, e)) = range {
+            let e = e.min(total - 1);
+            let payload = body[s as usize..=(e as usize)].to_vec();
+            return axum::response::Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header("content-range", format!("bytes {s}-{e}/{total}"))
+                .body(axum::body::Body::from(payload))
+                .unwrap()
+                .into_response();
+        }
+        axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-length", body.len())
+            .body(axum::body::Body::from(body))
+            .unwrap()
+            .into_response()
+    }));
+    tokio::spawn(async move {
+        axum::serve(listener2, app2).await.unwrap();
+    });
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "url": format!("http://{addr2}/guarded.bin"),
+            "dest": std::env::temp_dir().join(format!("e6-hdr-miss-{}", std::process::id())),
+        }))
+        .send()
+        .await
+        .unwrap();
+    // 引擎 add 探测失败 → add 返回错误（400/500 视错误映射），任务不创建或创建即失败
+    let status = resp.status();
+    if status == reqwest::StatusCode::CREATED {
+        // 若实现为创建后失败，轮询到终态断言 Failed/Error
+        let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let snap = poll_terminal(&client, &base, &tid).await;
+        assert_ne!(snap["state"], "Completed", "缺头（403）不得完成: {snap}");
+    } else {
+        assert!(
+            status == reqwest::StatusCode::BAD_REQUEST
+                || status == reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "探测失败应拒绝建任务: {status}"
+        );
+    }
+}
+
+/// E6 name + backup_url：主源 404 → 备用源兜底完成（E2 引擎语义经 API）；
+/// 显式名落盘（E4 metadata.name 权威）。
+#[tokio::test]
+async fn add_task_with_name_and_backup_url_e2e() {
+    let body = patterned(64 * 1024);
+    let srv = TestServer::start(body).await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let dest = std::env::temp_dir().join(format!("e6-backup-{}", std::process::id()));
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            // /missing 路径 TestServer 未注册 → 404 → 主源探测失败 → 备用源兜底
+            "url": format!("http://{}/missing", srv.addr),
+            "dest": dest,
+            "backup_url": srv.url(),
+            "name": "renamed-by-api.bin",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let snap = poll_terminal(&client, &base, &tid).await;
+    assert_eq!(
+        snap["state"], "Completed",
+        "主源 404 + 备用源兜底必须完成: {snap}"
+    );
+    let got = std::fs::read(dest.join("renamed-by-api.bin")).unwrap();
+    assert_eq!(got.len(), 64 * 1024, "落盘应为备用源内容（显式名落位）");
+}
