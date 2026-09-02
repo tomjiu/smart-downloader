@@ -12,6 +12,8 @@
 *.profraw
 *.profdata
 download.bin.part
+download.bin.part.progress
+download.bin.part.etag
 crates/daemon/download.bin
 scripts/research/captures/
 scripts/research/cloud_delivery/
