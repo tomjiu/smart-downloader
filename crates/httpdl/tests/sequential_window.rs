@@ -161,12 +161,14 @@ async fn sequential_caps_inflight_segments() {
         &client,
         &part,
         SIZE,
-        0,
         16 * MB,
         &mirrors,
         Arc::new(RateLimiter::new(0)),
         None,
         true,
+        None,
+        None,
+        None,
     )
     .await;
     assert!(r.is_ok(), "顺序下载应成功: {r:?}");
@@ -194,12 +196,14 @@ async fn parallel_runs_full_workers() {
         &client,
         &part,
         SIZE,
-        0,
         16 * MB,
         &mirrors,
         Arc::new(RateLimiter::new(0)),
         None,
         false,
+        None,
+        None,
+        None,
     )
     .await;
     assert!(r.is_ok(), "并行下载应成功: {r:?}");

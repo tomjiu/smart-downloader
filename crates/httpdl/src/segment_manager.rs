@@ -1,10 +1,16 @@
 //! 动态分段管理器（P0，方案A核心）：维护 pending/done 区间，
 //! worker 按 FIFO 动态领取段，粒度 `min_split`（默认 16MB），
-//! 支持续传偏移（跳过 [0, offset) 视为已下载）。
+//! 支持续传（两种凭据：前缀偏移 `new`；段账本 `new_with_done`）。
 //!
 //! 参考 aria2 SegmentMan 的按需领取机制（不引入 Piece/BitfieldMan 双层）。
 //! 失败语义：段全源失败即整体 Err（由 download_dynamic 处理），
 //! 本管理器不做段回收；release 接口 P1 预留。
+//!
+//! P4 演进：pending 从单游标改为段队列——账本恢复场景的已完成段不在
+//! 前缀位置（FIFO 中段完成），必须按队列跳过。`complete` 同步记录
+//! done 区间（账本持久化数据源）。
+
+use std::collections::VecDeque;
 
 /// 段（闭区间 [start, end]，长度 = end - start + 1）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -26,58 +32,96 @@ impl Segment {
 /// P0 默认最小段粒度（16MB）。
 pub const DEFAULT_MIN_SPLIT: u64 = 16 * 1024 * 1024;
 
-/// 动态分段管理器（内部仅持有一个 FIFO 游标 + 已下载字节统计；
-/// 领取按序 → 天然无重叠，done 区间合并无需分段维护）。
+/// 动态分段管理器：pending 段队列（FIFO 领取 → 天然无重叠）+
+/// 已完成段区间（账本持久化数据源）+ 已下载字节统计。
 pub struct SegmentManager {
     total: u64,
-    /// 最小段粒度（字节）。
-    min_split: u64,
-    /// 下一个待领取段起点（FIFO；初始 = 续传起点 offset）。
-    next: u64,
-    /// 已下载字节数（含续传偏移）。
+    /// 待领取段队列（FIFO）。
+    pending: VecDeque<Segment>,
+    /// 已下载字节数（含续传凭据折算）。
     done_bytes: u64,
+    /// 已完成段区间（升序；`new` 偏移路径不记前缀，`new_with_done` 记全量）。
+    done_ranges: Vec<(u64, u64)>,
 }
 
 impl SegmentManager {
-    /// `offset` = 续传起点（0 = 全新下载）。`min_split` <= 0 时用默认 16MB。
+    /// `offset` = 续传起点（0 = 全新下载；跳过 [0, offset) 视为已下载）。
+    /// `min_split` <= 0 时用默认 16MB。兼容旧前缀续传语义。
     pub fn new(total: u64, offset: u64, min_split: u64) -> Self {
-        let offset = offset.min(total);
+        let min_split = if min_split == 0 {
+            DEFAULT_MIN_SPLIT
+        } else {
+            min_split
+        };
+        let mut pending = VecDeque::new();
+        let mut next = offset.min(total);
+        while next < total {
+            let end = (next + min_split - 1).min(total - 1);
+            pending.push_back(Segment { start: next, end });
+            next = end + 1;
+        }
         SegmentManager {
             total,
-            min_split: if min_split == 0 {
-                DEFAULT_MIN_SPLIT
-            } else {
-                min_split
-            },
-            next: offset,
-            done_bytes: offset,
+            pending,
+            done_bytes: offset.min(total),
+            done_ranges: Vec::new(),
         }
+    }
+
+    /// 段账本恢复：按 `min_split` 粒度生成 [0, total) 的 FIFO 段计划，
+    /// 剔除 `done` 中已完成的段（须与计划严格对齐，未匹配的区间按待下处理）。
+    /// 完成段计入 done_bytes 与 done_ranges（账本回写保持完整视图）。
+    pub fn new_with_done(total: u64, min_split: u64, done: &[(u64, u64)]) -> Self {
+        let min_split = if min_split == 0 {
+            DEFAULT_MIN_SPLIT
+        } else {
+            min_split
+        };
+        let mut m = SegmentManager {
+            total,
+            pending: VecDeque::new(),
+            done_bytes: 0,
+            done_ranges: Vec::new(),
+        };
+        let mut k = 0u64;
+        while k * min_split < total {
+            let s = k * min_split;
+            let e = (s + min_split).min(total) - 1;
+            k += 1;
+            if done.contains(&(s, e)) {
+                m.done_ranges.push((s, e));
+                m.done_bytes += e - s + 1;
+            } else {
+                m.pending.push_back(Segment { start: s, end: e });
+            }
+        }
+        m
     }
 
     /// FIFO 领取下一段；全部领完 → None。
     pub fn take_segment(&mut self) -> Option<Segment> {
-        if self.next >= self.total {
-            return None;
-        }
-        let start = self.next;
-        let end = (start + self.min_split - 1).min(self.total - 1);
-        self.next = end + 1;
-        Some(Segment { start, end })
+        self.pending.pop_front()
     }
 
-    /// 段下载完成：累加字节数。
+    /// 段下载完成：累加字节数并记录区间（账本数据源）。
     pub fn complete(&mut self, seg: Segment) {
         self.done_bytes += seg.len();
+        self.done_ranges.push((seg.start, seg.end));
     }
 
-    /// 已下载字节数（含续传偏移）。
+    /// 已下载字节数（含续传凭据折算）。
     pub fn done_bytes(&self) -> u64 {
         self.done_bytes
     }
 
-    /// 剩余待下载字节数。
+    /// 剩余待领取字节数。
     pub fn pending_bytes(&self) -> u64 {
-        self.total - self.next
+        self.pending.iter().map(|s| s.len()).sum()
+    }
+
+    /// 已完成段区间（账本回写用）。
+    pub fn done_ranges(&self) -> &[(u64, u64)] {
+        &self.done_ranges
     }
 
     pub fn total(&self) -> u64 {
@@ -170,6 +214,53 @@ mod tests {
             })
         );
         assert_eq!(m.take_segment(), None);
+    }
+
+    #[test]
+    fn new_with_done_skips_completed_segments() {
+        // 账本恢复：64MB/16MB → 4 段，中间两段已完成 → 只领取首尾
+        let ms = 16 * MB;
+        let done = vec![(ms, 2 * ms - 1), (2 * ms, 3 * ms - 1)];
+        let mut m = SegmentManager::new_with_done(64 * MB, ms, &done);
+        assert_eq!(m.done_bytes(), 2 * ms, "恢复段计入已完成");
+        assert_eq!(m.pending_bytes(), 2 * ms);
+        assert_eq!(
+            m.take_segment(),
+            Some(Segment {
+                start: 0,
+                end: ms - 1
+            })
+        );
+        assert_eq!(
+            m.take_segment(),
+            Some(Segment {
+                start: 3 * ms,
+                end: 4 * ms - 1
+            })
+        );
+        assert_eq!(m.take_segment(), None);
+        // complete 记录区间（账本回写视图完整：恢复段 + 本次完成段）
+        m.complete(Segment {
+            start: 0,
+            end: ms - 1,
+        });
+        assert_eq!(m.done_ranges().len(), 3);
+    }
+
+    #[test]
+    fn new_with_done_unmatched_ranges_stay_pending() {
+        // 与计划不对齐的 done 条目（未经 validate 的直接调用方）按待下处理
+        let ms = 16 * MB;
+        let done = vec![(3, 100)];
+        let mut m = SegmentManager::new_with_done(2 * ms, ms, &done);
+        assert_eq!(m.pending_bytes(), 2 * ms, "未匹配段不折算已完成");
+        assert_eq!(
+            m.take_segment(),
+            Some(Segment {
+                start: 0,
+                end: ms - 1
+            })
+        );
     }
 
     #[test]

@@ -1,14 +1,23 @@
 //! 动态分段下载器（P0，方案A）：worker 池经 SegmentManager 按 FIFO 动态领取
 //! 段，段内流式写盘（seek+write，段不相交 → 并发写无锁）。
 //! 失败语义：任一段全 mirror 失败 → 整体 Err（不做部分成功利用，P0 约定）。
+//!
+//! P4 演进：
+//! - **段账本**：每段完成后原子写 `<part>.progress`（已完成段区间），
+//!   断点续传真源与下载过程同生共死（进程崩溃最多丢一个在飞段）。
+//! - **真暂停**：`pause` 标志在段边界检查——置位后不再领取新段，在飞段
+//!   收尾后返回 `Paused`（调用方不得对 Paused 结果做校验/落位）。
+//! - **进度回调**：每段完成回报全局已下载字节（引擎透传到 status）。
 
+use crate::ledger::{self, Ledger};
 use crate::rate::RateLimiter;
 use crate::segment_manager::SegmentManager;
 use crate::static_split::segment_count;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// Mirror 评分 clamp 边界（防单个坏源被无限惩罚/好源无限膨胀）。
@@ -20,24 +29,57 @@ const SCORE_MIN: i64 = -4;
 /// 在单连接流式与多连接吞吐间取平衡（TCP 窗口填充仍有余量）。
 pub const SEQUENTIAL_WINDOW: usize = 2;
 
+/// 段账本句柄：恢复已完成段 + 下载中逐段持久化进度。
+#[derive(Clone, Debug)]
+pub struct DynamicLedger {
+    /// 账本落盘路径（`<part>.progress`）。
+    pub path: PathBuf,
+    /// 内容一致性 token（随每笔账本写入持久化，供下次 add 决策）。
+    pub etag: Option<String>,
+    /// 本 session 段粒度（恢复场景必须沿用账本记录的粒度，保证段对齐）。
+    pub min_split: u64,
+    /// 已完成段（恢复起点；闭区间升序）。
+    pub done: Vec<(u64, u64)>,
+}
+
+/// download_dynamic 结局：`Completed` = 全部落位（可校验/落位）；
+/// `Paused` = 暂停退出（在飞段已收尾并记账，调用方不得 finalize）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DynamicOutcome {
+    Completed,
+    Paused,
+}
+
+/// worker 退出原因。
+enum WorkerExit {
+    /// 队列领空（正常收工）。
+    Drained,
+    /// 暂停标志置位（段边界退出）。
+    Paused,
+}
+
 /// 动态分段下载：worker 数 N=clamp(total/64MB, 2, 8)，段粒度 min_split。
-/// `offset` = 续传起点（跳过 [0, offset)，由调用方续传决策给出）。
+/// `ledger` = Some 时从已完成段恢复并逐段持久化进度（None = 一次性下载，
+/// 不落账本）。`pause` = Some 时段边界检查暂停标志。`progress` = 每段完成
+/// 后回报全局已下载字节（含恢复凭据折算）。
 /// 任一段全源失败 → Err（调用方决定重试/报错）。`limiter` 跨段共享（0 = 不限）。
 /// `scores` = 可选 Mirror 加权评分表（None = 不评分，纯按 mirrors 顺序）。
 /// `sequential` = 顺序下载：在飞段数收紧到 `SEQUENTIAL_WINDOW`（false = 不限）。
-/// 参数均为同层语义字段，聚合结构体反而增加调用方样板 → 允许 9 参。
+/// 参数均为同层语义字段，聚合结构体反而增加调用方样板 → 允许 11 参。
 #[allow(clippy::too_many_arguments)]
 pub async fn download_dynamic(
     client: &reqwest::Client,
     part: &Path,
     total: u64,
-    offset: u64,
     min_split: u64,
     mirrors: &[String],
     limiter: Arc<RateLimiter>,
     scores: Option<Arc<Mutex<HashMap<String, i64>>>>,
     sequential: bool,
-) -> Result<(), String> {
+    ledger_handle: Option<DynamicLedger>,
+    pause: Option<Arc<AtomicBool>>,
+    progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+) -> Result<DynamicOutcome, String> {
     // 预分配 .part（续传场景：旧 .part 保留，只写缺失段；不截断）
     let f = std::fs::OpenOptions::new()
         .create(true)
@@ -48,7 +90,17 @@ pub async fn download_dynamic(
     f.set_len(total).map_err(|e| e.to_string())?;
     drop(f);
 
-    let manager = Arc::new(Mutex::new(SegmentManager::new(total, offset, min_split)));
+    // 段管理器：账本恢复（沿用账本粒度，跳过已完成段）或全新计划
+    let manager = Arc::new(Mutex::new(match &ledger_handle {
+        Some(l) => SegmentManager::new_with_done(total, l.min_split, &l.done),
+        None => SegmentManager::new(total, 0, min_split),
+    }));
+
+    // 进度初报：恢复凭据折算的已完成字节立即可见（daemon 轮询无需等首段）
+    if let Some(p) = &progress {
+        p(manager.lock().done_bytes());
+    }
+
     // 顺序模式在飞闸门：permit 从领取前持有到 complete 后释放（RAII），
     // 失败/panic 退出路径同样随作用域释放，无泄漏。
     let seq_gate: Option<Arc<tokio::sync::Semaphore>> = if sequential {
@@ -66,8 +118,15 @@ pub async fn download_dynamic(
         let manager = manager.clone();
         let scores = scores.clone();
         let seq_gate = seq_gate.clone();
+        let ledger_handle = ledger_handle.clone();
+        let pause = pause.clone();
+        let progress = progress.clone();
         workers.spawn(async move {
             loop {
+                // 真暂停：段边界检查——置位后不再领取新段（在飞段收尾即退出）
+                if pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst)) {
+                    return Ok::<WorkerExit, String>(WorkerExit::Paused);
+                }
                 // 顺序模式：先拿 permit 再领取段，保证「在飞段数 ≤ 窗口」
                 // （先领后等会导致窗口外表内的段已占用 FIFO 游标）。
                 let _permit = match &seq_gate {
@@ -83,7 +142,7 @@ pub async fn download_dynamic(
                     let mut m = manager.lock();
                     match m.take_segment() {
                         Some(s) => s,
-                        None => return Ok::<(), String>(()),
+                        None => return Ok::<WorkerExit, String>(WorkerExit::Drained),
                     }
                 };
                 let mut ok = false;
@@ -110,15 +169,35 @@ pub async fn download_dynamic(
                         seg.start, seg.end
                     ));
                 }
-                manager.lock().complete(seg);
+                // 段完成：记账 + 账本原子落盘 + 进度回报（锁内一并完成，
+                // 保证账本视图与计数一致）
+                {
+                    let mut m = manager.lock();
+                    m.complete(seg);
+                    if let Some(l) = &ledger_handle {
+                        let snapshot = Ledger {
+                            version: ledger::LEDGER_VERSION,
+                            total,
+                            min_split: l.min_split,
+                            etag: l.etag.clone(),
+                            done: m.done_ranges().to_vec(),
+                        };
+                        ledger::save(&l.path, &snapshot);
+                    }
+                    if let Some(p) = &progress {
+                        p(m.done_bytes());
+                    }
+                }
                 drop(_permit); // 显式释放：permit 生命周期必须覆盖 complete
             }
         });
     }
-    // 任一 worker 失败 → 整体失败，取消其余
+    // 任一 worker 失败 → 整体失败，取消其余；暂停退出优先于正常收工判定
+    let mut paused = false;
     while let Some(res) = workers.join_next().await {
         match res {
-            Ok(Ok(())) => {}
+            Ok(Ok(WorkerExit::Drained)) => {}
+            Ok(Ok(WorkerExit::Paused)) => paused = true,
             Ok(Err(e)) => {
                 workers.abort_all();
                 return Err(e);
@@ -129,7 +208,10 @@ pub async fn download_dynamic(
             }
         }
     }
-    Ok(())
+    if paused {
+        return Ok(DynamicOutcome::Paused);
+    }
+    Ok(DynamicOutcome::Completed)
 }
 
 /// 更新 mirror 评分（成功 +delta / 失败惩罚，clamp [SCORE_MIN, SCORE_MAX]）。
