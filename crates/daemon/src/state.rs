@@ -16,7 +16,7 @@ use smart_dl_provider::{
     FallbackCoordinator, FallbackOutcome, HttpSink, ProviderError, ProviderRuntime, RemoteProvider,
     SinkError,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -82,6 +82,10 @@ pub struct TaskSnapshot {
     /// `DaemonState::set_task_limits`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limits: Option<smart_dl_core::task::TaskLimits>,
+    /// BT 子文件优先级表（None = 未设置走 libtorrent 默认 4；Some = 持久化
+    /// 全量快照，下标 = 文件序）。set 语义见 `DaemonState::set_task_file_priorities`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_priorities: Option<Vec<u32>>,
 }
 
 /// 列表条目。
@@ -195,6 +199,9 @@ pub struct DaemonState {
     disk_precheck_strict: bool,
     /// 生效配置快照（`GET /config` 返回；serve 注入精简字段；热重载后刷新）。
     config_snapshot: Mutex<Option<serde_json::Value>>,
+    /// 子文件优先级待重放集合（task_id）。恢复时 metadata 未就绪（magnet）
+    /// 挂入；就绪后由 replay 循环下发并移除；任务移除/引擎不支持时清理。
+    pending_file_prio: Mutex<HashSet<TaskId>>,
 }
 
 /// 持久化任务记录：`task`（含 source 原文：url/magnet/torrent 字节）+ 引擎种类。
@@ -499,6 +506,7 @@ impl DaemonState {
             http_token: None,
             disk_precheck_strict: false,
             config_snapshot: Mutex::new(None),
+            pending_file_prio: Mutex::new(HashSet::new()),
         }
     }
 
@@ -631,19 +639,37 @@ impl DaemonState {
             };
             match engine.add(&t).await {
                 Ok(tid) => {
-                    // 限速重放（best-effort）：恢复任务后把持久化的任务级限速
-                    // 重新下发引擎（原样传合并配置：BT 引擎 None 方向=不限的
+                    // 恢复期重放（best-effort）：持久化的任务级配置在恢复后原样
+                    // 下发引擎，单项失败仅记事件不阻断恢复（任务可用性优先）。
+                    let mut replay_details: Vec<String> = Vec::new();
+                    // ① 限速重放：原样传合并配置（BT 引擎 None 方向=不限的
                     // 全量快照语义；HTTP 引擎 None up=no-op 不触发方向预拒）。
-                    // 失败仅记事件不阻断恢复（任务可用性优先）。
-                    let limits_replayed = match t.limits.clone() {
-                        Some(l) if !l.is_empty() => {
-                            match engine.set_limits(&tid, l.down_kb_s, l.up_kb_s).await {
-                                Ok(()) => None,
-                                Err(e) => Some(format!("限速重放失败: {e}")),
+                    if let Some(l) = t.limits.clone().filter(|l| !l.is_empty()) {
+                        if let Err(e) = engine.set_limits(&tid, l.down_kb_s, l.up_kb_s).await {
+                            replay_details.push(format!("限速重放失败: {e}"));
+                        }
+                    }
+                    // ② 子文件优先级重放（仅 BT 任务；非 BT 引擎 Unsupported →
+                    // 记事件）。magnet 恢复时 metadata 未就绪（引擎 NotFound）→
+                    // 挂 pending 集合，由重放循环在就绪后收敛；.torrent 任务
+                    // add 时 metadata 已就绪，此处直接成功。
+                    if pt.engine_kind == EngineKind::Bt {
+                        if let Some(prios) = t.file_priorities.clone().filter(|p| !p.is_empty()) {
+                            let pairs: Vec<(usize, u32)> =
+                                prios.iter().enumerate().map(|(i, p)| (i, *p)).collect();
+                            match engine.set_file_priorities(&tid, &pairs).await {
+                                Ok(()) => {}
+                                Err(smart_dl_core::types::EngineError::NotFound) => {
+                                    self.pending_file_prio.lock().insert(t.id.clone());
+                                    replay_details
+                                        .push("子文件优先级待 metadata 就绪后重放".into());
+                                }
+                                Err(e) => {
+                                    replay_details.push(format!("子文件优先级重放失败: {e}"));
+                                }
                             }
                         }
-                        _ => None,
-                    };
+                    }
                     let mut rec = TaskRecord {
                         task: t,
                         engine_tid: Some(tid),
@@ -651,10 +677,10 @@ impl DaemonState {
                         engine_status: None,
                         events: vec![],
                     };
-                    if let Some(detail) = limits_replayed {
-                        rec.push_event("restored", Some(detail));
-                    } else {
+                    if replay_details.is_empty() {
                         rec.push_event("restored", None);
+                    } else {
+                        rec.push_event("restored", Some(replay_details.join("; ")));
                     }
                     self.tasks.lock().insert(rec.task.id.clone(), rec);
                     restored += 1;
@@ -793,6 +819,7 @@ impl DaemonState {
             state: TaskState::Queued,
             retry: Default::default(),
             created_at: std::time::Instant::now(),
+            file_priorities: None,
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
@@ -886,6 +913,7 @@ impl DaemonState {
             state: TaskState::Queued,
             retry: Default::default(),
             created_at: std::time::Instant::now(),
+            file_priorities: None,
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
@@ -1105,6 +1133,7 @@ impl DaemonState {
             state: TaskState::Queued,
             retry: Default::default(),
             created_at: std::time::Instant::now(),
+            file_priorities: None,
             metadata: TaskMetadata {
                 name: Some(meta.name.clone()),
                 added_at_unix: 0,
@@ -1204,6 +1233,7 @@ impl DaemonState {
             state: TaskState::Queued,
             retry: Default::default(),
             created_at: std::time::Instant::now(),
+            file_priorities: None,
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
@@ -1311,6 +1341,7 @@ impl DaemonState {
             state: TaskState::Queued,
             retry: Default::default(),
             created_at: std::time::Instant::now(),
+            file_priorities: None,
             metadata: TaskMetadata {
                 name: if is_dir { None } else { name },
                 added_at_unix: 0,
@@ -1404,6 +1435,7 @@ impl DaemonState {
             error: status.as_ref().and_then(|s| s.error.clone()),
             files: status.as_ref().map(|s| s.files.clone()).unwrap_or_default(),
             limits: rec.task.limits.clone(),
+            file_priorities: rec.task.file_priorities.clone(),
         })
     }
 
@@ -1559,7 +1591,9 @@ impl DaemonState {
     /// - 文件数锚定与 metadata 就绪性探测合一：先 readback 当前优先级表
     ///   （engine 侧真实文件数），metadata 未就绪/句柄缺失 → UnsupportedOp（409）
     /// - 下标越界 / 优先级 >7 → InvalidSource（400）；内核侧两段式校验兜底
-    /// - 运行时配置（不入库不重放）：重启后回到 libtorrent 默认 4
+    /// - 持久化 + 恢复重放：成功后把全量快照（readback None 视为默认 4）写入
+    ///   `task.file_priorities` 并落盘；恢复时原样重放（magnet 未就绪场景由
+    ///   重放循环延迟收敛，见 `replay_pending_file_priorities`）
     pub async fn set_task_file_priorities(
         &self,
         id: &str,
@@ -1610,10 +1644,94 @@ impl DaemonState {
             .set_file_priorities(&tid, priorities)
             .await
             .map_err(|e| DaemonError::Engine(e.to_string()))?;
-        engine
+        let snapshot = engine
             .file_priorities(&tid)
             .await
-            .map_err(|e| DaemonError::Engine(e.to_string()))
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        // 持久化全量快照：readback 的 None（内核未定值）按 libtorrent 默认
+        // 优先级 4 归一，保证重放值与引擎语义一致。
+        let persisted: Vec<u32> = snapshot.iter().map(|p| p.unwrap_or(4)).collect();
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.task.file_priorities = Some(persisted);
+                rec.push_event(
+                    "file_priorities_changed",
+                    Some(
+                        priorities
+                            .iter()
+                            .map(|(i, p)| format!("{i}={p}"))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                );
+            }
+        }
+        self.pending_file_prio.lock().remove(id);
+        self.autosave();
+        Ok(snapshot)
+    }
+
+    /// 子文件优先级重放收敛（单轮）：对恢复时 metadata 未就绪而挂起的任务，
+    /// 探测就绪性（readback 非空）→ 成功后全量重放并移除 pending。
+    /// 返回本轮成功重放的任务 id 列表（测试/日志用）。
+    ///
+    /// 容错口径：任务已移除 / engine_tid 缺失（恢复 add 失败，v1 不会自愈）/
+    /// 引擎不支持（Unsupported）→ 移除 pending（永不收敛项不留尾）；
+    /// 其余失败（引擎忙/暂不可用）保留 pending 下轮再试。
+    pub async fn replay_pending_file_priorities(&self) -> Vec<TaskId> {
+        let pending: Vec<TaskId> = self.pending_file_prio.lock().iter().cloned().collect();
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        let mut done = Vec::new();
+        for id in pending {
+            let (engine, tid, prios) = {
+                let tasks = self.tasks.lock();
+                let Some(rec) = tasks.get(&id) else {
+                    self.pending_file_prio.lock().remove(&id);
+                    continue;
+                };
+                let Some(tid) = rec.engine_tid.clone() else {
+                    self.pending_file_prio.lock().remove(&id);
+                    continue;
+                };
+                let Some(prios) = rec.task.file_priorities.clone() else {
+                    self.pending_file_prio.lock().remove(&id);
+                    continue;
+                };
+                match self.engine_for(rec.engine_kind) {
+                    Ok(e) => (e, tid, prios),
+                    Err(_) => continue, // 引擎暂不可用：下轮再试
+                }
+            };
+            // 就绪性探测：readback 成功且非空 = metadata 已就绪
+            match engine.file_priorities(&tid).await {
+                Ok(cur) if !cur.is_empty() => {
+                    let pairs: Vec<(usize, u32)> =
+                        prios.iter().enumerate().map(|(i, p)| (i, *p)).collect();
+                    match engine.set_file_priorities(&tid, &pairs).await {
+                        Ok(()) => {
+                            self.pending_file_prio.lock().remove(&id);
+                            if let Some(rec) = self.tasks.lock().get_mut(&id) {
+                                rec.push_event("restored", Some("子文件优先级重放完成".into()));
+                            }
+                            tracing::info!("任务 {id} 子文件优先级重放完成（{} 项）", pairs.len());
+                            done.push(id);
+                        }
+                        Err(smart_dl_core::types::EngineError::Unsupported) => {
+                            self.pending_file_prio.lock().remove(&id);
+                        }
+                        Err(_) => {} // 引擎忙/瞬态错误：下轮再试
+                    }
+                }
+                Err(smart_dl_core::types::EngineError::Unsupported) => {
+                    self.pending_file_prio.lock().remove(&id);
+                }
+                _ => {} // 未就绪/暂不可读：下轮再试
+            }
+        }
+        done
     }
 
     /// F5 P2SP：给运行中的 BT 任务逐条注入 web seed（云盘直链，BEP-19），
@@ -1856,6 +1974,7 @@ impl HttpSink for FallbackSink {
             state: TaskState::Queued,
             retry: Default::default(),
             created_at: std::time::Instant::now(),
+            file_priorities: None,
             metadata: TaskMetadata {
                 name,
                 added_at_unix: 0,
@@ -2430,6 +2549,7 @@ mod bt_alert_tests {
                 state,
                 retry: Default::default(),
                 created_at: std::time::Instant::now(),
+                file_priorities: None,
                 metadata: TaskMetadata {
                     name: None,
                     added_at_unix: 0,
@@ -3058,6 +3178,12 @@ pub struct FakeEngine {
     limits: parking_lot::Mutex<Vec<LimitCall>>,
     /// status() 额外透出的文件级进度（目录 files 同步测试用；默认空 = 保持旧行为）。
     status_files: parking_lot::Mutex<Vec<FileProgress>>,
+    /// 已下发的子文件优先级（(engine_tid, pairs)，优先级重放测试用）。
+    prio_calls: parking_lot::Mutex<Vec<(String, Vec<(usize, u32)>)>>,
+    /// file_priorities() 的可编程行为：None = 默认成功返回空表；
+    /// Some(Err(e)) = 返回该错误（metadata 未就绪模拟）；Some(Ok(v)) = 返回 v。
+    prio_readback:
+        parking_lot::Mutex<Option<Result<Vec<Option<u32>>, smart_dl_core::types::EngineError>>>,
 }
 
 #[cfg(test)]
@@ -3072,6 +3198,8 @@ impl FakeEngine {
             url_seeds: parking_lot::Mutex::new(Vec::new()),
             limits: parking_lot::Mutex::new(Vec::new()),
             status_files: parking_lot::Mutex::new(Vec::new()),
+            prio_calls: parking_lot::Mutex::new(Vec::new()),
+            prio_readback: parking_lot::Mutex::new(None),
         }
     }
 
@@ -3100,6 +3228,19 @@ impl FakeEngine {
     /// 设置 status() 返回的文件级进度（FTP 目录 files 同步测试注入用）。
     pub fn set_status_files(&self, files: Vec<FileProgress>) {
         *self.status_files.lock() = files;
+    }
+
+    /// 读取已下发的子文件优先级调用记录（优先级重放测试断言用）。
+    pub fn prio_calls(&self) -> Vec<(String, Vec<(usize, u32)>)> {
+        self.prio_calls.lock().clone()
+    }
+
+    /// 编程 file_priorities() 行为（就绪/未就绪模拟用）。
+    pub fn set_prio_readback(
+        &self,
+        v: Option<Result<Vec<Option<u32>>, smart_dl_core::types::EngineError>>,
+    ) {
+        *self.prio_readback.lock() = v;
     }
 }
 
@@ -3193,6 +3334,33 @@ impl DownloadEngine for FakeEngine {
         // 记录（engine_tid, down, up）供限速重放测试断言
         self.limits.lock().push((id.clone(), down_kb_s, up_kb_s));
         Ok(())
+    }
+
+    async fn set_file_priorities(
+        &self,
+        id: &EngineTaskId,
+        priorities: &[(usize, u32)],
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        // readback 错误态同步反映到 set（真实 BT 引擎 metadata 未就绪时
+        // set/read 同样失败）——pending 重放测试依赖该一致性
+        if let Some(Err(e)) = &*self.prio_readback.lock() {
+            return Err(e.clone());
+        }
+        self.prio_calls
+            .lock()
+            .push((id.clone(), priorities.to_vec()));
+        Ok(())
+    }
+
+    async fn file_priorities(
+        &self,
+        _id: &EngineTaskId,
+    ) -> Result<Vec<Option<u32>>, smart_dl_core::types::EngineError> {
+        match &*self.prio_readback.lock() {
+            None => Ok(vec![Some(4)]), // 默认就绪：单文件表
+            Some(Ok(v)) => Ok(v.clone()),
+            Some(Err(e)) => Err(e.clone()),
+        }
     }
     async fn add_peer(
         &self,
@@ -3343,6 +3511,107 @@ mod persist_tests {
             etid.starts_with("fk"),
             "engine_tid 应为 FakeEngine 返回的句柄: {etid}"
         );
+    }
+
+    #[cfg(feature = "bt")]
+    fn bt_prio_task(id: &str, prios: Option<Vec<u32>>) -> DownloadTask {
+        let magnet = "magnet:?xt=urn:btih:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        DownloadTask {
+            id: id.to_string(),
+            canonical_id: CanonicalId {
+                kind: CanonicalKind::Bt,
+                identity: magnet.to_string(),
+                validator: None,
+                token_sensitive: false,
+            },
+            source: DownloadSource::Magnet(magnet.to_string()),
+            identity: ContentIdentity::SingleFile {
+                size: 0,
+                etag: None,
+                sha256: None,
+                backup_md5: None,
+            },
+            dest_root: PathBuf::from("."),
+            files: vec![],
+            acquisitions: vec![],
+            aggregate: Default::default(),
+            state: TaskState::Queued,
+            retry: Default::default(),
+            created_at: std::time::Instant::now(),
+            file_priorities: prios,
+            metadata: TaskMetadata {
+                name: None,
+                added_at_unix: 0,
+            },
+            limits: None,
+        }
+    }
+
+    #[cfg(feature = "bt")]
+    #[tokio::test]
+    async fn restore_replays_file_priorities_when_metadata_ready() {
+        // metadata 已就绪（readback 非空表）：restore 必须直接全量重放一次
+        // （.torrent 恢复场景；magnet 已解析场景同路）
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("tasks.json");
+        let pts = vec![PersistedTask {
+            task: bt_prio_task("t1", Some(vec![0, 7])),
+            engine_kind: EngineKind::Bt,
+        }];
+        std::fs::write(&store, serde_json::to_vec(&pts).unwrap()).unwrap();
+
+        let fake2 = Arc::new(FakeEngine::new(EngineKind::Bt));
+        let state2 = DaemonState::new(fake2.clone(), vec![]);
+        let n = state2.restore_from(&store).await.unwrap();
+        assert_eq!(n, 1);
+        let calls = fake2.prio_calls();
+        assert_eq!(calls.len(), 1, "metadata 就绪时必须立即重放: {calls:?}");
+        assert_eq!(
+            calls[0].1,
+            vec![(0, 0), (1, 7)],
+            "下标-值对必须与持久化全量表一致"
+        );
+    }
+
+    #[cfg(feature = "bt")]
+    #[tokio::test]
+    async fn file_priorities_pending_replay_converges_when_metadata_arrives() {
+        // magnet 恢复且 metadata 未就绪（readback NotFound，与真实引擎分类一致）
+        // → restore 挂 pending → 就绪后由 replay 收敛 → 再跑幂等
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("tasks.json");
+        let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+        fake.set_prio_readback(Some(Err(smart_dl_core::types::EngineError::NotFound)));
+        let state = Arc::new(DaemonState::new(fake.clone(), vec![]));
+
+        let pts = vec![PersistedTask {
+            task: bt_prio_task("t1", Some(vec![0, 7])),
+            engine_kind: EngineKind::Bt,
+        }];
+        std::fs::write(&store, serde_json::to_vec(&pts).unwrap()).unwrap();
+        let n = state.restore_from(&store).await.unwrap();
+        assert_eq!(n, 1);
+        assert!(
+            !fake.prio_calls().iter().any(|(_, p)| !p.is_empty()),
+            "未就绪时不得成功重放: {:?}",
+            fake.prio_calls()
+        );
+        assert!(
+            state.pending_file_prio.lock().contains("t1"),
+            "未就绪必须挂 pending 集合"
+        );
+
+        // metadata 到达（readback 返回 2 文件表）→ 单轮收敛
+        fake.set_prio_readback(Some(Ok(vec![Some(0), Some(7)])));
+        let done = state.replay_pending_file_priorities().await;
+        assert_eq!(done, vec!["t1".to_string()]);
+        let calls = fake.prio_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1, vec![(0, 0), (1, 7)]);
+        // pending 清空 + 幂等（再跑无调用）
+        assert!(!state.pending_file_prio.lock().contains("t1"));
+        assert!(state.replay_pending_file_priorities().await.is_empty());
+        assert_eq!(fake.prio_calls().len(), 1);
     }
 
     #[tokio::test]

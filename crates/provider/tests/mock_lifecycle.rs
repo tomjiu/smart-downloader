@@ -117,6 +117,7 @@ impl HttpSink for EngineSink {
             state: TaskState::Queued,
             retry: Default::default(),
             created_at: std::time::Instant::now(),
+            file_priorities: None,
             metadata: smart_dl_core::task::TaskMetadata {
                 name,
                 added_at_unix: 0,
@@ -191,6 +192,7 @@ async fn full_flow_transfers_two_files_to_disk() {
         state: TaskState::Queued,
         retry: Default::default(),
         created_at: std::time::Instant::now(),
+        file_priorities: None,
         metadata: smart_dl_core::task::TaskMetadata {
             name: None,
             added_at_unix: 0,
