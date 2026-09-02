@@ -38,6 +38,12 @@ pub struct DownloadTask {
     /// metadata 未就绪（magnet 恢复）时由 daemon 延迟到就绪后下发。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_priorities: Option<Vec<u32>>,
+    /// 顺序下载（边下边播）。false = 默认并行策略（旧 tasks.json 无此字段自动补
+    /// false）。引擎语义：HTTP = 限制在飞段窗口（前缀尽快完整，FIFO 领取不变）；
+    /// BT = libtorrent sequential_download flag；FTP = 不支持（Unsupported）。
+    /// 持久化 + 恢复重放：restore_from 对 sequential=true 的任务原样重放。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sequential: bool,
 }
 
 /// 任务级限速（KiB/s）。语义：`None` = 不调整（保持现状/走全局）；

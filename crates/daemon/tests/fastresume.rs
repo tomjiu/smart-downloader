@@ -39,6 +39,7 @@ fn bt_task(id: &str, magnet: &str) -> DownloadTask {
         retry: RetryState::default(),
         created_at: Instant::now(),
         file_priorities: None,
+        sequential: false,
         metadata: TaskMetadata {
             name: None,
             added_at_unix: 0,

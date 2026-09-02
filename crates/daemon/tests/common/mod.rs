@@ -11,6 +11,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 /// 确定性内容（与 httpdl/provider 测试基建同构）。
+/// 部分测试二进制（如 sequential_api）不用 → 按二进制关闭 dead_code。
+#[allow(dead_code)]
 pub fn patterned(size: u64) -> Vec<u8> {
     (0..size).map(|i| (i % 251) as u8).collect()
 }

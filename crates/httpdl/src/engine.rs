@@ -54,6 +54,9 @@ struct HttpTask {
     /// 任务级下载限速（KiB/s 配置回显；None = 走全局）。实际生效速在
     /// limiters 表的 RateLimiter 上（set_limits 运行中即时改率）。
     limit_kb_s: Option<u32>,
+    /// 顺序下载（边下边播）：true = download_loop 每轮传给 download_dynamic，
+    /// 在飞段窗口收紧。set_sequential 运行中改写 → 下一次重下轮拾取。
+    sequential: bool,
 }
 
 struct EngineInner {
@@ -142,7 +145,7 @@ async fn download_loop(
 ) {
     loop {
         // 快照任务参数（不跨 await 持锁）
-        let (part, offset, mirrors_raw, total, sha256, md5) = {
+        let (part, offset, mirrors_raw, total, sha256, md5, sequential) = {
             let tasks = inner.tasks.lock();
             let t = match tasks.get(&tid) {
                 Some(t) if t.gen == gen => t,
@@ -155,6 +158,7 @@ async fn download_loop(
                 t.total,
                 t.sha256.clone(),
                 t.md5.clone(),
+                t.sequential,
             )
         };
 
@@ -174,6 +178,7 @@ async fn download_loop(
             &mirrors,
             limiter.clone(),
             Some(inner.mirror_scores.clone()),
+            sequential,
         )
         .await
         {
@@ -446,6 +451,7 @@ impl DownloadEngine for HttpEngine {
                     backup_used: false,
                     gen: 0,
                     limit_kb_s: None,
+                    sequential: task.sequential,
                 },
             );
         }
@@ -527,6 +533,20 @@ impl DownloadEngine for HttpEngine {
             }
         }
         Ok(())
+    }
+
+    /// 任务级顺序下载开关（trait 扩展）。语义：字段改写，下一次重下轮
+    /// （换源 / 校验失败 / 续传轮）拾取；运行中的当前轮不变（收尾在飞段）。
+    /// 新建任务在 add() 直接读 task.sequential → 立即生效。
+    async fn set_sequential(&self, id: &EngineTaskId, on: bool) -> Result<(), EngineError> {
+        let mut tasks = self.inner.tasks.lock();
+        match tasks.get_mut(id) {
+            Some(t) => {
+                t.sequential = on;
+                Ok(())
+            }
+            None => Err(EngineError::NotFound),
+        }
     }
 
     async fn peers(&self, _id: &EngineTaskId) -> Result<Vec<PeerInfo>, EngineError> {

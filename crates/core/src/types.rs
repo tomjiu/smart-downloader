@@ -284,6 +284,13 @@ pub trait DownloadEngine: Send + Sync {
         Err(EngineError::Unsupported)
     }
 
+    /// 任务级顺序下载开关（边下边播）。HTTP = 收紧在飞段窗口（新建任务立即
+    /// 生效；运行中任务自下一次重下轮起生效）；BT = sequential_download flag
+    /// （即时生效，metadata 未就绪也可设）；不支持引擎（FTP）→ `Unsupported`。
+    async fn set_sequential(&self, _id: &EngineTaskId, _on: bool) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
     /// 迅雷任务导入（M9）：接受 xunlei-convert 生成的 fastresume bencode。
     /// 默认实现返回 `not supported`；BT 引擎（libtorrent）应Override为 `add_torrent_resume`。
     async fn add_xunlei_resume(&self, _data: Vec<u8>) -> Result<EngineTaskId, EngineError> {

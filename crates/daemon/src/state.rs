@@ -86,6 +86,10 @@ pub struct TaskSnapshot {
     /// 全量快照，下标 = 文件序）。set 语义见 `DaemonState::set_task_file_priorities`。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub file_priorities: Option<Vec<u32>>,
+    /// 顺序下载（边下边播）。set 语义见 `DaemonState::set_task_sequential`；
+    /// false = 默认并行策略（不序列化，快照向后兼容）。
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sequential: bool,
 }
 
 /// 列表条目。
@@ -670,6 +674,14 @@ impl DaemonState {
                             }
                         }
                     }
+                    // ③ 顺序下载重放：sequential=true 原样下发（BT=handle 级
+                    // flag 即时；HTTP=字段改写，下一重下轮拾取；不支持引擎记
+                    // 事件不阻断恢复）。flag 幂等，与 add 时下发叠加无副作用。
+                    if t.sequential {
+                        if let Err(e) = engine.set_sequential(&tid, true).await {
+                            replay_details.push(format!("顺序下载重放失败: {e}"));
+                        }
+                    }
                     let mut rec = TaskRecord {
                         task: t,
                         engine_tid: Some(tid),
@@ -731,15 +743,30 @@ impl DaemonState {
         link: String,
         dest_root: Option<String>,
     ) -> Result<TaskId, DaemonError> {
+        self.add_link_task_opts(link, dest_root, false).await
+    }
+
+    /// 顺序下载变体：`sequential` 写入任务（HTTP=在飞窗口；BT=sequential
+    /// flag；其余引擎忽略）。引擎 add 后对 BT 任务立即下发（handle 级 flag，
+    /// metadata 未就绪也可设）。
+    pub async fn add_link_task_opts(
+        &self,
+        link: String,
+        dest_root: Option<String>,
+        sequential: bool,
+    ) -> Result<TaskId, DaemonError> {
         match normalize_user_link(&link) {
-            NormalizedSource::Http(real) => self.add_http_task(real, dest_root).await,
+            NormalizedSource::Http(real) => {
+                self.add_http_task_opts(real, dest_root, sequential).await
+            }
             NormalizedSource::Magnet(m) => {
                 #[cfg(feature = "bt")]
                 {
-                    return self.add_bt_task(m, dest_root).await;
+                    return self.add_bt_task_opts(m, dest_root, sequential).await;
                 }
                 #[cfg(not(feature = "bt"))]
                 {
+                    let _ = sequential;
                     Err(DaemonError::InvalidSource(format!(
                         "magnet 需 BT 引擎（编译时启用 --features daemon/bt）: {m}"
                     )))
@@ -769,12 +796,13 @@ impl DaemonState {
         }
     }
 
-    /// 添加 BT 任务（feature `bt`）：btih canonical 查重 → 引擎 add → TaskCreated 事件。
+    /// 添加 BT 任务（feature `bt`，顺序下载 opts 直通入口）：btih canonical 查重 → 引擎 add → TaskCreated 事件。
     #[cfg(feature = "bt")]
-    async fn add_bt_task(
+    async fn add_bt_task_opts(
         &self,
         magnet: String,
         dest_root: Option<String>,
+        sequential: bool,
     ) -> Result<TaskId, DaemonError> {
         // B10：目标目录预检（创建/可写）；magnet 总大小元数据前未知 → 空间预检跳过
         // dest 未指定 → 默认落盘目录（与 HTTP 一致：default_dest_root 配置）
@@ -820,6 +848,7 @@ impl DaemonState {
             retry: Default::default(),
             created_at: std::time::Instant::now(),
             file_priorities: None,
+            sequential,
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
@@ -832,6 +861,14 @@ impl DaemonState {
             .add(&task)
             .await
             .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        // 顺序下载立即下发（handle 级 flag，metadata 未就绪也可设；
+        // 失败不回滚任务，恢复重放 + set_sequential 端点可补）。
+        if sequential {
+            let engine = self.engine_for(EngineKind::Bt)?;
+            if let Err(e) = engine.set_sequential(&engine_tid, true).await {
+                tracing::warn!("BT 任务 {task_id} 顺序下载 flag 下发失败: {e}");
+            }
+        }
         let mut rec = TaskRecord {
             task,
             engine_tid: Some(engine_tid),
@@ -860,6 +897,18 @@ impl DaemonState {
         &self,
         torrent_bytes: Vec<u8>,
         dest_root: Option<String>,
+    ) -> Result<TaskId, DaemonError> {
+        self.add_torrent_task_opts(torrent_bytes, dest_root, false)
+            .await
+    }
+
+    /// 顺序下载变体：`sequential` 写入任务 + 引擎 add 后立即下发 flag。
+    #[cfg(feature = "bt")]
+    pub async fn add_torrent_task_opts(
+        &self,
+        torrent_bytes: Vec<u8>,
+        dest_root: Option<String>,
+        sequential: bool,
     ) -> Result<TaskId, DaemonError> {
         // B10：目标目录预检（创建/可写）；dest 未指定 → 默认落盘目录（与 HTTP/BT-magnet 一致）
         let def = self.default_dest_root.lock().to_string_lossy().into_owned();
@@ -914,6 +963,7 @@ impl DaemonState {
             retry: Default::default(),
             created_at: std::time::Instant::now(),
             file_priorities: None,
+            sequential,
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
@@ -926,6 +976,13 @@ impl DaemonState {
             .add(&task)
             .await
             .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        // 顺序下载立即下发（同 magnet 路径：handle 级 flag，失败不回滚）。
+        if sequential {
+            let engine = self.engine_for(EngineKind::Bt)?;
+            if let Err(e) = engine.set_sequential(&engine_tid, true).await {
+                tracing::warn!("BT 任务 {task_id} 顺序下载 flag 下发失败: {e}");
+            }
+        }
         let mut rec = TaskRecord {
             task,
             engine_tid: Some(engine_tid),
@@ -1134,6 +1191,7 @@ impl DaemonState {
             retry: Default::default(),
             created_at: std::time::Instant::now(),
             file_priorities: None,
+            sequential: false,
             metadata: TaskMetadata {
                 name: Some(meta.name.clone()),
                 added_at_unix: 0,
@@ -1180,6 +1238,16 @@ impl DaemonState {
         &self,
         url: String,
         dest_root: Option<String>,
+    ) -> Result<TaskId, DaemonError> {
+        self.add_http_task_opts(url, dest_root, false).await
+    }
+
+    /// 顺序下载变体：`sequential` 写入任务（HTTP 引擎在飞段窗口收紧）。
+    pub async fn add_http_task_opts(
+        &self,
+        url: String,
+        dest_root: Option<String>,
+        sequential: bool,
     ) -> Result<TaskId, DaemonError> {
         if !url.starts_with("http://") && !url.starts_with("https://") {
             return Err(DaemonError::InvalidSource(url));
@@ -1234,6 +1302,7 @@ impl DaemonState {
             retry: Default::default(),
             created_at: std::time::Instant::now(),
             file_priorities: None,
+            sequential,
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
@@ -1342,6 +1411,7 @@ impl DaemonState {
             retry: Default::default(),
             created_at: std::time::Instant::now(),
             file_priorities: None,
+            sequential: false,
             metadata: TaskMetadata {
                 name: if is_dir { None } else { name },
                 added_at_unix: 0,
@@ -1436,6 +1506,7 @@ impl DaemonState {
             files: status.as_ref().map(|s| s.files.clone()).unwrap_or_default(),
             limits: rec.task.limits.clone(),
             file_priorities: rec.task.file_priorities.clone(),
+            sequential: rec.task.sequential,
         })
     }
 
@@ -1670,6 +1741,40 @@ impl DaemonState {
         self.pending_file_prio.lock().remove(id);
         self.autosave();
         Ok(snapshot)
+    }
+
+    /// 任务级顺序下载开关（边下边播）：引擎即时生效（HTTP=字段改写下轮拾取；
+    /// BT=sequential flag 即时）+ 任务持久化 + TaskSequentialChanged 事件。
+    /// FTP 引擎不支持（Unsupported → 400）。
+    pub async fn set_task_sequential(&self, id: &str, on: bool) -> Result<(), DaemonError> {
+        let (engine, tid) = {
+            let rec = self
+                .tasks
+                .lock()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            let tid = rec
+                .engine_tid
+                .clone()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            (self.engine_for(rec.engine_kind)?, tid)
+        };
+        engine.set_sequential(&tid, on).await.map_err(|e| match e {
+            smart_dl_core::types::EngineError::Unsupported => {
+                DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持顺序下载"))
+            }
+            other => DaemonError::Engine(other.to_string()),
+        })?;
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.task.sequential = on;
+                rec.push_event("sequential_changed", Some(on.to_string()));
+            }
+        }
+        self.autosave();
+        Ok(())
     }
 
     /// 子文件优先级重放收敛（单轮）：对恢复时 metadata 未就绪而挂起的任务，
@@ -1975,6 +2080,7 @@ impl HttpSink for FallbackSink {
             retry: Default::default(),
             created_at: std::time::Instant::now(),
             file_priorities: None,
+            sequential: false,
             metadata: TaskMetadata {
                 name,
                 added_at_unix: 0,
@@ -2550,6 +2656,7 @@ mod bt_alert_tests {
                 retry: Default::default(),
                 created_at: std::time::Instant::now(),
                 file_priorities: None,
+                sequential: false,
                 metadata: TaskMetadata {
                     name: None,
                     added_at_unix: 0,
@@ -3541,6 +3648,7 @@ mod persist_tests {
             retry: Default::default(),
             created_at: std::time::Instant::now(),
             file_priorities: prios,
+            sequential: false,
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,

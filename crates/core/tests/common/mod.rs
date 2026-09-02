@@ -63,6 +63,7 @@ pub fn make_task(id: &str, name: &str) -> DownloadTask {
         },
         created_at: std::time::Instant::now(),
         file_priorities: None,
+        sequential: false,
         metadata: TaskMetadata {
             name: Some(name.to_string()),
             added_at_unix: 1,

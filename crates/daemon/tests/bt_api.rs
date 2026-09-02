@@ -740,3 +740,112 @@ async fn file_priority_persisted_and_replayed_after_restart() {
     }
     assert!(replayed, "重启后优先级必须重放收敛为 [0]");
 }
+
+// ============ 任务级顺序下载（sequential）============
+
+#[tokio::test]
+async fn torrent_task_sequential_flag_roundtrip_via_ffi() {
+    // 真实 torrent（metadata 即时就绪）→ sequential true/false 往返。
+    // 端点 200 = FFI lt_set_sequential 真实生效（引擎错误会上抛 500），
+    // 2.0.x 走 torrent_flags::sequential_download（on/off 均可）。
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "torrent_b64": minimal_torrent_b64() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // add 时带 sequential → 快照透出（flag 在 add 链路已下发，失败仅记日志）。
+    // torrent 用不同 name（infohash 不同）避免与首个任务 409 撞车。
+    let mut t2 = b"d4:infod6:lengthi123e4:name5:test212:piece lengthi16384e6:pieces20:".to_vec();
+    t2.extend_from_slice(&[0xCD; 20]);
+    t2.extend_from_slice(b"ee");
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "torrent_b64": base64::engine::general_purpose::STANDARD.encode(&t2),
+            "sequential": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid2 = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let snap: serde_json::Value = client
+        .get(format!("{base}/tasks/{tid2}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(snap["sequential"], serde_json::json!(true));
+
+    // 端点 on → 200（FFI 成功）；off → 200（2.0.x unset 可用）
+    for on in [true, false] {
+        let resp = client
+            .post(format!("{base}/tasks/{tid}/sequential"))
+            .json(&serde_json::json!({ "sequential": on }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "sequential={on} 必须 200: {:?}",
+            resp.text().await.unwrap()
+        );
+        let snap: serde_json::Value = resp.json().await.unwrap();
+        if on {
+            assert_eq!(snap["sequential"], serde_json::json!(true));
+        }
+    }
+}
+
+#[tokio::test]
+async fn magnet_sequential_flag_before_metadata_ready() {
+    // magnet（假 btih，metadata 永不到达）：handle 级 flag 不依赖 metadata
+    // → 端点必须 200（错误会上抛）。验证「未就绪也可设」契约。
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "url": MAGNET }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/sequential"))
+        .json(&serde_json::json!({ "sequential": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "metadata 未就绪时 sequential 也必须可设: {:?}",
+        resp.text().await.unwrap()
+    );
+    let snap: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(snap["sequential"], serde_json::json!(true));
+}

@@ -38,6 +38,7 @@ fn mock_task() -> smart_dl_core::task::DownloadTask {
         retry: Default::default(),
         created_at: std::time::Instant::now(),
         file_priorities: None,
+        sequential: false,
         metadata: smart_dl_core::task::TaskMetadata {
             name: None,
             added_at_unix: 0,
