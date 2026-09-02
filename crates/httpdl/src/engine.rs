@@ -1,11 +1,12 @@
 //! HttpEngine（§14，impl DownloadEngine）：M4a 骨架 + M4b 多连接并行下载/镜像/换源/校验。
-//! add = 探测 → 规划 → 登记 → 后台下载循环；段失败 → 镜像轮换；校验失败 → 重下 1 次 → 降级接受。
-//! P4 续传：段账本（`<part>.progress`）为唯一进度真源；pause 真停（段边界退出）；
-//! epoch 单写者模型（resume 无条件新 epoch 循环，旧循环在检查点自杀且永不 finalize）。
+//! add = 探测 → 规划 → 登记 → 后台下载循环（主源探测失败自动落备用源）；段失败 → 镜像轮换；
+//! 校验失败 → 重下 1 次 → 降级接受。update_sources 并发探测全部候选源 + 评分播种，
+//! 任一存活即换源成功（不再首源死即拒）。P4 续传：段账本（`<part>.progress`）为唯一进度真源；
+//! pause 真停（段边界退出）；epoch 单写者模型（resume 无条件新 epoch 循环，旧循环在检查点自杀且永不 finalize）。
 
-use crate::download::{download_dynamic, DynamicLedger, DynamicOutcome};
+use crate::download::{download_dynamic, update_score, DynamicLedger, DynamicOutcome};
 use crate::ledger;
-use crate::range::probe_range;
+use crate::range::{probe_range, Probe};
 use crate::rate::RateLimiter;
 use crate::segment_manager::DEFAULT_MIN_SPLIT;
 use crate::verify::{verify_file, verify_file_md5};
@@ -439,7 +440,34 @@ impl DownloadEngine for HttpEngine {
             } => (url.clone(), headers.clone(), backup_url.clone()),
             _ => return Err(EngineError::Other("source is not http".to_string())),
         };
-        let probe = probe_range(&self.client, &url, &headers).await?;
+        // 探测韧性（与 update_sources 并发探测同批）：主源探测失败且配置了备用源
+        // → 改用备用源建任务（身份切换与运行时“主源校验失败切备用源”同语义：
+        // sha256 → None、md5 ← backup_md5、backup_used = true 防运行时重复切换）。
+        // 双源均失败 → 返回双错（任务拒绝，同原语义）；无备用源 → 原样返回首错。
+        let mut fell_back_to: Option<String> = None;
+        let probe = match probe_range(&self.client, &url, &headers).await {
+            Ok(p) => p,
+            Err(primary_err) => match &backup_url {
+                Some(bu) => {
+                    println!(
+                        "[httpdl] {}: 主源探测失败（{primary_err}），尝试备用源",
+                        task.id
+                    );
+                    match probe_range(&self.client, bu, &headers).await {
+                        Ok(p) => {
+                            fell_back_to = Some(bu.clone());
+                            p
+                        }
+                        Err(backup_err) => {
+                            return Err(EngineError::Other(format!(
+                                "主源与备用源探测均失败: {primary_err} / {backup_err}"
+                            )));
+                        }
+                    }
+                }
+                None => return Err(primary_err),
+            },
+        };
         let total = probe.total.unwrap_or(0);
 
         let rel = task
@@ -491,6 +519,13 @@ impl DownloadEngine for HttpEngine {
             } => (sha256.clone(), backup_md5.clone()),
             _ => (None, None),
         };
+        // 探测韧性初始化：主源失败已落备用源 → mirrors 以备用源起步，身份切换
+        // （sha256 → None / md5 ← backup_md5）与运行时切备用源完全同语义；
+        // backup_used = true —— 运行时再遇校验失败不再重复切向同一备用源。
+        let (init_mirrors, init_sha256, init_md5, init_backup_used) = match &fell_back_to {
+            Some(bu) => (vec![bu.clone()], None, backup_md5.clone(), true),
+            None => (vec![url.clone()], sha256, None, false),
+        };
 
         let tid = task.id.clone();
         {
@@ -499,19 +534,19 @@ impl DownloadEngine for HttpEngine {
                 tid.clone(),
                 HttpTask {
                     headers,
-                    mirrors: vec![url.clone()],
+                    mirrors: init_mirrors,
                     etag: probe.etag.clone(),
                     dest,
                     state: EngineState::Downloading,
                     done: done0,
                     total,
                     error: None,
-                    sha256,
-                    md5: None,
+                    sha256: init_sha256,
+                    md5: init_md5,
                     verify_attempts: 0,
                     backup_url,
                     backup_md5,
-                    backup_used: false,
+                    backup_used: init_backup_used,
                     gen: 0,
                     epoch: 1,
                     pause: Arc::new(AtomicBool::new(false)),
@@ -650,7 +685,53 @@ impl DownloadEngine for HttpEngine {
             let tasks = self.inner.tasks.lock();
             tasks.get(id).ok_or(EngineError::NotFound)?.headers.clone()
         };
-        let probe = probe_range(&self.client, &urls[0], &headers).await?;
+        // 并发探测全部候选源（源探测韧性）：原实现只探 urls[0]，首个候选死即
+        // 整表拒绝——尽管下载循环本可逐段轮换到其余存活源。现改为：任一候选
+        // 探测成功 → 安装全表（etag 决策取输入序首个成功，确定性与单探一致）；
+        // 全失败 → 返回首错（拒绝语义保留）。探测结果播种 mirror 评分
+        // （成功 +1 / 失败 -1，与段评分同 clamp 口径）→ 后续段调度
+        // （分数降序稳定排序）自动优先存活/健康源，死源沉底。
+        let mut probes = tokio::task::JoinSet::new();
+        for u in &urls {
+            let client = self.client.clone();
+            let u = u.clone();
+            let headers = headers.clone();
+            probes.spawn(async move {
+                let r = probe_range(&client, &u, &headers).await;
+                (u, r)
+            });
+        }
+        let mut by_url: HashMap<String, Result<Probe, EngineError>> = HashMap::new();
+        let mut join_errs: Vec<String> = Vec::new();
+        while let Some(joined) = probes.join_next().await {
+            match joined {
+                Ok((u, r)) => {
+                    by_url.insert(u, r);
+                }
+                Err(je) => join_errs.push(je.to_string()), // 探测任务 panic（不预期）；无 url 可归因
+            }
+        }
+        let probe = urls
+            .iter()
+            .find_map(|u| by_url.get(u).and_then(|r| r.as_ref().ok()).cloned())
+            .ok_or_else(|| {
+                urls.iter()
+                    .find_map(|u| by_url.get(u).and_then(|r| r.as_ref().err()).cloned())
+                    .unwrap_or_else(|| {
+                        EngineError::Other(format!("all source probes failed: {join_errs:?}"))
+                    })
+            })?;
+        // 评分播种：按输入序去重（重复 url 只计一次，避免重复加/扣分）
+        {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for u in &urls {
+                if !seen.insert(u.as_str()) {
+                    continue;
+                }
+                let ok = by_url.get(u).is_some_and(|r| r.is_ok());
+                update_score(&self.inner.mirror_scores, u, if ok { 1 } else { -1 });
+            }
+        }
 
         let mut tasks = self.inner.tasks.lock();
         let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
