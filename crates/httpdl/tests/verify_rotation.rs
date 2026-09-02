@@ -30,16 +30,6 @@ async fn server_content(content: Vec<u8>) -> HttpTestServer {
     .await
 }
 
-async fn server_good() -> HttpTestServer {
-    HttpTestServer::start(HttpServerConfig {
-        size: SIZE,
-        range: true,
-        patterned_content: true,
-        ..Default::default()
-    })
-    .await
-}
-
 fn count(srv: &HttpTestServer) -> usize {
     srv.request_count.load(Ordering::SeqCst)
 }

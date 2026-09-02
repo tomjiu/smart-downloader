@@ -63,6 +63,8 @@ pub struct HttpServerConfig {
     pub patterned_content: bool,
     /// 自定义内容（覆盖 size/pattern；仅全文件语义，Range 仍按 size 切）。
     pub content: Option<Vec<u8>>,
+    /// 响应携带的 Content-Disposition 头（E4 文件名识别测试用）。
+    pub content_disposition: Option<String>,
 }
 
 impl Default for HttpServerConfig {
@@ -78,6 +80,7 @@ impl Default for HttpServerConfig {
             bad_first: 0,
             patterned_content: false,
             content: None,
+            content_disposition: None,
         }
     }
 }
@@ -145,6 +148,9 @@ async fn handler(State(st): State<ServerState>, headers: HeaderMap) -> Response 
     let mut builder = Response::builder();
     if let Some(etag) = st.cfg.etag {
         builder = builder.header(header::ETAG, etag);
+    }
+    if let Some(cd) = &st.cfg.content_disposition {
+        builder = builder.header(header::CONTENT_DISPOSITION, cd.as_str());
     }
 
     let range = headers
