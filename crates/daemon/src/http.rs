@@ -209,6 +209,43 @@ async fn task_set_proxy(
     }
 }
 
+/// 任务重命名（`POST /tasks/:id/name`，E15）：`{"name": "..."}` = 设置
+/// （V3 校验同 add，非法路径分量 400）；`{"name": null}` 或 `{}` = 清除
+/// 显式名（回退派生链）。显示层改名——落盘路径 add 时已定，不迁移文件。
+#[derive(Deserialize)]
+pub struct RenameTaskReq {
+    /// None（缺省/null）= 清除；空白拒绝（与 add 口径一致）。
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+async fn task_rename(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<RenameTaskReq>,
+) -> impl IntoResponse {
+    match state.set_task_name(&id, req.name) {
+        Ok(()) => match state.task_snapshot(&id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
 /// 任务级子文件优先级（`POST /tasks/:id/files/priority`，P1 能力增强，仅 BT）。
 /// priority 语义同 libtorrent：0=不下载 / 1=低 / 4=默认 / 7=最高。
 #[derive(Deserialize)]
@@ -1336,6 +1373,7 @@ macro_rules! router_base {
             .route("/tasks/:id/limit", post(task_limit))
             .route("/tasks/:id/sequential", post(task_sequential))
             .route("/tasks/:id/proxy", post(task_set_proxy))
+            .route("/tasks/:id/name", post(task_rename))
             .route("/tasks/:id/files/priority", post(task_file_priority))
             .route("/tasks/:id/webseeds", post(task_webseeds))
             .route("/bt/metadata", post(bt_magnet_metadata))
