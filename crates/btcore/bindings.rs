@@ -272,10 +272,11 @@ pub struct lt_torrent_status {
     pub num_seeds: ::std::os::raw::c_int,
     pub metadata_received: ::std::os::raw::c_int,
     pub paused: ::std::os::raw::c_int,
+    pub name: [::std::os::raw::c_char; 256usize],
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of lt_torrent_status"][::std::mem::size_of::<lt_torrent_status>() - 56usize];
+    ["Size of lt_torrent_status"][::std::mem::size_of::<lt_torrent_status>() - 312usize];
     ["Alignment of lt_torrent_status"][::std::mem::align_of::<lt_torrent_status>() - 8usize];
     ["Offset of field: lt_torrent_status::state"]
         [::std::mem::offset_of!(lt_torrent_status, state) - 0usize];
@@ -297,6 +298,8 @@ const _: () = {
         [::std::mem::offset_of!(lt_torrent_status, metadata_received) - 48usize];
     ["Offset of field: lt_torrent_status::paused"]
         [::std::mem::offset_of!(lt_torrent_status, paused) - 52usize];
+    ["Offset of field: lt_torrent_status::name"]
+        [::std::mem::offset_of!(lt_torrent_status, name) - 56usize];
 };
 unsafe extern "C" {
     pub fn lt_status(

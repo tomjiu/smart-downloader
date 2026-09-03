@@ -322,6 +322,10 @@ lt_err lt_status(lt_session* s, const char* ih, lt_torrent_status* out) {
         const lt::torrent_status st = h.status();
         out->metadata_received = st.has_metadata ? 1 : 0;
         out->paused = (st.flags & lt::torrent_flags::paused) ? 1 : 0;
+        /* E28: torrent 名透出（任务名回填链路）；metadata 前为空串。
+           memset 预置 + strncpy 截断安全（缓冲区 256 字节恒 NUL 结尾）。 */
+        std::memset(out->name, 0, sizeof(out->name));
+        std::strncpy(out->name, st.name.c_str(), sizeof(out->name) - 1);
         switch (st.state) {
             case lt::torrent_status::downloading_metadata:
                 out->state = 4;

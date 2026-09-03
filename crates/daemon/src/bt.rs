@@ -47,9 +47,9 @@ fn map_status(st: &TorrentStatus) -> EngineStatus {
         num_peers: st.num_peers.max(0) as u32,
         num_seeds: st.num_seeds.max(0) as u32,
         error: (state == EngineState::Error).then(|| "bt error".to_string()),
-        // BT 不参与 E9 名字回填：任务名来自 torrent metadata（files.rel_path
-        // 链路透出），语义与 HTTP 落盘名派生链不同
-        name: None,
+        // E28：BT 任务名回填接入 —— torrent metadata name 经 FFI status 透出，
+        // daemon E9 轮询幂等回填（同 CD 链口径：一次成功后 name 非 None 自然停）
+        name: st.name.clone(),
     };
     if total > 0 {
         es.files.push(FileProgress {

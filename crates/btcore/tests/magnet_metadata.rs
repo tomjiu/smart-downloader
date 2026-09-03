@@ -73,13 +73,21 @@ fn btcore_metadata_api_roundtrip() {
 
     // metadata 未就绪前 → Ok(None)；就绪后 → Some(bytes)
     let deadline = Instant::now() + Duration::from_secs(60);
-    let bytes = loop {
+    let (bytes, status_name) = loop {
         let st = core.status(&ih).expect("status");
         if st.metadata_received {
-            break core
-                .metadata(&ih)
-                .expect("metadata call")
-                .expect("metadata bytes");
+            // E28：metadata 就绪时 torrent 名应同步透出（非空）
+            let name = st
+                .name
+                .clone()
+                .unwrap_or_else(|| panic!("E28: metadata 就绪时 status.name 应为 Some"));
+            assert!(!name.is_empty(), "E28: torrent 名非空");
+            break (
+                core.metadata(&ih)
+                    .expect("metadata call")
+                    .expect("metadata bytes"),
+                name,
+            );
         }
         assert!(Instant::now() < deadline, "60s 内未收到 metadata");
         std::thread::sleep(Duration::from_millis(500));
@@ -88,6 +96,11 @@ fn btcore_metadata_api_roundtrip() {
     let summary = smart_dl_core::torrent_meta::parse_torrent(&bytes).expect("parse");
     assert_eq!(summary.infohash_v1, ih, "导出 infohash 与任务一致");
     assert!(summary.total_size > 0);
+    // E28：status.name 与 .torrent 内声明的 name 一致（同一数据源）
+    assert_eq!(
+        status_name, summary.name,
+        "FFI 透出名应与 torrent metadata 名一致"
+    );
 
     // 未注册任务 → Ok(None)（metadata 未就绪语义）
     let fake = "0123456789abcdef0123456789abcdef01234567";

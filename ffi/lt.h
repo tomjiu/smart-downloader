@@ -64,6 +64,8 @@ typedef struct {
     int     num_peers, num_seeds;   /* 已连接数（F2） */
     int     metadata_received;      /* F2 三阶段评估前提 */
     int     paused;                 /* torrent_handle::pause() 后的 paused 标志 */
+    char    name[256];         /* E28: torrent 名（metadata 就绪前为空串；NUL 结尾，
+                                  截断安全——内核侧 strncpy + 预置 memset） */
 } lt_torrent_status;
 
 lt_err lt_status(lt_session* s, const char* ih, lt_torrent_status* out);

@@ -284,3 +284,46 @@ async fn running_task_resumes_downloading_after_restart() {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
+
+#[tokio::test]
+async fn torrent_name_surfaces_in_engine_status() {
+    // E28：torrent metadata name → FFI status → EngineStatus.name（BT 任务
+    // 名回填链路的数据源就绪）；与 .torrent 内声明名交叉一致
+    let save = seed::TempDir::new().expect("tempdir");
+    let seeder = seed::TestSeeder::start();
+    let magnet = seeder.magnet().to_string();
+
+    let engine = BtEngine::new(save.path(), None, 0, 0, false, false, false).unwrap();
+    let ih = engine.add(&bt_task("t-name", &magnet)).await.unwrap();
+    let (ip, port) = seeder.addr();
+    engine.core().resume(&ih).unwrap();
+    engine.core().add_peer(&ih, &ip, port).unwrap();
+
+    // 等 metadata 就绪
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let st = engine.core().status(&ih).unwrap();
+        if st.metadata_received {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "60s 内未收到 metadata"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // 引擎层透出：DownloadEngine::status → EngineStatus.name = Some(非空)
+    let es = engine.status(&ih).await.unwrap();
+    let surfaced = es.name.expect("E28: EngineStatus.name 应为 Some");
+    assert!(!surfaced.is_empty(), "透出名非空");
+
+    // 交叉一致：与 .torrent 内声明的 name 同源
+    let meta = engine
+        .core()
+        .metadata(&ih)
+        .unwrap()
+        .expect("metadata bytes");
+    let summary = smart_dl_core::torrent_meta::parse_torrent(&meta).unwrap();
+    assert_eq!(surfaced, summary.name, "透出名应与 torrent metadata 名一致");
+}
