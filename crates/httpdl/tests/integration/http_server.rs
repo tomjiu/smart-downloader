@@ -60,6 +60,8 @@ pub struct HttpServerConfig {
     /// 所有 Range 请求回 416（+Content-Range: bytes */size）。
     pub always_416: bool,
     pub etag: Option<&'static str>,
+    /// E26：Last-Modified 响应头（备援指纹 e2e 用）。
+    pub last_modified: Option<&'static str>,
     /// 前 N 次请求回 429（按请求计数）。
     pub retry_429: u32,
     /// 这些 Range 起点 → 404（模拟中途断流/mirror 失效）。
@@ -86,6 +88,7 @@ impl Default for HttpServerConfig {
             range: true,
             always_416: false,
             etag: Some("etag-1"),
+            last_modified: None,
             retry_429: 0,
             fail_ranges: vec![],
             fail_ranges_min_len: None,
@@ -164,6 +167,9 @@ async fn handler(State(st): State<ServerState>, headers: HeaderMap) -> Response 
     let mut builder = Response::builder();
     if let Some(etag) = st.cfg.etag {
         builder = builder.header(header::ETAG, etag);
+    }
+    if let Some(lm) = st.cfg.last_modified {
+        builder = builder.header(header::LAST_MODIFIED, lm);
     }
     if let Some(cd) = &st.cfg.content_disposition {
         builder = builder.header(header::CONTENT_DISPOSITION, cd.as_str());

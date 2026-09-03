@@ -25,7 +25,14 @@ fn client() -> reqwest::Client {
 
 /// 预置中断现场：.part 预分配全尺寸（前 `n` 字节 = 真实内容，其余稀疏零），
 /// 附带段账本（前 `n` 字节 = `MS` 粒度的整段已完成）。`n` 必须与 `MS` 对齐。
-fn preset_interrupted(dir: &Path, name: &str, total: u64, n: u64, etag: Option<&str>) -> PathBuf {
+fn preset_interrupted(
+    dir: &Path,
+    name: &str,
+    total: u64,
+    n: u64,
+    etag: Option<&str>,
+    last_modified: Option<&str>,
+) -> PathBuf {
     assert_eq!(n % MS, 0, "n 必须与测试粒度对齐");
     assert!(n <= total);
     let part = dir.join(format!("{name}.part"));
@@ -51,6 +58,7 @@ fn preset_interrupted(dir: &Path, name: &str, total: u64, n: u64, etag: Option<&
         total,
         min_split: MS,
         etag: etag.map(str::to_string),
+        last_modified: last_modified.map(str::to_string),
         done,
     };
     std::fs::write(
@@ -75,7 +83,7 @@ async fn ledger_and_etag_match_resume_after_done_segments() {
     })
     .await;
     let dir = tempfile::tempdir().unwrap();
-    let part = preset_interrupted(dir.path(), "r.bin", total, n, Some("etag-r"));
+    let part = preset_interrupted(dir.path(), "r.bin", total, n, Some("etag-r"), None);
 
     let engine = HttpEngine::new(client());
     let tid = engine
@@ -127,7 +135,7 @@ async fn etag_mismatch_discards_part_and_redownloads() {
     })
     .await;
     let dir = tempfile::tempdir().unwrap();
-    preset_interrupted(dir.path(), "m.bin", total, n, Some("etag-old"));
+    preset_interrupted(dir.path(), "m.bin", total, n, Some("etag-old"), None);
 
     let engine = HttpEngine::new(client());
     let tid = engine
@@ -208,7 +216,14 @@ async fn part_longer_than_file_restarts() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     // 预置 .part 40KB > 32KB（含账本也应因 total 失配被拒）
-    let part = preset_interrupted(dir.path(), "b.bin", 40 * 1024, 16 * 1024, Some("etag-s"));
+    let part = preset_interrupted(
+        dir.path(),
+        "b.bin",
+        40 * 1024,
+        16 * 1024,
+        Some("etag-s"),
+        None,
+    );
 
     let engine = HttpEngine::new(client());
     let tid = engine
@@ -290,6 +305,7 @@ async fn tampered_ledger_restarts() {
         total,
         min_split: MS,
         etag: Some("etag-t".to_string()),
+        last_modified: None,
         done: vec![(7, 8 * 1024 - 1)], // 未对齐
     };
     std::fs::write(
@@ -312,4 +328,99 @@ async fn tampered_ledger_restarts() {
     assert_eq!(st.state, EngineState::Completed, "{st:?}");
     let final_bytes = std::fs::read(dir.path().join("t.bin")).unwrap();
     assert_eq!(final_bytes, patterned(total));
+}
+
+// ==================== E26：Last-Modified 备援指纹续传核对（e2e） ====================
+
+#[tokio::test]
+async fn last_modified_match_resumes_e2e() {
+    // 服务器发 Last-Modified；账本指纹一致 → 确认文件未变 → 从已完成段后续传
+    let total = 64 * 1024u64;
+    let n = 40 * 1024u64;
+    let srv = HttpTestServer::start(HttpServerConfig {
+        size: total,
+        range: true,
+        last_modified: Some("Mon, 01 Jan 2026 00:00:00 GMT"),
+        patterned_content: true,
+        ..Default::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    preset_interrupted(
+        dir.path(),
+        "lm.bin",
+        total,
+        n,
+        None,
+        Some("Mon, 01 Jan 2026 00:00:00 GMT"),
+    );
+
+    let engine = HttpEngine::new(client());
+    let tid = engine
+        .add(&make_http_task_to(
+            "lm-r",
+            &srv.url("/file"),
+            dir.path().to_path_buf(),
+            Some("lm.bin"),
+        ))
+        .await
+        .unwrap();
+    let st = wait_terminal(&engine, &tid).await;
+    assert_eq!(
+        st.state,
+        EngineState::Completed,
+        "指纹一致应续传完成: {st:?}"
+    );
+    let starts = srv.range_starts.lock().clone();
+    assert!(
+        starts.contains(&(40 * 1024)),
+        "应从账本已完成段后续传: {starts:?}"
+    );
+    assert!(
+        !starts.contains(&(8 * 1024)),
+        "已完成段不应重下: {starts:?}"
+    );
+    let final_bytes = std::fs::read(dir.path().join("lm.bin")).unwrap();
+    assert_eq!(final_bytes, patterned(total));
+}
+
+#[tokio::test]
+async fn last_modified_mismatch_restarts_e2e() {
+    // 服务器 Last-Modified 变了（无 ETag 场景）→ 内容已变证据 → 作废全量重下
+    let total = 48 * 1024u64;
+    let n = 16 * 1024u64;
+    let srv = HttpTestServer::start(HttpServerConfig {
+        size: total,
+        range: true,
+        last_modified: Some("Tue, 02 Jun 2026 00:00:00 GMT"), // 与账本不同
+        patterned_content: true,
+        ..Default::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    preset_interrupted(
+        dir.path(),
+        "lm2.bin",
+        total,
+        n,
+        None,
+        Some("Mon, 01 Jan 2026 00:00:00 GMT"),
+    );
+
+    let engine = HttpEngine::new(client());
+    let tid = engine
+        .add(&make_http_task_to(
+            "lm2-r",
+            &srv.url("/file"),
+            dir.path().to_path_buf(),
+            Some("lm2.bin"),
+        ))
+        .await
+        .unwrap();
+    let st = wait_terminal(&engine, &tid).await;
+    assert_eq!(st.state, EngineState::Completed, "重下后应完成: {st:?}");
+    let starts = srv.range_starts.lock().clone();
+    assert!(starts.contains(&0), "指纹失配必须从 0 全量重下: {starts:?}");
+    let final_bytes = std::fs::read(dir.path().join("lm2.bin")).unwrap();
+    assert_eq!(final_bytes, patterned(total), "内容必须完整一致");
 }

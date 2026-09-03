@@ -11,6 +11,9 @@ pub struct Probe {
     /// 服务器尊重 Range（探测响应 206）。
     pub range_supported: bool,
     pub etag: Option<String>,
+    /// 内容指纹备援（E26）：Last-Modified 原始串。服务器无 ETag 时的续传
+    /// 指纹；与 ETag 各自独立参与账本核对（见 ledger::decide）。
+    pub last_modified: Option<String>,
     /// 文件总长（Content-Range 或 Content-Length）。
     pub total: Option<u64>,
     /// 服务端声明文件名（Content-Disposition；已剥目录成分/控制符，仍需
@@ -41,6 +44,11 @@ pub async fn probe_range(
         .get(reqwest::header::ETAG)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let last_modified = resp
+        .headers()
+        .get(reqwest::header::LAST_MODIFIED)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let filename = resp
         .headers()
         .get(reqwest::header::CONTENT_DISPOSITION)
@@ -53,6 +61,7 @@ pub async fn probe_range(
             Ok(Probe {
                 range_supported: true,
                 etag,
+                last_modified,
                 total,
                 filename,
             })
@@ -60,12 +69,14 @@ pub async fn probe_range(
         reqwest::StatusCode::OK => Ok(Probe {
             range_supported: false,
             etag,
+            last_modified,
             total: resp.content_length(),
             filename,
         }),
         reqwest::StatusCode::RANGE_NOT_SATISFIABLE => Ok(Probe {
             range_supported: false,
             etag,
+            last_modified,
             // 416 通常带 Content-Range: bytes */TOTAL → 仍可取总长
             total: content_range_total(resp.headers()),
             filename,
@@ -213,6 +224,7 @@ mod tests {
             range_supported: true,
             etag: Some("\"v1\"".into()),
             total: Some(1024),
+            last_modified: None,
             filename: None,
         };
         // 同强 ETag + 同长 + 双 Range → 通过

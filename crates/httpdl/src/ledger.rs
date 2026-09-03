@@ -30,6 +30,10 @@ pub struct Ledger {
     /// 内容一致性 token（add 探测所得；失配 → 作废重下）。
     #[serde(default)]
     pub etag: Option<String>,
+    /// 内容指纹备援（E26）：Last-Modified 原始串（add 探测所得；与 etag
+    /// 各自独立参与 decide 核对；服务器无 ETag 时的续传指纹）。
+    #[serde(default)]
+    pub last_modified: Option<String>,
     /// 已完成段（闭区间 [start, end]，升序不重叠）。
     #[serde(default)]
     pub done: Vec<(u64, u64)>,
@@ -37,7 +41,12 @@ pub struct Ledger {
 
 impl Ledger {
     /// 新建空账本（全新下载起点）。
-    pub fn new(total: u64, min_split: u64, etag: Option<String>) -> Self {
+    pub fn new(
+        total: u64,
+        min_split: u64,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    ) -> Self {
         Ledger {
             version: LEDGER_VERSION,
             total,
@@ -47,6 +56,7 @@ impl Ledger {
                 min_split
             },
             etag,
+            last_modified,
             done: Vec::new(),
         }
     }
@@ -142,15 +152,34 @@ pub enum ResumeDecision {
 }
 
 /// 依据 .part 现状（文件长度 + 账本）与探测结果决定续传/重下。
-/// 决策矩阵（P4）：
+/// 决策矩阵（P4 + E26 加固）：
 /// 1. part 超过文件总长（源变小）→ 重下；
 /// 2. 无账本 → **重下**（预分配 .part 长度不可信——G1：空洞文件假完成）；
 /// 3. 账本 total 与探测 total 不一致 → 重下；
-/// 4. 账本 ETag 与探测 ETag 双方存在且失配 → 重下（内容变化证据——G2）；
-///    任一方缺失 → 无法证明变化，按 Range 语义继续（不强求服务器发 ETag）；
+/// 4. 指纹核对（E26：etag 与 last_modified 各自独立，任一失败即重下）：
+///    双方存在且相等 → 放行（确认服务器文件未变）；
+///    双方存在但失配 → 重下（内容变化证据——G2）；
+///    账本有而探测无 → 重下（指纹消失：无法确认未变，宁枉勿纵）；
+///    账本本就无此指纹 → 放行（无从核对，其余防线仍把关）；
 /// 5. 服务器不支持 Range（200/416）→ 重下（段下载依赖 206）；
 /// 6. 账本段校验失败 → 重下；
 /// 7. 其余 → 从 done 恢复。
+///
+/// 单一指纹字段的续传核对（E26 加固）。
+/// - (Some, Some) 相等 → 放行（指纹确认服务器文件未变）
+/// - (Some, Some) 不等 → 拒绝（内容已变，混合文件）
+/// - (Some, None) → 拒绝（先前有指纹、本次探测消失：无法确认未变，
+///   宁枉勿纵 —— 错误续传产出旧前缀+新尾部的静默损坏，代价远高于重下）
+/// - (None, _) → 放行（账本本就无此指纹，无从核对；其余指纹字段、
+///   总长核对、段对齐校验仍把关）
+fn fingerprint_ok(saved: &Option<String>, fresh: &Option<String>) -> bool {
+    match (saved, fresh) {
+        (Some(s), Some(f)) => s == f,
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
 pub fn decide(part_len: u64, ledger: Option<&Ledger>, probe: &Probe) -> ResumeDecision {
     if probe.total.is_some_and(|t| part_len > t) {
         return ResumeDecision::Restart;
@@ -161,10 +190,13 @@ pub fn decide(part_len: u64, ledger: Option<&Ledger>, probe: &Probe) -> ResumeDe
     if probe.total.is_some_and(|t| l.total != t) {
         return ResumeDecision::Restart;
     }
-    if let (Some(saved), Some(fresh)) = (&l.etag, &probe.etag) {
-        if saved != fresh {
-            return ResumeDecision::Restart;
-        }
+    // E26 双指纹核对：etag 与 last_modified 各自独立走 fingerprint_ok；
+    // 任一字段判定失败即作废（_saved 有而 fresh 无 = 指纹消失，同样拒绝）。
+    if !fingerprint_ok(&l.etag, &probe.etag) {
+        return ResumeDecision::Restart;
+    }
+    if !fingerprint_ok(&l.last_modified, &probe.last_modified) {
+        return ResumeDecision::Restart;
     }
     if !probe.range_supported || !l.validate_segments() {
         return ResumeDecision::Restart;
@@ -187,6 +219,7 @@ mod tests {
             total,
             min_split,
             etag: Some("e".into()),
+            last_modified: None,
             done,
         }
     }
@@ -261,6 +294,7 @@ mod tests {
             range_supported: true,
             etag: Some("e".into()),
             total: Some(100),
+            last_modified: None,
             filename: None,
         };
         assert_eq!(decide(100, None, &probe), ResumeDecision::Restart);
@@ -273,6 +307,7 @@ mod tests {
             range_supported: true,
             etag: Some("new".into()),
             total: Some(4096),
+            last_modified: None,
             filename: None,
         };
         let l = ledger(4096, 1024, vec![(0, 1023)]);
@@ -289,6 +324,7 @@ mod tests {
             range_supported: true,
             etag: Some("e".into()),
             total: Some(4096),
+            last_modified: None,
             filename: None,
         };
         let l = ledger(4096, 1024, vec![(0, 1023)]);
@@ -310,6 +346,7 @@ mod tests {
             range_supported: true,
             etag: Some("fresh".into()),
             total: Some(4096),
+            last_modified: None,
             filename: None,
         };
         assert!(matches!(
@@ -324,6 +361,7 @@ mod tests {
             range_supported: true,
             etag: Some("e".into()),
             total: Some(4096),
+            last_modified: None,
             filename: None,
         };
         // 账本 total 不同
@@ -342,6 +380,7 @@ mod tests {
             range_supported: false,
             etag: Some("e".into()),
             total: Some(4096),
+            last_modified: None,
             filename: None,
         };
         let l = ledger(4096, 1024, vec![(0, 1023)]);
@@ -354,6 +393,7 @@ mod tests {
             range_supported: true,
             etag: Some("e".into()),
             total: Some(4096),
+            last_modified: None,
             filename: None,
         };
         // 篡改账本：未对齐段

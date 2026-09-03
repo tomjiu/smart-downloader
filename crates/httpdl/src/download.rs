@@ -37,6 +37,8 @@ pub struct DynamicLedger {
     pub path: PathBuf,
     /// 内容一致性 token（随每笔账本写入持久化，供下次 add 决策）。
     pub etag: Option<String>,
+    /// 内容指纹备援（E26）：Last-Modified 原始串（随账本持久化）。
+    pub last_modified: Option<String>,
     /// 本 session 段粒度（恢复场景必须沿用账本记录的粒度，保证段对齐）。
     pub min_split: u64,
     /// 已完成段（恢复起点；闭区间升序）。
@@ -245,6 +247,7 @@ pub async fn download_dynamic(
                             total,
                             min_split: l.min_split,
                             etag: l.etag.clone(),
+                            last_modified: l.last_modified.clone(),
                             done: m.done_ranges().to_vec(),
                         };
                         ledger::save(&l.path, &snapshot);

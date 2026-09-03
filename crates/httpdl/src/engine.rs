@@ -35,6 +35,8 @@ struct HttpTask {
     mirrors: Vec<String>,
     /// 当前源 ETag（换源对比 + 账本写入）。
     etag: Option<String>,
+    /// 内容指纹备援（E26）：Last-Modified 原始串（账本写入 + 换源同步）。
+    last_modified: Option<String>,
     dest: PathBuf,
     state: EngineState,
     done: u64,
@@ -226,7 +228,19 @@ async fn download_loop(
 ) {
     loop {
         // 快照任务参数（不跨 await 持锁）；gen/epoch 失配 → 本循环作废
-        let (part, mirrors_raw, total, sha256, sha1, md5, sequential, etag, pause_flag, headers) = {
+        let (
+            part,
+            mirrors_raw,
+            total,
+            sha256,
+            sha1,
+            md5,
+            sequential,
+            etag,
+            last_modified,
+            pause_flag,
+            headers,
+        ) = {
             let tasks = inner.tasks.lock();
             let t = match tasks.get(&tid) {
                 Some(t) if t.gen == gen && t.epoch == epoch => t,
@@ -241,6 +255,7 @@ async fn download_loop(
                 t.md5.clone(),
                 t.sequential,
                 t.etag.clone(),
+                t.last_modified.clone(),
                 t.pause.clone(),
                 t.headers.clone(),
             )
@@ -262,6 +277,7 @@ async fn download_loop(
         let ledger_handle = DynamicLedger {
             path: ledger_path,
             etag: etag.clone(),
+            last_modified: last_modified.clone(),
             min_split: loaded
                 .as_ref()
                 .map(|l| l.min_split)
@@ -752,6 +768,7 @@ impl DownloadEngine for HttpEngine {
                     headers,
                     mirrors: init_mirrors,
                     etag: probe.etag.clone(),
+                    last_modified: probe.last_modified.clone(),
                     dest,
                     state: EngineState::Downloading,
                     done: done0,
@@ -1049,6 +1066,10 @@ impl DownloadEngine for HttpEngine {
         t.rotate_pool.clear();
         if let Some(e) = &probe.etag {
             t.etag = Some(e.clone());
+        }
+        // E26：Last-Modified 与 etag 同口径（探测有则更新，账本随写随持久化）
+        if let Some(lm) = &probe.last_modified {
+            t.last_modified = Some(lm.clone());
         }
         let (spawn, new_gen, epoch) = if etag_changed {
             (true, t.gen, t.epoch)

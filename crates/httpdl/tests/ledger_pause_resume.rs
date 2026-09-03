@@ -201,6 +201,7 @@ async fn progress_grows_monotonically_during_download() {
         total,
         min_split: ms,
         etag: Some("etag-p".to_string()),
+        last_modified: None,
         done: vec![(0, ms - 1), (ms, 2 * ms - 1)],
     };
     std::fs::write(
