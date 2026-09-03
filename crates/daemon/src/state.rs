@@ -355,6 +355,11 @@ pub struct AddHttpOpts {
     /// 主源内容校验目标（64 位十六进制 sha256）。传入后校验失败走既有处置链
     /// （重下 1 次 → 备用源 → 隔离试错轮换 → 降级，E3）。
     pub sha256: Option<String>,
+    /// 主源 SHA1 校验目标（E25，40 位十六进制）。与 sha256/md5 互斥
+    /// （同时提供多个 → add 拒绝 InvalidSource）。
+    pub sha1: Option<String>,
+    /// 主源 MD5 校验目标（E25，32 位十六进制）。与 sha256/sha1 互斥。
+    pub md5: Option<String>,
     /// 备用源 URL（主源探测/校验失败兕底，E2/E3）。http(s):// 前缀校验同主源。
     pub backup_url: Option<String>,
     /// 备用源 md5 校验目标（32 位十六进制）。必须与 backup_url 成对（单独给 md5
@@ -402,6 +407,33 @@ impl AddHttpOpts {
             if !is_hex_digest(&s, 64) {
                 return Err(format!("sha256 必须是 64 位十六进制: {s:?}"));
             }
+        }
+        if let Some(s) = &self.sha1 {
+            let s = normalize_digest(s);
+            if !is_hex_digest(&s, 40) {
+                return Err(format!("sha1 必须是 40 位十六进制: {s:?}"));
+            }
+        }
+        if let Some(m) = &self.md5 {
+            let m = normalize_digest(m);
+            if !is_hex_digest(&m, 32) {
+                return Err(format!("md5 必须是 32 位十六进制: {m:?}"));
+            }
+        }
+        // E25 互斥：主源校验目标至多一个（引擎单槽位择一校验）
+        let provided: Vec<&str> = [
+            self.sha256.as_ref().map(|_| "sha256"),
+            self.sha1.as_ref().map(|_| "sha1"),
+            self.md5.as_ref().map(|_| "md5"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        if provided.len() > 1 {
+            return Err(format!(
+                "sha256/sha1/md5 主源校验目标互斥，至多提供一个（收到 {}）",
+                provided.join(" + ")
+            ));
         }
         if let Some(m) = &self.backup_md5 {
             if self.backup_url.is_none() {
@@ -1575,6 +1607,8 @@ impl DaemonState {
                 size: 0,
                 etag: None,
                 sha256: None,
+                sha1: None,
+                md5: None,
                 backup_md5: None,
             },
             dest_root: dest_root.clone(),
@@ -1701,6 +1735,8 @@ impl DaemonState {
                 size: 0,
                 etag: None,
                 sha256: None,
+                sha1: None,
+                md5: None,
                 backup_md5: None,
             },
             dest_root: dest_root.clone(),
@@ -2021,6 +2057,8 @@ impl DaemonState {
             headers,
             basic_auth,
             sha256,
+            sha1,
+            md5,
             backup_url,
             backup_md5,
             name,
@@ -2037,6 +2075,8 @@ impl DaemonState {
         }
         // 校验和归一（引擎端摘要为小写 hex；trim 防复制粘贴带空白）
         let sha256 = sha256.map(|s| normalize_digest(&s));
+        let sha1 = sha1.map(|s| normalize_digest(&s));
+        let md5 = md5.map(|s| normalize_digest(&s));
         let backup_md5 = backup_md5.map(|s| normalize_digest(&s));
         // B10：目标目录预检（创建/可写）；HTTP 大小在响应头才知 → 空间预检跳过
         // dest 未指定 → 默认落盘目录（serve 配置 dest_root；未注入时为 daemon cwd）
@@ -2102,6 +2142,8 @@ impl DaemonState {
                 size: 0,
                 etag: None,
                 sha256,
+                sha1,
+                md5,
                 backup_md5,
             },
             dest_root: dest_root.clone(),
@@ -2147,6 +2189,8 @@ impl DaemonState {
                     .unwrap_or(0),
                 etag: None,
                 sha256: None,
+                sha1: None,
+                md5: None,
                 backup_md5: None,
             };
             rec.task.metadata.finished_at_unix = std::time::SystemTime::now()
@@ -2270,6 +2314,8 @@ impl DaemonState {
                 size: 0,
                 etag: None,
                 sha256: None,
+                sha1: None,
+                md5: None,
                 backup_md5: None,
             },
             dest_root: dest_root.clone(),
@@ -3458,6 +3504,8 @@ impl HttpSink for FallbackSink {
                 size: 0,
                 etag: None,
                 sha256: None,
+                sha1: None,
+                md5: None,
                 backup_md5: None,
             },
             dest_root,
@@ -4098,6 +4146,8 @@ mod bt_alert_tests {
                     size: 0,
                     etag: None,
                     sha256: None,
+                    sha1: None,
+                    md5: None,
                     backup_md5: None,
                 },
                 dest_root: PathBuf::from("."),
@@ -5243,6 +5293,8 @@ mod persist_tests {
                 size: 0,
                 etag: None,
                 sha256: None,
+                sha1: None,
+                md5: None,
                 backup_md5: None,
             },
             dest_root: PathBuf::from("."),
@@ -6175,6 +6227,8 @@ mod add_opts_tests {
                     sha256: Some(
                         " ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789 ".into(),
                     ),
+                    sha1: None,
+                    md5: None,
                     backup_url: Some("https://backup.example/f.bin".into()),
                     backup_md5: Some("ABCDEF0123456789ABCDEF0123456789".into()),
                     name: Some("explicit-name.bin".into()),
@@ -6250,6 +6304,71 @@ mod add_opts_tests {
             ),
             (
                 AddHttpOpts {
+                    sha1: Some("ab".repeat(19)), // 38 hex
+                    ..Default::default()
+                },
+                "sha1",
+            ),
+            (
+                AddHttpOpts {
+                    sha1: Some("z".repeat(40)), // 非 hex
+                    ..Default::default()
+                },
+                "sha1",
+            ),
+            (
+                AddHttpOpts {
+                    md5: Some("ab".repeat(15)), // 30 hex
+                    ..Default::default()
+                },
+                "md5",
+            ),
+            (
+                AddHttpOpts {
+                    md5: Some("w".repeat(32)), // 非 hex
+                    ..Default::default()
+                },
+                "md5",
+            ),
+            (
+                AddHttpOpts {
+                    // E25 互斥：sha256 + sha1
+                    sha256: Some("a".repeat(64)),
+                    sha1: Some("a".repeat(40)),
+                    ..Default::default()
+                },
+                "互斥",
+            ),
+            (
+                AddHttpOpts {
+                    // E25 互斥：sha256 + md5
+                    sha256: Some("a".repeat(64)),
+                    md5: Some("a".repeat(32)),
+                    ..Default::default()
+                },
+                "互斥",
+            ),
+            (
+                AddHttpOpts {
+                    // E25 互斥：sha1 + md5
+                    sha1: Some("a".repeat(40)),
+                    md5: Some("a".repeat(32)),
+                    ..Default::default()
+                },
+                "互斥",
+            ),
+            (
+                AddHttpOpts {
+                    // E25 互斥：三者同时
+                    sha256: Some("a".repeat(64)),
+                    sha1: Some("a".repeat(40)),
+                    md5: Some("a".repeat(32)),
+                    ..Default::default()
+                },
+                "互斥",
+            ),
+            (
+                AddHttpOpts {
                     backup_md5: Some("a".repeat(32)), // 无 backup_url
                     ..Default::default()
                 },
@@ -6311,6 +6430,61 @@ mod add_opts_tests {
             }
         }
         assert!(fake.added().is_empty(), "被拒任务不得进入引擎");
+    }
+
+    #[tokio::test]
+    async fn add_opts_verify_algo_e25_normalize_and_landing() {
+        // E25：sha1/md5 主源校验目标入参大写+空白 → 小写归一落 identity，
+        // 且经 API 层（AddHttpOpts）进入引擎可见的任务身份。
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task_opts(
+                "https://example.com/e25.bin".into(),
+                None,
+                AddHttpOpts {
+                    sha1: Some(format!(" {} ", "ab".repeat(20))), // 40 hex + 空白
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+        match &rec.task.identity {
+            ContentIdentity::SingleFile { sha1, md5, .. } => {
+                assert_eq!(
+                    sha1.as_deref(),
+                    Some("ab".repeat(20)).as_deref(),
+                    "sha1 大写+空白应小写归一"
+                );
+                assert_eq!(md5, &None);
+            }
+            other => panic!("identity 应为 SingleFile: {other:?}"),
+        }
+        // md5 同理（第二个任务，URL 不同避开 canonical 查重）
+        let tid2 = state
+            .add_http_task_opts(
+                "https://example.com/e25-md5.bin".into(),
+                None,
+                AddHttpOpts {
+                    md5: Some(" ABCDEF0123456789ABCDEF0123456789".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let rec2 = state.tasks.lock().get(&tid2).cloned().unwrap();
+        match &rec2.task.identity {
+            ContentIdentity::SingleFile { sha1, md5, .. } => {
+                assert_eq!(sha1, &None);
+                assert_eq!(
+                    md5.as_deref(),
+                    Some("abcdef0123456789abcdef0123456789"),
+                    "md5 大写+空白应小写归一"
+                );
+            }
+            other => panic!("identity 应为 SingleFile: {other:?}"),
+        }
     }
 }
 
@@ -6627,6 +6801,8 @@ mod task_proxy_set_tests {
                     size: 0,
                     etag: None,
                     sha256: None,
+                    sha1: None,
+                    md5: None,
                     backup_md5: None,
                 },
                 dest_root: PathBuf::from("."),
@@ -6979,6 +7155,8 @@ mod rate_cache_tests {
                     size: 0,
                     etag: None,
                     sha256: None,
+                    sha1: None,
+                    md5: None,
                     backup_md5: None,
                 },
                 dest_root: PathBuf::from("."),
@@ -7535,6 +7713,8 @@ mod batch_select_tests {
                     size: 0,
                     etag: None,
                     sha256: None,
+                    sha1: None,
+                    md5: None,
                     backup_md5: None,
                 },
                 dest_root: PathBuf::from("."),
@@ -7745,6 +7925,8 @@ mod cleanup_tests {
                     size: 0,
                     etag: None,
                     sha256: None,
+                    sha1: None,
+                    md5: None,
                     backup_md5: None,
                 },
                 dest_root: PathBuf::from("."),
@@ -8011,6 +8193,8 @@ mod scheduled_tests {
                     size: 0,
                     etag: None,
                     sha256: None,
+                    sha1: None,
+                    md5: None,
                     backup_md5: None,
                 },
                 dest_root: PathBuf::from("."),

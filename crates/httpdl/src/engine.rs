@@ -9,7 +9,7 @@ use crate::ledger;
 use crate::range::{multi_source_ok, probe_range, Probe};
 use crate::rate::{RateLimiter, RateSample};
 use crate::segment_manager::DEFAULT_MIN_SPLIT;
-use crate::verify::{verify_file, verify_file_md5};
+use crate::verify::{verify_file, verify_file_md5, verify_file_sha1};
 use parking_lot::Mutex;
 use smart_dl_core::identity::ContentIdentity;
 use smart_dl_core::session::output::OutputManager;
@@ -43,7 +43,10 @@ struct HttpTask {
     rate: RateSample,
     error: Option<String>,
     sha256: Option<String>,
-    /// 备用源内容 MD5 校验目标（切备用源后生效；主源阶段 None）。
+    /// 主源 SHA1 校验目标（E25；优先级 sha256 > sha1 > md5；切备用源后清空）。
+    sha1: Option<String>,
+    /// 主源 MD5 校验目标（E25；优先级末位）。切备用源后本槽被 backup_md5
+    /// 接管（同一槽位：主源摘要已随主源失败作废，语义不冲突）。
     md5: Option<String>,
     verify_attempts: u32,
     /// 备用源 URL（主源两次校验失败后切换）。
@@ -223,7 +226,7 @@ async fn download_loop(
 ) {
     loop {
         // 快照任务参数（不跨 await 持锁）；gen/epoch 失配 → 本循环作废
-        let (part, mirrors_raw, total, sha256, md5, sequential, etag, pause_flag, headers) = {
+        let (part, mirrors_raw, total, sha256, sha1, md5, sequential, etag, pause_flag, headers) = {
             let tasks = inner.tasks.lock();
             let t = match tasks.get(&tid) {
                 Some(t) if t.gen == gen && t.epoch == epoch => t,
@@ -234,6 +237,7 @@ async fn download_loop(
                 t.mirrors.clone(),
                 t.total,
                 t.sha256.clone(),
+                t.sha1.clone(),
                 t.md5.clone(),
                 t.sequential,
                 t.etag.clone(),
@@ -312,12 +316,14 @@ async fn download_loop(
                 if !still_current {
                     return;
                 }
-                // 段全部落位 → 校验（sha256 或备用源 md5；均未提供 → 不校验直接落位）
+                // 段全部落位 → 校验（E25 主源 sha256/sha1/md5 择一 + 备用源 md5；
+                // 均未提供 → 不校验直接落位）
                 let dest = dest_of(&inner, &tid);
-                let verify_result = match (&sha256, &md5) {
-                    (Some(expected), _) => verify_file(&part, expected),
-                    (None, Some(expected)) => verify_file_md5(&part, expected),
-                    (None, None) => Ok(true),
+                let verify_result = match (&sha256, &sha1, &md5) {
+                    (Some(expected), _, _) => verify_file(&part, expected),
+                    (None, Some(expected), _) => verify_file_sha1(&part, expected),
+                    (None, None, Some(expected)) => verify_file_md5(&part, expected),
+                    (None, None, None) => Ok(true),
                 };
                 match verify_result {
                     Ok(true) => {
@@ -376,6 +382,7 @@ async fn download_loop(
                             t.backup_used = true;
                             t.mirrors = vec![bu.clone()];
                             t.sha256 = None;
+                            t.sha1 = None;
                             t.md5 = backup_md5.clone();
                             t.verify_attempts = 0;
                             t.error = None;
@@ -421,8 +428,11 @@ async fn download_loop(
                             remove_part(&part);
                             continue;
                         }
-                        // 备用源与轮换池均耗尽（或未配置）→ 降级接受 + 告警（Q-B5）
-                        let warn = if md5.is_some() {
+                        // 备用源与轮换池均耗尽（或未配置）→ 降级接受 + 告警（Q-B5）；
+                        // 告警点名当前生效算法（E25：sha256/sha1/md5 择一）
+                        let warn = if sha1.is_some() {
+                            "sha1 mismatch, accepted downgrade".to_string()
+                        } else if md5.is_some() {
                             "md5 mismatch, accepted downgrade".to_string()
                         } else {
                             "sha256 mismatch, accepted downgrade".to_string()
@@ -705,21 +715,31 @@ impl DownloadEngine for HttpEngine {
             remove_credentials(&part0);
         }
         let done0: u64 = resume_done.iter().map(|(s, e)| e - s + 1).sum();
-        let (sha256, backup_md5) = match &task.identity {
+        let (sha256, sha1, md5_primary, backup_md5) = match &task.identity {
             ContentIdentity::SingleFile {
-                sha256, backup_md5, ..
-            } => (sha256.clone(), backup_md5.clone()),
-            _ => (None, None),
+                sha256,
+                sha1,
+                md5,
+                backup_md5,
+                ..
+            } => (
+                sha256.clone(),
+                sha1.clone(),
+                md5.clone(),
+                backup_md5.clone(),
+            ),
+            _ => (None, None, None, None),
         };
         // 探测韧性初始化：主源失败已落备用源 → mirrors 以备用源起步，身份切换
-        // （sha256 → None / md5 ← backup_md5）与运行时切备用源完全同语义；
+        // （sha256/sha1 → None / md5 ← backup_md5）与运行时切备用源完全同语义；
         // backup_used = true —— 运行时再遇校验失败不再重复切向同一备用源。
         // E24：双源同质门控通过 → 双 mirrors（身份仍为主源口径，内容一致）。
-        let (init_mirrors, init_sha256, init_md5, init_backup_used) = match &fell_back_to {
-            Some(bu) => (vec![bu.clone()], None, backup_md5.clone(), true),
+        let (init_mirrors, init_sha256, init_sha1, init_md5, init_backup_used) = match &fell_back_to
+        {
+            Some(bu) => (vec![bu.clone()], None, None, backup_md5.clone(), true),
             None => match dual_mirrors {
-                Some(m) => (m, sha256, None, false),
-                None => (vec![url.clone()], sha256, None, false),
+                Some(m) => (m, sha256, sha1, md5_primary, false),
+                None => (vec![url.clone()], sha256, sha1, md5_primary, false),
             },
         };
 
@@ -739,6 +759,7 @@ impl DownloadEngine for HttpEngine {
                     rate: RateSample::default(),
                     error: None,
                     sha256: init_sha256,
+                    sha1: init_sha1,
                     md5: init_md5,
                     verify_attempts: 0,
                     backup_url,

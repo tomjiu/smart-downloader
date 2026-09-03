@@ -1170,6 +1170,9 @@ async fn http_task_file_priority_conflict() {
 
 use sha2::{Digest, Sha256};
 
+// E25 主源 md5 校验 e2e 用（Digest trait 已由上方 sha2::Digest 引入，同一 re-export）。
+use md5::Md5;
+
 /// 轮询快照到终态（Completed/Error，30s 超时）。
 async fn poll_terminal(client: &reqwest::Client, base: &str, tid: &str) -> serde_json::Value {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
@@ -2458,4 +2461,94 @@ async fn events_stream_gap_replays_from_oldest_e2e() {
     );
     assert!(ids.len() >= 2, "重放应持续输出（读窗内数百帧）");
     assert!(data.len() == ids.len(), "data 与 id 一一对应");
+}
+
+// ==================== E25 主源 md5/sha1 校验 API 透出 ====================
+
+/// E25 e2e：API 传 md5 → 校验链生效；sha256+md5 同时给 → 400 互斥；
+/// 错误 sha1 → 降级接受 + 告警点名 sha1（Q-B5 语义经 API 保持）。
+#[tokio::test]
+async fn add_task_with_md5_sha1_e2e() {
+    let body = patterned(64 * 1024);
+    let mut hasher = Sha256::new();
+    hasher.update(&body);
+    let _ = hasher.finalize();
+    let srv = TestServer::start(body).await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 正确 md5 → Completed 无告警
+    let md5_good = {
+        // E25 e2e 内本地计算 md5（http_api 测试无 md5 依赖，逐字节复算）
+        let body2 = patterned(64 * 1024);
+        let mut h = Md5::new();
+        h.update(&body2);
+        format!("{:x}", h.finalize())
+    };
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "url": srv.url(),
+            "dest": std::env::temp_dir().join(format!("e25-md5-ok-{}", std::process::id())),
+            "md5": md5_good,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let snap = poll_terminal(&client, &base, &tid).await;
+    assert_eq!(snap["state"], "Completed", "正确 md5 必须完成: {snap}");
+    assert!(snap["error"].is_null(), "正确 md5 不得告警: {snap}");
+
+    // sha256 + md5 同时提供 → 400 互斥
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "url": srv.url(),
+            "sha256": "ab".repeat(32),
+            "md5": "cd".repeat(16),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "互斥必须 400"
+    );
+    let msg = resp.json::<serde_json::Value>().await.unwrap()["error"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(msg.contains("互斥"), "错误应定性互斥: {msg}");
+
+    // 错误 sha1 → 降级接受（Completed）+ 告警点名 sha1
+    let srv2 = TestServer::start(patterned(64 * 1024)).await;
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "url": srv2.url(),
+            "dest": std::env::temp_dir().join(format!("e25-sha1-bad-{}", std::process::id())),
+            "sha1": "ef".repeat(20),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let snap = poll_terminal(&client, &base, &tid).await;
+    assert_eq!(
+        snap["state"], "Completed",
+        "降级接受语义（Q-B5）经 API 保持: {snap}"
+    );
+    let err = snap["error"].as_str().unwrap_or_default();
+    assert!(err.contains("sha1"), "告警应定性 sha1: {err}");
 }

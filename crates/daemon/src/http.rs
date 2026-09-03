@@ -66,6 +66,14 @@ pub struct AddTaskReq {
     /// 传入后内容校验失败走既有处置链（重下 → 备用源 → 隔离试错 → 降级）。
     #[serde(default)]
     pub sha256: Option<String>,
+    /// 主源 SHA1 校验目标（E25，仅 HTTP 任务生效）：40 位十六进制。
+    /// 与 `sha256`/`md5` 互斥（同时提供多个 → 400）。
+    #[serde(default)]
+    pub sha1: Option<String>,
+    /// 主源 MD5 校验目标（E25，仅 HTTP 任务生效）：32 位十六进制。
+    /// 与 `sha256`/`sha1` 互斥（同时提供多个 → 400）。
+    #[serde(default)]
+    pub md5: Option<String>,
     /// 备用源 URL（E6，仅 HTTP 任务生效）：主源探测/校验失败自动兜底。
     #[serde(default)]
     pub backup_url: Option<String>,
@@ -951,6 +959,8 @@ async fn add_task(
                         .unwrap_or_default(),
                     basic_auth: req.username.map(|u| (u, req.password.unwrap_or_default())),
                     sha256: req.sha256,
+                    sha1: req.sha1,
+                    md5: req.md5,
                     backup_url: req.backup_url,
                     backup_md5: req.backup_md5,
                     name: req.name,

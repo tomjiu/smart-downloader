@@ -29,6 +29,8 @@ fn bt_task(id: &str, magnet: &str) -> DownloadTask {
             size: 0,
             etag: None,
             sha256: None,
+            sha1: None,
+            md5: None,
             backup_md5: None,
         },
         dest_root: PathBuf::from("."),

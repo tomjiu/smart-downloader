@@ -219,6 +219,8 @@ async fn engine_task_headers_reach_segments() {
         size: 0,
         etag: None,
         sha256: Some(sha256_of(&patterned(SIZE))),
+        sha1: None,
+        md5: None,
         backup_md5: None,
     };
 

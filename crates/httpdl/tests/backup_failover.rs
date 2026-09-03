@@ -130,6 +130,8 @@ async fn backup_url_only_reuses_main_sha256() {
         size: 0,
         etag: None,
         sha256: Some(sha256_of(&good)),
+        sha1: None,
+        md5: None,
         backup_md5: None,
     };
     let tid = engine.add(&task).await.unwrap();

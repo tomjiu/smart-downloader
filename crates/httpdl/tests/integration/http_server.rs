@@ -14,6 +14,7 @@ use axum::{
 };
 use md5::{Digest as Md5Digest, Md5};
 use parking_lot::Mutex;
+use sha1::Sha1;
 use sha2::Sha256;
 use std::net::SocketAddr;
 use std::sync::{
@@ -38,6 +39,14 @@ pub fn sha256_of(bytes: &[u8]) -> String {
 #[allow(dead_code)]
 pub fn md5_of(bytes: &[u8]) -> String {
     let mut h = Md5::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
+/// E25 主源 SHA1 校验用。
+#[allow(dead_code)]
+pub fn sha1_of(bytes: &[u8]) -> String {
+    let mut h = Sha1::new();
     h.update(bytes);
     format!("{:x}", h.finalize())
 }

@@ -110,6 +110,8 @@ fn make_proxied_task(
         size: 0,
         etag: None,
         sha256: Some(sha.to_string()),
+        sha1: None,
+        md5: None,
         backup_md5: None,
     };
     t
