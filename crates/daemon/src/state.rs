@@ -312,6 +312,28 @@ impl From<anyhow::Error> for DaemonError {
 /// 校验目标/备用源/显式名继续散参不可维护 → 收敛为结构体。
 /// `add_link_task_opts` 复用本结构：magnet/ftp 分支仅取 `sequential`
 /// （其余字段对非 HTTP 任务无语义，与 AddTaskReq 一字段多引擎口径一致）。
+/// 文件冲突策略（E21）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictPolicy {
+    /// 覆盖既有文件（默认，旧行为）。
+    Overwrite,
+    /// 自动改名：`name.bin` → `name(1).bin` → `name(2).bin` … 取首个空闲。
+    Rename,
+    /// 跳过下载：任务直接置 Completed（既有文件保持原样），照常发完成事件/Webhook。
+    Skip,
+}
+
+impl ConflictPolicy {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "overwrite" => Some(Self::Overwrite),
+            "rename" => Some(Self::Rename),
+            "skip" => Some(Self::Skip),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct AddHttpOpts {
     /// 顺序下载（HTTP = 在飞段窗口收紧；BT = sequential flag）。
@@ -332,6 +354,9 @@ pub struct AddHttpOpts {
     pub backup_md5: Option<String>,
     /// 用户显式落盘名（V3 语义：非法即拒；None = 引擎派生链 E4：CD → URL 末段 → 兕底）。
     pub name: Option<String>,
+    /// 文件冲突策略（E21）：目标文件已存在时的处置。None = overwrite（默认）。
+    /// 仅对显式名任务生效（派生名任务最终名在引擎侧 CD 才确定，v1 保持覆盖）。
+    pub conflict: Option<ConflictPolicy>,
 }
 
 /// 校验和归一：小写化（引擎端 sha256/md5 摘要格式化为小写 hex，入参大写需归一后参与比较）。
@@ -1235,6 +1260,26 @@ impl DaemonState {
     /// 链接任务创建（E6 opts 收口）：HTTP 分支整体透传 `AddHttpOpts`；
     /// magnet 分支仅取 `sequential`（其余字段对 BT 无语义，静默忽略）；
     /// ed2k/ftp/xunlei 分支不受影响。
+    /// 文件冲突改名候选（E21）：`a.bin` → `a(1).bin`（无扩展名 → `a(1)`）；
+    /// 首个磁盘不存在的候选。上限 1000（防极端目录全占满时死循环）。
+    fn bump_conflict_name(dir: &Path, name: &str) -> Option<String> {
+        let (stem, ext) = match name.rsplit_once('.') {
+            // 无扩展名或纯点：整体当 stem（对齐常见下载器行为）
+            Some((st, e)) if !st.is_empty() && !e.is_empty() => (st, Some(e)),
+            _ => (name, None),
+        };
+        for k in 1..1000 {
+            let cand = match ext {
+                Some(e) => format!("{stem}({k}).{e}"),
+                None => format!("{stem}({k})"),
+            };
+            if !dir.join(&cand).exists() {
+                return Some(cand);
+            }
+        }
+        None
+    }
+
     pub async fn add_link_task_opts(
         &self,
         link: String,
@@ -1755,6 +1800,7 @@ impl DaemonState {
             backup_url,
             backup_md5,
             name,
+            conflict,
         } = opts;
         // E5：任务级代理 URL 校验（构建一次 client 试水，成功即合法）。
         if let Some(p) = &proxy {
@@ -1794,6 +1840,29 @@ impl DaemonState {
             }
         }
 
+        // E21 文件冲突策略：仅显式名任务可预判目标路径（派生名任务最终名在
+        // 引擎侧 CD 才确定，v1 保持引擎默认覆盖）。`.part` 存在不属冲突
+        //（那是续传现场），只看最终落盘名。
+        let mut skip_download = false;
+        let name = match (name, conflict) {
+            (Some(n), Some(ConflictPolicy::Rename)) => {
+                if dest_root.join(&n).exists() {
+                    let bumped = Self::bump_conflict_name(&dest_root, &n).ok_or_else(|| {
+                        DaemonError::InvalidSource("改名冲突：连续 1000 个候选名均被占用".into())
+                    })?;
+                    tracing::info!("冲突策略 rename: {n:?} → {bumped:?}");
+                    Some(bumped)
+                } else {
+                    Some(n)
+                }
+            }
+            (Some(n), Some(ConflictPolicy::Skip)) if dest_root.join(&n).exists() => {
+                skip_download = true;
+                Some(n)
+            }
+            (n, _) => n, // overwrite（默认）或目标不存在：原样
+        };
+
         let task = DownloadTask {
             id: task_id.clone(),
             canonical_id: canonical,
@@ -1828,6 +1897,44 @@ impl DaemonState {
             limits: None,
         };
 
+        // E21 skip：目标文件已在 → 不入引擎，任务直接落 Completed
+        //（既有文件保持原样；完成事件/Webhook 照常——publish_task_completed
+        // 一并写 finished_at）
+        if skip_download {
+            let mut rec = TaskRecord {
+                task,
+                engine_tid: None,
+                engine_kind: EngineKind::Http,
+                engine_status: None,
+                events: vec![],
+            };
+            rec.push_event("add", Some("conflict_skip".into()));
+            rec.task.state = TaskState::Completed;
+            rec.task.identity = ContentIdentity::SingleFile {
+                size: rec
+                    .task
+                    .metadata
+                    .name
+                    .as_deref()
+                    .and_then(|n| dest_root.join(n).metadata().ok())
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+                etag: None,
+                sha256: None,
+                backup_md5: None,
+            };
+            rec.task.metadata.finished_at_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            self.tasks.lock().insert(task_id.clone(), rec);
+            self.autosave();
+            self.hub.publish(SchedulerEvent::TaskCreated {
+                task_id: task_id.clone(),
+            });
+            self.publish_task_completed(&task_id);
+            return Ok(task_id);
+        }
         let engine_tid = self
             .engine_for(EngineKind::Http)?
             .add(&task)
@@ -5717,6 +5824,7 @@ mod add_opts_tests {
                     backup_url: Some("https://backup.example/f.bin".into()),
                     backup_md5: Some("ABCDEF0123456789ABCDEF0123456789".into()),
                     name: Some("explicit-name.bin".into()),
+                    conflict: None,
                 },
             )
             .await
@@ -7392,5 +7500,107 @@ mod cleanup_tests {
         }
         let swept = state.sweep_completed_cleanup().await;
         assert!(swept.is_empty(), "非 Completed 状态不清扫");
+    }
+}
+
+/// E21 文件冲突策略：改名候选 / skip 秒完成 / 默认覆盖不变。
+#[cfg(test)]
+mod conflict_tests {
+    use super::*;
+
+    #[test]
+    fn bump_conflict_name_skips_occupied() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path();
+        assert_eq!(
+            DaemonState::bump_conflict_name(p, "a.bin").as_deref(),
+            Some("a(1).bin"),
+            "空闲目录取 (1)"
+        );
+        std::fs::write(p.join("a(1).bin"), b"x").unwrap();
+        assert_eq!(
+            DaemonState::bump_conflict_name(p, "a.bin").as_deref(),
+            Some("a(2).bin"),
+            "占用则顺延"
+        );
+        // 无扩展名
+        assert_eq!(
+            DaemonState::bump_conflict_name(p, "file").as_deref(),
+            Some("file(1)")
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_policy_completes_without_engine_add() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dup.bin"), b"existing").unwrap();
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        // V2 白名单：显式 dest 落测试目录 → 注入为白名单根
+        let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![])
+            .with_dest_root(dir.path().to_path_buf());
+
+        let id = state
+            .add_http_task_opts(
+                "https://example.com/dup.bin".into(),
+                Some(dir.path().to_string_lossy().into_owned()),
+                crate::state::AddHttpOpts {
+                    name: Some("dup.bin".into()),
+                    conflict: Some(ConflictPolicy::Skip),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        // 引擎未收到 add
+        assert!(fake.added.lock().is_empty(), "skip 不得入引擎");
+        // 任务直接 Completed + 完成时刻入档 + 事件标记 conflict_skip
+        {
+            let tasks = state.tasks.lock();
+            let rec = tasks.get(&id).unwrap();
+            assert_eq!(rec.task.state, TaskState::Completed);
+            assert!(rec.task.metadata.finished_at_unix > 0);
+            assert!(
+                rec.events
+                    .iter()
+                    .any(|e| e.detail.as_deref() == Some("conflict_skip")),
+                "应有 conflict_skip 事件"
+            );
+            // identity.size 反映既有文件字节数（快照 total 口径来自引擎，
+            // skip 无引擎任务 → 用 identity 断言）
+            match &rec.task.identity {
+                ContentIdentity::SingleFile { size, .. } => assert_eq!(*size, 8),
+                other => panic!("identity 应为 SingleFile: {other:?}"),
+            }
+        }
+        // 快照可读
+        let snap = state.task_snapshot(&id).await.unwrap();
+        assert_eq!(snap.state, "Completed");
+        // 可正常删除
+        assert!(state.remove_with(&id, false).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn no_policy_keeps_default_overwrite_flow() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dup.bin"), b"existing").unwrap();
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![])
+            .with_dest_root(dir.path().to_path_buf());
+
+        // 显式名 + 无策略 → 旧行为：照常入引擎（引擎 finalize 覆盖）
+        let id = state
+            .add_http_task_opts(
+                "https://example.com/dup.bin".into(),
+                Some(dir.path().to_string_lossy().into_owned()),
+                crate::state::AddHttpOpts {
+                    name: Some("dup.bin".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(fake.added.lock().len(), 1, "默认照常入引擎");
+        assert_eq!(state.task_snapshot(&id).await.unwrap().state, "Downloading");
     }
 }
