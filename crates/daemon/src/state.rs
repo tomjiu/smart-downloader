@@ -82,6 +82,12 @@ pub struct TaskSnapshot {
     /// 文件级进度（实时读引擎 status().files；单文件/无文件引擎为空数组）。
     /// FTP 目录任务与 BT 多文件任务在此处行为一致（都从引擎状态链透出）。
     pub files: Vec<FileProgress>,
+    /// 实时速率（E13）：取自与 `done`/`total` 同一次引擎快照，非 `engine_status`
+    /// 轮询缓存（缓存 2s 龄且仅活跃任务有写入，快照应即时）。记录级 Paused
+    /// 恒 0（对齐 `pause()` 清零语义，防 <200ms 平滑窗口的陈旧值毛刺）。
+    /// None = 引擎不可达/任务未接入引擎，序列化时省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rates: Option<TaskRates>,
     /// 任务级限速配置（KiB/s；None = 未设置走全局）。set 语义见
     /// `DaemonState::set_task_limits`。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -98,6 +104,18 @@ pub struct TaskSnapshot {
     /// false = 默认并行策略（不序列化，快照向后兼容）。
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub sequential: bool,
+}
+
+/// 实时速率（E13 透出）：与快照 `done`/`total` 同一次引擎快照取样——
+/// HTTP/FTP 为引擎侧增量采样值（`RateSample`，快照按需查询与轮询器共用
+/// 同一采样点，<200ms 窗口沿用平滑值），BT 为 FFI 实时值。字段名与
+/// `DaemonStats` 聚合口径一致。
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct TaskRates {
+    /// 下行速率（B/s）。
+    pub down_bytes_s: u64,
+    /// 上行速率（B/s；仅 BT 等双向引擎非零）。
+    pub up_bytes_s: u64,
 }
 
 /// 列表条目。
@@ -1746,6 +1764,22 @@ impl DaemonState {
             },
         };
         let state = state_label(&effective_state);
+        // E13：速率与 done/total 同源同新鲜度；Paused 记录态是显示层权威
+        // （qB 式），速率同样以记录为准清零——引擎侧 <200ms 窗口会沿用
+        // 平滑值（陈旧非零），不锁则暂停后最长 200ms 内快照仍报旧速率。
+        let rates = status.as_ref().map(|s| {
+            if matches!(effective_state, TaskState::Paused) {
+                TaskRates {
+                    down_bytes_s: 0,
+                    up_bytes_s: 0,
+                }
+            } else {
+                TaskRates {
+                    down_bytes_s: s.down_rate,
+                    up_bytes_s: s.up_rate,
+                }
+            }
+        });
         Some(TaskSnapshot {
             task_id: id.to_string(),
             state,
@@ -1757,6 +1791,7 @@ impl DaemonState {
             total: status.as_ref().map(|s| s.total).unwrap_or(0),
             error: status.as_ref().and_then(|s| s.error.clone()),
             files: status.as_ref().map(|s| s.files.clone()).unwrap_or_default(),
+            rates,
             limits: rec.task.limits.clone(),
             file_priorities: rec.task.file_priorities.clone(),
             sequential: rec.task.sequential,
@@ -5926,5 +5961,73 @@ mod rate_cache_tests {
             "暂停任务不在候选集——缓存不得被写入陈旧速率"
         );
         assert_eq!(state.stats().down_bytes_s, 0);
+    }
+
+    /// E13：快照速率取自实时引擎快照——轮询器未跑（缓存恒 None）也能透出，
+    /// 锁定「实时源而非缓存源」的设计语义。
+    #[tokio::test]
+    async fn snapshot_exposes_live_engine_rates_without_cache() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task("https://example.com/f.bin".into(), None)
+            .await
+            .unwrap();
+        assert!(
+            state
+                .tasks
+                .lock()
+                .get(&tid)
+                .unwrap()
+                .engine_status
+                .is_none(),
+            "前提：无轮询器 → 缓存必须为空（证明速率来自实时快照）"
+        );
+        fake.set_status_rates(1234, 56);
+        let snap = state.task_snapshot(&tid).await.unwrap();
+        assert_eq!(
+            snap.rates,
+            Some(TaskRates {
+                down_bytes_s: 1234,
+                up_bytes_s: 56
+            }),
+            "快照速率应来自引擎实时 status()，与缓存无关"
+        );
+        // 引擎报零 → 速率字段仍在（Some），形状恒定不省略
+        fake.set_status_rates(0, 0);
+        let snap = state.task_snapshot(&tid).await.unwrap();
+        assert_eq!(
+            snap.rates,
+            Some(TaskRates {
+                down_bytes_s: 0,
+                up_bytes_s: 0
+            })
+        );
+    }
+
+    /// E13：记录级 Paused 是显示权威（qB 式），快照速率对齐 pause() 清零
+    /// 语义——引擎侧 <200ms 平滑窗口的陈旧非零值不得穿透到暂停任务快照。
+    #[tokio::test]
+    async fn snapshot_zeroes_rates_for_paused_record() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task("https://example.com/f.bin".into(), None)
+            .await
+            .unwrap();
+        fake.set_status_rates(9999, 888);
+        state.pause(&tid).await.unwrap();
+        let snap = state.task_snapshot(&tid).await.unwrap();
+        assert_eq!(snap.state, "Paused");
+        // FakeEngine.status() 仍报 (9999, 888) + Downloading——清零只能来自
+        // 记录级 Paused 守卫（引擎实时值与显示权威的裁决点）。
+        assert_eq!(
+            snap.rates,
+            Some(TaskRates {
+                down_bytes_s: 0,
+                up_bytes_s: 0
+            }),
+            "暂停任务快照速率必须清零（防平滑窗口陈旧值毛刺）"
+        );
     }
 }

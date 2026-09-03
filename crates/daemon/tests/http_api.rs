@@ -1971,6 +1971,83 @@ async fn stats_aggregates_live_down_rate_e2e() {
     );
 }
 
+/// E13 快照速率 e2e：慢速流式源 → `GET /tasks/:id` 的 `rates` 透出实时速率。
+/// 轮询器 300ms 装配（状态机推进必需），快照与轮询器共用采样点（
+/// `RateSample` 设计内的双消费者：各自 ≥200ms 窗口取真实值，短窗沿用
+/// 平滑值）。下载推进期间 down_bytes_s > 0（形状含 up_bytes_s），
+/// pause 后双速立即清零（记录级 Paused 权威裁决，不等引擎窗口自愈）。
+#[tokio::test]
+async fn task_snapshot_exposes_live_rates_e2e() {
+    let total = 1024 * 1024; // 1MiB < DEFAULT_MIN_SPLIT → 单连接整流
+    let srv = SlowTestServer::start(patterned(total), 20, 200).await; // ≈4s
+    let (addr, state) = serve().await;
+    // 测试装配：300ms 轮询（状态机推进 + 缓存刷新；慢于默认 2s 缩短捕获时延）
+    let _h = smart_dl_daemon::http_events::spawn_http_events(
+        state.clone(),
+        std::time::Duration::from_millis(300),
+    );
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let (status, b) = add_task(&client, &base, &srv.url()).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "add 应 201: {b}");
+    let tid = b["task_id"].as_str().unwrap().to_string();
+
+    // 用 list（记录态）等下载推进——不触发引擎 status()，保首个采样窗口干净
+    wait_list_state(&client, &base, &tid, "Downloading").await;
+
+    // 快照轮询等待非零下行速率（下载持续 ≈4s，窗口余量充足）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut seen = 0u64;
+    while std::time::Instant::now() < deadline {
+        let snap: serde_json::Value = client
+            .get(format!("{base}/tasks/{tid}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(r) = snap["rates"].as_object() {
+            seen = r.get("down_bytes_s").and_then(|v| v.as_u64()).unwrap_or(0);
+            if seen > 0 {
+                assert!(
+                    r.contains_key("up_bytes_s"),
+                    "rates 形状必须含 up_bytes_s: {r:?}"
+                );
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    assert!(seen > 0, "活跃下载期间快照速率应 > 0（实时链路）");
+
+    // pause → 快照速率立即清零（记录级 Paused 权威裁决，不等引擎窗口自愈）
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/pause"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let snap: serde_json::Value = client
+        .get(format!("{base}/tasks/{tid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        snap["rates"]["down_bytes_s"].as_u64().unwrap_or(255),
+        0,
+        "pause 后快照下行速率必须清零"
+    );
+    assert_eq!(
+        snap["rates"]["up_bytes_s"].as_u64().unwrap_or(255),
+        0,
+        "pause 后快照上行速率必须清零"
+    );
+}
+
 /// E12 SSE 读取助手：raw TcpStream 发 GET（reqwest 无 stream feature），
 /// 在 `dur` 时间窗内收集响应字节后断开（SSE 流无自然终点）。
 /// 返回 (整段文本, Content-Type 头值)。
