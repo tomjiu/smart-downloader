@@ -47,6 +47,9 @@ fn map_status(st: &TorrentStatus) -> EngineStatus {
         num_peers: st.num_peers.max(0) as u32,
         num_seeds: st.num_seeds.max(0) as u32,
         error: (state == EngineState::Error).then(|| "bt error".to_string()),
+        // BT 不参与 E9 名字回填：任务名来自 torrent metadata（files.rel_path
+        // 链路透出），语义与 HTTP 落盘名派生链不同
+        name: None,
     };
     if total > 0 {
         es.files.push(FileProgress {
