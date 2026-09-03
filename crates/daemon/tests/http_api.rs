@@ -2004,7 +2004,8 @@ async fn sse_read_for(
     let ct = text
         .lines()
         .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
-        .map(|l| l.splitn(2, ':').nth(1).unwrap_or("").trim().to_string())
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, v)| v.trim().to_string())
         .unwrap_or_default();
     (text, ct)
 }
@@ -2048,8 +2049,6 @@ fn parse_sse(text: &str) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>)
 /// + type 过滤在重放生效。
 #[tokio::test]
 async fn events_stream_replay_shape_and_filter_e2e() {
-    use smart_dl_core::state_machine::TaskState;
-
     let (addr, state) = serve().await;
     state.hub().publish(SchedulerEvent::TaskCreated {
         task_id: "t1".into(),
