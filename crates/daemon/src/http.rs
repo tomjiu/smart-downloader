@@ -96,6 +96,12 @@ pub struct AddTaskReq {
     /// （导入语义 = 云端已完成的存量转移）。
     #[serde(default)]
     pub start_at_unix: Option<u64>,
+    /// 失败自动重试次数上限（E30，仅 HTTP/FTP 任务生效）：任务失败且预算未
+    /// 用尽时按指数退避（2s/4s/8s…封顶 60s）自动重新入队；用尽后落 Failed。
+    /// 缺省/0 = 不自动重试（一次性失败语义）。BT 任务忽略（alert 驱动语义
+    /// 不同）。取值 0..=10，越界 400。
+    #[serde(default)]
+    pub auto_retry: Option<u32>,
 }
 
 #[cfg(feature = "xunlei-import")]
@@ -1018,6 +1024,15 @@ async fn add_task(
                 Json(serde_json::json!({ "error": "需要 url 或 torrent_b64" })),
             );
         };
+        // E30：auto_retry 范围门（0..=10；防极端配置拖垮调度循环）
+        let auto_retry = req.auto_retry.unwrap_or(0);
+        if auto_retry > 10 {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error":
+                    format!("auto_retry 取值 0..=10，收到 {auto_retry}") })),
+            );
+        }
         state
             .add_link_task_opts(
                 url,
@@ -1050,6 +1065,7 @@ async fn add_task(
                         },
                     },
                     start_at_unix: req.start_at_unix,
+                    auto_retry,
                 },
             )
             .await

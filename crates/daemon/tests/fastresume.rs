@@ -48,6 +48,7 @@ fn bt_task(id: &str, magnet: &str) -> DownloadTask {
             tags: Vec::new(),
             finished_at_unix: 0,
             start_at_unix: 0,
+            next_retry_at_unix: 0,
         },
         limits: None,
     }
