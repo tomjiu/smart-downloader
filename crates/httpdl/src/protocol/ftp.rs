@@ -2,6 +2,7 @@
 //! 被动模式（PASV）、REST 断点续传（.part）、421 退避重试、目录下载（LIST 单层）；
 //! 不支持 SFTP/FTPS 隐式/目录递归/FXP。
 
+use crate::rate::RateSample;
 use crate::retry::Backoff;
 use crate::static_split::plan_segments;
 use parking_lot::Mutex;
@@ -52,6 +53,8 @@ struct FtpTask {
     total: u64,
     state: EngineState,
     done: u64,
+    /// 速率采样器（E11）：status() 读取时增量采样（B/s），daemon /stats 聚合消费。
+    rate: RateSample,
     error: Option<String>,
     /// 目录任务的文件级进度（单文件任务为空）。
     files: Vec<FtpFile>,
@@ -174,6 +177,7 @@ impl FtpEngine {
                     total,
                     state: EngineState::Downloading,
                     done,
+                    rate: RateSample::default(),
                     error: None,
                     files,
                 },
@@ -761,6 +765,7 @@ impl DownloadEngine for FtpEngine {
                             total,
                             state: EngineState::Downloading,
                             done: part_done(&part),
+                            rate: RateSample::default(),
                             error: None,
                             files: vec![],
                         },
@@ -790,8 +795,8 @@ impl DownloadEngine for FtpEngine {
     }
 
     async fn status(&self, id: &EngineTaskId) -> Result<EngineStatus, EngineError> {
-        let tasks = self.inner.tasks.lock();
-        let t = tasks.get(id).ok_or(EngineError::NotFound)?;
+        let mut tasks = self.inner.tasks.lock();
+        let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
         // 目录任务 → 文件级进度（FileProgress）；单文件任务 → 空（保持既有行为）
         let files = t
             .files
@@ -802,13 +807,14 @@ impl DownloadEngine for FtpEngine {
                 size: f.size,
             })
             .collect();
+        let down_rate = t.rate.sample(t.done);
         Ok(EngineStatus {
             state: t.state,
             metadata_received: true,
             files,
             total_done: t.done,
             total: t.total,
-            down_rate: 0,
+            down_rate,
             up_rate: 0,
             num_peers: 0,
             num_seeds: 0,

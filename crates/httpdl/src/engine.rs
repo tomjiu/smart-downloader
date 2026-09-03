@@ -7,7 +7,7 @@
 use crate::download::{download_dynamic, update_score, DynamicLedger, DynamicOutcome, SCORE_MIN};
 use crate::ledger;
 use crate::range::{probe_range, Probe};
-use crate::rate::RateLimiter;
+use crate::rate::{RateLimiter, RateSample};
 use crate::segment_manager::DEFAULT_MIN_SPLIT;
 use crate::verify::{verify_file, verify_file_md5};
 use parking_lot::Mutex;
@@ -39,6 +39,8 @@ struct HttpTask {
     state: EngineState,
     done: u64,
     total: u64,
+    /// 速率采样器（E11）：status() 读取时增量采样（B/s），daemon /stats 聚合消费。
+    rate: RateSample,
     error: Option<String>,
     sha256: Option<String>,
     /// 备用源内容 MD5 校验目标（切备用源后生效；主源阶段 None）。
@@ -702,6 +704,7 @@ impl DownloadEngine for HttpEngine {
                     state: EngineState::Downloading,
                     done: done0,
                     total,
+                    rate: RateSample::default(),
                     error: None,
                     sha256: init_sha256,
                     md5: init_md5,
@@ -752,15 +755,16 @@ impl DownloadEngine for HttpEngine {
     }
 
     async fn status(&self, id: &EngineTaskId) -> Result<EngineStatus, EngineError> {
-        let tasks = self.inner.tasks.lock();
-        let t = tasks.get(id).ok_or(EngineError::NotFound)?;
+        let mut tasks = self.inner.tasks.lock();
+        let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
+        let down_rate = t.rate.sample(t.done);
         Ok(EngineStatus {
             state: t.state,
             metadata_received: true,
             files: vec![],
             total_done: t.done,
             total: t.total,
-            down_rate: 0,
+            down_rate,
             up_rate: 0,
             num_peers: 0,
             num_seeds: 0,

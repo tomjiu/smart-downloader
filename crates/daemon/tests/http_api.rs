@@ -5,7 +5,7 @@
 mod common;
 
 use base64::Engine;
-use common::{patterned, TestServer};
+use common::{patterned, SlowTestServer, TestServer};
 use smart_dl_daemon::events::SchedulerEvent;
 use smart_dl_daemon::http;
 use smart_dl_daemon::state::DaemonState;
@@ -588,7 +588,7 @@ async fn http_task_completed_advances_list_state() {
     )
     .await;
     // 幂等：再轮询无新效果（不会重复推进/广播）
-    let again = state.poll_http_task_states().await;
+    let again = state.poll_engine_states().await;
     assert!(again.is_empty(), "已终态任务不应重复推进: {again:?}");
 }
 
@@ -654,7 +654,7 @@ async fn http_task_failure_marks_failed_in_list() {
     )
     .await;
     // 幂等
-    let again = state.poll_http_task_states().await;
+    let again = state.poll_engine_states().await;
     assert!(again.is_empty(), "已 Failed 任务不应重复推进: {again:?}");
 }
 
@@ -1711,7 +1711,7 @@ async fn task_name_backfilled_from_content_disposition_e2e() {
         .to_string();
 
     // 手动驱动轮询（生产由 spawn_http_events 2s 周期驱动；测试直接调）
-    state.poll_http_task_states().await;
+    state.poll_engine_states().await;
 
     // 快照 name = CD 派生名（回填生效）
     let snap: serde_json::Value = client
@@ -1904,4 +1904,69 @@ async fn events_api_pagination_filter_and_validation_e2e() {
     assert_eq!(tail["events"].as_array().unwrap().len(), 0);
     assert_eq!(tail["next_after"], 99);
     assert_eq!(tail["has_more"], false);
+}
+
+/// E11 速率聚合 e2e：慢速流式源（单连接，chunk 节奏限速）→ 引擎侧增量采样 →
+/// 轮询缓存 → `GET /stats` 聚合下行速率 > 0；pause 后聚合清零。
+/// 轮询间隔 300ms（> RateSample 200ms 最小窗口，密集快照查询会切碎采样窗口——
+/// 故本测试等待阶段用 list（读记录不触引擎），速率等待阶段只打 /stats）。
+#[tokio::test]
+async fn stats_aggregates_live_down_rate_e2e() {
+    let total = 1024 * 1024; // 1MiB < DEFAULT_MIN_SPLIT → 单连接整流
+    let srv = SlowTestServer::start(patterned(total), 20, 200).await; // ≈4s
+    let (addr, state) = serve().await;
+    // 测试装配：300ms 轮询（慢于默认 2s，缩短速率捕获时延）
+    let _h = smart_dl_daemon::http_events::spawn_http_events(
+        state.clone(),
+        std::time::Duration::from_millis(300),
+    );
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let (status, b) = add_task(&client, &base, &srv.url()).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "add 应 201: {b}");
+    let tid = b["task_id"].as_str().unwrap().to_string();
+
+    // 用 list（记录态）等下载推进——不触发引擎 status()，保采样窗口干净
+    wait_list_state(&client, &base, &tid, "Downloading").await;
+
+    // /stats 轮询等待非零下行速率（下载持续 ≈4s，窗口余量充足）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    let mut seen = 0u64;
+    while std::time::Instant::now() < deadline {
+        let stats: serde_json::Value = client
+            .get(format!("{base}/stats"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        seen = stats["down_bytes_s"].as_u64().unwrap_or(0);
+        if seen > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    }
+    assert!(seen > 0, "活跃下载期间 /stats 聚合下行速率应 > 0");
+
+    // pause → 聚合立即清零（pause 同步清缓存，不等下一轮）
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/pause"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let stats: serde_json::Value = client
+        .get(format!("{base}/stats"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        stats["down_bytes_s"].as_u64().unwrap_or(255),
+        0,
+        "pause 后聚合下行速率必须清零"
+    );
 }

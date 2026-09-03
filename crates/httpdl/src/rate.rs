@@ -76,10 +76,88 @@ impl RateLimiter {
     }
 }
 
+/// 速率采样窗口下限：低于此窗口视为密集采样噪声，沿用上次平滑值
+/// （daemon 周期轮询 + 快照按需查询共用同一采样点，双消费者窗口可能被切碎）。
+const RATE_SAMPLE_MIN_WINDOW: Duration = Duration::from_millis(200);
+
+/// 速率采样器（E11）：`status()` 读取时以「done 增量 ÷ 距上次采样时长」估计
+/// 瞬时速率（B/s）。无需后台计数——下载循环对 `done` 的单调累加即输入，
+/// 引擎侧零改动接线。done 回退（换源重置/重下）以饱和减法兜底取 0，一轮自愈。
+#[derive(Clone, Default)]
+pub(crate) struct RateSample {
+    last_done: u64,
+    last_at: Option<Instant>,
+    /// 窗口过短或首次采样时沿用的平滑值（上次完整窗口结果）。
+    smoothed: u64,
+}
+
+impl RateSample {
+    /// 以当前累计 `done` 采样一次，返回估计速率（B/s）。
+    pub(crate) fn sample(&mut self, done: u64) -> u64 {
+        let now = Instant::now();
+        let Some(last) = self.last_at else {
+            // 首采样无时间窗：登记基线，速率报 0（下一窗口起有值）
+            self.last_done = done;
+            self.last_at = Some(now);
+            return 0;
+        };
+        let dt = now.duration_since(last);
+        let db = done.saturating_sub(self.last_done);
+        self.last_done = done;
+        self.last_at = Some(now);
+        if dt < RATE_SAMPLE_MIN_WINDOW {
+            return self.smoothed;
+        }
+        let r = (db as f64 / dt.as_secs_f64()).round() as u64;
+        self.smoothed = r;
+        r
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn rate_sample_first_read_is_zero() {
+        let mut s = RateSample::default();
+        assert_eq!(s.sample(0), 0, "首采样无时间窗 → 0");
+        assert_eq!(s.sample(0), 0, "done 未动 → 0");
+    }
+
+    #[test]
+    fn rate_sample_windowed_delta_over_elapsed() {
+        let mut s = RateSample::default();
+        s.sample(0);
+        std::thread::sleep(Duration::from_millis(250));
+        let r = s.sample(1000); // 1000B / ≥250ms ≈ ≤4000 B/s
+        assert!(r > 0 && r <= 4500, "窗口速率应在合理区间: {r}");
+    }
+
+    #[test]
+    fn rate_sample_short_window_keeps_smoothed() {
+        let mut s = RateSample::default();
+        s.sample(0);
+        std::thread::sleep(Duration::from_millis(250));
+        let r = s.sample(1000);
+        assert!(r > 0);
+        // 密集采样（窗口 <200ms）：沿用平滑值，不产生噪声
+        assert_eq!(s.sample(1500), r, "短窗口应沿用平滑值");
+    }
+
+    #[test]
+    fn rate_sample_done_regression_bounded_at_zero() {
+        let mut s = RateSample::default();
+        s.sample(0);
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(s.sample(1000) > 0);
+        // done 回退（换源重置）：饱和减法 → 一轮 0，随后自愈
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(s.sample(0), 0, "done 回退窗口速率为 0（饱和）");
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(s.sample(500) > 0, "回退后恢复正常采样");
+    }
 
     #[tokio::test]
     async fn unlimited_is_noop() {
