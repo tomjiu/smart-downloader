@@ -123,6 +123,7 @@ impl HttpSink for EngineSink {
             metadata: smart_dl_core::task::TaskMetadata {
                 name,
                 added_at_unix: 0,
+                tags: Vec::new(),
             },
             limits: None,
         };
@@ -199,6 +200,7 @@ async fn full_flow_transfers_two_files_to_disk() {
         metadata: smart_dl_core::task::TaskMetadata {
             name: None,
             added_at_unix: 0,
+            tags: Vec::new(),
         },
         limits: None,
     };

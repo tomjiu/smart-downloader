@@ -109,4 +109,8 @@ pub struct RetryState {
 pub struct TaskMetadata {
     pub name: Option<String>,
     pub added_at_unix: u64,
+    /// 用户标签（E18）：显示/分组元数据，引擎无关；空 = 无标签。
+    /// 序列化缺省兼容旧 tasks.json（恢复时缺字段 → 空集）。
+    #[serde(default)]
+    pub tags: Vec<String>,
 }

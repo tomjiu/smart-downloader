@@ -43,6 +43,7 @@ fn bt_task(id: &str, magnet: &str) -> DownloadTask {
         metadata: TaskMetadata {
             name: None,
             added_at_unix: 0,
+            tags: Vec::new(),
         },
         limits: None,
     }

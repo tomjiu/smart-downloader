@@ -96,6 +96,9 @@ pub struct TaskSnapshot {
     /// 派生链未回填，序列化时省略）。与列表 `TaskSummary::name` 同口径。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// 用户标签（E18）。与列表 `TaskSummary::tags` 同口径（空省略）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     /// BT 子文件优先级表（None = 未设置走 libtorrent 默认 4；Some = 持久化
     /// 全量快照，下标 = 文件序）。set 语义见 `DaemonState::set_task_file_priorities`。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -132,6 +135,9 @@ pub struct TaskSummary {
     /// （E4 CD → URL 末段）尚未回填，序列化时省略）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// 用户标签（E18）：空 = 无标签（序列化省略，不产生噪声字段）。
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
 }
 
 /// 列表过滤/分页查询（E7）。`states`/`engines` 空 = 不过滤；匹配均大小写不敏感。
@@ -145,6 +151,9 @@ pub struct ListQuery {
     pub limit: Option<usize>,
     pub offset: usize,
     pub search: Option<String>,
+    /// 标签 any-of 过滤（E18）：空 = 不过滤；命中任一标签即保留（维度内
+    /// OR、与 states/engines/search 维度间 AND）；大小写不敏感。
+    pub tags: Vec<String>,
 }
 
 /// 合法状态标签全集（E7 `?state=` 校验依据；与 `state_label` 输出同步——
@@ -1309,6 +1318,7 @@ impl DaemonState {
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
+                tags: Vec::new(),
             },
             limits: None,
         };
@@ -1424,6 +1434,7 @@ impl DaemonState {
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
+                tags: Vec::new(),
             },
             limits: None,
         };
@@ -1652,6 +1663,7 @@ impl DaemonState {
             metadata: TaskMetadata {
                 name: Some(meta.name.clone()),
                 added_at_unix: 0,
+                tags: Vec::new(),
             },
             limits: None,
         };
@@ -1789,6 +1801,7 @@ impl DaemonState {
             metadata: TaskMetadata {
                 name,
                 added_at_unix: 0,
+                tags: Vec::new(),
             },
             limits: None,
         };
@@ -1898,6 +1911,7 @@ impl DaemonState {
             metadata: TaskMetadata {
                 name: if is_dir { None } else { name },
                 added_at_unix: 0,
+                tags: Vec::new(),
             },
             limits: None,
         };
@@ -2008,6 +2022,7 @@ impl DaemonState {
             file_priorities: rec.task.file_priorities.clone(),
             sequential: rec.task.sequential,
             name: rec.task.metadata.name.clone(),
+            tags: rec.task.metadata.tags.clone(),
         })
     }
 
@@ -2056,9 +2071,23 @@ impl DaemonState {
                                 .search_urls()
                                 .iter()
                                 .any(|u| u.to_lowercase().contains(&n));
-                            name_hit || url_hit
+                            // E18：标签入搜索语料（名字/URL 同款子串命中）
+                            let tag_hit = rec
+                                .task
+                                .metadata
+                                .tags
+                                .iter()
+                                .any(|t| t.to_lowercase().contains(&n));
+                            name_hit || url_hit || tag_hit
                         }
                     }
+                    // E18：标签 any-of 过滤（空集合跳过；大小写不敏感）
+                    && (q.tags.is_empty()
+                        || rec.task.metadata.tags.iter().any(|t| {
+                            q.tags
+                                .iter()
+                                .any(|want| want.eq_ignore_ascii_case(t))
+                        }))
             })
             .map(|(_, rec)| rec)
             .collect();
@@ -2074,6 +2103,7 @@ impl DaemonState {
                 source: rec.task.source.redacted_debug(),
                 engine: kind_label(&rec.engine_kind),
                 name: rec.task.metadata.name.clone(),
+                tags: rec.task.metadata.tags.clone(),
             })
             .collect();
         (page, total)
@@ -2486,6 +2516,61 @@ impl DaemonState {
         Ok(())
     }
 
+    /// 任务标签设置（E18）：**替换式**全量覆盖（请求携带的标签列表即为最终权威，
+    /// 语义可预测）；`None`/空表 = 清除全部。显示/分组元数据——引擎无关零副作用
+    /// （对齐 set_task_name 边界），持久化随 tasks.json（TaskMetadata serde default
+    /// 兼容旧档案），入 `?tag=` 过滤与 `?search=` 语料。
+    ///
+    /// 归一化：逐个 trim → 丢空串 → 去重（保留首次出现序，大小写敏感——
+    /// 标签匹配大小写不敏感但显示保留原样）→ 上限 16 个/单个 1..=64 字符
+    ///（超限 400 InvalidSource，调用方可先归一化再展示）。
+    pub fn set_task_tags(
+        &self,
+        id: &str,
+        tags: Option<Vec<String>>,
+    ) -> Result<Vec<String>, DaemonError> {
+        let normalized = match tags {
+            None => Vec::new(),
+            Some(list) => {
+                if list.len() > 16 {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "标签数量超上限 16（实际 {}）",
+                        list.len()
+                    )));
+                }
+                let mut out: Vec<String> = Vec::new();
+                for t in list {
+                    let t = t.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    if t.chars().count() > 64 {
+                        return Err(DaemonError::InvalidSource(format!("标签超 64 字符: {t:?}")));
+                    }
+                    if !out.iter().any(|e| e == t) {
+                        out.push(t.to_string());
+                    }
+                }
+                out
+            }
+        };
+        {
+            let mut tasks = self.tasks.lock();
+            let rec = tasks
+                .get_mut(id)
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            let detail = if normalized.is_empty() {
+                "cleared"
+            } else {
+                "set"
+            };
+            rec.task.metadata.tags = normalized.clone();
+            rec.push_event("tags_changed", Some(detail.into()));
+        }
+        self.autosave();
+        Ok(normalized)
+    }
+
     /// 子文件优先级重放收敛（单轮）：对恢复时 metadata 未就绪而挂起的任务，
     /// 探测就绪性（readback 非空）→ 成功后全量重放并移除 pending。
     /// 返回本轮成功重放的任务 id 列表（测试/日志用）。
@@ -2810,6 +2895,7 @@ impl HttpSink for FallbackSink {
             metadata: TaskMetadata {
                 name,
                 added_at_unix: 0,
+                tags: Vec::new(),
             },
             limits: None,
         };
@@ -3447,6 +3533,7 @@ mod bt_alert_tests {
                 metadata: TaskMetadata {
                     name: None,
                     added_at_unix: 0,
+                    tags: Vec::new(),
                 },
                 limits: None,
             },
@@ -4589,6 +4676,7 @@ mod persist_tests {
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
+                tags: Vec::new(),
             },
             limits: None,
         }
@@ -5968,6 +6056,7 @@ mod task_proxy_set_tests {
                 metadata: TaskMetadata {
                     name: None,
                     added_at_unix: 0,
+                    tags: Vec::new(),
                 },
                 limits: None,
             },
@@ -6317,6 +6406,7 @@ mod rate_cache_tests {
                 metadata: TaskMetadata {
                     name: None,
                     added_at_unix: 0,
+                    tags: Vec::new(),
                 },
                 limits: None,
             },
@@ -6651,5 +6741,186 @@ mod global_limits_tests {
         let snap = state.config_snapshot();
         assert_eq!(snap["max_download_kb_s"], 2048, "/config 快照覆盖");
         assert_eq!(snap["max_upload_kb_s"], 512);
+    }
+}
+
+/// E18 任务标签：归一化 / 校验 / 清除 / 过滤 / 搜索联动。
+#[cfg(test)]
+mod tags_tests {
+    use super::*;
+
+    async fn state_with_tasks(n: usize) -> (Arc<DaemonState>, Arc<FakeEngine>, Vec<String>) {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![]);
+        let mut ids = Vec::new();
+        for i in 0..n {
+            ids.push(
+                state
+                    .add_http_task(format!("https://example.com/f{i}.bin"), None)
+                    .await
+                    .unwrap(),
+            );
+        }
+        (Arc::new(state), fake, ids)
+    }
+
+    #[test]
+    fn set_tags_normalizes_and_links_everywhere() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (state, _fake, ids) = state_with_tasks(2).await;
+            let id0 = ids[0].clone();
+
+            // trim + 去重 + 丢空，返回归一化结果
+            let got = state
+                .set_task_tags(
+                    &id0,
+                    Some(vec![
+                        " Movie ".into(),
+                        "4K".into(),
+                        "".into(),
+                        "Movie".into(),
+                    ]),
+                )
+                .unwrap();
+            assert_eq!(got, vec!["Movie", "4K"]);
+
+            // 快照 / 列表联动
+            let snap = state.task_snapshot(&id0).await.unwrap();
+            assert_eq!(snap.tags, vec!["Movie".to_string(), "4K".to_string()]);
+            let (rows, _) = state.list_filtered(&ListQuery::default());
+            let row = rows.iter().find(|r| r.task_id == id0).unwrap();
+            assert_eq!(row.tags, vec!["Movie".to_string(), "4K".to_string()]);
+
+            // 搜索语料含标签（?search=movie 命中 t1，即使名字是 example.com）
+            let (rows, _) = state.list_filtered(&ListQuery {
+                search: Some("4k".into()),
+                ..Default::default()
+            });
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].task_id, id0);
+
+            // 日志事件
+            let logs = state.task_logs(&id0).unwrap();
+            assert!(
+                serde_json::to_string(&logs["events"])
+                    .unwrap()
+                    .contains("tags_changed"),
+                "应有 tags_changed 事件"
+            );
+        });
+    }
+
+    #[test]
+    fn clear_tags_via_none_and_empty_list() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (state, _fake, ids) = state_with_tasks(1).await;
+            let id0 = ids[0].clone();
+            state
+                .set_task_tags(&id0, Some(vec!["a".into(), "b".into()]))
+                .unwrap();
+            // None 清除
+            let got = state.set_task_tags(&id0, None).unwrap();
+            assert!(got.is_empty());
+            // Some(空) 同清除
+            state.set_task_tags(&id0, Some(vec!["x".into()])).unwrap();
+            let got = state.set_task_tags(&id0, Some(vec![])).unwrap();
+            assert!(got.is_empty());
+            let snap = state.task_snapshot(&id0).await.unwrap();
+            assert!(snap.tags.is_empty(), "清除后快照无标签");
+        });
+    }
+
+    #[test]
+    fn tag_validation_rejects_over_limits() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (state, _fake, ids) = state_with_tasks(1).await;
+            let id0 = ids[0].clone();
+
+            // 17 个标签 → 400（InvalidSource）
+            let many: Vec<String> = (0..17).map(|i| format!("t{i}")).collect();
+            assert!(state.set_task_tags(&id0, Some(many)).is_err());
+
+            // 65 字符标签 → 400
+            let long = "a".repeat(65);
+            assert!(state.set_task_tags(&id0, Some(vec![long])).is_err());
+
+            // 零副作用：失败后标签仍为空
+            let snap = state.task_snapshot(&id0).await.unwrap();
+            assert!(snap.tags.is_empty(), "失败设置不得产生半写状态");
+
+            // 不存在任务 → NotFound
+            assert!(matches!(
+                state.set_task_tags("t999", Some(vec!["x".into()])),
+                Err(DaemonError::NotFound(_))
+            ));
+        });
+    }
+
+    #[test]
+    fn list_filter_by_tag_any_of_and_case_insensitive() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (state, _fake, ids) = state_with_tasks(3).await;
+            state
+                .set_task_tags(&ids[0], Some(vec!["movie".into()]))
+                .unwrap();
+            state
+                .set_task_tags(&ids[1], Some(vec!["Music".into(), "4K".into()]))
+                .unwrap();
+            // ids[2] 无标签
+
+            // 单标签命中（大小写不敏感）
+            let (rows, total) = state.list_filtered(&ListQuery {
+                tags: vec!["MOVIE".into()],
+                ..Default::default()
+            });
+            assert_eq!((rows.len(), total), (1, 1));
+            assert_eq!(rows[0].task_id, ids[0]);
+
+            // 多标签 any-of
+            let (rows, _) = state.list_filtered(&ListQuery {
+                tags: vec!["movie".into(), "music".into()],
+                ..Default::default()
+            });
+            assert_eq!(rows.len(), 2);
+
+            // 与 states 维度 AND：Queued 全部命中（三条均 Queued）
+            let (rows, total) = state.list_filtered(&ListQuery {
+                tags: vec!["4k".into()],
+                states: vec!["queued".into()],
+                ..Default::default()
+            });
+            assert_eq!((rows.len(), total), (1, 1));
+
+            // 与 states 维度 AND：Failed 零命中
+            let (rows, _) = state.list_filtered(&ListQuery {
+                tags: vec!["4k".into()],
+                states: vec!["failed".into()],
+                ..Default::default()
+            });
+            assert!(rows.is_empty());
+
+            // 无标签任务不被命中
+            let (rows, _) = state.list_filtered(&ListQuery {
+                tags: vec!["nothing".into()],
+                ..Default::default()
+            });
+            assert!(rows.is_empty());
+        });
     }
 }
