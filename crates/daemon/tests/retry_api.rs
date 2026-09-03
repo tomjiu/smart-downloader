@@ -4,7 +4,6 @@
 //! 语义（回归）。全链路：API add → poll 轮询 → fail_or_schedule_retry →
 //! activate_due_tasks → 引擎重试。
 
-
 use smart_dl_daemon::http;
 use smart_dl_daemon::state::DaemonState;
 use smart_dl_httpdl::HttpEngine;
