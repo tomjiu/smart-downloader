@@ -202,6 +202,11 @@ pub struct EngineStatus {
     pub num_peers: u32,
     pub num_seeds: u32,
     pub error: Option<String>,
+    /// 引擎侧最终落盘名（E9 透出）：HTTP 引擎在 add 探测后即定——显式名回显
+    /// 同值；派生名 = CD → URL 末段 → 兜底链结果（已 sanitize_rel 终审）。
+    /// daemon 轮询据此回填 `metadata.name`（空缺时），使派生名进入列表/快照
+    /// 透出链。None = 引擎未透出（BT/FTP/NAS/xunlei 暂不参与回填）。
+    pub name: Option<String>,
 }
 
 /// 引擎侧任务状态。
