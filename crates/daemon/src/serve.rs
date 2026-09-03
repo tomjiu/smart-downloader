@@ -127,12 +127,14 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     let mut state = DaemonState::new(http_engine, providers)
         .with_dest_root(cfg.download.dest_root.clone())
         .with_http_token(http_token.clone())
-        .with_disk_precheck_strict(cfg.download.disk_precheck_strict);
+        .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
+        .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s);
     #[cfg(not(feature = "bt"))]
     let mut state = DaemonState::new(http_engine, providers)
         .with_dest_root(cfg.download.dest_root.clone())
         .with_http_token(http_token.clone())
-        .with_disk_precheck_strict(cfg.download.disk_precheck_strict);
+        .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
+        .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s);
 
     // 4. BT 引擎（先取 core 句柄，供 alert 事件流）
     #[cfg(feature = "bt")]
@@ -212,11 +214,12 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         tracing::warn!("配置启用了 xunlei 但编译未带 --features xunlei，Xunlei 不可用");
     }
 
-    // 4d. FTP 引擎（feature `ftp`；与 HTTP 共用默认 dest_root）
+    // 4d. FTP 引擎（feature `ftp`；与 HTTP 共用默认 dest_root + 全局限速总阀门）
     #[cfg(feature = "ftp")]
     {
-        let ftp_engine: Arc<dyn smart_dl_core::types::DownloadEngine> =
-            Arc::new(smart_dl_httpdl::FtpEngine::new());
+        let ftp_engine: Arc<dyn smart_dl_core::types::DownloadEngine> = Arc::new(
+            smart_dl_httpdl::FtpEngine::new_limited(cfg.download.max_download_kb_s),
+        );
         state = state.with_ftp(ftp_engine);
         tracing::info!("FTP 引擎已启用");
     }
@@ -325,6 +328,17 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
                 match toml::from_str::<Config>(&text) {
                     Ok(new_cfg) => {
                         st.refresh_config(&new_cfg, &tasks);
+                        // E16：限速总阀门随热重载生效（文件为准——与 dest_root
+                        // 同口径）；值无变化时 apply 内部 no-op，无事件噪声。
+                        if let Err(e) = st
+                            .apply_global_limits(
+                                Some(new_cfg.download.max_download_kb_s),
+                                Some(new_cfg.bt.max_upload_kb_s),
+                            )
+                            .await
+                        {
+                            tracing::warn!("配置热重载限速下发失败（保留引擎侧旧值）: {e}");
+                        }
                         tracing::info!("配置热重载生效: {}", path.display());
                         last = Some(text);
                     }

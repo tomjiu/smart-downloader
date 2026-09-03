@@ -165,6 +165,11 @@ fn type_labels_cover_all_variants_and_match_serde_tag() {
                 last_error: None,
             },
         },
+        // E16：daemon 级事件（无 task_id）
+        SchedulerEvent::GlobalLimitsChanged {
+            max_download_kb_s: 1024,
+            max_upload_kb_s: 512,
+        },
     ];
     for ev in &extra {
         let label = ev.type_label();
@@ -174,6 +179,6 @@ fn type_labels_cover_all_variants_and_match_serde_tag() {
         );
         assert!(seen.insert(label), "known 内标签重复: {label}");
     }
-    // 全集长度 = 8 常规 + 2 特殊构造
-    assert_eq!(known.len(), 10);
+    // 全集长度 = 8 常规 + 3 特殊构造
+    assert_eq!(known.len(), 11);
 }

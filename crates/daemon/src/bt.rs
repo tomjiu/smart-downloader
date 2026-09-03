@@ -73,6 +73,19 @@ pub struct BtEngine {
     /// metadata 到达后反复复活用户暂停的任务，单次压制无效——
     /// 改为持续执法：alert 循环周期性对比 done 增长，增长即再压（Bug A，调度层）。
     pause_intents: parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+    /// 会话级网络策略当前值（E16）：set_global_limits 热改全局限速时需整包
+    /// re-apply（libtorrent settings_pack 全量语义）——保存启动时代理与双
+    /// 方向速率，热改限速时代理原样重放（BT 代理属会话级，E8 边界不变）。
+    network: parking_lot::Mutex<BtNetwork>,
+}
+
+/// BtEngine 会话级网络策略快照（E16）。`proxy_url` 保存原始 URL 串（None =
+/// 直连），re-apply 时重新 parse（避免依赖 btcore FFI 结构 Clone）。
+#[derive(Debug, Clone)]
+struct BtNetwork {
+    proxy_url: Option<String>,
+    down_kb_s: u32,
+    up_kb_s: u32,
 }
 
 impl BtEngine {
@@ -111,6 +124,11 @@ impl BtEngine {
             core: Arc::new(core),
             save_path: save_path.to_path_buf(),
             pause_intents: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            network: parking_lot::Mutex::new(BtNetwork {
+                proxy_url: proxy.map(|s| s.to_string()).filter(|s| !s.is_empty()),
+                down_kb_s,
+                up_kb_s,
+            }),
         })
     }
 
@@ -415,6 +433,42 @@ impl DownloadEngine for BtEngine {
         self.core
             .set_limits(id, down, up)
             .map_err(|e| EngineError::Other(core_err(&e)))
+    }
+
+    /// 引擎全局限速热改（E16 trait 扩展）：双方向合并进 network 快照后整包
+    /// re-apply（settings_pack 全量语义，代理原样重放）。任一方向 None =
+    /// 沿用当前值；Some(n)/Some(0) = 上限 n KiB/s / 不限。
+    async fn set_global_limits(
+        &self,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<(), EngineError> {
+        let net = {
+            let mut n = self.network.lock();
+            if let Some(d) = down_kb_s {
+                n.down_kb_s = d;
+            }
+            if let Some(u) = up_kb_s {
+                n.up_kb_s = u;
+            }
+            n.clone()
+        };
+        // 启动时代理原样重放（会话级边界不变，E8）；重新 parse 失败 → Other
+        //（启动时已校验过，此处兜底）
+        let proxy_cfg = match net.proxy_url.as_deref() {
+            Some(u) => match smart_dl_btcore::ffi::parse_proxy(u) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    return Err(EngineError::Other(format!(
+                        "bt proxy 解析失败 {u:?}: {e:?}"
+                    )))
+                }
+            },
+            None => None,
+        };
+        self.core
+            .apply_network(proxy_cfg.as_ref(), net.down_kb_s, net.up_kb_s)
+            .map_err(|e| EngineError::Other(format!("bt apply_network: {e:?}")))
     }
 
     /// BT 子文件优先级批量设置（trait 扩展；需 metadata 就绪）。
