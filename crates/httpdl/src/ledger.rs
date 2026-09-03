@@ -296,6 +296,7 @@ mod tests {
             total: Some(100),
             last_modified: None,
             filename: None,
+            content_type: None,
         };
         assert_eq!(decide(100, None, &probe), ResumeDecision::Restart);
     }
@@ -309,6 +310,7 @@ mod tests {
             total: Some(4096),
             last_modified: None,
             filename: None,
+            content_type: None,
         };
         let l = ledger(4096, 1024, vec![(0, 1023)]);
         assert_eq!(
@@ -326,6 +328,7 @@ mod tests {
             total: Some(4096),
             last_modified: None,
             filename: None,
+            content_type: None,
         };
         let l = ledger(4096, 1024, vec![(0, 1023)]);
         assert_eq!(
@@ -348,6 +351,7 @@ mod tests {
             total: Some(4096),
             last_modified: None,
             filename: None,
+            content_type: None,
         };
         assert!(matches!(
             decide(4096, Some(&l), &probe),
@@ -363,6 +367,7 @@ mod tests {
             total: Some(4096),
             last_modified: None,
             filename: None,
+            content_type: None,
         };
         // 账本 total 不同
         let l = ledger(8192, 1024, vec![]);
@@ -382,6 +387,7 @@ mod tests {
             total: Some(4096),
             last_modified: None,
             filename: None,
+            content_type: None,
         };
         let l = ledger(4096, 1024, vec![(0, 1023)]);
         assert_eq!(decide(4096, Some(&l), &probe), ResumeDecision::Restart);
@@ -395,6 +401,7 @@ mod tests {
             total: Some(4096),
             last_modified: None,
             filename: None,
+            content_type: None,
         };
         // 篡改账本：未对齐段
         let l = ledger(4096, 1024, vec![(7, 1023)]);

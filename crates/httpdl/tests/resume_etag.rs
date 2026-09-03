@@ -13,6 +13,7 @@ fn probe(range: bool, etag: Option<&str>, total: u64) -> Probe {
         total: Some(total),
         last_modified: None,
         filename: None,
+        content_type: None,
     }
 }
 
@@ -119,6 +120,7 @@ fn probe_lm(range: bool, etag: Option<&str>, lm: Option<&str>, total: u64) -> Pr
         last_modified: lm.map(str::to_string),
         total: Some(total),
         filename: None,
+        content_type: None,
     }
 }
 

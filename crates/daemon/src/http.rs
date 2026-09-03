@@ -104,6 +104,104 @@ pub struct AddTaskReq {
     pub auto_retry: Option<u32>,
 }
 
+/// E31 探测预览请求：不建任务，仅探测 URL 元数据（add 前预览入口）。
+#[derive(Deserialize)]
+pub struct ProbeReq {
+    /// http(s) 直链（v1 仅支持 HTTP 源预览；magnet/ed2k/ftp → 400）。
+    pub url: String,
+    /// 任务级自定义请求头（同 add `headers` 语义：随探测请求下发，典型
+    /// Referer/Cookie 反防盗链）。
+    #[serde(default)]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+    /// 任务级代理 URL（同 add `proxy` 语义：http(s)/socks5/socks4，可带
+    /// user:pass@；非法 → 400）。
+    #[serde(default)]
+    pub proxy: Option<String>,
+    /// HTTP Basic 认证用户名（探测请求携带）。
+    #[serde(default)]
+    pub username: Option<String>,
+    /// HTTP Basic 认证密码（可空串）。
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+/// E31 探测预览：`POST /probe` —— 复用引擎同源探测（GET Range: bytes=0-0）
+/// 取大小/服务端文件名/Range 支持/ETag/Last-Modified/Content-Type，不创建
+/// 任务。`suggest_name` 与引擎落盘名派生链完全一致（CD → URL 末段 →
+/// download.bin，逐候选 sanitize_rel 终审）。探测失败（网络/非 2xx/416
+/// 之外状态）→ 502；入参非法 → 400。url 不回显（请求方自持；凭据不二次暴露）。
+async fn probe_endpoint(
+    State(_state): State<Arc<DaemonState>>,
+    Json(req): Json<ProbeReq>,
+) -> Response {
+    let url = req.url.trim();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "url 必须是 http(s):// 直链（v1 仅支持 HTTP 源预览）" })),
+        )
+            .into_response();
+    }
+    // 任务级代理（E5 同款试水：构建一次 client 即校验）
+    let client = match req.proxy.as_deref() {
+        Some(p) if !p.is_empty() => match smart_dl_httpdl::build_proxied_client(p) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("proxy 非法 {p:?}: {e}") })),
+                )
+                    .into_response()
+            }
+        },
+        _ => reqwest::Client::new(),
+    };
+    let mut headers: Vec<(String, String)> = req
+        .headers
+        .map(|m| m.into_iter().collect())
+        .unwrap_or_default();
+    if let Some(u) = &req.username {
+        let cred = format!("{u}:{}", req.password.as_deref().unwrap_or(""));
+        headers.push((
+            "Authorization".into(),
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(cred)
+            ),
+        ));
+    }
+    match smart_dl_httpdl::range::probe_range(&client, url, &headers).await {
+        Ok(p) => {
+            // suggest_name：与引擎落盘名决策（engine.rs E4 派生链）同源同序
+            let suggest = p
+                .filename
+                .iter()
+                .chain(smart_dl_httpdl::url_basename(url).iter())
+                .find_map(|c| smart_dl_core::session::output::sanitize_rel(c).ok())
+                .unwrap_or_else(|| std::path::PathBuf::from("download.bin"));
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "state": "ok",
+                    "total": p.total,
+                    "range_supported": p.range_supported,
+                    "filename": p.filename,
+                    "suggest_name": suggest.to_string_lossy(),
+                    "etag": p.etag,
+                    "last_modified": p.last_modified,
+                    "content_type": p.content_type,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "state": "unreachable", "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(feature = "xunlei-import")]
 #[derive(Deserialize)]
 pub struct AddXunleiImportReq {
@@ -1689,6 +1787,7 @@ macro_rules! router_base {
     ($app:expr) => {
         $app.route("/tasks", get(list_tasks).post(add_task))
             .route("/tasks/batch", post(batch_tasks))
+            .route("/probe", post(probe_endpoint))
             .route("/tasks/:id", get(task_snapshot).delete(remove_task))
             .route("/tasks/:id/pause", post(pause_task))
             .route("/tasks/:id/resume", post(resume_task))
