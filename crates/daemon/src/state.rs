@@ -420,6 +420,8 @@ pub struct DaemonState {
     webhook_url: Mutex<Option<String>>,
     /// Webhook 投递 client（共享连接池；完成频率低，单实例足够）。
     webhook_client: reqwest::Client,
+    /// 自动清理当前配置（E20）：days=0 禁用；serve 注入 + 热重载跟随。
+    cleanup: Mutex<crate::config::CleanupCfg>,
 }
 
 /// 全局限速总阀门当前值（E16，KiB/s；0 = 不限）。
@@ -746,6 +748,7 @@ impl DaemonState {
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .build()
                 .unwrap_or_default(),
+            cleanup: Mutex::new(crate::config::CleanupCfg::default()),
         }
     }
 
@@ -799,6 +802,12 @@ impl DaemonState {
     /// 注入任务完成 Webhook URL（E17）：None/空 = 禁用。
     pub fn with_webhook_url(self, url: Option<String>) -> Self {
         *self.webhook_url.lock() = url.filter(|u| !u.is_empty());
+        self
+    }
+
+    /// 注入自动清理配置（E20）：serve 从 `[cleanup]` 传入，热重载跟随。
+    pub fn with_cleanup(self, cfg: crate::config::CleanupCfg) -> Self {
+        *self.cleanup.lock() = cfg;
         self
     }
 
@@ -901,6 +910,15 @@ impl DaemonState {
     /// 触发完成 Webhook。三个完成转移点（HTTP/FTP 轮询循环、BT alert 流
     /// Seeding 转移、Provider 兜底成功）一律经此，保证事件与通知不脱钩。
     pub fn publish_task_completed(&self, task_id: &str) {
+        // E20：完成时刻入档（自动清理判龄依据；记录不存在则跳过写点）
+        {
+            if let Some(rec) = self.tasks.lock().get_mut(task_id) {
+                rec.task.metadata.finished_at_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+            }
+        }
         self.hub.publish(SchedulerEvent::Completed {
             task_id: task_id.to_string(),
         });
@@ -1319,6 +1337,7 @@ impl DaemonState {
                 name: None,
                 added_at_unix: 0,
                 tags: Vec::new(),
+                finished_at_unix: 0,
             },
             limits: None,
         };
@@ -1435,6 +1454,7 @@ impl DaemonState {
                 name: None,
                 added_at_unix: 0,
                 tags: Vec::new(),
+                finished_at_unix: 0,
             },
             limits: None,
         };
@@ -1664,6 +1684,7 @@ impl DaemonState {
                 name: Some(meta.name.clone()),
                 added_at_unix: 0,
                 tags: Vec::new(),
+                finished_at_unix: 0,
             },
             limits: None,
         };
@@ -1802,6 +1823,7 @@ impl DaemonState {
                 name,
                 added_at_unix: 0,
                 tags: Vec::new(),
+                finished_at_unix: 0,
             },
             limits: None,
         };
@@ -1912,6 +1934,7 @@ impl DaemonState {
                 name: if is_dir { None } else { name },
                 added_at_unix: 0,
                 tags: Vec::new(),
+                finished_at_unix: 0,
             },
             limits: None,
         };
@@ -2876,6 +2899,64 @@ impl DaemonState {
                 *hook = new;
             }
         }
+        // E20：自动清理配置热重载
+        {
+            let mut c = self.cleanup.lock();
+            if *c != cfg.cleanup {
+                tracing::info!(
+                    "配置热重载: auto_remove_completed_days {} → {}",
+                    c.auto_remove_completed_days,
+                    cfg.cleanup.auto_remove_completed_days
+                );
+                *c = cfg.cleanup.clone();
+            }
+        }
+    }
+
+    /// 已完成任务自动清扫（E20）：扫描 Completed 且完成龄期 ≥
+    /// `auto_remove_completed_days` 的任务，逐个按 `auto_remove_keep_data`
+    /// 处置（默认保留文件）。返回本次清扫的任务 id（测试断言用）。
+    /// days=0 禁用；记录无完成时刻（旧档未记）→ 跳过（不猜测龄期）。
+    pub async fn sweep_completed_cleanup(&self) -> Vec<String> {
+        let (days, keep_data) = {
+            let c = self.cleanup.lock();
+            (c.auto_remove_completed_days, c.auto_remove_keep_data)
+        };
+        if days == 0 {
+            return Vec::new(); // 禁用
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let deadline = now.saturating_sub(days as u64 * 86_400);
+        let due: Vec<String> = {
+            let tasks = self.tasks.lock();
+            tasks
+                .values()
+                .filter(|r| {
+                    r.task.state == TaskState::Completed
+                        && r.task.metadata.finished_at_unix > 0
+                        && r.task.metadata.finished_at_unix <= deadline
+                })
+                .map(|r| r.task.id.clone())
+                .collect()
+        };
+        let mut swept = Vec::new();
+        for id in due {
+            // remove_with 处置记录 + 引擎退役 + 落盘；保持清扫尽力而为不短路
+            match self.remove_with(&id, !keep_data).await {
+                Ok(()) => {
+                    tracing::info!("自动清扫已完成任务: {id}（保留数据={keep_data}）");
+                    swept.push(id);
+                }
+                Err(e) => tracing::warn!("自动清扫 {id} 失败（跳过）: {e}"),
+            }
+        }
+        if !swept.is_empty() {
+            tracing::info!("本次自动清扫 {} 个已完成任务", swept.len());
+        }
+        swept
     }
 }
 
@@ -2934,6 +3015,7 @@ impl HttpSink for FallbackSink {
                 name,
                 added_at_unix: 0,
                 tags: Vec::new(),
+                finished_at_unix: 0,
             },
             limits: None,
         };
@@ -3572,6 +3654,7 @@ mod bt_alert_tests {
                     name: None,
                     added_at_unix: 0,
                     tags: Vec::new(),
+                    finished_at_unix: 0,
                 },
                 limits: None,
             },
@@ -4715,6 +4798,7 @@ mod persist_tests {
                 name: None,
                 added_at_unix: 0,
                 tags: Vec::new(),
+                finished_at_unix: 0,
             },
             limits: None,
         }
@@ -6095,6 +6179,7 @@ mod task_proxy_set_tests {
                     name: None,
                     added_at_unix: 0,
                     tags: Vec::new(),
+                    finished_at_unix: 0,
                 },
                 limits: None,
             },
@@ -6445,6 +6530,7 @@ mod rate_cache_tests {
                     name: None,
                     added_at_unix: 0,
                     tags: Vec::new(),
+                    finished_at_unix: 0,
                 },
                 limits: None,
             },
@@ -6999,6 +7085,7 @@ mod batch_select_tests {
                     name: None,
                     added_at_unix: 0,
                     tags: Vec::new(),
+                    finished_at_unix: 0,
                 },
                 limits: None,
             },
@@ -7162,5 +7249,148 @@ mod batch_select_tests {
             .unwrap();
         assert_eq!(outcome.succeeded, 1);
         assert_eq!(outcome.results[0].id, "t2");
+    }
+}
+
+/// E20 已完成任务自动清扫：判龄 / 禁用 / 数据处置。
+#[cfg(test)]
+mod cleanup_tests {
+    use super::*;
+
+    /// 白盒插入 Completed 任务，可编程完成时刻与引擎槽位。
+    fn insert_completed(state: &DaemonState, id: &str, finished_at_unix: u64) {
+        let rec = TaskRecord {
+            task: DownloadTask {
+                id: id.into(),
+                canonical_id: CanonicalId {
+                    kind: CanonicalKind::Http,
+                    identity: format!("https://example.com/{id}"),
+                    validator: None,
+                    token_sensitive: false,
+                },
+                source: DownloadSource::Http {
+                    url: format!("https://example.com/{id}"),
+                    headers: vec![],
+                    auth: None,
+                    backup_url: None,
+                    proxy: None,
+                },
+                identity: ContentIdentity::SingleFile {
+                    size: 0,
+                    etag: None,
+                    sha256: None,
+                    backup_md5: None,
+                },
+                dest_root: PathBuf::from("."),
+                files: vec![],
+                acquisitions: vec![],
+                aggregate: Default::default(),
+                state: TaskState::Completed,
+                retry: Default::default(),
+                created_at: std::time::Instant::now(),
+                file_priorities: None,
+                sequential: false,
+                metadata: TaskMetadata {
+                    name: None,
+                    added_at_unix: 0,
+                    tags: Vec::new(),
+                    finished_at_unix,
+                },
+                limits: None,
+            },
+            engine_tid: Some(id.to_string()),
+            engine_kind: EngineKind::Http,
+            engine_status: None,
+            events: vec![],
+        };
+        state.tasks.lock().insert(id.into(), rec);
+    }
+
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[tokio::test]
+    async fn sweep_respects_age_and_disabled() {
+        // days=0 禁用
+        let state = DaemonState::new(Arc::new(FakeEngine::new(EngineKind::Http)), vec![])
+            .with_cleanup(crate::config::CleanupCfg {
+                auto_remove_completed_days: 0,
+                auto_remove_keep_data: true,
+            });
+        insert_completed(&state, "old1", now_secs() - 86_400 * 30);
+        assert!(
+            state.sweep_completed_cleanup().await.is_empty(),
+            "禁用时空转"
+        );
+
+        // days=7：老任务清扫，年轻任务保留
+        let state = DaemonState::new(Arc::new(FakeEngine::new(EngineKind::Http)), vec![])
+            .with_cleanup(crate::config::CleanupCfg {
+                auto_remove_completed_days: 7,
+                auto_remove_keep_data: true,
+            });
+        insert_completed(&state, "old1", now_secs() - 86_400 * 8);
+        insert_completed(&state, "new1", now_secs() - 86_400);
+        insert_completed(&state, "old_nots", now_secs() - 86_400 * 30);
+        {
+            // 无完成时刻（旧档）→ 跳过不猜龄
+            let mut tasks = state.tasks.lock();
+            tasks
+                .get_mut("old_nots")
+                .unwrap()
+                .task
+                .metadata
+                .finished_at_unix = 0;
+        }
+        let swept = state.sweep_completed_cleanup().await;
+        assert_eq!(
+            swept,
+            vec!["old1".to_string()],
+            "仅超龄且有完成时刻的被清扫"
+        );
+        let tasks = state.tasks.lock();
+        assert!(tasks.get("new1").is_some(), "年轻任务保留");
+        assert!(tasks.get("old_nots").is_some(), "无时刻任务保留");
+        assert!(tasks.get("old1").is_none(), "超龄任务已移除");
+    }
+
+    #[tokio::test]
+    async fn sweep_data_disposition_follows_config() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![]).with_cleanup(
+            crate::config::CleanupCfg {
+                auto_remove_completed_days: 1,
+                auto_remove_keep_data: false, // 连数据一起删
+            },
+        );
+        insert_completed(&state, "old1", now_secs() - 86_400 * 2);
+        let swept = state.sweep_completed_cleanup().await;
+        assert_eq!(swept.len(), 1);
+        assert_eq!(
+            fake.removed_calls(),
+            vec![("old1".to_string(), true)],
+            "keep_data=false → 引擎侧删数据"
+        );
+    }
+
+    #[tokio::test]
+    async fn sweep_ignores_non_completed_states() {
+        let state = DaemonState::new(Arc::new(FakeEngine::new(EngineKind::Http)), vec![])
+            .with_cleanup(crate::config::CleanupCfg {
+                auto_remove_completed_days: 1,
+                auto_remove_keep_data: true,
+            });
+        // Seeding 任务带超龄完成时刻——状态非 Completed 不清扫（做种保护）
+        {
+            insert_completed(&state, "seed1", now_secs() - 86_400 * 30);
+            let mut tasks = state.tasks.lock();
+            tasks.get_mut("seed1").unwrap().task.state = TaskState::Seeding;
+        }
+        let swept = state.sweep_completed_cleanup().await;
+        assert!(swept.is_empty(), "非 Completed 状态不清扫");
     }
 }

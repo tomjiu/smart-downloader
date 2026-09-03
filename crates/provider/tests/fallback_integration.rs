@@ -42,6 +42,7 @@ fn bt_partial_task(dest_root: std::path::PathBuf) -> smart_dl_core::task::Downlo
             name: None,
             added_at_unix: 0,
             tags: Vec::new(),
+            finished_at_unix: 0,
         },
         limits: None,
     }

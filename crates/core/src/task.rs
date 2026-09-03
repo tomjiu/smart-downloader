@@ -113,4 +113,8 @@ pub struct TaskMetadata {
     /// 序列化缺省兼容旧 tasks.json（恢复时缺字段 → 空集）。
     #[serde(default)]
     pub tags: Vec<String>,
+    /// 完成时刻（E20，unix 秒；0 = 未完成/未知）：完成事件统一出口
+    /// publish_task_completed 写入，自动清理按此判龄。serde default 兼容旧档。
+    #[serde(default)]
+    pub finished_at_unix: u64,
 }
