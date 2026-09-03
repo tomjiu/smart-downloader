@@ -158,3 +158,42 @@ async fn no_cd_falls_back_to_url_basename() {
     assert_eq!(sha256_of(&got), sha256_of(&src));
     assert!(!dir.path().join("download.bin").exists());
 }
+
+/// E9：status().name 透出落盘名决策结果——CD 派生名优先于 URL 末段
+/// （daemon 名字回填的数据源契约）。
+#[tokio::test]
+async fn status_name_reports_cd_derived_name() {
+    let srv = server_with_cd("attachment; filename=\"setup-v2.exe\"").await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = HttpEngine::new(reqwest::Client::new());
+    // 无显式名 → 派生链（CD 压制 URL 末段）
+    let task = make_http_task_to("cd9", &srv.url("/file"), dir.path().to_path_buf(), None);
+    let tid = engine.add(&task).await.unwrap();
+    let st = engine.status(&tid).await.unwrap();
+    assert_eq!(
+        st.name.as_deref(),
+        Some("setup-v2.exe"),
+        "status 必须透出 CD 派生名（回填数据源）"
+    );
+}
+
+/// E9：显式名回显同口径（决策结果 = 显式名，daemon 侧不覆盖）。
+#[tokio::test]
+async fn status_name_reports_explicit_name() {
+    let srv = server_with_cd("attachment; filename=\"server-name.bin\"").await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = HttpEngine::new(reqwest::Client::new());
+    let task = make_http_task_to(
+        "cd10",
+        &srv.url("/file"),
+        dir.path().to_path_buf(),
+        Some("my-name.bin"),
+    );
+    let tid = engine.add(&task).await.unwrap();
+    let st = engine.status(&tid).await.unwrap();
+    assert_eq!(
+        st.name.as_deref(),
+        Some("my-name.bin"),
+        "显式名回显同口径（权威不被服务端声明压制）"
+    );
+}

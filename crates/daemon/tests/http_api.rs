@@ -1634,3 +1634,113 @@ async fn set_task_proxy_api_e2e() {
         .unwrap();
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 }
+
+/// E9 派生名回填 e2e：服务端 CD 声明名 → add（无显式名）→ 轮询回填 →
+/// 快照/列表透出（显式名与透出链已在 E6/E7 覆盖，此处验证 CD 派生路径）。
+#[tokio::test]
+async fn task_name_backfilled_from_content_disposition_e2e() {
+    use axum::extract::Request;
+    use axum::http::{header, StatusCode as SC};
+    use axum::response::IntoResponse;
+    use axum::routing;
+    use axum::Router;
+
+    let body = patterned(256 * 1024);
+    let total = body.len();
+    // 内联 CD server：响应头带 Content-Disposition 声明名（Range 206 支持）
+    let app = Router::new().fallback(routing::any(move |req: Request| {
+        let body = body.clone();
+        async move {
+            let total = total as u64;
+            if let Some(r) = req
+                .headers()
+                .get(header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("bytes="))
+                .and_then(|s| s.split_once('-'))
+            {
+                let s: u64 = r.0.parse().unwrap_or(0);
+                let e: u64 = r.1.parse::<u64>().unwrap_or(total - 1).min(total - 1);
+                let payload = body[s as usize..=(e as usize)].to_vec();
+                return axum::response::Response::builder()
+                    .status(SC::PARTIAL_CONTENT)
+                    .header(header::CONTENT_RANGE, format!("bytes {s}-{e}/{total}"))
+                    .header(
+                        header::CONTENT_DISPOSITION,
+                        "attachment; filename=\"cd-served.bin\"",
+                    )
+                    .body(axum::body::Body::from(payload))
+                    .unwrap()
+                    .into_response();
+            }
+            axum::response::Response::builder()
+                .status(SC::OK)
+                .header(header::CONTENT_LENGTH, total)
+                .header(
+                    header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"cd-served.bin\"",
+                )
+                .body(axum::body::Body::from(body))
+                .unwrap()
+                .into_response()
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let srv_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (addr, state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let dest = std::env::temp_dir().join(format!("e9-cdname-{}", std::process::id()));
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "url": format!("http://{srv_addr}/file"),
+            "dest": dest.to_str().unwrap(),
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 手动驱动轮询（生产由 spawn_http_events 2s 周期驱动；测试直接调）
+    state.poll_http_task_states().await;
+
+    // 快照 name = CD 派生名（回填生效）
+    let snap: serde_json::Value = client
+        .get(format!("{base}/tasks/{tid}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        snap["name"], "cd-served.bin",
+        "快照必须透出引擎回填的 CD 派生名: {snap}"
+    );
+
+    // 列表 name 同步生效
+    let list: serde_json::Value = client
+        .get(format!("{base}/tasks"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["task_id"] == tid.as_str())
+        .unwrap();
+    assert_eq!(row["name"], "cd-served.bin", "列表必须透出回填名: {row}");
+}

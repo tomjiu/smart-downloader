@@ -813,6 +813,8 @@ impl DownloadEngine for FtpEngine {
             num_peers: 0,
             num_seeds: 0,
             error: t.error.clone(),
+            // FTP 不参与 E9 名字回填：daemon add 时已派生 URL 末段名
+            name: None,
         })
     }
 

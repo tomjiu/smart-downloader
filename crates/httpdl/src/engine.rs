@@ -72,6 +72,10 @@ struct HttpTask {
     /// （覆盖全局）；None = 引擎共享 client。实际生效 client 在 spawn/
     /// update_sources/add 探测时按此字段构建。
     proxy: Option<String>,
+    /// 最终落盘名（E9 配置回显）：add 落盘名决策结果（显式名回显同值；派生
+    /// 名 = CD → URL 末段 → 兑底链，已 sanitize_rel 终审）。status() 透出供
+    /// daemon 回填 metadata.name——引擎内部派生的名字不再对 daemon 隐身。
+    resolved_name: Option<String>,
 }
 
 struct EngineInner {
@@ -636,6 +640,8 @@ impl DownloadEngine for HttpEngine {
             }
         };
         let dest = task.dest_root.join(&rel_pb);
+        // E9：决策结果回显（显式名/派生名同口径）——daemon 轮询回填 metadata.name
+        let resolved_name = rel_pb.to_string_lossy().into_owned();
         // 断点续传（P4 段账本版）：`<dest>.part` + `<dest>.part.progress` 账本为
         // 唯一可信进度凭据。预分配 .part 的文件长度恒等于 total，不可作为进度
         // 证据（G1：空洞文件假完成）；ETag 失配即作废（G2：混合内容文件）。
@@ -710,6 +716,7 @@ impl DownloadEngine for HttpEngine {
                     limit_kb_s: None,
                     sequential: task.sequential,
                     proxy,
+                    resolved_name: Some(resolved_name),
                 },
             );
         }
@@ -758,6 +765,7 @@ impl DownloadEngine for HttpEngine {
             num_peers: 0,
             num_seeds: 0,
             error: t.error.clone(),
+            name: t.resolved_name.clone(),
         })
     }
 
