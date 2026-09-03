@@ -2105,6 +2105,76 @@ impl DaemonState {
         Ok(())
     }
 
+    /// 任务级代理热改（E8）：`Some(url)` = 切任务专用 client（覆盖全局，
+    /// add 时 E5 语义的运行时版）；`None` = 清除回引擎共享 client。
+    ///
+    /// - 仅 HTTP 任务：daemon 侧预拒（其余 kind → `UnsupportedOp` 409），
+    ///   不依赖引擎 trait default 拒绝——错误信息带任务 kind，且避免
+    ///   engine_for 未注册引擎时的笼统报错。
+    /// - `Some` 空串拒绝（与 add 口径一致：空串是非法 URL 不是清除；清除
+    ///   语义由 `None` 承担）。
+    /// - URL 试水（`build_proxied_client`）先行 → `InvalidSource` 400；
+    ///   远端不可达 ≠ 代理非法（不发起连接，纯本地构建校验）。
+    /// - 引擎应用成功后才改记录（引擎侧对下载中任务 epoch+1 重入，
+    ///   段账本恢复进度）；记录改写用 match 下钻 enum（`DownloadSource::Http`
+    ///   的 `proxy` 字段）。
+    /// - 事件 detail 不放 URL 原文（proxy 可含凭据；push_event 链路无
+    ///   脱敏通道）——只记 set/cleared。
+    pub async fn set_task_proxy(&self, id: &str, proxy: Option<String>) -> Result<(), DaemonError> {
+        if let Some(p) = &proxy {
+            if p.is_empty() {
+                return Err(DaemonError::InvalidSource(
+                    "proxy 不能为空字符串（清除语义请传 null）".into(),
+                ));
+            }
+            smart_dl_httpdl::build_proxied_client(p)
+                .map_err(|e| DaemonError::InvalidSource(format!("proxy 非法 {p:?}: {e}")))?;
+        }
+        let (engine, tid) = {
+            let rec = self
+                .tasks
+                .lock()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            let tid = rec
+                .engine_tid
+                .clone()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            if rec.engine_kind != EngineKind::Http {
+                return Err(DaemonError::UnsupportedOp(format!(
+                    "任务 {id}（{:?}）不支持任务级代理——仅 HTTP 任务（BT 代理属会话级配置）",
+                    rec.engine_kind
+                )));
+            }
+            (self.engine_for(rec.engine_kind)?, tid)
+        };
+        engine
+            .set_task_proxy(&tid, proxy.clone())
+            .await
+            .map_err(|e| match e {
+                smart_dl_core::types::EngineError::Unsupported => {
+                    DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持任务级代理"))
+                }
+                other => DaemonError::Engine(other.to_string()),
+            })?;
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                // 引擎 kind 已预拒非 Http；此处必然命中 Http 变体（防御性 if let）
+                if let DownloadSource::Http { proxy: p, .. } = &mut rec.task.source {
+                    *p = proxy.clone();
+                }
+                rec.push_event(
+                    "proxy_changed",
+                    Some(if proxy.is_some() { "set" } else { "cleared" }.into()),
+                );
+            }
+        }
+        self.autosave();
+        Ok(())
+    }
+
     /// 子文件优先级重放收敛（单轮）：对恢复时 metadata 未就绪而挂起的任务，
     /// 探测就绪性（readback 非空）→ 成功后全量重放并移除 pending。
     /// 返回本轮成功重放的任务 id 列表（测试/日志用）。
@@ -3641,6 +3711,8 @@ pub struct FakeEngine {
     resumed: parking_lot::Mutex<Vec<String>>,
     /// 已下发的 remove 调用（(engine_tid, delete_data)，E7 数据处置断言用）。
     removed: parking_lot::Mutex<Vec<(String, bool)>>,
+    /// 已下发的 set_task_proxy 调用（(engine_tid, proxy)，E8 热改断言用）。
+    proxy_sets: parking_lot::Mutex<Vec<(String, Option<String>)>>,
 }
 
 #[cfg(test)]
@@ -3660,6 +3732,7 @@ impl FakeEngine {
             paused: parking_lot::Mutex::new(Vec::new()),
             resumed: parking_lot::Mutex::new(Vec::new()),
             removed: parking_lot::Mutex::new(Vec::new()),
+            proxy_sets: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -3693,6 +3766,11 @@ impl FakeEngine {
     /// 读取已下发的 remove 调用（(engine_tid, delete_data)，E7 数据处置断言用）。
     pub fn removed_calls(&self) -> Vec<(String, bool)> {
         self.removed.lock().clone()
+    }
+
+    /// 读取已下发的 set_task_proxy 调用（(engine_tid, proxy)，E8 热改断言用）。
+    pub fn proxy_set_calls(&self) -> Vec<(String, Option<String>)> {
+        self.proxy_sets.lock().clone()
     }
 
     /// 读取已下发的 resume 调用（P4 G5 重放测试断言用）。
@@ -3779,6 +3857,15 @@ impl DownloadEngine for FakeEngine {
         delete_data: bool,
     ) -> Result<(), smart_dl_core::types::EngineError> {
         self.removed.lock().push((id.to_string(), delete_data));
+        Ok(())
+    }
+
+    async fn set_task_proxy(
+        &self,
+        id: &EngineTaskId,
+        proxy: Option<String>,
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        self.proxy_sets.lock().push((id.to_string(), proxy));
         Ok(())
     }
     async fn peers(
@@ -5274,5 +5361,160 @@ mod list_batch_tests {
         }
         let engines = known_engine_labels();
         assert_eq!(engines, vec!["bt", "http", "ftp", "provider", "xunlei-nas"]);
+    }
+}
+
+/// E8 任务级代理热改：记录回显 + 引擎调用 + 入参校验 + 非 HTTP 预拒
+/// （FakeEngine 记录调用；BT 任务白盒插记录，precheck 在 engine_for 之前，
+/// 非 bt 构建同样可测）。
+#[cfg(test)]
+mod task_proxy_set_tests {
+    use super::*;
+    use smart_dl_core::identity::{CanonicalId, CanonicalKind, ContentIdentity};
+
+    /// 手工插一条 BT kind 记录（不注册 BT 引擎——set_task_proxy 的 kind
+    /// 预拒发生在 engine_for 之前，未注册引擎不影响断言路径）。
+    fn insert_bt_rec(state: &DaemonState, id: &str, ih: &str) {
+        let rec = TaskRecord {
+            task: DownloadTask {
+                id: id.into(),
+                canonical_id: CanonicalId {
+                    kind: CanonicalKind::Bt,
+                    identity: ih.to_string(),
+                    validator: None,
+                    token_sensitive: false,
+                },
+                source: DownloadSource::Magnet(format!("magnet:?xt=urn:btih:{ih}")),
+                identity: ContentIdentity::SingleFile {
+                    size: 0,
+                    etag: None,
+                    sha256: None,
+                    backup_md5: None,
+                },
+                dest_root: PathBuf::from("."),
+                files: vec![],
+                acquisitions: vec![],
+                aggregate: Default::default(),
+                state: TaskState::Downloading(EngineKind::Bt),
+                retry: Default::default(),
+                created_at: std::time::Instant::now(),
+                file_priorities: None,
+                sequential: false,
+                metadata: TaskMetadata {
+                    name: None,
+                    added_at_unix: 0,
+                },
+                limits: None,
+            },
+            engine_tid: Some(ih.to_string()),
+            engine_kind: EngineKind::Bt,
+            engine_status: None,
+            events: vec![],
+        };
+        state.tasks.lock().insert(id.into(), rec);
+    }
+
+    fn source_proxy(state: &DaemonState, id: &str) -> Option<String> {
+        match &state.tasks.lock().get(id).unwrap().task.source {
+            DownloadSource::Http { proxy, .. } => proxy.clone(),
+            other => panic!("source 应为 Http: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_task_proxy_updates_record_and_engine() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task("https://example.com/f.bin".into(), None)
+            .await
+            .unwrap();
+
+        state
+            .set_task_proxy(&tid, Some("http://127.0.0.1:8080".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            source_proxy(&state, &tid),
+            Some("http://127.0.0.1:8080".into()),
+            "proxy 必须回显到任务 source（持久化口径）"
+        );
+        let engine_tid = state.tasks.lock().get(&tid).unwrap().engine_tid.clone();
+        assert_eq!(
+            fake.proxy_set_calls(),
+            vec![(
+                engine_tid.clone().unwrap(),
+                Some("http://127.0.0.1:8080".into())
+            )],
+            "引擎必须收到热改调用（按 engine_tid 记录）"
+        );
+        // 清除回共享 client
+        state.set_task_proxy(&tid, None).await.unwrap();
+        assert_eq!(
+            source_proxy(&state, &tid),
+            None,
+            "清除后 source.proxy = None"
+        );
+        assert_eq!(
+            fake.proxy_set_calls()[1],
+            (engine_tid.unwrap(), None),
+            "清除语义必须透传引擎（None 而非空串）"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_task_proxy_rejects_invalid_without_side_effect() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task("https://example.com/f.bin".into(), None)
+            .await
+            .unwrap();
+
+        for bad in [
+            "",                       // 空串：非法 URL 不是清除（清除传 None）
+            "http://127.0.0.1:70000", // 端口越界
+        ] {
+            let r = state.set_task_proxy(&tid, Some(bad.to_string())).await;
+            match r {
+                Err(DaemonError::InvalidSource(m)) => {
+                    assert!(!m.is_empty(), "{bad:?} 必须带错误说明");
+                }
+                other => panic!("非法 proxy {bad:?} 必须 InvalidSource: {other:?}"),
+            }
+        }
+        assert!(
+            fake.proxy_set_calls().is_empty(),
+            "非法 proxy 不得触达引擎（零副作用）"
+        );
+        assert_eq!(source_proxy(&state, &tid), None, "记录保持原状");
+        // 不存在的任务 → NotFound
+        assert!(matches!(
+            state
+                .set_task_proxy("t404", Some("http://127.0.0.1:1".into()))
+                .await,
+            Err(DaemonError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn set_task_proxy_rejects_non_http_task() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        insert_bt_rec(&state, "t-bt", "ABC123");
+
+        let r = state
+            .set_task_proxy("t-bt", Some("http://127.0.0.1:8080".into()))
+            .await;
+        match r {
+            Err(DaemonError::UnsupportedOp(m)) => {
+                assert!(m.contains("HTTP"), "409 错误信息应定性仅 HTTP 支持: {m}");
+            }
+            other => panic!("BT 任务 set proxy 必须 UnsupportedOp(409): {other:?}"),
+        }
+        assert!(
+            fake.proxy_set_calls().is_empty(),
+            "HTTP 引擎不得收到 BT 任务的调用"
+        );
     }
 }

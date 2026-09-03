@@ -219,3 +219,100 @@ async fn unproxied_task_fails_on_unreachable_target() {
         "对照组不得触达代理（证明主例内容确实来自代理）"
     );
 }
+
+/// E8 热改测试基建口径：32MB（2 段 × 16MB min_split，segment_count 最小 2 并发）
+/// + 全局限速 4MiB/s（总时长 ~8s）+ 固定 300ms 后热改——此时两段均在飞
+/// （每段 ~4s），"下载中"由总时长保证，不依赖进度轮询（进度按段完成上报，
+/// 16MB 段粒度下中途恒为 0）。
+const E8_SIZE: u64 = 32 * 1024 * 1024;
+const E8_RATE_KB_S: u32 = 4096;
+
+/// E8：下载中任务热切代理——新循环（epoch+1 重入）用新 client 领剩余段，
+/// 新代理必须被触达；终态 Completed 且内容一致（旧循环检查点自杀不 finalize，
+/// 并发覆盖写同内容字节幂等，P4 既有收敛语义）。
+#[tokio::test]
+async fn set_task_proxy_hot_switch_mid_download() {
+    let content = patterned(E8_SIZE);
+    let sha = sha256_of(&content);
+    let (proxy_a, hits_a) = start_mini_proxy(content.clone(), false).await;
+    let (proxy_b, hits_b) = start_mini_proxy(content.clone(), false).await;
+
+    let engine = HttpEngine::new_limited(reqwest::Client::new(), E8_RATE_KB_S);
+    let dir = tempfile::tempdir().unwrap();
+    let task = make_proxied_task(
+        "t-hotswitch",
+        Some(proxy_a),
+        dir.path().to_path_buf(),
+        "hotswitch.bin",
+        &sha,
+    );
+    let tid = engine.add(&task).await.unwrap();
+
+    // 等下载进入中途（总时长 ~8s，300ms 时两段均在飞）
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let st = engine.status(&tid).await.unwrap();
+    assert_eq!(st.state, EngineState::Downloading, "300ms 时应仍在下载");
+    assert!(
+        hits_a.load(Ordering::SeqCst) > 0,
+        "切换前代理 A 必须已被触达"
+    );
+
+    // 热切 proxy B：立即返回（不等待下载），新循环用 B 重入
+    engine
+        .set_task_proxy(&tid, Some(proxy_b.clone()))
+        .await
+        .unwrap();
+
+    let st = wait_terminal(&engine, &tid).await;
+    assert_eq!(
+        st.state,
+        EngineState::Completed,
+        "热切代理后应经新代理完成: err={:?}",
+        st.error
+    );
+    assert!(
+        hits_b.load(Ordering::SeqCst) > 0,
+        "切换后新代理 B 必须被触达（新 client 生效证据）"
+    );
+    let got = std::fs::read(dir.path().join("hotswitch.bin")).unwrap();
+    assert_eq!(sha256_of(&got), sha, "落位内容必须与 patterned 一致");
+}
+
+/// E8：下载中任务清除代理（None）——新循环直连不可达目标（DNS 必失败），
+/// 终态非 Completed；旧循环即使把剩余段领完也不 finalize（epoch 门控），
+/// 落位文件不得存在。
+#[tokio::test]
+async fn set_task_proxy_clear_falls_back_direct() {
+    let content = patterned(E8_SIZE);
+    let sha = sha256_of(&content);
+    let (proxy_a, _hits_a) = start_mini_proxy(content.clone(), false).await;
+
+    let engine = HttpEngine::new_limited(reqwest::Client::new(), E8_RATE_KB_S);
+    let dir = tempfile::tempdir().unwrap();
+    let task = make_proxied_task(
+        "t-clear",
+        Some(proxy_a),
+        dir.path().to_path_buf(),
+        "cleared.bin",
+        &sha,
+    );
+    let tid = engine.add(&task).await.unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let st = engine.status(&tid).await.unwrap();
+    assert_eq!(st.state, EngineState::Downloading, "300ms 时应仍在下载");
+
+    // 清除代理：新循环直连 .invalid → DNS 必失败 → 段全失败 → Error
+    engine.set_task_proxy(&tid, None).await.unwrap();
+
+    let st = wait_terminal(&engine, &tid).await;
+    assert_ne!(
+        st.state,
+        EngineState::Completed,
+        "清除代理后直连不可达目标不得完成"
+    );
+    assert!(
+        !dir.path().join("cleared.bin").exists(),
+        "未完成任务不得落位（旧循环 epoch 门控不 finalize）"
+    );
+}
