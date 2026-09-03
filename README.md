@@ -115,7 +115,7 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 
 ## 配置
 
-TOML 配置（默认 `./config.toml`，任务状态 `./tasks.json`）：`[download]`（dest_root/并发/限速/代理）、`[bt]`（save_path/DHT/LSD/UPnP/做种）、`[provider]`（fallback 链）、`[server]`（bind/token）、`[webhook]`（任务完成通知 URL，POST JSON，fire-and-forget）、`[scheduler]`（start_jitter_seconds 错峰随机延迟上限，秒；0 = 关）。支持热重载。
+TOML 配置（默认 `./config.toml`，任务状态 `./tasks.json`）：`[download]`（dest_root/并发/限速/代理）、`[bt]`（save_path/DHT/LSD/UPnP/做种）、`[provider]`（fallback 链）、`[server]`（bind/token）、`[webhook]`（任务完成通知 URL，POST JSON，fire-and-forget）、`[post_download]`（完成后自动处理：move_to 移动到目标目录 + hook 外部程序，环境变量 SD_TASK_ID/SD_TASK_NAME/SD_FILE_PATH/SD_ENGINE 传任务上下文；空 = 禁用）、`[scheduler]`（start_jitter_seconds 错峰随机延迟上限，秒；0 = 关）。支持热重载。
 
 ## 文档地图
 

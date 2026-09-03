@@ -15,6 +15,7 @@ pub struct Config {
     pub provider_xunlei: ProviderXunleiCfg,
     pub webhook: WebhookCfg,
     pub cleanup: CleanupCfg,
+    pub post_download: PostDownloadCfg,
     pub scheduler: SchedulerCfg,
     pub lock: LockCfg,
     pub storage: StorageCfg,
@@ -126,6 +127,23 @@ pub struct CleanupCfg {
     pub auto_remove_keep_data: bool,
 }
 
+/// 下载完成自动处理配置（E27，清单 #15）：完成后移动 + 外部钩子。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct PostDownloadCfg {
+    /// 完成后把落盘文件移动到该目录（目录自动创建；同盘 rename，跨盘
+    /// copy+delete 回退；同名冲突自动改名 `name(1).ext`）。空 = 禁用（默认）。
+    /// 仅对单文件任务生效（BT 多文件目录跳过）；`conflict_policy=skip` 的
+    /// 任务不移动（尊重"既有文件保持原样"语义，钩子照发）。
+    pub move_to: String,
+    /// 完成后执行的外部程序路径（不带 shell 直启；任务上下文经环境变量
+    /// 传入：SD_TASK_ID / SD_TASK_NAME / SD_FILE_PATH（移动后终路径）/
+    /// SD_ENGINE）。空 = 禁用（默认）。fire-and-forget：后台线程收尾，
+    /// 失败仅记日志，不反压下载主链路（钩子挂起只滞留一个后台线程）。
+    /// 安全提示：程序以 daemon 同权限执行，请自行评估脚本内容。
+    pub hook: String,
+}
+
 /// 调度配置（E23 定时/错峰下载）：任务定时启动与批量入队错峰。
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
@@ -179,6 +197,7 @@ impl Default for Config {
             provider_xunlei: ProviderXunleiCfg::default(),
             webhook: WebhookCfg::default(),
             cleanup: CleanupCfg::default(),
+            post_download: PostDownloadCfg::default(),
             scheduler: SchedulerCfg::default(),
             lock: LockCfg {
                 path: PathBuf::from("./daemon.lock"),
@@ -266,6 +285,8 @@ impl Config {
             "webhook_url": self.webhook.url,
             "auto_remove_completed_days": self.cleanup.auto_remove_completed_days,
             "auto_remove_keep_data": self.cleanup.auto_remove_keep_data,
+            "post_move_to": self.post_download.move_to,
+            "post_hook": self.post_download.hook,
             "start_jitter_seconds": self.scheduler.start_jitter_seconds,
             // 仅暴露「登录态文件是否存在」布尔，不泄露路径字符串本身。
             "provider_xunlei_token_exists": self
@@ -550,5 +571,30 @@ path = "/tmp/sd.lock"
         assert_eq!(c2.webhook.url, "http://127.0.0.1:9000/hook");
         let snap2 = c2.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
         assert_eq!(snap2["webhook_url"], "http://127.0.0.1:9000/hook");
+    }
+
+    #[test]
+    fn post_download_parse_and_snapshot() {
+        // E27：[post_download] move_to/hook 解析 + 快照透出
+        let c = Config::default();
+        assert_eq!(c.post_download.move_to, "", "默认禁用");
+        assert_eq!(c.post_download.hook, "", "默认禁用");
+        let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap["post_move_to"], "");
+        assert_eq!(snap["post_hook"], "");
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(
+            &p,
+            "[post_download]\nmove_to = \"/data/inbox\"\nhook = \"/usr/local/bin/on-done.sh\"\n",
+        )
+        .unwrap();
+        let c2 = Config::load(Some(&p)).unwrap();
+        assert_eq!(c2.post_download.move_to, "/data/inbox");
+        assert_eq!(c2.post_download.hook, "/usr/local/bin/on-done.sh");
+        let snap2 = c2.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap2["post_move_to"], "/data/inbox");
+        assert_eq!(snap2["post_hook"], "/usr/local/bin/on-done.sh");
     }
 }
