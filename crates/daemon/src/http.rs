@@ -15,7 +15,7 @@ use axum::{
     http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{sse::Event as SseEvent, IntoResponse, Sse},
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use base64::Engine as _;
@@ -116,6 +116,18 @@ pub struct AddXunleiImportReq {
 #[derive(Deserialize)]
 pub struct WebseedReq {
     pub urls: Vec<String>,
+}
+
+/// E29 tracker 运行时管理：`POST /tasks/:id/trackers` 批量追加（仅 BT 任务）。
+#[derive(Deserialize)]
+pub struct TrackersReq {
+    pub urls: Vec<String>,
+}
+
+/// E29：`DELETE /tasks/:id/trackers?url=...`（URL 精确匹配，无匹配 404）。
+#[derive(Deserialize)]
+pub struct RemoveTrackerQuery {
+    pub url: String,
 }
 
 /// 任务级限速（`POST /tasks/:id/limit`，P1 能力增强）。
@@ -350,6 +362,66 @@ async fn task_webseeds(
 ) -> impl IntoResponse {
     match state.add_webseeds(&id, &req.urls).await {
         Ok(n) => Json(serde_json::json!({ "added": n })).into_response(),
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+/// E29：`GET /tasks/:id/trackers`——列举当前 announce 表（URL + tier）。
+async fn task_trackers_list(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.list_trackers(&id).await {
+        Ok(v) => Json(serde_json::json!(v)).into_response(),
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+/// E29：`POST /tasks/:id/trackers`——批量追加（仅 BT 任务，非法 URL 400）。
+async fn task_trackers_add(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<TrackersReq>,
+) -> impl IntoResponse {
+    match state.add_trackers(&id, &req.urls).await {
+        Ok(n) => Json(serde_json::json!({ "added": n })).into_response(),
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+/// E29：`DELETE /tasks/:id/trackers?url=...`——精确删除（无匹配 404）。
+async fn task_trackers_remove(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Query(q): Query<RemoveTrackerQuery>,
+) -> impl IntoResponse {
+    match state.remove_tracker(&id, &q.url).await {
+        Ok(()) => Json(serde_json::json!({ "removed": q.url })).into_response(),
         Err(e) => {
             let body = Json(serde_json::json!({ "error": e.to_string() }));
             let status = match e {
@@ -1613,6 +1685,9 @@ macro_rules! router_base {
             .route("/tasks/:id/tags", post(task_set_tags))
             .route("/tasks/:id/files/priority", post(task_file_priority))
             .route("/tasks/:id/webseeds", post(task_webseeds))
+            .route("/tasks/:id/trackers", get(task_trackers_list))
+            .route("/tasks/:id/trackers", post(task_trackers_add))
+            .route("/tasks/:id/trackers", delete(task_trackers_remove))
             .route("/bt/metadata", post(bt_magnet_metadata))
             .route("/config", get(config_endpoint))
             .route("/config/limit", post(config_set_limit))

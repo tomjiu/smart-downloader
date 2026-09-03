@@ -3,6 +3,8 @@
 
 use std::path::Path;
 
+use smart_dl_core::types::TrackerEntry;
+
 use crate::alerts::Alert;
 use crate::ffi::{self, lt_peer, lt_torrent_status, Session};
 use crate::resume::ResumeBytes;
@@ -264,6 +266,31 @@ impl BtCore {
 
     pub fn add_tracker(&self, ih: &str, url: &str) -> ffi::Result<()> {
         self.sess.add_tracker(ih, url)
+    }
+
+    /// tracker 表列举（E29）：C 缓冲 → `TrackerEntry`（NUL 截断安全）。
+    pub fn list_trackers(&self, ih: &str) -> ffi::Result<Vec<TrackerEntry>> {
+        let raw = self.sess.list_trackers(ih)?;
+        Ok(raw
+            .into_iter()
+            .map(|t| {
+                let bytes: Vec<u8> = t
+                    .url
+                    .iter()
+                    .take_while(|&&c| c != 0)
+                    .map(|&c| c as u8)
+                    .collect();
+                TrackerEntry {
+                    url: String::from_utf8_lossy(&bytes).into_owned(),
+                    tier: t.tier,
+                }
+            })
+            .collect())
+    }
+
+    /// 删 tracker（E29）：URL 精确匹配，无匹配 → NotFound 定性错误。
+    pub fn remove_tracker(&self, ih: &str, url: &str) -> ffi::Result<()> {
+        self.sess.remove_tracker(ih, url)
     }
 
     pub fn set_sequential(&self, ih: &str, on: bool) -> ffi::Result<()> {

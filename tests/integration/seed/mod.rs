@@ -42,8 +42,12 @@ impl Drop for TempDir {
     }
 }
 
+// E29：tracker 增删查等纯 handle 级测试只用 magnet/TempDir，不启动 seeder——
+// 部分产物在个别测试二进制中无调用方（clippy --all-targets -D warnings 门禁）。
+#[allow(dead_code)]
 static SEED_MAIN: OnceLock<Option<PathBuf>> = OnceLock::new();
 
+#[allow(dead_code)]
 fn seed_main_path() -> Option<PathBuf> {
     SEED_MAIN
         .get_or_init(|| {
@@ -71,6 +75,7 @@ fn seed_main_path() -> Option<PathBuf> {
         .clone()
 }
 
+#[allow(dead_code)]
 fn pick_free_port() -> u16 {
     TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .expect("bind ephemeral")

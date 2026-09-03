@@ -528,6 +528,44 @@ impl Session {
         )
     }
 
+    /// tracker 表列举（E29）：两段式（cap=0 探测 → BUFFER_TOO_SMALL → 扩容重试），
+    /// 与 peers() 同构。空表 → Ok(vec![])。
+    pub fn list_trackers(&self, ih: &str) -> Result<Vec<lt_tracker_info>> {
+        let i = self.ih(ih)?;
+        let mut need: c_int = 0;
+        let code = unsafe { lt_list_trackers(self.raw, i.as_ptr(), ptr::null_mut(), 0, &mut need) };
+        match code {
+            lt_err_LT_OK => return Ok(Vec::new()), // 空表
+            lt_err_LT_ERR_BUFFER_TOO_SMALL => {}   // need 已为所需数
+            c => return Err(Error::from(c)),
+        }
+        let cap = need as usize;
+        let mut buf: Vec<lt_tracker_info> = Vec::with_capacity(cap);
+        buf.resize_with(cap, || lt_tracker_info {
+            url: [0; 256],
+            tier: 0,
+        });
+        let mut n: c_int = 0;
+        let code2 = unsafe {
+            lt_list_trackers(self.raw, i.as_ptr(), buf.as_mut_ptr(), cap as c_int, &mut n)
+        };
+        if code2 != lt_err_LT_OK {
+            return Err(Error::from(code2));
+        }
+        buf.truncate(n.max(0) as usize);
+        Ok(buf)
+    }
+
+    /// 删 tracker（E29）：内核按 URL 精确匹配，无匹配 → Error（NotFound 定性）。
+    pub fn remove_tracker(&self, ih: &str, url: &str) -> Result<()> {
+        let i = self.ih(ih)?;
+        let u = cstr(url)?;
+        call(
+            unsafe { lt_remove_tracker(self.raw, i.as_ptr(), u.as_ptr()) },
+            || Ok(()),
+        )
+    }
+
     pub fn set_sequential(&self, ih: &str, on: bool) -> Result<()> {
         let i = self.ih(ih)?;
         call(

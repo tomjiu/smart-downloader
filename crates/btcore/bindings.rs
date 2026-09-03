@@ -401,6 +401,35 @@ unsafe extern "C" {
         out_count: *mut usize,
     ) -> lt_err;
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct lt_tracker_info {
+    pub url: [::std::os::raw::c_char; 256usize],
+    pub tier: ::std::os::raw::c_int,
+}
+#[allow(clippy::unnecessary_operation, clippy::identity_op)]
+const _: () = {
+    ["Size of lt_tracker_info"][::std::mem::size_of::<lt_tracker_info>() - 260usize];
+    ["Alignment of lt_tracker_info"][::std::mem::align_of::<lt_tracker_info>() - 4usize];
+    ["Offset of field: lt_tracker_info::url"][::std::mem::offset_of!(lt_tracker_info, url) - 0usize];
+    ["Offset of field: lt_tracker_info::tier"][::std::mem::offset_of!(lt_tracker_info, tier) - 256usize];
+};
+unsafe extern "C" {
+    pub fn lt_list_trackers(
+        s: *mut lt_session,
+        ih: *const ::std::os::raw::c_char,
+        out: *mut lt_tracker_info,
+        cap: ::std::os::raw::c_int,
+        out_len: *mut ::std::os::raw::c_int,
+    ) -> lt_err;
+}
+unsafe extern "C" {
+    pub fn lt_remove_tracker(
+        s: *mut lt_session,
+        ih: *const ::std::os::raw::c_char,
+        url: *const ::std::os::raw::c_char,
+    ) -> lt_err;
+}
 pub const lt_alert_mask_LT_ALERT_TRACKER: lt_alert_mask = 1;
 pub const lt_alert_mask_LT_ALERT_PEER: lt_alert_mask = 2;
 pub const lt_alert_mask_LT_ALERT_ERROR: lt_alert_mask = 4;

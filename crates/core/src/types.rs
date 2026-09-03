@@ -202,6 +202,13 @@ pub enum EngineKind {
 /// 引擎任务句柄（v1 用引擎侧生成字符串 id）。
 pub type EngineTaskId = String;
 
+/// BT 任务 tracker 表项（E29 运行时增删查；tier 同 libtorrent 语义，小者优先）。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct TrackerEntry {
+    pub url: String,
+    pub tier: i32,
+}
+
 /// 引擎错误。
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum EngineError {
@@ -355,6 +362,22 @@ pub trait DownloadEngine: Send + Sync {
         _id: &EngineTaskId,
         _proxy: Option<String>,
     ) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// 批量追加 tracker（E29，BT 任务；announce/webseed 无关，metadata 未
+    /// 就绪也可设）。不支持引擎（HTTP/FTP）→ `Unsupported`。
+    async fn add_trackers(&self, _id: &EngineTaskId, _urls: &[String]) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// 删 tracker（E29，BT 任务）：URL 精确匹配，无匹配 → `NotFound`。
+    async fn remove_tracker(&self, _id: &EngineTaskId, _url: &str) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// 列举 tracker 表（E29，BT 任务）：返回当前 announce 表（URL + tier）。
+    async fn list_trackers(&self, _id: &EngineTaskId) -> Result<Vec<TrackerEntry>, EngineError> {
         Err(EngineError::Unsupported)
     }
 
