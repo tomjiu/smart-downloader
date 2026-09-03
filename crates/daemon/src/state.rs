@@ -406,6 +406,11 @@ pub struct DaemonState {
     /// 不持久化（重启回到配置文件口径——与 dest_root 同为配置层，任务层
     /// 不感知）。
     global_limits: Mutex<GlobalLimits>,
+    /// 任务完成 Webhook URL（E17）：Some = 完成态时 POST 通知；None = 禁用。
+    /// serve 从 `[webhook] url` 注入，热重载跟随（refresh_config）。
+    webhook_url: Mutex<Option<String>>,
+    /// Webhook 投递 client（共享连接池；完成频率低，单实例足够）。
+    webhook_client: reqwest::Client,
 }
 
 /// 全局限速总阀门当前值（E16，KiB/s；0 = 不限）。
@@ -727,6 +732,11 @@ impl DaemonState {
                 max_download_kb_s: 0,
                 max_upload_kb_s: 0,
             }),
+            webhook_url: Mutex::new(None),
+            webhook_client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default(),
         }
     }
 
@@ -775,6 +785,12 @@ impl DaemonState {
     /// 读取全局限速总阀门当前值（E16）。
     pub fn global_limits(&self) -> GlobalLimits {
         *self.global_limits.lock()
+    }
+
+    /// 注入任务完成 Webhook URL（E17）：None/空 = 禁用。
+    pub fn with_webhook_url(self, url: Option<String>) -> Self {
+        *self.webhook_url.lock() = url.filter(|u| !u.is_empty());
+        self
     }
 
     /// 全局限速总阀门热改（E16）：合并方向后下发各引擎（BT → FTP → HTTP 顺序，
@@ -870,6 +886,70 @@ impl DaemonState {
                 "{label} 全局限速下发失败: {e}"
             ))),
         }
+    }
+
+    /// 任务完成事件统一出口（E17）：广播 `SchedulerEvent::Completed` +
+    /// 触发完成 Webhook。三个完成转移点（HTTP/FTP 轮询循环、BT alert 流
+    /// Seeding 转移、Provider 兜底成功）一律经此，保证事件与通知不脱钩。
+    pub fn publish_task_completed(&self, task_id: &str) {
+        self.hub.publish(SchedulerEvent::Completed {
+            task_id: task_id.to_string(),
+        });
+        self.fire_completion_webhook(task_id);
+    }
+
+    /// 完成通知投递（E17）：fire-and-forget——单次 POST、5s 超时、失败仅记
+    /// 警告日志（不重试不排队；通知属尽力而为，不得反压下载主链路）。
+    /// 未配置 URL 时零开销直返。payload 从任务记录快照构建（锁内取值锁外投递）。
+    fn fire_completion_webhook(&self, task_id: &str) {
+        let Some(url) = self.webhook_url.lock().clone() else {
+            return;
+        };
+        let payload = {
+            let tasks = self.tasks.lock();
+            match tasks.get(task_id) {
+                None => return, // 任务已移除（完成通知失去主体）→ 静默
+                Some(rec) => {
+                    // 总字节：优先 add 探测 identity，缺省回退 E11 引擎快照缓存
+                    //（HTTP 探测失败/信息聚合型源 identity.size=0 时仍有值）
+                    let total_bytes = match &rec.task.identity {
+                        ContentIdentity::SingleFile { size, .. } if *size > 0 => Some(*size),
+                        _ => rec
+                            .engine_status
+                            .as_ref()
+                            .map(|s| s.total)
+                            .filter(|t| *t > 0),
+                    };
+                    serde_json::json!({
+                        "event": "task_completed",
+                        "task_id": rec.task.id,
+                        "name": rec.task.metadata.name,
+                        "engine": kind_label(&rec.engine_kind),
+                        "total_bytes": total_bytes,
+                        "finished_at_unix": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    })
+                }
+            }
+        };
+        let client = self.webhook_client.clone();
+        tokio::spawn(async move {
+            let result = client
+                .post(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .json(&payload)
+                .send()
+                .await;
+            match result {
+                Ok(resp) if resp.status().is_success() => {}
+                Ok(resp) => {
+                    tracing::warn!("完成 Webhook 非成功响应: {url} status={}", resp.status())
+                }
+                Err(e) => tracing::warn!("完成 Webhook 投递失败: {url} {e}"),
+            }
+        });
     }
 
     /// 生效的 dest 白名单（V2）：未显式注入时兜底 default_dest_root。
@@ -2612,9 +2692,8 @@ impl DaemonState {
             from: TaskState::Downloading(EngineKind::Bt),
             to: TaskState::Completed,
         });
-        self.hub.publish(SchedulerEvent::Completed {
-            task_id: id.to_string(),
-        });
+        // E17：完成事件统一出口（广播 + Webhook）
+        self.publish_task_completed(id);
         Ok(outcome)
     }
 
@@ -2664,6 +2743,15 @@ impl DaemonState {
         let snap = crate::config::Config::snapshot_json(cfg, tasks_path);
         if *self.config_snapshot.lock() != Some(snap.clone()) {
             *self.config_snapshot.lock() = Some(snap);
+        }
+        // E17：完成 Webhook URL 热重载（空 = 禁用）
+        {
+            let mut hook = self.webhook_url.lock();
+            let new = (!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone());
+            if *hook != new {
+                tracing::info!("配置热重载: webhook_url {:?} → {:?}", *hook, new);
+                *hook = new;
+            }
         }
     }
 }

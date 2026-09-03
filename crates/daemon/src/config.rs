@@ -13,6 +13,7 @@ pub struct Config {
     pub xunlei: XunleiCfg,
     pub provider: ProviderCfg,
     pub provider_xunlei: ProviderXunleiCfg,
+    pub webhook: WebhookCfg,
     pub lock: LockCfg,
     pub storage: StorageCfg,
 }
@@ -103,6 +104,15 @@ pub struct ProviderXunleiCfg {
     pub tier: Option<String>,
 }
 
+/// 任务完成 Webhook 配置（E17）：任务到达完成态时 daemon 向 `url` POST 一条
+/// JSON 通知（fire-and-forget，单次尝试 5s 超时，失败仅记日志）。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct WebhookCfg {
+    /// 完成通知 Webhook URL；空 = 禁用（默认）。参与热重载。
+    pub url: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct LockCfg {
@@ -144,6 +154,7 @@ impl Default for Config {
                 mock: false,
             },
             provider_xunlei: ProviderXunleiCfg::default(),
+            webhook: WebhookCfg::default(),
             lock: LockCfg {
                 path: PathBuf::from("./daemon.lock"),
             },
@@ -227,6 +238,7 @@ impl Config {
             "provider_xunlei_enabled": self.provider_xunlei.enabled,
             // 身份档位名（非敏感；无 token 布尔那样有路径泄露风险）。
             "provider_xunlei_tier": self.resolve_xunlei_tier_name(),
+            "webhook_url": self.webhook.url,
             // 仅暴露「登录态文件是否存在」布尔，不泄露路径字符串本身。
             "provider_xunlei_token_exists": self
                 .provider_xunlei
@@ -493,5 +505,22 @@ path = "/tmp/sd.lock"
         std::fs::write(&p, "server = [unclosed").unwrap();
         let err = Config::load(Some(&p)).unwrap_err();
         assert!(err.contains("解析失败"), "应报解析错误: {err}");
+    }
+
+    #[test]
+    fn webhook_url_parse_and_snapshot() {
+        // E17：[webhook] url 解析 + 快照透出（运维可读，非敏感）
+        let c = Config::default();
+        assert_eq!(c.webhook.url, "", "默认禁用");
+        let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap["webhook_url"], "");
+
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(&p, "[webhook]\nurl = \"http://127.0.0.1:9000/hook\"\n").unwrap();
+        let c2 = Config::load(Some(&p)).unwrap();
+        assert_eq!(c2.webhook.url, "http://127.0.0.1:9000/hook");
+        let snap2 = c2.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap2["webhook_url"], "http://127.0.0.1:9000/hook");
     }
 }
