@@ -678,6 +678,41 @@ async fn config_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResp
     Json(state.config_snapshot())
 }
 
+/// 全局限速总阀门热改（`POST /config/limit`，E16）。
+///
+/// 请求体（两字段均可选，`Option` 缺省语义）：
+/// - `max_download_kb_s`：所有引擎合计下行上限（KiB/s；0 = 不限）
+/// - `max_upload_kb_s`：BT 合计上行上限（KiB/s；0 = 不限；HTTP/FTP 无上传）
+/// - 字段缺省/null = 该方向不调整；双缺省 = 纯查询（返回当前值）
+///
+/// 成功：200 + 当前生效 `{max_download_kb_s, max_upload_kb_s}`；
+/// 下发失败（如 BT settings_pack 错误）：500。不落盘——重启回到配置文件口径；
+/// `GET /config` 快照的两键随生效值同步刷新，`global_limits_changed` 事件广播。
+#[derive(Deserialize)]
+pub struct GlobalLimitReq {
+    #[serde(default)]
+    pub max_download_kb_s: Option<u32>,
+    #[serde(default)]
+    pub max_upload_kb_s: Option<u32>,
+}
+
+async fn config_set_limit(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<GlobalLimitReq>,
+) -> impl IntoResponse {
+    match state
+        .apply_global_limits(req.max_download_kb_s, req.max_upload_kb_s)
+        .await
+    {
+        Ok(g) => Json(g).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 /// 全局统计（任务按状态/引擎聚合 + 聚合速率，速率口径 1s 快照）。
 async fn stats_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     Json(state.stats())
@@ -1378,6 +1413,7 @@ macro_rules! router_base {
             .route("/tasks/:id/webseeds", post(task_webseeds))
             .route("/bt/metadata", post(bt_magnet_metadata))
             .route("/config", get(config_endpoint))
+            .route("/config/limit", post(config_set_limit))
             .route("/stats", get(stats_endpoint))
             .route("/version", get(version_endpoint))
             .route("/health", get(health_endpoint))

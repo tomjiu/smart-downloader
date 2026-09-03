@@ -2,7 +2,7 @@
 //! 被动模式（PASV）、REST 断点续传（.part）、421 退避重试、目录下载（LIST 单层）；
 //! 不支持 SFTP/FTPS 隐式/目录递归/FXP。
 
-use crate::rate::RateSample;
+use crate::rate::{RateLimiter, RateSample};
 use crate::retry::Backoff;
 use crate::static_split::plan_segments;
 use parking_lot::Mutex;
@@ -62,6 +62,10 @@ struct FtpTask {
 
 struct EngineInner {
     tasks: Mutex<HashMap<EngineTaskId, FtpTask>>,
+    /// 引擎全局限速器（E16 总阀门）：0 = 不限（wait 早退零开销）；
+    /// set_global_limits 运行中热调。FTP 无任务级限速（引擎能力边界），
+    /// 所有 FTP 任务的合计带宽由本 limiter 统一约束。
+    limiter: Arc<RateLimiter>,
 }
 
 /// FTP 引擎（串行段下载：PASV + REST + RETR）。
@@ -78,10 +82,22 @@ impl FtpEngine {
 
     /// 可注入退避（421 测试用短退避）。
     pub fn with_backoff(backoff: Backoff) -> Self {
+        FtpEngine::with_backoff_limited(backoff, 0)
+    }
+
+    /// `download_kb_s` = 全局下载限速 KiB/s（0 = 不限；E16 总阀门，
+    /// 所有 FTP 任务合计不超速，运行中可经 set_global_limits 热改）。
+    pub fn new_limited(download_kb_s: u32) -> Self {
+        FtpEngine::with_backoff_limited(Backoff::default(), download_kb_s)
+    }
+
+    /// 可注入退避 + 全局限速（E16）。
+    pub fn with_backoff_limited(backoff: Backoff, download_kb_s: u32) -> Self {
         FtpEngine {
             backoff,
             inner: Arc::new(EngineInner {
                 tasks: Mutex::new(HashMap::new()),
+                limiter: Arc::new(RateLimiter::new(download_kb_s)),
             }),
         }
     }
@@ -415,6 +431,7 @@ fn parse_pasv(resp: &str) -> Result<SocketAddr, String> {
 }
 
 /// 下载一个段（独立连接：连接+登录+PASV+REST+RETR），写入 .part 段位置。
+#[allow(clippy::too_many_arguments)] // 参数即协议会话要素（E16 增 limiter），拆 struct 反而模糊
 async fn download_segment(
     host: &str,
     port: u16,
@@ -423,6 +440,7 @@ async fn download_segment(
     path: &str,
     seg: crate::static_split::Segment,
     part: &Path,
+    limiter: &RateLimiter,
 ) -> Result<(), String> {
     let mut s = FtpSession::connect(host, port).await?;
     s.login(user, pass).await?;
@@ -447,6 +465,8 @@ async fn download_segment(
         if n == 0 {
             return Err(format!("data connection closed early: {got}/{need}"));
         }
+        // E16 全局限速：逐块消费全局预算（限速器内部计数，速率 0 早退零开销）
+        limiter.wait(n as u64).await;
         got += n;
     }
     let _ = read_response(&mut s.reader).await; // 226
@@ -480,6 +500,7 @@ async fn download_file<F: Fn(u64)>(
     dest: &Path,
     total: u64,
     backoff: Backoff,
+    limiter: &RateLimiter,
     on_progress: F,
 ) -> Result<(), String> {
     let part = part_path_of(dest);
@@ -506,7 +527,7 @@ async fn download_file<F: Fn(u64)>(
 
     for seg in segments {
         for attempt in 1..=CONNECT_ATTEMPTS {
-            match download_segment(host, port, user, pass, path, seg, &part).await {
+            match download_segment(host, port, user, pass, path, seg, &part, limiter).await {
                 Ok(()) => break,
                 Err(e) => {
                     // 连接层失败（421/IO）→ 退避重试；550 等终态 → 直接失败
@@ -543,6 +564,7 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
     };
     let inner2 = inner.clone();
     let tid2 = tid.clone();
+    let limiter = inner.limiter.clone();
     let r = download_file(
         &host,
         port,
@@ -552,6 +574,7 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
         &dest,
         total,
         backoff,
+        &limiter,
         move |n| {
             let mut tasks = inner2.tasks.lock();
             if let Some(t) = tasks.get_mut(&tid2) {
@@ -600,6 +623,7 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
         let inner2 = inner.clone();
         let tid2 = tid.clone();
         let name2 = name.clone();
+        let limiter = inner.limiter.clone();
         let r = download_file(
             &host,
             port,
@@ -609,6 +633,7 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
             &dest,
             size,
             backoff,
+            &limiter,
             move |n| {
                 let mut tasks = inner2.tasks.lock();
                 if let Some(t) = tasks.get_mut(&tid2) {
@@ -691,6 +716,24 @@ impl DownloadEngine for FtpEngine {
 
     fn capabilities(&self) -> Vec<Capability> {
         vec![Capability::Ftp, Capability::FtpResume]
+    }
+
+    /// 引擎全局限速热改（E16 trait 扩展）：热调引擎全局 limiter，所有 FTP
+    /// 任务合计带宽立即按新速率节流。仅 down 方向：up 请求被显式拒绝。
+    async fn set_global_limits(
+        &self,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<(), EngineError> {
+        if up_kb_s.is_some() {
+            return Err(EngineError::Other(
+                "HTTP/FTP 引擎无上传方向，up_kb_s 不适用".to_string(),
+            ));
+        }
+        if let Some(kb) = down_kb_s {
+            self.inner.limiter.set_rate_kb_s(kb);
+        }
+        Ok(())
     }
 
     async fn add(&self, task: &DownloadTask) -> Result<EngineTaskId, EngineError> {

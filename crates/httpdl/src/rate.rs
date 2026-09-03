@@ -19,6 +19,11 @@ struct RateInner {
     rate: AtomicU64,
     /// 下一 chunk 允许完成时刻（跨段共享）。
     next: Mutex<Instant>,
+    /// 上游串联限速器（E16 全局总阀门）：Some = wait 先消费上游预算再消费
+    /// 自身——任务级限速器链到引擎全局 limiter，保证「总阀门控制所有任务
+    /// 合计不超速」对任务级限速任务同样成立（串联两层各自维护 deadline 链，
+    /// 有效速率 ≈ min(任务级, 全局)）。仅允许一层（构造入口不暴露嵌套口）。
+    upstream: Option<RateLimiter>,
 }
 
 impl Default for RateLimiter {
@@ -32,6 +37,7 @@ impl Default for RateInner {
         RateInner {
             rate: AtomicU64::new(0),
             next: Mutex::new(Instant::now()),
+            upstream: None,
         }
     }
 }
@@ -43,6 +49,20 @@ impl RateLimiter {
             inner: Arc::new(RateInner {
                 rate: AtomicU64::new(kb_s as u64 * 1024),
                 next: Mutex::new(Instant::now()),
+                upstream: None,
+            }),
+        }
+    }
+
+    /// 任务级限速器构造（E16）：`kb_s` 同 `new`，另串联引擎全局 limiter 作
+    /// 上游——每次 wait 先消费上游（全局）预算再消费自身，总阀门对任务级
+    /// 限速任务同样生效。`upstream` 自身速率为 0（不限）时透传零开销。
+    pub fn new_chained(kb_s: u32, upstream: &RateLimiter) -> Self {
+        RateLimiter {
+            inner: Arc::new(RateInner {
+                rate: AtomicU64::new(kb_s as u64 * 1024),
+                next: Mutex::new(Instant::now()),
+                upstream: Some(upstream.clone()),
             }),
         }
     }
@@ -59,10 +79,24 @@ impl RateLimiter {
     }
 
     /// 消费 `n` 字节的"时间预算"：若 deadline 在将来则 sleep 至 deadline。
-    /// 速率 0 → 立即返回（不限速）。
+    /// 串联上游（E16）时先消费上游预算（上游自身速率为 0 → 透传零开销）。
+    /// 速率 0 → 立即返回（不限速；上游已先行消费）。
     pub async fn wait(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
+        if let Some(up) = self.inner.upstream.as_ref() {
+            // 上游恒为单层（new_chained 构造口不暴露嵌套）→ 非递归内部路径，
+            // 免 async fn 递归所需的 Box::pin 装箱（wait 每 chunk 一次）。
+            up.wait_inner(n).await;
+        }
+        self.wait_inner(n).await;
+    }
+
+    /// 自身预算消费（不含上游）。`upstream: None` 恒成立时与 wait 等价。
+    async fn wait_inner(&self, n: u64) {
         let rate = self.inner.rate.load(Ordering::Relaxed);
-        if rate == 0 || n == 0 {
+        if rate == 0 {
             return;
         }
         let dur = Duration::from_secs_f64(n as f64 / rate as f64);
@@ -199,6 +233,67 @@ mod tests {
         let el = t0.elapsed();
         assert!(el >= Duration::from_millis(1800), "elapsed {el:?}");
         assert!(el < Duration::from_secs(4), "不应超长 {el:?}");
+    }
+
+    #[tokio::test]
+    async fn chained_zero_task_rate_still_consumes_upstream() {
+        // E16 语义核心：任务级限速 0（不限）串联全局后仍受全局约束——
+        // 任务级不限速 ≠ 绕过总阀门。2×1MiB @ 全局 1MiB/s → 第二笔 ≈1s。
+        let global = RateLimiter::new(1024);
+        let task = RateLimiter::new_chained(0, &global);
+        let t0 = Instant::now();
+        task.wait(1024 * 1024).await; // 冷启动放行，全局 next 推进 +1s
+        task.wait(1024 * 1024).await; // 受全局 next 约束
+        let el = t0.elapsed();
+        assert!(el >= Duration::from_millis(900), "elapsed {el:?}");
+        assert!(el < Duration::from_secs(3), "不应超长 {el:?}");
+    }
+
+    #[tokio::test]
+    async fn chained_upstream_zero_is_passthrough_noop() {
+        // 全局不限（0）时上游透传零开销：任务级限速 1024KiB/s 独自生效，
+        // 行为与未串联的 new(1024) 一致（第二次调用受限 ≈1s）。
+        let global = RateLimiter::new(0);
+        let task = RateLimiter::new_chained(1024, &global);
+        let t0 = Instant::now();
+        task.wait(1024 * 1024).await;
+        task.wait(1024 * 1024).await;
+        let el = t0.elapsed();
+        assert!(el >= Duration::from_millis(900), "elapsed {el:?}");
+        assert!(el < Duration::from_secs(3), "不应超长 {el:?}");
+    }
+
+    #[tokio::test]
+    async fn chained_task_rate_hot_adjust_keeps_upstream() {
+        // 任务级热调速率为 0 后仍受上游约束（上游链不随热调丢失）。
+        let global = RateLimiter::new(1024);
+        let task = RateLimiter::new_chained(0, &global);
+        task.set_rate_kb_s(0); // 语义同初始（不限），验证热调不破坏上游链
+        let t0 = Instant::now();
+        task.wait(1024 * 1024).await;
+        task.wait(1024 * 1024).await;
+        let el = t0.elapsed();
+        assert!(
+            el >= Duration::from_millis(900),
+            "热调后上游约束丢失: {el:?}"
+        );
+        assert!(el < Duration::from_secs(3), "不应超长 {el:?}");
+    }
+
+    #[tokio::test]
+    async fn chained_upstream_hot_adjust_observed_through_task_limiter() {
+        // 全局总阀门热调：引擎全局 limiter set_rate 后，经由任务级链式限速器
+        // 立即可见（全局 Arc 内共享）——全局 0 → 4MiB 放行；非零值回读验证。
+        let global = RateLimiter::new(0);
+        let task = RateLimiter::new_chained(0, &global);
+        let t0 = Instant::now();
+        task.wait(4 * 1024 * 1024).await;
+        assert!(
+            t0.elapsed() < Duration::from_millis(50),
+            "全局不限应立即放行"
+        );
+        global.set_rate_kb_s(4 * 1024);
+        assert_eq!(global.rate_kb_s(), 4 * 1024, "全局热调回读");
     }
 
     #[tokio::test]

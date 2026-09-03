@@ -9,8 +9,8 @@ use smart_dl_core::task::{DownloadTask, TaskId, TaskMetadata};
 #[cfg(any(feature = "ftp", feature = "xunlei-import"))]
 use smart_dl_core::task::{FileState, TaskFile};
 use smart_dl_core::types::{
-    Auth, DownloadEngine, DownloadSource, EngineKind, EngineState, EngineStatus, EngineTaskId,
-    FileProgress,
+    Auth, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
+    EngineTaskId, FileProgress,
 };
 use smart_dl_provider::{
     FallbackCoordinator, FallbackOutcome, HttpSink, ProviderError, ProviderRuntime, RemoteProvider,
@@ -401,6 +401,20 @@ pub struct DaemonState {
     /// 子文件优先级待重放集合（task_id）。恢复时 metadata 未就绪（magnet）
     /// 挂入；就绪后由 replay 循环下发并移除；任务移除/引擎不支持时清理。
     pending_file_prio: Mutex<HashSet<TaskId>>,
+    /// 全局限速总阀门当前值（E16）：启动时由 config 注入；运行中经
+    /// POST /config/limit 或 TOML 热重载调整（apply_global_limits）。
+    /// 不持久化（重启回到配置文件口径——与 dest_root 同为配置层，任务层
+    /// 不感知）。
+    global_limits: Mutex<GlobalLimits>,
+}
+
+/// 全局限速总阀门当前值（E16，KiB/s；0 = 不限）。
+/// `max_download_kb_s` = 所有引擎合计下行上限；`max_upload_kb_s` = BT 合计
+/// 上行上限（HTTP/FTP 无上传方向）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct GlobalLimits {
+    pub max_download_kb_s: u32,
+    pub max_upload_kb_s: u32,
 }
 
 /// 持久化任务记录：`task`（含 source 原文：url/magnet/torrent 字节）+ 引擎种类。
@@ -709,6 +723,10 @@ impl DaemonState {
             disk_precheck_strict: false,
             config_snapshot: Mutex::new(None),
             pending_file_prio: Mutex::new(HashSet::new()),
+            global_limits: Mutex::new(GlobalLimits {
+                max_download_kb_s: 0,
+                max_upload_kb_s: 0,
+            }),
         }
     }
 
@@ -741,6 +759,117 @@ impl DaemonState {
     pub fn with_disk_precheck_strict(mut self, strict: bool) -> Self {
         self.disk_precheck_strict = strict;
         self
+    }
+
+    /// 注入全局限速总阀门初始值（E16）：serve 从 config
+    /// `[download] max_download_kb_s` + `[bt] max_upload_kb_s` 传入——
+    /// 引擎构造时已携同值，此处仅同步内存口径（GET /config/限速查询一致）。
+    pub fn with_global_limits(mut self, max_download_kb_s: u32, max_upload_kb_s: u32) -> Self {
+        self.global_limits = Mutex::new(GlobalLimits {
+            max_download_kb_s,
+            max_upload_kb_s,
+        });
+        self
+    }
+
+    /// 读取全局限速总阀门当前值（E16）。
+    pub fn global_limits(&self) -> GlobalLimits {
+        *self.global_limits.lock()
+    }
+
+    /// 全局限速总阀门热改（E16）：合并方向后下发各引擎（BT → FTP → HTTP 顺序，
+    /// 可失败引擎先行保证近全有或全无），成功后同步内存值 + /config 快照覆盖
+    /// + `global_limits_changed` 事件。
+    ///
+    /// - `None` 方向 = 不调整；`Some(0)` = 不限；`Some(n)` = 合计上限 n KiB/s
+    /// - 双 `None` = 纯查询（返回当前值，零副作用）
+    /// - 合并后值与当前一致 → 无变化 no-op（引擎侧已是该值，不发事件）
+    /// - 引擎调用：HTTP/FTP 仅 down 方向；BT 双方向（settings_pack 全量语义，
+    ///   代理原样重放）。`Unsupported`（引擎无该设施）静默跳过——引擎尽力
+    ///   而为，不阻塞总阀门下发；`Other` 级失败 → Err（BT 先行故此时 HTTP
+    ///   尚未改动，阀门状态保持一致）
+    /// - 不落盘：重启回到配置文件口径（与 dest_root 同为配置层）
+    pub async fn apply_global_limits(
+        &self,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<GlobalLimits, DaemonError> {
+        let old = *self.global_limits.lock();
+        if down_kb_s.is_none() && up_kb_s.is_none() {
+            return Ok(old); // 纯查询
+        }
+        let effective = GlobalLimits {
+            max_download_kb_s: down_kb_s.unwrap_or(old.max_download_kb_s),
+            max_upload_kb_s: up_kb_s.unwrap_or(old.max_upload_kb_s),
+        };
+        if effective == old {
+            return Ok(old); // 无变化 no-op
+        }
+        // 引擎下发：BT（可失败，FFI settings_pack）→ FTP/HTTP（原子 store，
+        // 实际不可失败）——可失败者先行，失败时其余引擎未动，阀门保持旧值。
+        // `Unsupported`（引擎无限速设施，如 NAS 远程引擎）静默跳过。
+        if let Some(bt) = self.engines.get(&EngineKind::Bt).cloned() {
+            Self::dispatch_global_limits(
+                bt.as_ref(),
+                Some(effective.max_download_kb_s),
+                Some(effective.max_upload_kb_s),
+                "BT",
+            )
+            .await?;
+        }
+        for kind in [EngineKind::Ftp, EngineKind::Http] {
+            if let Some(eng) = self.engines.get(&kind).cloned() {
+                Self::dispatch_global_limits(
+                    eng.as_ref(),
+                    Some(effective.max_download_kb_s),
+                    None,
+                    &format!("{kind:?}"),
+                )
+                .await?;
+            }
+        }
+        *self.global_limits.lock() = effective;
+        self.overlay_config_limits(effective);
+        self.hub.publish(SchedulerEvent::GlobalLimitsChanged {
+            max_download_kb_s: effective.max_download_kb_s,
+            max_upload_kb_s: effective.max_upload_kb_s,
+        });
+        Ok(effective)
+    }
+
+    /// /config 快照限速两键覆盖（E16）：API/热重载改阀门后 GET /config 与
+    /// 实际生效值保持一致（快照本身不含敏感项，覆盖安全）。
+    fn overlay_config_limits(&self, g: GlobalLimits) {
+        let mut snap = self.config_snapshot.lock();
+        if let Some(v) = snap.as_mut() {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert(
+                    "max_download_kb_s".into(),
+                    serde_json::json!(g.max_download_kb_s),
+                );
+                obj.insert(
+                    "max_upload_kb_s".into(),
+                    serde_json::json!(g.max_upload_kb_s),
+                );
+            }
+        }
+    }
+
+    /// 单引擎全局限速下发（E16 内部助手）：`Unsupported`（引擎无限速设施）
+    /// 静默跳过；其余错误定性为阀门下发失败（Err）。
+    async fn dispatch_global_limits(
+        engine: &dyn DownloadEngine,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+        label: &str,
+    ) -> Result<(), DaemonError> {
+        match engine.set_global_limits(down_kb_s, up_kb_s).await {
+            Ok(()) => Ok(()),
+            Err(EngineError::Unsupported) => Ok(()),
+            Err(e) => Err(DaemonError::Engine(format!(
+                "{label} 全局限速下发失败: {e}"
+            ))),
+        }
     }
 
     /// 生效的 dest 白名单（V2）：未显式注入时兜底 default_dest_root。
@@ -3931,6 +4060,10 @@ pub struct FakeEngine {
     status_name: parking_lot::Mutex<Option<String>>,
     /// status() 速率回显（(down, up) B/s，E11 速率缓存测试用；默认 (0,0) 旧行为）。
     status_rates: parking_lot::Mutex<(u64, u64)>,
+    /// 已下发的 set_global_limits 调用（(down, up)，E16 总阀门断言用）。
+    global_sets: parking_lot::Mutex<Vec<(Option<u32>, Option<u32>)>>,
+    /// set_global_limits 的可编程行为：Some(e) = 恒返回该错误（下发失败模拟）。
+    global_limits_err: parking_lot::Mutex<Option<smart_dl_core::types::EngineError>>,
 }
 
 #[cfg(test)]
@@ -3953,6 +4086,8 @@ impl FakeEngine {
             proxy_sets: parking_lot::Mutex::new(Vec::new()),
             status_name: parking_lot::Mutex::new(None),
             status_rates: parking_lot::Mutex::new((0, 0)),
+            global_sets: parking_lot::Mutex::new(Vec::new()),
+            global_limits_err: parking_lot::Mutex::new(None),
         }
     }
 
@@ -4001,6 +4136,16 @@ impl FakeEngine {
     /// 设置 status() 速率回显（(down, up) B/s；E11 速率缓存测试用）。
     pub fn set_status_rates(&self, down: u64, up: u64) {
         *self.status_rates.lock() = (down, up);
+    }
+
+    /// 读取已下发的 set_global_limits 调用（E16 总阀门断言用）。
+    pub fn global_sets(&self) -> Vec<(Option<u32>, Option<u32>)> {
+        self.global_sets.lock().clone()
+    }
+
+    /// 编程 set_global_limits 恒返回某错误（E16 下发失败模拟）。
+    pub fn fail_global_limits(&self, e: smart_dl_core::types::EngineError) {
+        *self.global_limits_err.lock() = Some(e);
     }
 
     /// 读取已下发的 resume 调用（P4 G5 重放测试断言用）。
@@ -4133,6 +4278,19 @@ impl DownloadEngine for FakeEngine {
     ) -> Result<(), smart_dl_core::types::EngineError> {
         // 记录（engine_tid, down, up）供限速重放测试断言
         self.limits.lock().push((id.clone(), down_kb_s, up_kb_s));
+        Ok(())
+    }
+
+    async fn set_global_limits(
+        &self,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        // 记录 (down, up) 供 E16 总阀门下发断言（可编程拒绝：global_limits_err）
+        if let Some(e) = &*self.global_limits_err.lock() {
+            return Err(e.clone());
+        }
+        self.global_sets.lock().push((down_kb_s, up_kb_s));
         Ok(())
     }
 
@@ -6259,5 +6417,151 @@ mod rate_cache_tests {
             }),
             "暂停任务快照速率必须清零（防平滑窗口陈旧值毛刺）"
         );
+    }
+}
+
+/// E16 全局限速总阀门：引擎下发形态 / 纯查询 / 无变化 no-op / 失败回滚。
+#[cfg(test)]
+mod global_limits_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dispatches_down_to_http_and_both_to_bt() {
+        let http_fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let bt_fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+        let mut state = DaemonState::new(http_fake.clone() as Arc<dyn DownloadEngine>, vec![]);
+        // 直接注入 Bt 槽位（with_bt 是 feature 门控；测试模块内私有字段可及）
+        state
+            .engines
+            .insert(EngineKind::Bt, bt_fake.clone() as Arc<dyn DownloadEngine>);
+
+        let g = state
+            .apply_global_limits(Some(2048), Some(512))
+            .await
+            .unwrap();
+        assert_eq!(g.max_download_kb_s, 2048);
+        assert_eq!(g.max_upload_kb_s, 512);
+        // HTTP 位：仅 down 方向（up 请求不该下发，HTTP/FTP 无上传概念）
+        assert_eq!(
+            http_fake.global_sets(),
+            vec![(Some(2048), None)],
+            "HTTP 位应只收 down 方向"
+        );
+        // BT 位：全量两方向（settings_pack 全量语义）
+        assert_eq!(bt_fake.global_sets(), vec![(Some(2048), Some(512))]);
+
+        // 内存值同步
+        let cur = state.global_limits();
+        assert_eq!(cur.max_download_kb_s, 2048);
+        assert_eq!(cur.max_upload_kb_s, 512);
+
+        // 事件广播
+        let envs = state.hub().read_after(0, 100);
+        assert!(
+            envs.iter()
+                .any(|e| e.event.type_label() == "global_limits_changed"),
+            "应广播 global_limits_changed 事件"
+        );
+    }
+
+    #[tokio::test]
+    async fn both_none_is_pure_query() {
+        let http_fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(http_fake.clone() as Arc<dyn DownloadEngine>, vec![])
+            .with_global_limits(1024, 256);
+
+        let g = state.apply_global_limits(None, None).await.unwrap();
+        assert_eq!(g.max_download_kb_s, 1024, "纯查询返回注入值");
+        assert_eq!(g.max_upload_kb_s, 256);
+        assert!(http_fake.global_sets().is_empty(), "纯查询不得产生引擎调用");
+        assert!(state.hub().read_after(0, 100).is_empty(), "纯查询无事件");
+    }
+
+    #[tokio::test]
+    async fn unchanged_values_are_noop() {
+        let http_fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(http_fake.clone() as Arc<dyn DownloadEngine>, vec![])
+            .with_global_limits(1024, 0);
+
+        state.apply_global_limits(Some(1024), None).await.unwrap();
+        assert!(
+            http_fake.global_sets().is_empty(),
+            "合并后与当前一致 → no-op（引擎侧已是该值）"
+        );
+        assert!(state.hub().read_after(0, 100).is_empty(), "无变化不发事件");
+    }
+
+    #[tokio::test]
+    async fn partial_merge_keeps_unset_direction() {
+        let bt_fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+        let mut state = DaemonState::new(Arc::new(FakeEngine::new(EngineKind::Http)), vec![])
+            .with_global_limits(1024, 512);
+        state
+            .engines
+            .insert(EngineKind::Bt, bt_fake.clone() as Arc<dyn DownloadEngine>);
+
+        let g = state.apply_global_limits(None, Some(256)).await.unwrap();
+        assert_eq!(g.max_download_kb_s, 1024, "None 方向沿用当前值");
+        assert_eq!(g.max_upload_kb_s, 256);
+        assert_eq!(bt_fake.global_sets(), vec![(Some(1024), Some(256))]);
+    }
+
+    #[tokio::test]
+    async fn engine_failure_keeps_valve_unchanged() {
+        let http_fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let bt_fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+        bt_fake.fail_global_limits(EngineError::Other("settings_pack boom".into()));
+        let mut state = DaemonState::new(http_fake.clone() as Arc<dyn DownloadEngine>, vec![])
+            .with_global_limits(1024, 128);
+        state
+            .engines
+            .insert(EngineKind::Bt, bt_fake.clone() as Arc<dyn DownloadEngine>);
+
+        let err = state
+            .apply_global_limits(Some(4096), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("全局限速下发失败"),
+            "错误应定性为阀门下发失败: {err}"
+        );
+        // BT 先行失败 → HTTP 未下发、内存值不变（近全有或全无）
+        assert!(
+            http_fake.global_sets().is_empty(),
+            "BT 失败时 HTTP 不得已改动"
+        );
+        let cur = state.global_limits();
+        assert_eq!(cur.max_download_kb_s, 1024, "阀门保持旧值");
+        assert!(state.hub().read_after(0, 100).is_empty(), "失败无事件");
+    }
+
+    #[tokio::test]
+    async fn unsupported_engine_is_skipped_silently() {
+        // 引擎无该设施（返回 Unsupported，如未来 NAS 远程引擎同位替换）→
+        // 静默跳过，不阻塞阀门生效（内存值照常更新 + 事件照发）
+        let http_fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        http_fake.fail_global_limits(EngineError::Unsupported);
+        let state = DaemonState::new(http_fake.clone() as Arc<dyn DownloadEngine>, vec![]);
+
+        let g = state.apply_global_limits(Some(2048), None).await.unwrap();
+        assert_eq!(g.max_download_kb_s, 2048, "阀门照常生效（内存值）");
+        assert!(!state.hub().read_after(0, 100).is_empty(), "事件照发");
+    }
+
+    #[tokio::test]
+    async fn snapshot_overlay_reflects_effective_values() {
+        let state = DaemonState::new(Arc::new(FakeEngine::new(EngineKind::Http)), vec![])
+            .with_config(serde_json::json!({
+                "dest_root": "./downloads",
+                "max_download_kb_s": 0,
+                "max_upload_kb_s": 0,
+            }));
+        state
+            .apply_global_limits(Some(2048), Some(512))
+            .await
+            .unwrap();
+        let snap = state.config_snapshot();
+        assert_eq!(snap["max_download_kb_s"], 2048, "/config 快照覆盖");
+        assert_eq!(snap["max_upload_kb_s"], 512);
     }
 }

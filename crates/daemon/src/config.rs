@@ -38,7 +38,9 @@ pub struct DownloadCfg {
     /// `socks4://host:port`（BT 支持带凭据 `user:pass@`）；空 = 直连。启动时生效
     /// （proxy 不参与热重载，避免重建连接）。敏感项：不出现在 `/config` 快照。
     pub proxy: String,
-    /// 全局下载限速（KiB/s，HTTP + BT 共用）；0 = 不限。启动时生效。
+    /// 全局下载限速（KiB/s，HTTP + FTP + BT 共用总阀门）；0 = 不限。
+    /// 启动时生效；运行中可经 `POST /config/limit` 热改或随配置热重载
+    /// 生效（E16，文件为准）。
     pub max_download_kb_s: u32,
     /// 安全修复（V10-2）：磁盘预检严格模式——true = 磁盘可用空间不可探测时
     /// 拒绝入队（防预检被绕过后续盘写满）；false（默认）= 告警 + 放行（旧行为）。
@@ -52,7 +54,8 @@ pub struct BtCfg {
     pub enabled: bool,
     /// BT 落盘目录（须存在；默认与 dest_root 相同）。
     pub save_path: Option<PathBuf>,
-    /// BT 上传限速（KiB/s）；0 = 不限。启动时生效。
+    /// BT 上传限速（KiB/s）；0 = 不限。启动时生效；运行中可经
+    /// `POST /config/limit` 热改或随配置热重载生效（E16）。
     pub max_upload_kb_s: u32,
     /// 启用 DHT（去中心化 peer 发现）。默认关闭保持确定性；纯磁力无 tracker
     /// 冷启动可开启。启动时生效。

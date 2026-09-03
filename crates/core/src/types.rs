@@ -308,6 +308,19 @@ pub trait DownloadEngine: Send + Sync {
         Err(EngineError::Unsupported)
     }
 
+    /// 引擎全局限速热改（E16 总阀门）：作用于该引擎的**所有**任务合计速率。
+    /// 方向语义与 `set_limits` 一致：`None` = 不调整；`Some(0)` = 不限；
+    /// `Some(n)` = 合计上限 n KiB/s。引擎无该方向（HTTP/FTP 无上传）报
+    /// `EngineError::Other`；整个操作不支持时返回 `EngineError::Unsupported`。
+    /// 默认实现：不支持（引擎可安全忽略，daemon 侧按「尽力而为」处理）。
+    async fn set_global_limits(
+        &self,
+        _down_kb_s: Option<u32>,
+        _up_kb_s: Option<u32>,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
     /// 任务级子文件优先级批量设置（BT 多文件）。`priorities` =
     /// (文件下标, 0..=7)，0=不下载 / 1=低 / 4=默认 / 7=最高（libtorrent 语义）。
     /// 需要 metadata 的引擎（BT）在 metadata 未就绪时返回 `EngineError::Other`。

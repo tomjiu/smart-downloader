@@ -98,11 +98,12 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 | `/tasks/:id/name` | POST | 任务重命名（显示层；`{"name": null}` 清除回退派生链） |
 | `/tasks/:id/logs` | GET | 任务日志 |
 | `/tasks/:id/limit` | POST | 任务级限速（BT 双向 / HTTP 下载向） |
+| `/config/limit` | POST | 全局限速总阀门热改（合计下行 + BT 上行；缺省字段 = 沿用当前值，双缺省 = 查询） |
 | `/tasks/:id/files/priority` | POST | BT 子文件优先级（持久化 + 恢复重放） |
 | `/tasks/:id/webseeds` | POST | web seed 注入（P2SP，feature webseed） |
 | `/tasks/:id/fallback` | POST | 手动 Provider 兜底（BT→直链→HTTP） |
 | `/bt/metadata` | POST | magnet 元数据抓取（摘要 + torrent_b64） |
-| `/config` | GET | 当前配置 |
+| `/config` | GET | 当前配置（限速两键随运行中热改同步） |
 | `/stats` · `/version` · `/health` | GET | 运维三件套 |
 | `/providers` | GET | Provider 状态 |
 | `/events` | GET | 事件历史查询（seq 游标分页 + task_id/type 过滤 + 缺口报警） |

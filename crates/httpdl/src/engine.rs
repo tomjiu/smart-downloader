@@ -85,7 +85,8 @@ struct EngineInner {
     /// Mirror 加权评分（URL → 分数）：跨任务持久，成功 +1 / 失败 -2，clamp [-4, +4]。
     mirror_scores: Arc<Mutex<HashMap<String, i64>>>,
     /// 任务级限速器（tid → limiter）；未登记的任务走引擎全局 limiter。
-    /// 与全局不同：任务条目内的 RateLimiter 速率可运行中热调（set_rate_kb_s）。
+    /// 与全局不同：任务条目内的 RateLimiter 速率可运行中热调（set_rate_kb_s），
+    /// 且串联引擎全局 limiter 作上游（E16 总阀门，全局约束不因任务级限速被绕过）。
     limiters: Mutex<HashMap<EngineTaskId, Arc<RateLimiter>>>,
 }
 
@@ -175,7 +176,8 @@ impl HttpEngine {
             }
             return;
         }
-        // 任务级限速优先，未登记回退全局（跨段共享口径不变）。
+        // 任务级限速优先，未登记回退全局（跨段共享口径不变）；登记条目
+        // 已在 set_limits 时串联全局上游（E16），此处直接取用即可。
         let limiter = self
             .inner
             .limiters
@@ -818,8 +820,32 @@ impl DownloadEngine for HttpEngine {
         match limiters.get(id) {
             Some(lim) => lim.set_rate_kb_s(kb), // 已有限速器 → 原地热调
             None => {
-                limiters.insert(id.clone(), Arc::new(RateLimiter::new(kb)));
+                // E16：任务级 limiter 串联引擎全局（上游）——总阀门对任务级
+                // 限速任务同样生效（任务级不限 ≠ 绕过总阀门）。
+                limiters.insert(
+                    id.clone(),
+                    Arc::new(RateLimiter::new_chained(kb, &self.limiter)),
+                );
             }
+        }
+        Ok(())
+    }
+
+    /// 引擎全局限速热改（E16 trait 扩展）：热调引擎全局 limiter——所有未
+    /// 登记任务级限速的任务立即按新速率节流；任务级限速任务经链式上游
+    /// 同样受约束。仅 down 方向有意义：up 请求被显式拒绝（HTTP/FTP 无上传）。
+    async fn set_global_limits(
+        &self,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<(), EngineError> {
+        if up_kb_s.is_some() {
+            return Err(EngineError::Other(
+                "HTTP/FTP 引擎无上传方向，up_kb_s 不适用".to_string(),
+            ));
+        }
+        if let Some(kb) = down_kb_s {
+            self.limiter.set_rate_kb_s(kb);
         }
         Ok(())
     }
