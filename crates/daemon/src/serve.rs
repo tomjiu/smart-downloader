@@ -130,6 +130,10 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
         .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s)
         .with_webhook_url((!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone()))
+        .with_post_download(
+            (!cfg.post_download.move_to.is_empty()).then(|| cfg.post_download.move_to.clone()),
+            (!cfg.post_download.hook.is_empty()).then(|| cfg.post_download.hook.clone()),
+        )
         .with_cleanup(cfg.cleanup.clone())
         .with_start_jitter(cfg.scheduler.start_jitter_seconds);
     #[cfg(not(feature = "bt"))]
@@ -139,6 +143,10 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
         .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s)
         .with_webhook_url((!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone()))
+        .with_post_download(
+            (!cfg.post_download.move_to.is_empty()).then(|| cfg.post_download.move_to.clone()),
+            (!cfg.post_download.hook.is_empty()).then(|| cfg.post_download.hook.clone()),
+        )
         .with_cleanup(cfg.cleanup.clone())
         .with_start_jitter(cfg.scheduler.start_jitter_seconds);
 

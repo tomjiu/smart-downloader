@@ -502,6 +502,12 @@ pub struct DaemonState {
     webhook_url: Mutex<Option<String>>,
     /// Webhook 投递 client（共享连接池；完成频率低，单实例足够）。
     webhook_client: reqwest::Client,
+    /// 完成后移动目标目录（E27）：Some = 完成后把落盘文件移入该目录；
+    /// None = 禁用。serve 从 `[post_download] move_to` 注入。
+    post_move_to: Mutex<Option<PathBuf>>,
+    /// 完成后外部钩子程序（E27）：Some = 完成后 spawn 执行（环境变量传
+    /// 任务上下文）；None = 禁用。serve 从 `[post_download] hook` 注入。
+    post_hook: Mutex<Option<String>>,
     /// 自动清理当前配置（E20）：days=0 禁用；serve 注入 + 热重载跟随。
     cleanup: Mutex<crate::config::CleanupCfg>,
     /// 错峰随机延迟上限（E23，秒；0 = 关）：任务添加未显式 start_at 时在
@@ -834,6 +840,8 @@ impl DaemonState {
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .build()
                 .unwrap_or_default(),
+            post_move_to: Mutex::new(None),
+            post_hook: Mutex::new(None),
             cleanup: Mutex::new(crate::config::CleanupCfg::default()),
             start_jitter_secs: std::sync::atomic::AtomicU32::new(0),
         }
@@ -896,6 +904,13 @@ impl DaemonState {
     /// 注入任务完成 Webhook URL（E17）：None/空 = 禁用。
     pub fn with_webhook_url(self, url: Option<String>) -> Self {
         *self.webhook_url.lock() = url.filter(|u| !u.is_empty());
+        self
+    }
+
+    /// 注入完成自动处理配置（E27）：move_to/hook 均空 = 禁用。
+    pub fn with_post_download(self, move_to: Option<String>, hook: Option<String>) -> Self {
+        *self.post_move_to.lock() = move_to.filter(|s| !s.is_empty()).map(PathBuf::from);
+        *self.post_hook.lock() = hook.filter(|s| !s.is_empty());
         self
     }
 
@@ -1017,6 +1032,120 @@ impl DaemonState {
             task_id: task_id.to_string(),
         });
         self.fire_completion_webhook(task_id);
+        self.run_post_download_actions(task_id);
+    }
+
+    /// 完成自动处理（E27，清单 #15）：`[post_download] move_to` 移动 +
+    /// `hook` 外部程序。fire-and-forget——失败仅记日志/事件，不反压链路；
+    /// 未配置两者时零开销直返。锁内快照、锁外行动（同 webhook 纪律）。
+    fn run_post_download_actions(&self, task_id: &str) {
+        let move_to = self.post_move_to.lock().clone();
+        let hook = self.post_hook.lock().clone();
+        if move_to.is_none() && hook.is_none() {
+            return;
+        }
+        // 锁内快照：任务名/引擎/落盘路径/conflict-skip 标记
+        let snap = {
+            let tasks = self.tasks.lock();
+            let Some(rec) = tasks.get(task_id) else {
+                return; // 任务已移除 → 无处理主体
+            };
+            let conflict_skip = rec
+                .events
+                .iter()
+                .any(|e| e.op == "add" && e.detail.as_deref() == Some("conflict_skip"));
+            Some((
+                rec.task.metadata.name.clone(),
+                kind_label(&rec.engine_kind),
+                rec.task.dest_root.clone(),
+                conflict_skip,
+            ))
+        };
+        let Some((Some(name), engine, dest_root, conflict_skip)) = snap else {
+            return; // 无名任务（BT metadata 未回填等）→ 无落盘文件可定位
+        };
+        let src = dest_root.join(&name);
+        // 单文件门控：路径不存在 / 是目录（BT 多文件）→ 移动无意义；
+        // hook 仍照发（webhook 同口径：通知尽力而为）
+        let is_file = src.is_file();
+        let mut final_path = src.clone();
+
+        // 1) 移动（conflict-skip 任务不动既有文件——尊重 skip 语义）
+        if let Some(dst_dir) = &move_to {
+            if conflict_skip {
+                tracing::info!("post_download: 任务 {task_id} 为 conflict-skip，既有文件不移动");
+            } else if !is_file {
+                tracing::info!(
+                    "post_download: 任务 {task_id} 落盘路径非单文件（{:?}），移动跳过",
+                    src
+                );
+            } else {
+                match Self::move_completed_file(&src, dst_dir, &name) {
+                    Ok(target) => {
+                        tracing::info!("post_download: 任务 {task_id} 文件已移动 → {target:?}");
+                        final_path = target.clone();
+                        let mut tasks = self.tasks.lock();
+                        if let Some(rec) = tasks.get_mut(task_id) {
+                            rec.push_event(
+                                "post_move",
+                                Some(target.to_string_lossy().into_owned()),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("post_download: 任务 {task_id} 移动失败: {e}");
+                        let mut tasks = self.tasks.lock();
+                        if let Some(rec) = tasks.get_mut(task_id) {
+                            rec.push_event("post_move", Some(format!("failed: {e}")));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2) 外部钩子（移动后终路径经 SD_FILE_PATH 传递；后台线程收尾）
+        if let Some(prog) = &hook {
+            let prog = prog.clone();
+            let envs = vec![
+                ("SD_TASK_ID".to_string(), task_id.to_string()),
+                ("SD_TASK_NAME".to_string(), name),
+                (
+                    "SD_FILE_PATH".to_string(),
+                    final_path.to_string_lossy().into_owned(),
+                ),
+                ("SD_ENGINE".to_string(), engine.to_string()),
+            ];
+            let hook_task_id = task_id.to_string();
+            let hook_prog = prog.clone();
+            std::thread::spawn(move || {
+                match std::process::Command::new(&hook_prog)
+                    .envs(envs)
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                {
+                    Ok(out) if out.status.success() => {
+                        tracing::info!("post_download: 任务 {hook_task_id} 钩子执行成功");
+                    }
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        tracing::warn!(
+                            "post_download: 任务 {hook_task_id} 钩子非零退出 status={:?} stdout={stdout} stderr={stderr}",
+                            out.status.code()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "post_download: 任务 {hook_task_id} 钩子启动失败 {hook_prog:?}: {e}"
+                        );
+                    }
+                }
+            });
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(task_id) {
+                rec.push_event("post_hook", Some(prog));
+            }
+        }
     }
 
     /// 完成通知投递（E17）：fire-and-forget——单次 POST、5s 超时、失败仅记
@@ -1509,6 +1638,30 @@ impl DaemonState {
             }
         }
         None
+    }
+
+    /// 完成文件移动（E27）：目标目录自动创建；同名冲突自动改名
+    /// （`bump_conflict_name`）；同盘 rename 直达，跨盘（EXDEV 等错误）
+    /// copy+remove 回退。返回最终落位路径。
+    fn move_completed_file(src: &Path, dst_dir: &Path, name: &str) -> Result<PathBuf, String> {
+        fs::create_dir_all(dst_dir).map_err(|e| format!("目标目录创建失败 {dst_dir:?}: {e}"))?;
+        let target_name = if dst_dir.join(name).exists() {
+            DaemonState::bump_conflict_name(dst_dir, name)
+                .ok_or_else(|| format!("目标目录同名冲突且改名候选耗尽: {dst_dir:?}/{name}"))?
+        } else {
+            name.to_string()
+        };
+        let target = dst_dir.join(target_name);
+        if let Err(e) = fs::rename(src, &target) {
+            // 跨设备 rename 失败（EXDEV）→ copy + remove 回退
+            fs::copy(src, &target).map_err(|e2| {
+                let _ = fs::remove_file(&target); // 半份拷贝不留垃圾
+                format!("rename 失败（{e}）且 copy 回退也失败: {e2}")
+            })?;
+            fs::remove_file(src)
+                .map_err(|e| format!("copy 成功但源文件删除失败（存在重复副本）: {e}"))?;
+        }
+        Ok(target)
     }
 
     pub async fn add_link_task_opts(
@@ -8426,5 +8579,198 @@ mod scheduled_tests {
         let activated = state2.activate_due_tasks().await;
         assert_eq!(activated, vec![tid.clone()]);
         assert_eq!(fake2.added.lock().len(), 1);
+    }
+}
+
+/// E27 完成自动处理：move_to 移动 + hook 外部程序 + conflict-skip/目录豁免。
+#[cfg(test)]
+mod post_download_tests {
+    use super::*;
+
+    /// 造一个"已完成 + 显式名 + 文件已落盘"的任务（FakeEngine 不联网）。
+    async fn completed_task_with_file(
+        state: &DaemonState,
+        url_path: &str,
+        name: &str,
+        content: &[u8],
+    ) -> String {
+        let dir = state.default_dest_root.lock().clone();
+        std::fs::write(dir.join(name), content).unwrap();
+        let id = state
+            .add_http_task_opts(
+                format!("https://example.com/{url_path}"),
+                None,
+                crate::state::AddHttpOpts {
+                    name: Some(name.into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut tasks = state.tasks.lock();
+        let rec = tasks.get_mut(&id).unwrap();
+        rec.task.state = TaskState::Completed;
+        rec.task.metadata.name = Some(name.into());
+        id
+    }
+
+    #[tokio::test]
+    async fn post_move_relocates_file_and_records_event() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![])
+            .with_dest_root(dir.path().to_path_buf())
+            .with_post_download(Some(inbox.path().to_string_lossy().into_owned()), None);
+
+        let id = completed_task_with_file(&state, "a.bin", "done.bin", b"payload").await;
+        state.publish_task_completed(&id);
+
+        assert!(!dir.path().join("done.bin").exists(), "源文件应已移走");
+        let target = inbox.path().join("done.bin");
+        assert_eq!(std::fs::read(&target).unwrap(), b"payload", "内容不变");
+        let tasks = state.tasks.lock();
+        let rec = tasks.get(&id).unwrap();
+        assert!(
+            rec.events.iter().any(|e| e.op == "post_move"
+                && e.detail.as_deref() == Some(target.to_string_lossy().as_ref())),
+            "应有 post_move 事件且记录目标路径: {:?}",
+            rec.events
+        );
+    }
+
+    #[tokio::test]
+    async fn post_move_collision_autorenames() {
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = tempfile::tempdir().unwrap();
+        std::fs::write(inbox.path().join("done.bin"), b"old").unwrap();
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![])
+            .with_dest_root(dir.path().to_path_buf())
+            .with_post_download(Some(inbox.path().to_string_lossy().into_owned()), None);
+
+        let id = completed_task_with_file(&state, "b.bin", "done.bin", b"new").await;
+        state.publish_task_completed(&id);
+
+        assert_eq!(
+            std::fs::read(inbox.path().join("done.bin")).unwrap(),
+            b"old"
+        );
+        assert_eq!(
+            std::fs::read(inbox.path().join("done(1).bin")).unwrap(),
+            b"new",
+            "同名冲突自动改名落位"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_move_skipped_for_conflict_skip_tasks() {
+        // conflict_policy=skip：既有文件用户明确要求不动 → 不移动
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("dup.bin"), b"existing").unwrap();
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![])
+            .with_dest_root(dir.path().to_path_buf())
+            .with_post_download(Some(inbox.path().to_string_lossy().into_owned()), None);
+
+        let id = state
+            .add_http_task_opts(
+                "https://example.com/dup.bin".into(),
+                Some(dir.path().to_string_lossy().into_owned()),
+                crate::state::AddHttpOpts {
+                    name: Some("dup.bin".into()),
+                    conflict: Some(ConflictPolicy::Skip),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state.publish_task_completed(&id);
+
+        assert!(
+            dir.path().join("dup.bin").exists(),
+            "skip 任务既有文件必须保持原样"
+        );
+        assert!(!inbox.path().join("dup.bin").exists(), "不得移动进目标目录");
+        let tasks = state.tasks.lock();
+        let rec = tasks.get(&id).unwrap();
+        assert!(
+            !rec.events.iter().any(|e| e.op == "post_move"),
+            "不得有 post_move 事件"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_move_skipped_for_directory_task() {
+        // 落盘路径是目录（BT 多文件）→ 移动跳过
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = tempfile::tempdir().unwrap();
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![])
+            .with_dest_root(dir.path().to_path_buf())
+            .with_post_download(Some(inbox.path().to_string_lossy().into_owned()), None);
+
+        let id = completed_task_with_file(&state, "c.torrent", "bundle", b"").await;
+        // 把落盘路径改成目录
+        std::fs::remove_file(dir.path().join("bundle")).unwrap();
+        std::fs::create_dir(dir.path().join("bundle")).unwrap();
+        state.publish_task_completed(&id);
+
+        assert!(dir.path().join("bundle").is_dir(), "目录任务不得被移动");
+        assert!(!inbox.path().join("bundle").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_hook_receives_final_path_env() {
+        // unix-only：hook 脚本 dump 环境变量 → 断言 SD_FILE_PATH = 移动后终路径
+        let dir = tempfile::tempdir().unwrap();
+        let inbox = tempfile::tempdir().unwrap();
+        let dump = dir.path().join("envdump.txt");
+        let script = dir.path().join("hook.sh");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\nenv > {}\n", dump.to_string_lossy().into_owned()),
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![])
+            .with_dest_root(dir.path().to_path_buf())
+            .with_post_download(
+                Some(inbox.path().to_string_lossy().into_owned()),
+                Some(script.to_string_lossy().into_owned()),
+            );
+
+        let id = completed_task_with_file(&state, "d.bin", "done.bin", b"payload").await;
+        state.publish_task_completed(&id);
+
+        // 钩子在后台线程执行 → 轮询等待 dump 文件
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !dump.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "钩子 10s 内未产出环境 dump"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let env = std::fs::read_to_string(&dump).unwrap();
+        assert!(env.contains("SD_TASK_ID="), "应有 SD_TASK_ID: {env}");
+        assert!(
+            env.contains(&format!(
+                "SD_FILE_PATH={}",
+                inbox.path().join("done.bin").to_string_lossy()
+            )),
+            "SD_FILE_PATH 应为移动后终路径: {env}"
+        );
+        let tasks = state.tasks.lock();
+        let rec = tasks.get(&id).unwrap();
+        assert!(
+            rec.events.iter().any(|e| e.op == "post_hook"),
+            "应有 post_hook 事件"
+        );
     }
 }
