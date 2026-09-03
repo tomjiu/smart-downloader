@@ -69,6 +69,7 @@ pub fn make_task(id: &str, name: &str) -> DownloadTask {
             added_at_unix: 1,
             tags: Vec::new(),
             finished_at_unix: 0,
+            start_at_unix: 0,
         },
         limits: None,
     }

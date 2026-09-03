@@ -117,4 +117,10 @@ pub struct TaskMetadata {
     /// publish_task_completed 写入，自动清理按此判龄。serde default 兼容旧档。
     #[serde(default)]
     pub finished_at_unix: u64,
+    /// 定时启动时刻（E23，unix 秒；0 = 立即/未调度）：未来时刻的任务不接入
+    /// 引擎（engine_tid 空、停留 Queued），到点由 daemon 调度循环激活。
+    /// 持久化 + 恢复：重启后未到期的任务继续等待（不误启动）。serde default
+    /// 兼容旧档。
+    #[serde(default)]
+    pub start_at_unix: u64,
 }

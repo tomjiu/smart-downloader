@@ -107,6 +107,10 @@ pub struct TaskSnapshot {
     /// false = 默认并行策略（不序列化，快照向后兼容）。
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub sequential: bool,
+    /// 定时启动时刻（E23，unix 秒；0 = 未调度，序列化省略）。与列表
+    /// `TaskSummary::start_at_unix` 同口径。
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub start_at_unix: u64,
 }
 
 /// 实时速率（E13 透出）：与快照 `done`/`total` 同一次引擎快照取样——
@@ -138,6 +142,10 @@ pub struct TaskSummary {
     /// 用户标签（E18）：空 = 无标签（序列化省略，不产生噪声字段）。
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// 定时启动时刻（E23，unix 秒；0 = 未调度，序列化省略）：未到期任务
+    /// 停留 Queued 且不入引擎，列表据此可展示「定时中」。
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub start_at_unix: u64,
 }
 
 /// 列表过滤/分页查询（E7）。`states`/`engines` 空 = 不过滤；匹配均大小写不敏感。
@@ -357,11 +365,28 @@ pub struct AddHttpOpts {
     /// 文件冲突策略（E21）：目标文件已存在时的处置。None = overwrite（默认）。
     /// 仅对显式名任务生效（派生名任务最终名在引擎侧 CD 才确定，v1 保持覆盖）。
     pub conflict: Option<ConflictPolicy>,
+    /// 定时启动时刻（E23，unix 秒）：Some(未来) = 延迟入引擎，到点由调度
+    /// 循环激活；Some(过去)/None/0 = 立即。仅 HTTP 分支消费（AddTaskReq
+    /// 直传）；BT/FTP 走各自 add 参传同语义字段。
+    pub start_at_unix: Option<u64>,
 }
 
 /// 校验和归一：小写化（引擎端 sha256/md5 摘要格式化为小写 hex，入参大写需归一后参与比较）。
 fn normalize_digest(s: &str) -> String {
     s.trim().to_ascii_lowercase()
+}
+
+/// 当前 unix 秒（E23 调度判定用；时钟回拨/系统异常兑底 0 = 立即语义）。
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// serde skip_serializing_if 谓词：start_at_unix 为 0（未调度）时快照省略。
+fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
 }
 
 fn is_hex_digest(s: &str, len: usize) -> bool {
@@ -447,6 +472,10 @@ pub struct DaemonState {
     webhook_client: reqwest::Client,
     /// 自动清理当前配置（E20）：days=0 禁用；serve 注入 + 热重载跟随。
     cleanup: Mutex<crate::config::CleanupCfg>,
+    /// 错峰随机延迟上限（E23，秒；0 = 关）：任务添加未显式 start_at 时在
+    /// 0..=N 秒内延迟启动。serve 从 `[scheduler] start_jitter_seconds`
+    /// 注入，热重载跟随（只影响新任务；AtomicU32 无锁读取，add 热路径）。
+    start_jitter_secs: std::sync::atomic::AtomicU32,
 }
 
 /// 全局限速总阀门当前值（E16，KiB/s；0 = 不限）。
@@ -774,7 +803,15 @@ impl DaemonState {
                 .build()
                 .unwrap_or_default(),
             cleanup: Mutex::new(crate::config::CleanupCfg::default()),
+            start_jitter_secs: std::sync::atomic::AtomicU32::new(0),
         }
+    }
+
+    /// 注入错峰随机延迟上限（E23；serve 从 `[scheduler] start_jitter_seconds` 传入）。
+    pub fn with_start_jitter(self, secs: u32) -> Self {
+        self.start_jitter_secs
+            .store(secs, std::sync::atomic::Ordering::Relaxed);
+        self
     }
 
     /// 注入 HTTP 任务默认落盘目录（dest 未指定时使用；serve 从 `[download] dest_root` 传入）。
@@ -1095,6 +1132,27 @@ impl DaemonState {
         for pt in pts {
             let mut t = pt.task.clone();
             let was_paused = pt.paused; // 用户暂停意图（P4 G5，旧文件无此字段 = false）
+                                        // E23：定时任务未到期 → 不入引擎（engine_tid 空），到点由调度
+                                        // 循环激活。paused 意图保留（用户在调度等待期暂停过）——恢复后
+                                        // 仍 Paused，激活器只认 Queued 不会误触发；resume = 立即激活。
+            if t.metadata.start_at_unix > now_unix() {
+                t.state = if was_paused {
+                    TaskState::Paused
+                } else {
+                    TaskState::Queued
+                };
+                let mut rec = TaskRecord {
+                    task: t,
+                    engine_tid: None,
+                    engine_kind: pt.engine_kind,
+                    engine_status: None,
+                    events: vec![],
+                };
+                rec.push_event("restored", Some("scheduled_start".into()));
+                self.tasks.lock().insert(rec.task.id.clone(), rec);
+                restored += 1;
+                continue;
+            }
             t.state = TaskState::Queued; // 重启后重新入队
             let engine = match self.engine_for(pt.engine_kind) {
                 Ok(e) => e,
@@ -1253,6 +1311,147 @@ impl DaemonState {
             .await
     }
 
+    // ===== 定时/错峰下载（E23）=====
+    //
+    // 语义：start_at 在未来的任务**不接入引擎**（engine_tid 空、停留 Queued），
+    // 到点由调度循环 `activate_due_tasks` 调引擎 add 激活（与普通 add 同链路，
+    // 查重/预检/目录创建已在 add 路径完成）。两个入口：
+    // - 显式定时：`AddTaskReq.start_at_unix`（unix 秒；过去时刻 = 立即，宽容不 400）
+    // - 错峰：`[scheduler] start_jitter_seconds` > 0 时，未显式指定的任务在
+    //   0..=N 秒内随机延迟启动（批量入队不被同时压向引擎/带宽）。
+
+    /// 解析任务定时启动时刻（E23）：显式值直传（0/过去 = 立即）；未显式且
+    /// 配置了错峰抖动 → now + 0..=jitter 秒（亚秒纳秒 ^ next_id 混熵，错峰
+    /// 无需密码学随机）；否则 0（立即）。
+    fn resolve_start_at(&self, explicit: Option<u64>) -> u64 {
+        if let Some(t) = explicit {
+            return t;
+        }
+        let jitter = self
+            .start_jitter_secs
+            .load(std::sync::atomic::Ordering::Relaxed) as u64;
+        if jitter == 0 {
+            return 0;
+        }
+        let nano = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        let mix = nano
+            ^ self
+                .next_id
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        now_unix() + (mix % (jitter + 1))
+    }
+
+    /// 落一条调度等待任务记录（E23）：不入引擎（engine_tid 空），到点由
+    /// 调度循环激活。与 E21 conflict_skip 同款「有记录无句柄」形态。
+    fn insert_scheduled_task(&self, task: DownloadTask, kind: EngineKind) -> String {
+        let task_id = task.id.clone();
+        let start_at = task.metadata.start_at_unix;
+        let mut rec = TaskRecord {
+            task,
+            engine_tid: None,
+            engine_kind: kind,
+            engine_status: None,
+            events: vec![],
+        };
+        rec.push_event("add", Some(format!("scheduled_start@{start_at}")));
+        self.tasks.lock().insert(task_id.clone(), rec);
+        self.autosave();
+        self.hub.publish(SchedulerEvent::TaskCreated {
+            task_id: task_id.clone(),
+        });
+        task_id
+    }
+
+    /// 激活单个定时任务（E23）：调引擎 add 接入 + 记录句柄 + 事件。
+    /// add 失败/引擎不可用 → 任务置 Failed（对齐 restore add 失败语义）。
+    /// 返回是否激活成功。调用方需保证任务处于 Queued（调度等待态）。
+    async fn activate_one(&self, id: &str, task: DownloadTask, kind: EngineKind) -> bool {
+        let engine = match self.engine_for(kind) {
+            Ok(e) => e,
+            Err(e) => {
+                {
+                    let mut tasks = self.tasks.lock();
+                    if let Some(rec) = tasks.get_mut(id) {
+                        rec.task.state = TaskState::Failed;
+                        rec.push_event("scheduled_start", Some(format!("引擎不可用: {e}")));
+                    }
+                }
+                self.autosave();
+                self.hub.publish(SchedulerEvent::Failed {
+                    task_id: id.to_string(),
+                    reason: format!("定时激活引擎不可用: {e}"),
+                });
+                return false;
+            }
+        };
+        match engine.add(&task).await {
+            Ok(tid) => {
+                {
+                    let mut tasks = self.tasks.lock();
+                    match tasks.get_mut(id) {
+                        // 双检：激活间隙任务可能已被 resume 路径抢先激活/被移除
+                        Some(rec) if rec.engine_tid.is_none() => {
+                            rec.engine_tid = Some(tid);
+                            rec.push_event("scheduled_start", None);
+                        }
+                        _ => return false,
+                    }
+                }
+                self.autosave();
+                self.hub.publish(SchedulerEvent::TaskActivated {
+                    task_id: id.to_string(),
+                });
+                true
+            }
+            Err(e) => {
+                {
+                    let mut tasks = self.tasks.lock();
+                    if let Some(rec) = tasks.get_mut(id) {
+                        rec.task.state = TaskState::Failed;
+                        rec.push_event("scheduled_start", Some(format!("引擎 add 失败: {e}")));
+                    }
+                }
+                self.autosave();
+                self.hub.publish(SchedulerEvent::Failed {
+                    task_id: id.to_string(),
+                    reason: format!("定时激活失败: {e}"),
+                });
+                false
+            }
+        }
+    }
+
+    /// 调度激活循环驱动点（E23）：把到期任务（start_at ≤ now、未接入引擎、
+    /// Queued）逐个接入引擎。serve 以 1s 周期驱动；测试可直接调用。返回
+    /// 激活成功的 task_id 列表（保持迭代序）。
+    pub async fn activate_due_tasks(&self) -> Vec<String> {
+        let now = now_unix();
+        let due: Vec<(String, DownloadTask, EngineKind)> = {
+            let tasks = self.tasks.lock();
+            tasks
+                .iter()
+                .filter(|(_, rec)| {
+                    rec.engine_tid.is_none()
+                        && rec.task.state == TaskState::Queued
+                        && rec.task.metadata.start_at_unix > 0
+                        && rec.task.metadata.start_at_unix <= now
+                })
+                .map(|(id, rec)| (id.clone(), rec.task.clone(), rec.engine_kind))
+                .collect()
+        };
+        let mut activated = Vec::new();
+        for (id, task, kind) in due {
+            if self.activate_one(&id, task, kind).await {
+                activated.push(id);
+            }
+        }
+        activated
+    }
+
     /// 顺序下载变体：`sequential` 写入任务（HTTP=在飞窗口；BT=sequential
     /// flag；其余引擎忽略）。引擎 add 后对 BT 任务立即下发（handle 级 flag，
     /// metadata 未就绪也可设）。
@@ -1291,11 +1490,14 @@ impl DaemonState {
             NormalizedSource::Magnet(m) => {
                 #[cfg(feature = "bt")]
                 {
-                    return self.add_bt_task_opts(m, dest_root, opts.sequential).await;
+                    return self
+                        .add_bt_task_opts(m, dest_root, opts.sequential, opts.start_at_unix)
+                        .await;
                 }
                 #[cfg(not(feature = "bt"))]
                 {
                     let _ = opts.sequential;
+                    let _ = opts.start_at_unix;
                     Err(DaemonError::InvalidSource(format!(
                         "magnet 需 BT 引擎（编译时启用 --features daemon/bt）: {m}"
                     )))
@@ -1307,10 +1509,13 @@ impl DaemonState {
             NormalizedSource::Ftp(u) => {
                 #[cfg(feature = "ftp")]
                 {
-                    return self.add_ftp_task(u, dest_root).await;
+                    return self
+                        .add_ftp_task_opts(u, dest_root, opts.start_at_unix)
+                        .await;
                 }
                 #[cfg(not(feature = "ftp"))]
                 {
+                    let _ = opts.start_at_unix;
                     Err(DaemonError::InvalidSource(format!(
                         "ftp 需 FTP 引擎（编译时启用 --features ftp）: {u}"
                     )))
@@ -1326,12 +1531,15 @@ impl DaemonState {
     }
 
     /// 添加 BT 任务（feature `bt`，顺序下载 opts 直通入口）：btih canonical 查重 → 引擎 add → TaskCreated 事件。
+    /// `start_at_unix`（E23）：Some(未来) = 延迟入引擎（不调 engine.add），
+    /// 到点由调度循环激活。
     #[cfg(feature = "bt")]
     async fn add_bt_task_opts(
         &self,
         magnet: String,
         dest_root: Option<String>,
         sequential: bool,
+        start_at_unix: Option<u64>,
     ) -> Result<TaskId, DaemonError> {
         // B10：目标目录预检（创建/可写）；magnet 总大小元数据前未知 → 空间预检跳过
         // dest 未指定 → 默认落盘目录（与 HTTP 一致：default_dest_root 配置）
@@ -1383,9 +1591,16 @@ impl DaemonState {
                 added_at_unix: 0,
                 tags: Vec::new(),
                 finished_at_unix: 0,
+                start_at_unix: self.resolve_start_at(start_at_unix),
             },
             limits: None,
         };
+
+        // E23 定时启动：start_at 未来 → 延迟入引擎（记录 Queued + 无句柄），
+        // 到点由调度循环接入（engine.add 与查重/预检后置同链路）。
+        if task.metadata.start_at_unix > now_unix() {
+            return Ok(self.insert_scheduled_task(task, EngineKind::Bt));
+        }
 
         let engine_tid = self
             .engine_for(EngineKind::Bt)?
@@ -1429,17 +1644,19 @@ impl DaemonState {
         torrent_bytes: Vec<u8>,
         dest_root: Option<String>,
     ) -> Result<TaskId, DaemonError> {
-        self.add_torrent_task_opts(torrent_bytes, dest_root, false)
+        self.add_torrent_task_opts(torrent_bytes, dest_root, false, None)
             .await
     }
 
     /// 顺序下载变体：`sequential` 写入任务 + 引擎 add 后立即下发 flag。
+    /// `start_at_unix`（E23）：Some(未来) = 延迟入引擎，到点由调度循环激活。
     #[cfg(feature = "bt")]
     pub async fn add_torrent_task_opts(
         &self,
         torrent_bytes: Vec<u8>,
         dest_root: Option<String>,
         sequential: bool,
+        start_at_unix: Option<u64>,
     ) -> Result<TaskId, DaemonError> {
         // B10：目标目录预检（创建/可写）；dest 未指定 → 默认落盘目录（与 HTTP/BT-magnet 一致）
         let def = self.default_dest_root.lock().to_string_lossy().into_owned();
@@ -1500,9 +1717,15 @@ impl DaemonState {
                 added_at_unix: 0,
                 tags: Vec::new(),
                 finished_at_unix: 0,
+                start_at_unix: self.resolve_start_at(start_at_unix),
             },
             limits: None,
         };
+
+        // E23 定时启动：start_at 未来 → 延迟入引擎，到点由调度循环接入。
+        if task.metadata.start_at_unix > now_unix() {
+            return Ok(self.insert_scheduled_task(task, EngineKind::Bt));
+        }
 
         let engine_tid = self
             .engine_for(EngineKind::Bt)?
@@ -1730,6 +1953,7 @@ impl DaemonState {
                 added_at_unix: 0,
                 tags: Vec::new(),
                 finished_at_unix: 0,
+                start_at_unix: 0,
             },
             limits: None,
         };
@@ -1801,6 +2025,7 @@ impl DaemonState {
             backup_md5,
             name,
             conflict,
+            start_at_unix,
         } = opts;
         // E5：任务级代理 URL 校验（构建一次 client 试水，成功即合法）。
         if let Some(p) = &proxy {
@@ -1893,6 +2118,7 @@ impl DaemonState {
                 added_at_unix: 0,
                 tags: Vec::new(),
                 finished_at_unix: 0,
+                start_at_unix: self.resolve_start_at(start_at_unix),
             },
             limits: None,
         };
@@ -1935,6 +2161,12 @@ impl DaemonState {
             self.publish_task_completed(&task_id);
             return Ok(task_id);
         }
+        // E23 定时启动：start_at 未来 → 延迟入引擎（记录 Queued + 无句柄），
+        // 到点由调度循环接入。置于 conflict_skip 之后：文件已在即完成，
+        // 调度无意义（两开关同时给出时 skip 优先）。
+        if task.metadata.start_at_unix > now_unix() {
+            return Ok(self.insert_scheduled_task(task, EngineKind::Http));
+        }
         let engine_tid = self
             .engine_for(EngineKind::Http)?
             .add(&task)
@@ -1974,6 +2206,18 @@ impl DaemonState {
         &self,
         url: String,
         dest_root: Option<String>,
+    ) -> Result<TaskId, DaemonError> {
+        self.add_ftp_task_opts(url, dest_root, None).await
+    }
+
+    /// 定时变体（E23）：`start_at_unix` Some(未来) = 延迟入引擎，到点由
+    /// 调度循环激活。
+    #[cfg(feature = "ftp")]
+    pub async fn add_ftp_task_opts(
+        &self,
+        url: String,
+        dest_root: Option<String>,
+        start_at_unix: Option<u64>,
     ) -> Result<TaskId, DaemonError> {
         if !url.starts_with("ftp://") {
             return Err(DaemonError::InvalidSource(url));
@@ -2042,9 +2286,15 @@ impl DaemonState {
                 added_at_unix: 0,
                 tags: Vec::new(),
                 finished_at_unix: 0,
+                start_at_unix: self.resolve_start_at(start_at_unix),
             },
             limits: None,
         };
+
+        // E23 定时启动：start_at 未来 → 延迟入引擎，到点由调度循环接入。
+        if task.metadata.start_at_unix > now_unix() {
+            return Ok(self.insert_scheduled_task(task, EngineKind::Ftp));
+        }
 
         let engine = self.engine_for(EngineKind::Ftp)?;
         let engine_tid = engine
@@ -2153,6 +2403,7 @@ impl DaemonState {
             sequential: rec.task.sequential,
             name: rec.task.metadata.name.clone(),
             tags: rec.task.metadata.tags.clone(),
+            start_at_unix: rec.task.metadata.start_at_unix,
         })
     }
 
@@ -2234,6 +2485,7 @@ impl DaemonState {
                 engine: kind_label(&rec.engine_kind),
                 name: rec.task.metadata.name.clone(),
                 tags: rec.task.metadata.tags.clone(),
+                start_at_unix: rec.task.metadata.start_at_unix,
             })
             .collect();
         (page, total)
@@ -2338,6 +2590,48 @@ impl DaemonState {
     }
 
     pub async fn pause(&self, id: &str) -> Result<(), DaemonError> {
+        // E23：调度等待中任务（engine_tid 空 + Queued）无引擎句柄可暂停——
+        // 语义 = 取消自动启动（记录置 Paused；start_at 保留供展示，激活器
+        // 只认 Queued 不会误触发）。resume 回该任务 = 立即激活。
+        // 其余无句柄任务（E21 skip Completed / restore add 失败 Failed）→
+        // 落到引擎侧逻辑按 404 口径拒绝，与现行为一致。
+        // 结构约束：锁作用域内不得出现 await（guard 非 Send，会污染整个
+        // handler future 的 Send 判定）——锁内纯决策，await 全部在锁外。
+        let decision = {
+            let mut tasks = self.tasks.lock();
+            match tasks.get_mut(id) {
+                Some(rec) if rec.engine_tid.is_some() => Some(true), // 已被激活 → 引擎侧暂停
+                Some(rec) => {
+                    if rec.task.state != TaskState::Queued {
+                        return Err(DaemonError::NotFound(id.to_string()));
+                    }
+                    rec.push_event("pause", Some("scheduled".into()));
+                    rec.task.state = TaskState::Paused;
+                    if let Some(es) = rec.engine_status.as_mut() {
+                        es.down_rate = 0;
+                        es.up_rate = 0;
+                    }
+                    Some(false) // 调度中 → 记录级暂停已完成
+                }
+                None => return Err(DaemonError::NotFound(id.to_string())),
+            }
+        };
+        match decision {
+            Some(true) => self.pause_engine_task(id).await,
+            _ => {
+                self.autosave();
+                self.hub.publish(SchedulerEvent::StateChanged {
+                    task_id: id.to_string(),
+                    from: TaskState::Queued,
+                    to: TaskState::Paused,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// 引擎侧暂停（原 pause 主体，E23 拆出：调度中任务走记录级暂停分支）。
+    async fn pause_engine_task(&self, id: &str) -> Result<(), DaemonError> {
         let rec = self
             .tasks
             .lock()
@@ -2373,6 +2667,49 @@ impl DaemonState {
     }
 
     pub async fn resume(&self, id: &str) -> Result<(), DaemonError> {
+        // E23：未接入引擎的任务（调度等待 Queued / 调度等待期被暂停 Paused）
+        // → resume = 立即激活（消费定时，直接开始）。激活后记录态置
+        // Downloading（对齐引擎侧 resume 语义；HTTP add 自启下载循环，BT 内
+        // 核由 add 后正常下载链路接管）。其余无句柄终态（E21 skip Completed /
+        // 激活失败 Failed）→ 404 口径拒绝。
+        let pending = {
+            let tasks = self.tasks.lock();
+            match tasks.get(id) {
+                Some(rec) => {
+                    if rec.engine_tid.is_none() {
+                        Some((rec.task.clone(), rec.engine_kind))
+                    } else {
+                        None
+                    }
+                }
+                None => return Err(DaemonError::NotFound(id.to_string())),
+            }
+        };
+        if let Some((task, kind)) = pending {
+            if !matches!(task.state, TaskState::Queued | TaskState::Paused) {
+                return Err(DaemonError::NotFound(id.to_string()));
+            }
+            let from = task.state.clone();
+            if !self.activate_one(id, task, kind).await {
+                return Err(DaemonError::Engine(format!(
+                    "任务 {id} 调度激活失败（任务已标 Failed，详情见任务事件）"
+                )));
+            }
+            {
+                let mut tasks = self.tasks.lock();
+                if let Some(rec) = tasks.get_mut(id) {
+                    rec.push_event("resume", None);
+                    rec.task.state = TaskState::Downloading(kind);
+                }
+            }
+            self.autosave();
+            self.hub.publish(SchedulerEvent::StateChanged {
+                task_id: id.to_string(),
+                from,
+                to: TaskState::Downloading(kind),
+            });
+            return Ok(());
+        }
         let rec = self
             .tasks
             .lock()
@@ -3018,6 +3355,20 @@ impl DaemonState {
                 *c = cfg.cleanup.clone();
             }
         }
+        // E23：错峰抖动热重载（只影响之后新添加的任务；存量等待任务不受影响）
+        {
+            let old = self.start_jitter_secs.swap(
+                cfg.scheduler.start_jitter_seconds,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            if old != cfg.scheduler.start_jitter_seconds {
+                tracing::info!(
+                    "配置热重载: start_jitter_seconds {} → {}",
+                    old,
+                    cfg.scheduler.start_jitter_seconds
+                );
+            }
+        }
     }
 
     /// 已完成任务自动清扫（E20）：扫描 Completed 且完成龄期 ≥
@@ -3123,6 +3474,7 @@ impl HttpSink for FallbackSink {
                 added_at_unix: 0,
                 tags: Vec::new(),
                 finished_at_unix: 0,
+                start_at_unix: 0,
             },
             limits: None,
         };
@@ -3762,6 +4114,7 @@ mod bt_alert_tests {
                     added_at_unix: 0,
                     tags: Vec::new(),
                     finished_at_unix: 0,
+                    start_at_unix: 0,
                 },
                 limits: None,
             },
@@ -4906,6 +5259,7 @@ mod persist_tests {
                 added_at_unix: 0,
                 tags: Vec::new(),
                 finished_at_unix: 0,
+                start_at_unix: 0,
             },
             limits: None,
         }
@@ -5825,6 +6179,7 @@ mod add_opts_tests {
                     backup_md5: Some("ABCDEF0123456789ABCDEF0123456789".into()),
                     name: Some("explicit-name.bin".into()),
                     conflict: None,
+                    start_at_unix: None,
                 },
             )
             .await
@@ -6288,6 +6643,7 @@ mod task_proxy_set_tests {
                     added_at_unix: 0,
                     tags: Vec::new(),
                     finished_at_unix: 0,
+                    start_at_unix: 0,
                 },
                 limits: None,
             },
@@ -6639,6 +6995,7 @@ mod rate_cache_tests {
                     added_at_unix: 0,
                     tags: Vec::new(),
                     finished_at_unix: 0,
+                    start_at_unix: 0,
                 },
                 limits: None,
             },
@@ -7194,6 +7551,7 @@ mod batch_select_tests {
                     added_at_unix: 0,
                     tags: Vec::new(),
                     finished_at_unix: 0,
+                    start_at_unix: 0,
                 },
                 limits: None,
             },
@@ -7403,6 +7761,7 @@ mod cleanup_tests {
                     added_at_unix: 0,
                     tags: Vec::new(),
                     finished_at_unix,
+                    start_at_unix: 0,
                 },
                 limits: None,
             },
@@ -7602,5 +7961,286 @@ mod conflict_tests {
             .unwrap();
         assert_eq!(fake.added.lock().len(), 1, "默认照常入引擎");
         assert_eq!(state.task_snapshot(&id).await.unwrap().state, "Downloading");
+    }
+}
+
+/// 定时/错峰下载（E23）：延迟入引擎 + 调度激活 + 调度中 pause/resume +
+/// 恢复不误启动。
+#[cfg(test)]
+mod scheduled_tests {
+    use super::*;
+
+    /// 等待持久化文件出现（autosave 异步时序；本模块独立实现——
+    /// wait_file 定义于 persist_tests 模块内部，跨模块不可见）。
+    fn wait_file(path: &std::path::Path, timeout_ms: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        while std::time::Instant::now() < deadline {
+            if path.exists() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("等待持久化文件超时: {path:?}");
+    }
+
+    /// 白盒插入调度等待任务（engine_tid 空 + start_at 指定时刻；不联网）。
+    fn insert_scheduled(
+        state: &DaemonState,
+        id: &str,
+        kind: EngineKind,
+        start_at: u64,
+        st: TaskState,
+    ) {
+        let rec = TaskRecord {
+            task: DownloadTask {
+                id: id.into(),
+                canonical_id: CanonicalId {
+                    kind: CanonicalKind::Http,
+                    identity: format!("https://s.example/{id}"),
+                    validator: None,
+                    token_sensitive: false,
+                },
+                source: DownloadSource::Http {
+                    url: format!("https://s.example/{id}"),
+                    headers: vec![],
+                    auth: None,
+                    backup_url: None,
+                    proxy: None,
+                },
+                identity: ContentIdentity::SingleFile {
+                    size: 0,
+                    etag: None,
+                    sha256: None,
+                    backup_md5: None,
+                },
+                dest_root: PathBuf::from("."),
+                files: vec![],
+                acquisitions: vec![],
+                aggregate: Default::default(),
+                state: st,
+                retry: Default::default(),
+                created_at: std::time::Instant::now(),
+                file_priorities: None,
+                sequential: false,
+                metadata: TaskMetadata {
+                    name: None,
+                    added_at_unix: 0,
+                    tags: Vec::new(),
+                    finished_at_unix: 0,
+                    start_at_unix: start_at,
+                },
+                limits: None,
+            },
+            engine_tid: None,
+            engine_kind: kind,
+            engine_status: None,
+            events: vec![],
+        };
+        state.tasks.lock().insert(id.into(), rec);
+    }
+
+    #[tokio::test]
+    async fn add_with_future_start_at_defers_engine() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![]);
+        let future = now_unix() + 3600;
+        let tid = state
+            .add_http_task_opts(
+                "https://s.example/later.bin".into(),
+                None,
+                AddHttpOpts {
+                    start_at_unix: Some(future),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // 引擎未被触碰（延迟入引擎的核心证据）
+        assert!(
+            fake.added.lock().is_empty(),
+            "定时任务不应在 add 时接入引擎"
+        );
+        let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+        assert!(rec.engine_tid.is_none(), "调度等待中无引擎句柄");
+        assert_eq!(rec.task.state, TaskState::Queued);
+        assert_eq!(rec.task.metadata.start_at_unix, future);
+        // 列表/快照透出（0 省略、非 0 出现）
+        let list = state.list();
+        assert_eq!(list[0].start_at_unix, future);
+        let snap = state.task_snapshot(&tid).await.unwrap();
+        assert_eq!(snap.start_at_unix, future);
+        assert_eq!(snap.state, "Queued");
+        // 对照：未指定 start_at 的任务立即入引擎且字段省略
+        let tid2 = state
+            .add_http_task("https://s.example/now.bin".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(fake.added.lock().len(), 1, "普通任务照常入引擎");
+        let snap2 = state.task_snapshot(&tid2).await.unwrap();
+        assert_eq!(snap2.start_at_unix, 0);
+    }
+
+    #[tokio::test]
+    async fn activate_due_tasks_activates_only_due() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![]);
+        let past = now_unix() - 10;
+        let future = now_unix() + 3600;
+        insert_scheduled(&state, "t1", EngineKind::Http, past, TaskState::Queued);
+        insert_scheduled(&state, "t2", EngineKind::Http, future, TaskState::Queued);
+        insert_scheduled(&state, "t3", EngineKind::Http, 0, TaskState::Queued); // 无调度（0）
+        let activated = state.activate_due_tasks().await;
+        assert_eq!(activated, vec!["t1".to_string()], "仅到期任务被激活");
+        assert_eq!(fake.added.lock().len(), 1);
+        {
+            let tasks = state.tasks.lock();
+            assert!(tasks.get("t1").unwrap().engine_tid.is_some());
+            assert_eq!(
+                tasks.get("t1").unwrap().task.state,
+                TaskState::Queued,
+                "激活不改记录态（轮询器对齐）"
+            );
+            assert!(
+                tasks.get("t2").unwrap().engine_tid.is_none(),
+                "未到期不激活"
+            );
+            assert!(
+                tasks.get("t3").unwrap().engine_tid.is_none(),
+                "无调度不激活"
+            );
+        }
+        // 事件：t1 有 TaskActivated（通过任务事件链验证 scheduled_start）
+        let rec = state.tasks.lock().get("t1").cloned().unwrap();
+        assert!(
+            rec.events.iter().any(|e| e.op == "scheduled_start"),
+            "激活应落任务事件: {:?}",
+            rec.events
+        );
+    }
+
+    #[tokio::test]
+    async fn activate_without_engine_marks_failed() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![]);
+        // Provider 引擎未装配 → engine_for 失败 → Failed 终态
+        insert_scheduled(
+            &state,
+            "t9",
+            EngineKind::Provider,
+            now_unix() - 5,
+            TaskState::Queued,
+        );
+        let activated = state.activate_due_tasks().await;
+        assert!(activated.is_empty(), "激活失败不进返回集");
+        {
+            let tasks = state.tasks.lock();
+            let rec = tasks.get("t9").unwrap();
+            assert_eq!(rec.task.state, TaskState::Failed);
+            assert!(rec.engine_tid.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_resume_on_scheduled_task_lifecycle() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![]);
+        insert_scheduled(
+            &state,
+            "t1",
+            EngineKind::Http,
+            now_unix() + 3600,
+            TaskState::Queued,
+        );
+        // pause = 取消自动启动（记录级，无引擎调用）
+        state.pause("t1").await.unwrap();
+        assert!(fake.paused_calls().is_empty(), "调度中暂停不触碰引擎");
+        assert_eq!(
+            state.tasks.lock().get("t1").unwrap().task.state,
+            TaskState::Paused
+        );
+        // resume = 立即激活（消费定时）
+        state.resume("t1").await.unwrap();
+        assert_eq!(fake.added.lock().len(), 1, "resume 应接入引擎");
+        assert_eq!(
+            state.tasks.lock().get("t1").unwrap().task.state,
+            TaskState::Downloading(EngineKind::Http)
+        );
+        // 激活后再次 pause → 走引擎侧原路径
+        state.pause("t1").await.unwrap();
+        assert_eq!(fake.paused_calls().len(), 1);
+    }
+
+    #[test]
+    fn resolve_start_at_explicit_and_jitter() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        // 显式值直传：过去时刻原样保留（= 立即语义），不受 jitter 影响
+        let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![]);
+        assert_eq!(state.resolve_start_at(Some(12345)), 12345);
+        assert_eq!(state.resolve_start_at(Some(0)), 0);
+        // jitter 未配置 → None = 0（立即）
+        assert_eq!(state.resolve_start_at(None), 0);
+        // jitter 配置后：None → now..=now+jitter；显式值不被抖动叠加
+        let state2 =
+            DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![]).with_start_jitter(5);
+        for _ in 0..20 {
+            let t = state2.resolve_start_at(None);
+            assert!(
+                t > now_unix() - 1 && t <= now_unix() + 5,
+                "jitter 时刻应在 (now, now+5] 内: {t}"
+            );
+        }
+        assert_eq!(
+            state2.resolve_start_at(Some(999)),
+            999,
+            "显式 start_at 不叠加抖动"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_keeps_future_scheduled_out_of_engine() {
+        // 定时任务重启：未到期任务恢复为记录（不入引擎），到期后可被激活
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("tasks.json");
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = Arc::new(
+            DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![])
+                .with_storage(store.clone()),
+        );
+        let future = now_unix() + 3600;
+        let tid = state
+            .add_http_task_opts(
+                "https://s.example/boot.bin".into(),
+                None,
+                AddHttpOpts {
+                    start_at_unix: Some(future),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(fake.added.lock().is_empty());
+        wait_file(&store, 2000);
+
+        // 新 state 恢复：不入引擎、保持 Queued、start_at 保留
+        let fake2 = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state2 = DaemonState::new(fake2.clone() as Arc<dyn DownloadEngine>, vec![]);
+        let n = state2.restore_from(&store).await.unwrap();
+        assert_eq!(n, 1);
+        assert!(fake2.added.lock().is_empty(), "未到期任务恢复时不得误启动");
+        {
+            let tasks = state2.tasks.lock();
+            let rec = tasks.get(&tid).unwrap();
+            assert!(rec.engine_tid.is_none());
+            assert_eq!(rec.task.state, TaskState::Queued);
+            assert_eq!(rec.task.metadata.start_at_unix, future);
+        }
+        // 手工把时刻改为已到期（模拟"等待期间时刻流逝"）→ 调度循环可激活
+        {
+            let mut tasks = state2.tasks.lock();
+            tasks.get_mut(&tid).unwrap().task.metadata.start_at_unix = now_unix() - 1;
+        }
+        let activated = state2.activate_due_tasks().await;
+        assert_eq!(activated, vec![tid.clone()]);
+        assert_eq!(fake2.added.lock().len(), 1);
     }
 }

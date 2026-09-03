@@ -81,6 +81,13 @@ pub struct AddTaskReq {
     /// `rename`（自动改名 name(1).ext）/ `skip`（已存在则任务直接 Completed）。
     #[serde(default)]
     pub conflict_policy: Option<String>,
+    /// 定时启动时刻（E23，unix 秒）：未来时刻 = 到点前不入引擎（停留 Queued），
+    /// 由 daemon 调度循环激活；缺省/0/过去时刻 = 立即开始（宽容不 400）。
+    /// 错峰（`[scheduler] start_jitter_seconds`）仅在本字段缺省时叠加。
+    /// 对 HTTP/BT-magnet/.torrent/FTP 任务全开放；xunlei import 忽略
+    /// （导入语义 = 云端已完成的存量转移）。
+    #[serde(default)]
+    pub start_at_unix: Option<u64>,
 }
 
 #[cfg(feature = "xunlei-import")]
@@ -909,7 +916,7 @@ async fn add_task(
                 #[cfg(feature = "bt")]
                 {
                     state
-                        .add_torrent_task_opts(bytes, req.dest, req.sequential)
+                        .add_torrent_task_opts(bytes, req.dest, req.sequential, req.start_at_unix)
                         .await
                 }
                 #[cfg(not(feature = "bt"))]
@@ -960,6 +967,7 @@ async fn add_task(
                             }
                         },
                     },
+                    start_at_unix: req.start_at_unix,
                 },
             )
             .await

@@ -125,6 +125,7 @@ impl HttpSink for EngineSink {
                 added_at_unix: 0,
                 tags: Vec::new(),
                 finished_at_unix: 0,
+                start_at_unix: 0,
             },
             limits: None,
         };
@@ -203,6 +204,7 @@ async fn full_flow_transfers_two_files_to_disk() {
             added_at_unix: 0,
             tags: Vec::new(),
             finished_at_unix: 0,
+            start_at_unix: 0,
         },
         limits: None,
     };

@@ -15,6 +15,7 @@ pub struct Config {
     pub provider_xunlei: ProviderXunleiCfg,
     pub webhook: WebhookCfg,
     pub cleanup: CleanupCfg,
+    pub scheduler: SchedulerCfg,
     pub lock: LockCfg,
     pub storage: StorageCfg,
 }
@@ -125,6 +126,16 @@ pub struct CleanupCfg {
     pub auto_remove_keep_data: bool,
 }
 
+/// 调度配置（E23 定时/错峰下载）：任务定时启动与批量入队错峰。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct SchedulerCfg {
+    /// 错峰随机延迟上限（秒）：任务添加时未显式指定 start_at 且本值 > 0，
+    /// 则在 0..=N 秒内随机延迟启动（到点前不入引擎，与显式 start_at 同
+    /// 机制）。0 = 关闭（默认，立即入引擎）。参与热重载（只影响新任务）。
+    pub start_jitter_seconds: u32,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct LockCfg {
@@ -168,6 +179,7 @@ impl Default for Config {
             provider_xunlei: ProviderXunleiCfg::default(),
             webhook: WebhookCfg::default(),
             cleanup: CleanupCfg::default(),
+            scheduler: SchedulerCfg::default(),
             lock: LockCfg {
                 path: PathBuf::from("./daemon.lock"),
             },
@@ -254,6 +266,7 @@ impl Config {
             "webhook_url": self.webhook.url,
             "auto_remove_completed_days": self.cleanup.auto_remove_completed_days,
             "auto_remove_keep_data": self.cleanup.auto_remove_keep_data,
+            "start_jitter_seconds": self.scheduler.start_jitter_seconds,
             // 仅暴露「登录态文件是否存在」布尔，不泄露路径字符串本身。
             "provider_xunlei_token_exists": self
                 .provider_xunlei

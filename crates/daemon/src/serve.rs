@@ -130,7 +130,8 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
         .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s)
         .with_webhook_url((!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone()))
-        .with_cleanup(cfg.cleanup.clone());
+        .with_cleanup(cfg.cleanup.clone())
+        .with_start_jitter(cfg.scheduler.start_jitter_seconds);
     #[cfg(not(feature = "bt"))]
     let mut state = DaemonState::new(http_engine, providers)
         .with_dest_root(cfg.download.dest_root.clone())
@@ -138,7 +139,8 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
         .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s)
         .with_webhook_url((!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone()))
-        .with_cleanup(cfg.cleanup.clone());
+        .with_cleanup(cfg.cleanup.clone())
+        .with_start_jitter(cfg.scheduler.start_jitter_seconds);
 
     // 4. BT 引擎（先取 core 句柄，供 alert 事件流）
     #[cfg(feature = "bt")]
@@ -322,6 +324,19 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
             loop {
                 tokio::time::sleep(Duration::from_secs(600)).await;
                 let _ = st.sweep_completed_cleanup().await;
+            }
+        });
+    }
+
+    // 4d--. 定时任务调度循环（E23）：1s 周期把到期任务接入引擎
+    //（start_at 未来不入引擎，Queued 等待；jitter 错峰同样由本循环到点激活）。
+    // 无定时任务时空转（filter 后空集，无引擎调用）。
+    {
+        let st = state_arc.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _ = st.activate_due_tasks().await;
             }
         });
     }
