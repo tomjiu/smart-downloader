@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use smart_dl_core::identity::{CanonicalId, CanonicalKind, ContentIdentity};
 use smart_dl_core::source_parse::normalize::{normalize_user_link, NormalizedSource};
 use smart_dl_core::state_machine::TaskState;
-use smart_dl_core::task::{DownloadTask, TaskId, TaskMetadata};
+use smart_dl_core::task::{DownloadTask, RetryState, TaskId, TaskMetadata};
 #[cfg(any(feature = "ftp", feature = "xunlei-import"))]
 use smart_dl_core::task::{FileState, TaskFile};
 use smart_dl_core::types::{
@@ -65,6 +65,33 @@ impl TaskRecord {
             detail,
         });
     }
+
+    /// 失败处置统一入口（E30）：重试预算未用尽 → 清引擎句柄、任务回 Queued、
+    /// 按指数退避安排到期重激活；预算用尽/未配置 → Failed 终态。锁内调用。
+    /// 返回最终状态（Queued = 已安排重试，Failed = 终态）。
+    fn fail_or_schedule_retry(&mut self, reason: Option<&str>) -> TaskState {
+        if self.task.retry.retries < self.task.retry.max_retries {
+            self.task.retry.retries += 1;
+            let delay = retry_backoff_delay_s(self.task.retry.retries);
+            self.task.metadata.next_retry_at_unix = now_unix() + delay;
+            self.engine_tid = None;
+            self.task.state = TaskState::Queued;
+            self.push_event(
+                "auto_retry",
+                Some(format!(
+                    "第 {}/{} 次自动重试已安排，{}s 后执行: {}",
+                    self.task.retry.retries,
+                    self.task.retry.max_retries,
+                    delay,
+                    reason.unwrap_or("")
+                )),
+            );
+            TaskState::Queued
+        } else {
+            self.task.state = TaskState::Failed;
+            TaskState::Failed
+        }
+    }
 }
 
 /// 任务快照（GET /tasks/:id，跳号补拉入口）。
@@ -111,6 +138,16 @@ pub struct TaskSnapshot {
     /// `TaskSummary::start_at_unix` 同口径。
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub start_at_unix: u64,
+    /// 已执行自动重试次数（E30；0 = 无，序列化省略）。与列表同口径。
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub retries: u64,
+    /// 自动重试次数上限（E30；0 = 不自动重试，序列化省略）。与列表同口径。
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub max_retries: u64,
+    /// 自动重试到期时刻（E30，unix 秒；0 = 无重试安排，序列化省略）。
+    /// 非 0 且状态 Queued = 重试等待中，列表据此可展示「重试中」。
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub next_retry_at_unix: u64,
 }
 
 /// 实时速率（E13 透出）：与快照 `done`/`total` 同一次引擎快照取样——
@@ -146,6 +183,14 @@ pub struct TaskSummary {
     /// 停留 Queued 且不入引擎，列表据此可展示「定时中」。
     #[serde(skip_serializing_if = "is_zero_u64")]
     pub start_at_unix: u64,
+    /// 自动重试预算/进度（E30）：`retries`/`max_retries`/`next_retry_at_unix`
+    /// 均 0 省略；非 0 = 任务配置了自动重试（或已安排重试）。
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub retries: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub max_retries: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub next_retry_at_unix: u64,
 }
 
 /// 列表过滤/分页查询（E7）。`states`/`engines` 空 = 不过滤；匹配均大小写不敏感。
@@ -374,6 +419,16 @@ pub struct AddHttpOpts {
     /// 循环激活；Some(过去)/None/0 = 立即。仅 HTTP 分支消费（AddTaskReq
     /// 直传）；BT/FTP 走各自 add 参传同语义字段。
     pub start_at_unix: Option<u64>,
+    /// 失败自动重试次数上限（E30，仅 HTTP/FTP 链路生效）：任务失败且预算未
+    /// 用尽时清引擎句柄回 Queued，按指数退避（2s/4s/8s…封顶 60s）由调度
+    /// 循环重激活。0 = 不自动重试（默认，保持既有一次性失败语义）。
+    pub auto_retry: u32,
+}
+
+/// E30 退避延迟（秒）：第 n 次重试延迟 `2^n` s（2/4/8/…），封顶 60s。
+/// 纯函数；n=0 不会被调用（重试预算判定在前），兑底 2。
+fn retry_backoff_delay_s(retries: u32) -> u64 {
+    2u64.saturating_pow(retries.min(31)).clamp(2, 60)
 }
 
 /// 校验和归一：小写化（引擎端 sha256/md5 摘要格式化为小写 hex，入参大写需归一后参与比较）。
@@ -1528,24 +1583,32 @@ impl DaemonState {
     }
 
     /// 激活单个定时任务（E23）：调引擎 add 接入 + 记录句柄 + 事件。
-    /// add 失败/引擎不可用 → 任务置 Failed（对齐 restore add 失败语义）。
+    /// add 失败/引擎不可用 → E30 重试拦截（预算未用尽安排退避重试）否则置
+    /// Failed（对齐 restore add 失败语义）。激活成功时消费重试安排
+    /// （next_retry_at 清零，快照不再显示过期时间）。
     /// 返回是否激活成功。调用方需保证任务处于 Queued（调度等待态）。
     async fn activate_one(&self, id: &str, task: DownloadTask, kind: EngineKind) -> bool {
         let engine = match self.engine_for(kind) {
             Ok(e) => e,
             Err(e) => {
-                {
+                let retrying = {
                     let mut tasks = self.tasks.lock();
-                    if let Some(rec) = tasks.get_mut(id) {
-                        rec.task.state = TaskState::Failed;
-                        rec.push_event("scheduled_start", Some(format!("引擎不可用: {e}")));
+                    match tasks.get_mut(id) {
+                        Some(rec) => {
+                            rec.push_event("scheduled_start", Some(format!("引擎不可用: {e}")));
+                            let to = rec.fail_or_schedule_retry(Some(&format!("引擎不可用: {e}")));
+                            to == TaskState::Queued
+                        }
+                        None => false,
                     }
-                }
+                };
                 self.autosave();
-                self.hub.publish(SchedulerEvent::Failed {
-                    task_id: id.to_string(),
-                    reason: format!("定时激活引擎不可用: {e}"),
-                });
+                if !retrying {
+                    self.hub.publish(SchedulerEvent::Failed {
+                        task_id: id.to_string(),
+                        reason: format!("定时激活引擎不可用: {e}"),
+                    });
+                }
                 return false;
             }
         };
@@ -1554,9 +1617,11 @@ impl DaemonState {
                 {
                     let mut tasks = self.tasks.lock();
                     match tasks.get_mut(id) {
-                        // 双检：激活间隙任务可能已被 resume 路径抢先激活/被移除
+                        // 双检：激活间隙任务可能已被 resume 路径抢先激活/被移除。
+                        // 激活成功即消费重试安排（E30：next_retry_at 清零）。
                         Some(rec) if rec.engine_tid.is_none() => {
                             rec.engine_tid = Some(tid);
+                            rec.task.metadata.next_retry_at_unix = 0;
                             rec.push_event("scheduled_start", None);
                         }
                         _ => return false,
@@ -1569,26 +1634,35 @@ impl DaemonState {
                 true
             }
             Err(e) => {
-                {
+                let retrying = {
                     let mut tasks = self.tasks.lock();
-                    if let Some(rec) = tasks.get_mut(id) {
-                        rec.task.state = TaskState::Failed;
-                        rec.push_event("scheduled_start", Some(format!("引擎 add 失败: {e}")));
+                    match tasks.get_mut(id) {
+                        Some(rec) => {
+                            rec.push_event("scheduled_start", Some(format!("引擎 add 失败: {e}")));
+                            let to =
+                                rec.fail_or_schedule_retry(Some(&format!("引擎 add 失败: {e}")));
+                            to == TaskState::Queued
+                        }
+                        None => false,
                     }
-                }
+                };
                 self.autosave();
-                self.hub.publish(SchedulerEvent::Failed {
-                    task_id: id.to_string(),
-                    reason: format!("定时激活失败: {e}"),
-                });
+                if !retrying {
+                    self.hub.publish(SchedulerEvent::Failed {
+                        task_id: id.to_string(),
+                        reason: format!("定时激活失败: {e}"),
+                    });
+                }
                 false
             }
         }
     }
 
-    /// 调度激活循环驱动点（E23）：把到期任务（start_at ≤ now、未接入引擎、
-    /// Queued）逐个接入引擎。serve 以 1s 周期驱动；测试可直接调用。返回
-    /// 激活成功的 task_id 列表（保持迭代序）。
+    /// 调度激活循环驱动点（E23+E30）：把到期任务（未接入引擎、Queued）逐个
+    /// 接入引擎。到期判定：任务带重试安排（next_retry_at > 0）→ 按 next_retry_at
+    /// 判定（重试安排优先，避免定时任务首次激活间隙被误读）；否则按 E23
+    /// start_at 判定。serve 以 1s 周期驱动；测试可直接调用。返回激活成功的
+    /// task_id 列表（保持迭代序）。
     pub async fn activate_due_tasks(&self) -> Vec<String> {
         let now = now_unix();
         let due: Vec<(String, DownloadTask, EngineKind)> = {
@@ -1596,10 +1670,17 @@ impl DaemonState {
             tasks
                 .iter()
                 .filter(|(_, rec)| {
-                    rec.engine_tid.is_none()
-                        && rec.task.state == TaskState::Queued
-                        && rec.task.metadata.start_at_unix > 0
-                        && rec.task.metadata.start_at_unix <= now
+                    if rec.engine_tid.is_some() || rec.task.state != TaskState::Queued {
+                        return false;
+                    }
+                    let m = &rec.task.metadata;
+                    if m.next_retry_at_unix > 0 {
+                        // E30：重试等待中——到期才激活
+                        m.next_retry_at_unix <= now
+                    } else {
+                        // E23：定时启动等待中——到期才激活
+                        m.start_at_unix > 0 && m.start_at_unix <= now
+                    }
                 })
                 .map(|(id, rec)| (id.clone(), rec.task.clone(), rec.engine_kind))
                 .collect()
@@ -1779,6 +1860,7 @@ impl DaemonState {
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: self.resolve_start_at(start_at_unix),
+                next_retry_at_unix: 0,
             },
             limits: None,
         };
@@ -1907,6 +1989,7 @@ impl DaemonState {
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: self.resolve_start_at(start_at_unix),
+                next_retry_at_unix: 0,
             },
             limits: None,
         };
@@ -2143,6 +2226,7 @@ impl DaemonState {
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: 0,
+                next_retry_at_unix: 0,
             },
             limits: None,
         };
@@ -2217,6 +2301,7 @@ impl DaemonState {
             name,
             conflict,
             start_at_unix,
+            auto_retry,
         } = opts;
         // E5：任务级代理 URL 校验（构建一次 client 试水，成功即合法）。
         if let Some(p) = &proxy {
@@ -2304,7 +2389,10 @@ impl DaemonState {
             acquisitions: vec![],
             aggregate: Default::default(),
             state: TaskState::Queued,
-            retry: Default::default(),
+            retry: RetryState {
+                retries: 0,
+                max_retries: auto_retry,
+            },
             created_at: std::time::Instant::now(),
             file_priorities: None,
             sequential,
@@ -2314,6 +2402,7 @@ impl DaemonState {
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: self.resolve_start_at(start_at_unix),
+                next_retry_at_unix: 0,
             },
             limits: None,
         };
@@ -2486,6 +2575,7 @@ impl DaemonState {
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: self.resolve_start_at(start_at_unix),
+                next_retry_at_unix: 0,
             },
             limits: None,
         };
@@ -2603,6 +2693,9 @@ impl DaemonState {
             name: rec.task.metadata.name.clone(),
             tags: rec.task.metadata.tags.clone(),
             start_at_unix: rec.task.metadata.start_at_unix,
+            retries: rec.task.retry.retries as u64,
+            max_retries: rec.task.retry.max_retries as u64,
+            next_retry_at_unix: rec.task.metadata.next_retry_at_unix,
         })
     }
 
@@ -2685,6 +2778,9 @@ impl DaemonState {
                 name: rec.task.metadata.name.clone(),
                 tags: rec.task.metadata.tags.clone(),
                 start_at_unix: rec.task.metadata.start_at_unix,
+                retries: rec.task.retry.retries as u64,
+                max_retries: rec.task.retry.max_retries as u64,
+                next_retry_at_unix: rec.task.metadata.next_retry_at_unix,
             })
             .collect();
         (page, total)
@@ -3777,6 +3873,7 @@ impl HttpSink for FallbackSink {
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: 0,
+                next_retry_at_unix: 0,
             },
             limits: None,
         };
@@ -4081,7 +4178,7 @@ impl DaemonState {
             // Bug B 根因修复：autosave 移到锁外（persisted_tasks 重入同一把非重入锁
             // 会同线程自死锁——与 apply_bt_alert 同源缺陷）。
             let mut backfilled = false;
-            let advanced: Option<TaskState> = {
+            let advanced: Option<(TaskState, TaskState)> = {
                 let mut tasks = self.tasks.lock();
                 let Some(rec) = tasks.get_mut(&id) else {
                     continue;
@@ -4107,14 +4204,21 @@ impl DaemonState {
                     }
                 }
                 let from = rec.task.state.clone();
-                let to = engine_state_to_task(&st.state, kind);
+                let raw_to = engine_state_to_task(&st.state, kind);
+                // E30：失败拦截——重试预算未用尽 → 清句柄回 Queued 安排退避
+                // 重激活（调度循环到期重接入引擎）；用尽 → Failed 终态。
+                let to = if raw_to == TaskState::Failed {
+                    rec.fail_or_schedule_retry(st.error.as_deref())
+                } else {
+                    raw_to.clone()
+                };
                 if to == from {
                     // 已在目标态（活跃→活跃）：不迁移，但本轮回填/缓存仍生效
                     None
                 } else {
                     // 错误随快照整体入缓存（st.error），无需单独写点
                     rec.task.state = to.clone();
-                    Some(from)
+                    Some((from, to))
                 }
             }; // ← tasks 锁在此释放
             if backfilled {
@@ -4123,12 +4227,13 @@ impl DaemonState {
             if advanced.is_some() {
                 self.autosave(); // 锁外落盘：终态/推进落盘（修复 Bug B 重入自死锁）
             }
-            // 仅真迁移产生 effect（to==from 的纯回填轮次不广播）
-            if let Some(from) = advanced {
+            // 仅真迁移产生 effect（to==from 的纯回填轮次不广播）；
+            // E30：to 取拦截后的实际目标（重试安排 = Queued，非引擎报的 Failed）
+            if let Some((from, to)) = advanced {
                 effects.push(HttpPollEffect {
                     task_id: id,
                     from,
-                    to: engine_state_to_task(&st.state, kind),
+                    to,
                     message: st.error.clone().unwrap_or_default(),
                 });
             }
@@ -4428,6 +4533,7 @@ mod bt_alert_tests {
                     tags: Vec::new(),
                     finished_at_unix: 0,
                     start_at_unix: 0,
+                    next_retry_at_unix: 0,
                 },
                 limits: None,
             },
@@ -5129,6 +5235,8 @@ pub struct FakeEngine {
     status_name: parking_lot::Mutex<Option<String>>,
     /// status() 速率回显（(down, up) B/s，E11 速率缓存测试用；默认 (0,0) 旧行为）。
     status_rates: parking_lot::Mutex<(u64, u64)>,
+    /// status().state 可编程回显（E30 重试 e2e；None = 保持默认）。
+    status_state: parking_lot::Mutex<Option<EngineState>>,
     /// 已下发的 set_global_limits 调用（(down, up)，E16 总阀门断言用）。
     global_sets: parking_lot::Mutex<Vec<(Option<u32>, Option<u32>)>>,
     /// set_global_limits 的可编程行为：Some(e) = 恒返回该错误（下发失败模拟）。
@@ -5155,6 +5263,7 @@ impl FakeEngine {
             proxy_sets: parking_lot::Mutex::new(Vec::new()),
             status_name: parking_lot::Mutex::new(None),
             status_rates: parking_lot::Mutex::new((0, 0)),
+            status_state: parking_lot::Mutex::new(None),
             global_sets: parking_lot::Mutex::new(Vec::new()),
             global_limits_err: parking_lot::Mutex::new(None),
         }
@@ -5162,6 +5271,11 @@ impl FakeEngine {
 
     pub fn fail_url(&self, url: &str) {
         self.fail_urls.lock().insert(url.to_string());
+    }
+
+    /// 移除 add 失败标记（E30 重试 e2e：模拟故障源恢复后重试成功）。
+    pub fn unfail_url(&self, url: &str) {
+        self.fail_urls.lock().remove(url);
     }
 
     pub fn added(&self) -> Vec<String> {
@@ -5205,6 +5319,11 @@ impl FakeEngine {
     /// 设置 status() 速率回显（(down, up) B/s；E11 速率缓存测试用）。
     pub fn set_status_rates(&self, down: u64, up: u64) {
         *self.status_rates.lock() = (down, up);
+    }
+
+    /// 设置 status().state 回显（E30 重试 e2e：模拟引擎报 Error）。
+    pub fn set_status_state(&self, s: EngineState) {
+        *self.status_state.lock() = Some(s);
     }
 
     /// 读取已下发的 set_global_limits 调用（E16 总阀门断言用）。
@@ -5291,13 +5410,17 @@ impl DownloadEngine for FakeEngine {
         _id: &EngineTaskId,
     ) -> Result<EngineStatus, smart_dl_core::types::EngineError> {
         let (down_rate, up_rate) = *self.status_rates.lock();
-        Ok(EngineStatus {
+        let mut st = EngineStatus {
             down_rate,
             up_rate,
             files: self.status_files.lock().clone(),
             name: self.status_name.lock().clone(),
             ..EngineStatus::default()
-        })
+        };
+        if let Some(s) = *self.status_state.lock() {
+            st.state = s;
+        }
+        Ok(st)
     }
     async fn remove(
         &self,
@@ -5575,6 +5698,7 @@ mod persist_tests {
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: 0,
+                next_retry_at_unix: 0,
             },
             limits: None,
         }
@@ -6497,6 +6621,7 @@ mod add_opts_tests {
                     name: Some("explicit-name.bin".into()),
                     conflict: None,
                     start_at_unix: None,
+                    auto_retry: 0,
                 },
             )
             .await
@@ -7083,6 +7208,7 @@ mod task_proxy_set_tests {
                     tags: Vec::new(),
                     finished_at_unix: 0,
                     start_at_unix: 0,
+                    next_retry_at_unix: 0,
                 },
                 limits: None,
             },
@@ -7196,6 +7322,358 @@ mod task_proxy_set_tests {
             fake.proxy_set_calls().is_empty(),
             "HTTP 引擎不得收到 BT 任务的调用"
         );
+    }
+}
+
+/// E30 失败自动重试：退避纯函数序列 / 失败处置矩阵 / 调度门控 /
+/// poll Error 拦截全环 / add 失败安排重试后源恢复重试成功。
+/// 全部 FakeEngine 白盒构造，无真实网络。
+#[cfg(test)]
+mod auto_retry_tests {
+    use super::*;
+
+    fn rec_with_retry(max: u32, st: TaskState) -> TaskRecord {
+        let mut rec = TaskRecord {
+            task: DownloadTask {
+                id: "tX".into(),
+                canonical_id: CanonicalId {
+                    kind: CanonicalKind::Http,
+                    identity: "https://x/f.bin".into(),
+                    validator: None,
+                    token_sensitive: false,
+                },
+                source: DownloadSource::Http {
+                    url: "https://x/f.bin".into(),
+                    headers: vec![],
+                    auth: None,
+                    backup_url: None,
+                    proxy: None,
+                },
+                identity: ContentIdentity::SingleFile {
+                    size: 0,
+                    etag: None,
+                    sha256: None,
+                    sha1: None,
+                    md5: None,
+                    backup_md5: None,
+                },
+                dest_root: PathBuf::from("."),
+                files: vec![],
+                acquisitions: vec![],
+                aggregate: Default::default(),
+                state: st.clone(),
+                retry: RetryState {
+                    retries: 0,
+                    max_retries: max,
+                },
+                created_at: std::time::Instant::now(),
+                file_priorities: None,
+                sequential: false,
+                metadata: TaskMetadata {
+                    name: None,
+                    added_at_unix: 0,
+                    tags: Vec::new(),
+                    finished_at_unix: 0,
+                    start_at_unix: 0,
+                    next_retry_at_unix: 0,
+                },
+                limits: None,
+            },
+            engine_tid: Some("fk1".into()),
+            engine_kind: EngineKind::Http,
+            engine_status: None,
+            events: vec![],
+        };
+        // state 与句柄一致性前置校验：Failed 用例应无句柄语义混淆——
+        // 统一从 Downloading 出发（真实失败路径正是活跃 → 失败）。
+        if st == TaskState::Failed {
+            rec.task.state = TaskState::Failed;
+            rec.engine_tid = None;
+        }
+        rec
+    }
+
+    #[test]
+    fn backoff_delay_sequence_and_cap() {
+        // 2/4/8/16/32 → 封顶 60
+        assert_eq!(retry_backoff_delay_s(1), 2);
+        assert_eq!(retry_backoff_delay_s(2), 4);
+        assert_eq!(retry_backoff_delay_s(3), 8);
+        assert_eq!(retry_backoff_delay_s(4), 16);
+        assert_eq!(retry_backoff_delay_s(5), 32);
+        assert_eq!(retry_backoff_delay_s(6), 60, "2^6=64 → 封顶 60");
+        assert_eq!(retry_backoff_delay_s(7), 60);
+        assert_eq!(retry_backoff_delay_s(25), 60, "远超上限恒封顶");
+    }
+
+    #[test]
+    fn fail_with_zero_budget_is_terminal() {
+        let mut rec = rec_with_retry(0, TaskState::Downloading(EngineKind::Http));
+        let to = rec.fail_or_schedule_retry(Some("boom"));
+        assert_eq!(to, TaskState::Failed);
+        assert_eq!(rec.task.state, TaskState::Failed);
+        assert_eq!(rec.task.retry.retries, 0, "max=0 不消耗计数");
+        assert_eq!(rec.task.metadata.next_retry_at_unix, 0);
+        assert!(
+            rec.events.iter().all(|e| e.op != "auto_retry"),
+            "终态不产生重试事件"
+        );
+    }
+
+    #[test]
+    fn fail_within_budget_schedules_retry() {
+        let mut rec = rec_with_retry(1, TaskState::Downloading(EngineKind::Http));
+        let to = rec.fail_or_schedule_retry(Some("boom"));
+        assert_eq!(to, TaskState::Queued, "预算未用尽 → 回队列等待退避");
+        assert_eq!(rec.task.state, TaskState::Queued);
+        assert_eq!(rec.task.retry.retries, 1);
+        assert!(
+            rec.task.metadata.next_retry_at_unix > now_unix(),
+            "next_retry 应为未来时刻（退避延迟）"
+        );
+        assert!(rec.engine_tid.is_none(), "重试等待任务必须无引擎句柄");
+        assert!(
+            rec.events.iter().any(|e| e.op == "auto_retry"),
+            "必须落 auto_retry 事件"
+        );
+
+        // 第二次失败：预算（max=1）用尽 → 终态
+        let to2 = rec.fail_or_schedule_retry(Some("boom again"));
+        assert_eq!(to2, TaskState::Failed);
+        assert_eq!(rec.task.retry.retries, 1, "retries 停在 max，不再递增");
+        assert_eq!(rec.task.state, TaskState::Failed);
+    }
+
+    #[tokio::test]
+    async fn poll_error_schedules_retry_then_exhausts() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task_opts(
+                "https://example.com/f.bin".into(),
+                None,
+                AddHttpOpts {
+                    auto_retry: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // 白盒推进到 Downloading（真实失败路径：活跃中报 Error）
+        state.tasks.lock().get_mut(&tid).unwrap().task.state =
+            TaskState::Downloading(EngineKind::Http);
+        fake.set_status_state(EngineState::Error);
+
+        // 首轮 poll：Error → 预算未用尽 → Queued + 重试安排
+        let effects = state.poll_engine_states().await;
+        assert_eq!(effects.len(), 1, "重试安排也是一次状态迁移（广播）");
+        assert_eq!(
+            effects[0].to,
+            TaskState::Queued,
+            "effect 目标必须是 Queued（非 Failed）"
+        );
+        {
+            let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+            assert_eq!(rec.task.state, TaskState::Queued);
+            assert_eq!(rec.task.retry.retries, 1);
+            assert_eq!(rec.task.retry.max_retries, 1);
+            assert!(rec.task.metadata.next_retry_at_unix > now_unix());
+            assert!(rec.engine_tid.is_none());
+        }
+
+        // 未到期：调度循环不激活
+        let activated = state.activate_due_tasks().await;
+        assert!(activated.is_empty(), "退避期内不得激活");
+
+        // 白盒到期 → 激活（引擎 add 恒成功）→ 恢复 Downloading → next_retry 消费
+        state
+            .tasks
+            .lock()
+            .get_mut(&tid)
+            .unwrap()
+            .task
+            .metadata
+            .next_retry_at_unix = 1;
+        let activated = state.activate_due_tasks().await;
+        assert_eq!(activated, vec![tid.clone()]);
+        {
+            let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+            // 重试 = 重新 add → 引擎侧新句柄（FakeEngine counter 自增：fk2）
+            assert!(rec.engine_tid.is_some(), "重试激活必须重建引擎句柄");
+            assert_eq!(
+                rec.task.metadata.next_retry_at_unix, 0,
+                "激活即消费重试安排"
+            );
+        }
+
+        // 再次 Error：预算用尽 → Failed 终态
+        state.tasks.lock().get_mut(&tid).unwrap().task.state =
+            TaskState::Downloading(EngineKind::Http);
+        let effects = state.poll_engine_states().await;
+        assert_eq!(effects.len(), 1);
+        assert_eq!(effects[0].to, TaskState::Failed);
+        let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+        assert_eq!(rec.task.state, TaskState::Failed);
+        assert_eq!(rec.task.retry.retries, 1);
+    }
+
+    #[tokio::test]
+    async fn poll_zero_budget_keeps_legacy_failed_semantics() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task("https://example.com/f.bin".into(), None)
+            .await
+            .unwrap();
+        state.tasks.lock().get_mut(&tid).unwrap().task.state =
+            TaskState::Downloading(EngineKind::Http);
+        fake.set_status_state(EngineState::Error);
+
+        state.poll_engine_states().await;
+        let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+        assert_eq!(
+            rec.task.state,
+            TaskState::Failed,
+            "默认 auto_retry=0 必须保持既有一次性失败语义"
+        );
+        assert_eq!(rec.task.metadata.next_retry_at_unix, 0);
+    }
+
+    #[tokio::test]
+    async fn add_failure_schedules_retry_and_succeeds_after_recovery() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        fake.fail_url("https://example.com/f.bin");
+        // 白盒建「重试等待」记录（首次 add 失败/restore 激活失败后的形态）：
+        // Queued + 句柄空 + next_retry 已到期
+        let tid = "t901".to_string();
+        state.tasks.lock().insert(
+            tid.clone(),
+            TaskRecord {
+                task: DownloadTask {
+                    id: tid.clone(),
+                    canonical_id: CanonicalId {
+                        kind: CanonicalKind::Http,
+                        identity: "https://example.com/f.bin".into(),
+                        validator: None,
+                        token_sensitive: false,
+                    },
+                    source: DownloadSource::Http {
+                        url: "https://example.com/f.bin".into(),
+                        headers: vec![],
+                        auth: None,
+                        backup_url: None,
+                        proxy: None,
+                    },
+                    identity: ContentIdentity::SingleFile {
+                        size: 0,
+                        etag: None,
+                        sha256: None,
+                        sha1: None,
+                        md5: None,
+                        backup_md5: None,
+                    },
+                    dest_root: PathBuf::from("."),
+                    files: vec![],
+                    acquisitions: vec![],
+                    aggregate: Default::default(),
+                    state: TaskState::Queued,
+                    retry: RetryState {
+                        retries: 0,
+                        max_retries: 1,
+                    },
+                    created_at: std::time::Instant::now(),
+                    file_priorities: None,
+                    sequential: false,
+                    metadata: TaskMetadata {
+                        name: None,
+                        added_at_unix: 0,
+                        tags: Vec::new(),
+                        finished_at_unix: 0,
+                        start_at_unix: 0,
+                        next_retry_at_unix: 1, // 已到期
+                    },
+                    limits: None,
+                },
+                engine_tid: None,
+                engine_kind: EngineKind::Http,
+                engine_status: None,
+                events: vec![],
+            },
+        );
+
+        // add 仍败：重试预算消耗 → 再次安排（retries=1，继续等待）
+        let activated = state.activate_due_tasks().await;
+        assert!(activated.is_empty(), "重试轮仍失败不进 activated");
+        {
+            let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+            assert_eq!(rec.task.state, TaskState::Queued, "预算内 → 继续等待");
+            assert_eq!(rec.task.retry.retries, 1);
+            assert!(rec.task.metadata.next_retry_at_unix > 1, "新退避时刻已安排");
+        }
+
+        // 源恢复 → 到期重激活成功
+        fake.unfail_url("https://example.com/f.bin");
+        state
+            .tasks
+            .lock()
+            .get_mut(&tid)
+            .unwrap()
+            .task
+            .metadata
+            .next_retry_at_unix = 1;
+        let activated = state.activate_due_tasks().await;
+        assert_eq!(activated, vec![tid.clone()]);
+        let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+        assert!(rec.engine_tid.is_some());
+        assert_eq!(
+            fake.added().len(),
+            1,
+            "恢复后重试 add 成功 1 次（首败在记录前）"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_and_summary_surface_retry_fields() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task_opts(
+                "https://example.com/f.bin".into(),
+                None,
+                AddHttpOpts {
+                    auto_retry: 3,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let snap = state.task_snapshot(&tid).await.unwrap();
+        let json = serde_json::to_value(&snap).unwrap();
+        assert!(json.get("retries").is_none(), "retries=0 序列化省略");
+        assert_eq!(json["max_retries"], 3);
+        assert!(
+            json.get("next_retry_at_unix").is_none(),
+            "无重试安排序列化省略"
+        );
+
+        // 安排重试后：三字段全透出
+        state
+            .tasks
+            .lock()
+            .get_mut(&tid)
+            .unwrap()
+            .fail_or_schedule_retry(Some("x"));
+        let snap = state.task_snapshot(&tid).await.unwrap();
+        let json = serde_json::to_value(&snap).unwrap();
+        assert_eq!(json["retries"], 1);
+        assert_eq!(json["max_retries"], 3);
+        assert!(json["next_retry_at_unix"].as_u64().unwrap() > 0);
+
+        let (summaries, _) = state.list_filtered(&ListQuery::default());
+        let s = summaries.iter().find(|s| s.task_id == tid).unwrap();
+        assert_eq!(s.retries, 1);
+        assert_eq!(s.max_retries, 3);
     }
 }
 
@@ -7437,6 +7915,7 @@ mod rate_cache_tests {
                     tags: Vec::new(),
                     finished_at_unix: 0,
                     start_at_unix: 0,
+                    next_retry_at_unix: 0,
                 },
                 limits: None,
             },
@@ -7995,6 +8474,7 @@ mod batch_select_tests {
                     tags: Vec::new(),
                     finished_at_unix: 0,
                     start_at_unix: 0,
+                    next_retry_at_unix: 0,
                 },
                 limits: None,
             },
@@ -8207,6 +8687,7 @@ mod cleanup_tests {
                     tags: Vec::new(),
                     finished_at_unix,
                     start_at_unix: 0,
+                    next_retry_at_unix: 0,
                 },
                 limits: None,
             },
@@ -8475,6 +8956,7 @@ mod scheduled_tests {
                     tags: Vec::new(),
                     finished_at_unix: 0,
                     start_at_unix: start_at,
+                    next_retry_at_unix: 0,
                 },
                 limits: None,
             },
@@ -8925,6 +9407,7 @@ mod bt_name_backfill_tests {
                     tags: Vec::new(),
                     finished_at_unix: 0,
                     start_at_unix: 0,
+                    next_retry_at_unix: 0,
                 },
                 limits: None,
             },

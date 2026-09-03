@@ -123,4 +123,10 @@ pub struct TaskMetadata {
     /// 兼容旧档。
     #[serde(default)]
     pub start_at_unix: u64,
+    /// 自动重试到期时刻（E30，unix 秒；0 = 无重试安排）：任务失败且重试预算
+    /// 未用尽时，daemon 清空引擎句柄、任务回 Queued 并按指数退避安排到期
+    /// 重激活。持久化 + 恢复：重启后未到期的重试继续等待。serde default
+    /// 兼容旧档。
+    #[serde(default)]
+    pub next_retry_at_unix: u64,
 }
