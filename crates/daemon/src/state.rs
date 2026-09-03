@@ -31,6 +31,10 @@ pub struct TaskRecord {
     pub task: DownloadTask,
     pub engine_tid: Option<EngineTaskId>,
     pub engine_kind: EngineKind,
+    /// 引擎快照缓存（E11 起真实写入）：轮询器每轮对活跃任务整体写入
+    /// `engine.status()` 结果——速率供 `/stats` 聚合、error 供 `task_logs`；
+    /// 运行态字段不落盘（持久化排除），写缓存不触发 autosave。
+    /// 非活跃（暂停/终态）时轮询不再光顾，速率由 pause/终态迁移清零防陈旧。
     pub engine_status: Option<EngineStatus>,
     /// 运行态操作日志（add/pause/resume/remove/restored；引擎状态变更不记——见快照）。
     events: Vec<TaskEvent>,
@@ -193,7 +197,9 @@ pub struct BatchOutcome {
 }
 
 /// 全局统计（`GET /stats`）：任务按状态/引擎聚合 + 聚合速率。
-/// 速率来自引擎快照缓存（`engine_status`，1s 轮询口径），非实时值。
+/// 速率来自引擎快照缓存（`engine_status`，serve 装配 2s 轮询口径），非实时值；
+/// 覆盖 HTTP/FTP（引擎侧增量采样）与 BT（FFI 实时值）的活跃任务
+/// （Downloading/Seeding/Queued），暂停/终态速率清零。
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct DaemonStats {
     /// 任务总数。
@@ -1883,6 +1889,12 @@ impl DaemonState {
         if let Some(rec) = self.tasks.lock().get_mut(id) {
             rec.push_event("pause", None);
             rec.task.state = TaskState::Paused; // 记录缓存同步（alert 流不迁移 pause）
+                                                // E11：暂停即清零缓存速率——轮询器不再光顾暂停任务，
+                                                // 不清则 /stats 恒把最后窗口速率计入聚合（恢复后下一轮刷新）。
+            if let Some(es) = rec.engine_status.as_mut() {
+                es.down_rate = 0;
+                es.up_rate = 0;
+            }
         }
         // 暂停意图必须立刻持久化（P4 G5）：否则重启后暂停任务被当作运行任务恢复
         self.autosave();
@@ -2693,6 +2705,19 @@ impl DaemonState {
                     if to == TaskState::Failed {
                         es.error = Some(a.msg.clone());
                     }
+                    // E11：BT 走向非活跃态时轮询缓存仍持最后窗口速率——
+                    // 轮询器不再光顾非活跃任务，不清则 /stats 聚合虚高（陈旧速率）。
+                    // Seeding 不清：仍是活跃轮询候选，下一轮以引擎实时值刷新。
+                    if matches!(
+                        to,
+                        TaskState::Paused
+                            | TaskState::Completed
+                            | TaskState::Failed
+                            | TaskState::Stopped
+                    ) {
+                        es.down_rate = 0;
+                        es.up_rate = 0;
+                    }
                 }
                 found = Some(BtAlertEffect {
                     task_id: id.clone(),
@@ -2710,25 +2735,34 @@ impl DaemonState {
         effect
     }
 
-    /// HTTP 任务状态推进轮询：权威 = 引擎实时状态（v1 HTTP 引擎无 alert 回调，
-    /// 记录 state 此前停在 Queued——list 与 status 不一致）。每轮：
-    /// - 引擎终态（Completed/Error）→ 记录推进 Completed/Failed + 落盘；
-    /// - 引擎活跃（Downloading/MetadataPending）→ Queued 记录顺带推进 Downloading(Http)。
+    /// 引擎状态轮询：HTTP/FTP 任务状态推进（记录权威=引擎实时态）+ 全引擎速率缓存。
+    /// 每轮对候选项调用 `engine.status()`：
+    /// - 缓存：`EngineStatus` 整体写入 `engine_status`（速率/错误供 `/stats`、
+    ///   `task_logs` 读取；运行态字段不落盘，无 autosave 负担）；
+    /// - HTTP/FTP：引擎终态（Completed/Error）→ 记录推进 Completed/Failed + 落盘；
+    ///   引擎活跃（Downloading/MetadataPending）→ Queued 记录顺带推进 Downloading；
+    /// - BT：仅缓存（状态权威 = alert 流，轮询不得双头迁移）。
     ///
-    /// 返回本批效果供事件广播；无变化的任务跳过。
-    pub async fn poll_http_task_states(&self) -> Vec<HttpPollEffect> {
-        // 先收集候选（锁外做引擎调用；避免长持锁）。HTTP + FTP 引擎任务都走本推进路径
-        //（FTP 引擎无 alert 回调，状态推进依赖轮询——与 HTTP 一致）。
+    /// 返回本批 HTTP/FTP 迁移效果供事件广播；无变化的任务跳过。
+    pub async fn poll_engine_states(&self) -> Vec<HttpPollEffect> {
+        // 先收集候选（锁外做引擎调用；避免长持锁）。HTTP/FTP 引擎无 alert 回调，
+        // 状态推进依赖轮询；BT 活跃任务仅做速率缓存（Downloading/Seeding——
+        // 做种中 up_rate 对 /stats 有意义）。
         let candidates: Vec<(String, EngineTaskId, EngineKind)> = {
             let tasks = self.tasks.lock();
             tasks
                 .iter()
-                .filter(|(_, rec)| matches!(rec.engine_kind, EngineKind::Http | EngineKind::Ftp))
-                .filter(|(_, rec)| {
-                    matches!(
+                .filter(|(_, rec)| match rec.engine_kind {
+                    EngineKind::Http | EngineKind::Ftp => matches!(
                         rec.task.state,
                         TaskState::Queued | TaskState::Downloading(_)
-                    )
+                    ),
+                    EngineKind::Bt => matches!(
+                        rec.task.state,
+                        TaskState::Downloading(_) | TaskState::Seeding
+                    ),
+                    // provider/xunlei-nas 暂无轮询路径
+                    EngineKind::Provider | EngineKind::XunleiNas => false,
                 })
                 .filter_map(|(id, rec)| {
                     rec.engine_tid
@@ -2746,6 +2780,21 @@ impl DaemonState {
             let Ok(st) = engine.status(&tid).await else {
                 continue;
             };
+            if matches!(kind, EngineKind::Bt) {
+                // BT 缓存分支：只写快照，不迁移不回填不落盘（状态权威 = alert 流）。
+                let mut tasks = self.tasks.lock();
+                if let Some(rec) = tasks.get_mut(&id) {
+                    // 双检：轮询间隙状态可能已被 alert 推进至终态
+                    //（终态不缓存——与 apply_bt_alert 的终态清零同口径）
+                    if matches!(
+                        rec.task.state,
+                        TaskState::Downloading(_) | TaskState::Seeding
+                    ) {
+                        rec.engine_status = Some(st.clone());
+                    }
+                }
+                continue;
+            }
             // Bug B 根因修复：autosave 移到锁外（persisted_tasks 重入同一把非重入锁
             // 会同线程自死锁——与 apply_bt_alert 同源缺陷）。
             let mut backfilled = false;
@@ -2761,6 +2810,9 @@ impl DaemonState {
                 ) {
                     continue;
                 }
+                // E11 速率缓存：引擎快照整体入缓存（含速率/错误；运行态不落盘，
+                // 不 autosave）。置于回填/迁移之前——to==from 轮次缓存仍刷新。
+                rec.engine_status = Some(st.clone());
                 // E9 名字回填（幂等）：metadata.name 空缺 + 引擎报了最终落盘名
                 // → 回填 + 事件。置于状态迁移判断之前：下载中任务 to==from
                 // 不迁移，但回填仍需进行（回填一次成功后 name 非 None 自然停）。
@@ -2774,15 +2826,11 @@ impl DaemonState {
                 let from = rec.task.state.clone();
                 let to = engine_state_to_task(&st.state, kind);
                 if to == from {
-                    // 已在目标态（活跃→活跃）：不迁移，但本轮回填仍生效
+                    // 已在目标态（活跃→活跃）：不迁移，但本轮回填/缓存仍生效
                     None
                 } else {
+                    // 错误随快照整体入缓存（st.error），无需单独写点
                     rec.task.state = to.clone();
-                    if let Some(es) = rec.engine_status.as_mut() {
-                        if to == TaskState::Failed {
-                            es.error = st.error.clone();
-                        }
-                    }
                     Some(from)
                 }
             }; // ← tasks 锁在此释放
@@ -3215,6 +3263,63 @@ mod bt_alert_tests {
             resume_ready: false,
         };
         assert!(state.apply_bt_alert(&alert).is_none());
+    }
+
+    #[test]
+    fn error_alert_zeroes_cached_rates() {
+        // E11：轮询缓存持最后窗口速率，Error alert → Failed（非活跃终态）
+        // → 速率清零，否则 /stats 聚合把陈旧速率计入失败任务。
+        let mut rec = bt_rec(TaskState::Downloading(EngineKind::Bt), "RATES01");
+        rec.engine_status = Some(EngineStatus {
+            down_rate: 3000,
+            up_rate: 1500,
+            ..EngineStatus::default()
+        });
+        let state = make_state_with(rec);
+        let alert = Alert {
+            kind: AlertKind::State,
+            ih: "rates01".into(),
+            msg: "torrent error: pex failed".into(),
+            at: 0,
+            resume_ready: false,
+        };
+        let eff = state.apply_bt_alert(&alert).unwrap();
+        assert_eq!(eff.to, TaskState::Failed);
+        let rec_lock = state.tasks.lock();
+        let es = rec_lock.get("t1").unwrap().engine_status.as_ref().unwrap();
+        assert_eq!(es.down_rate, 0, "Failed 后缓存下行速率必须清零");
+        assert_eq!(es.up_rate, 0, "Failed 后缓存上行速率必须清零");
+        assert_eq!(
+            es.error.as_deref(),
+            Some("torrent error: pex failed"),
+            "错误信息随迁移写入缓存（task_logs 读取口径）"
+        );
+    }
+
+    #[test]
+    fn finished_alert_keeps_rates_for_seeding_poll() {
+        // Finished → Seeding：不做种前清零（Seeding 仍是活跃轮询候选，
+        // 下一轮以引擎实时值刷新——上行速率对 /stats 有意义）。
+        let mut rec = bt_rec(TaskState::Downloading(EngineKind::Bt), "RATES02");
+        rec.engine_status = Some(EngineStatus {
+            down_rate: 3000,
+            up_rate: 1500,
+            ..EngineStatus::default()
+        });
+        let state = make_state_with(rec);
+        let alert = Alert {
+            kind: AlertKind::State,
+            ih: "rates02".into(),
+            msg: "torrent finished downloading".into(),
+            at: 0,
+            resume_ready: false,
+        };
+        let eff = state.apply_bt_alert(&alert).unwrap();
+        assert_eq!(eff.to, TaskState::Seeding);
+        let rec_lock = state.tasks.lock();
+        let es = rec_lock.get("t1").unwrap().engine_status.as_ref().unwrap();
+        assert_eq!(es.down_rate, 3000, "Seeding 不清零（活跃候选待刷新）");
+        assert_eq!(es.up_rate, 1500);
     }
 
     #[test]
@@ -3734,6 +3839,8 @@ pub struct FakeEngine {
     proxy_sets: parking_lot::Mutex<Vec<(String, Option<String>)>>,
     /// status().name 可编程回显（E9 名字回填测试用；None = 不透出）。
     status_name: parking_lot::Mutex<Option<String>>,
+    /// status() 速率回显（(down, up) B/s，E11 速率缓存测试用；默认 (0,0) 旧行为）。
+    status_rates: parking_lot::Mutex<(u64, u64)>,
 }
 
 #[cfg(test)]
@@ -3755,6 +3862,7 @@ impl FakeEngine {
             removed: parking_lot::Mutex::new(Vec::new()),
             proxy_sets: parking_lot::Mutex::new(Vec::new()),
             status_name: parking_lot::Mutex::new(None),
+            status_rates: parking_lot::Mutex::new((0, 0)),
         }
     }
 
@@ -3798,6 +3906,11 @@ impl FakeEngine {
     /// 设置 status().name 回显值（E9 名字回填测试：模拟引擎已定落盘名）。
     pub fn set_status_name(&self, name: &str) {
         *self.status_name.lock() = Some(name.to_string());
+    }
+
+    /// 设置 status() 速率回显（(down, up) B/s；E11 速率缓存测试用）。
+    pub fn set_status_rates(&self, down: u64, up: u64) {
+        *self.status_rates.lock() = (down, up);
     }
 
     /// 读取已下发的 resume 调用（P4 G5 重放测试断言用）。
@@ -3873,7 +3986,10 @@ impl DownloadEngine for FakeEngine {
         &self,
         _id: &EngineTaskId,
     ) -> Result<EngineStatus, smart_dl_core::types::EngineError> {
+        let (down_rate, up_rate) = *self.status_rates.lock();
         Ok(EngineStatus {
+            down_rate,
+            up_rate,
             files: self.status_files.lock().clone(),
             name: self.status_name.lock().clone(),
             ..EngineStatus::default()
@@ -4378,7 +4494,7 @@ mod persist_tests {
     }
 
     /// Bug B 回归（重入自死锁，HTTP 推进路径）：storage 启用 + 引擎状态推进
-    /// （Queued → Downloading）触发锁内 autosave。修复前：poll_http_task_states
+    /// （Queued → Downloading）触发锁内 autosave。修复前：poll_engine_states
     /// 持 tasks 锁调 autosave → persisted_tasks 同线程重入 → 5s 超时失败。
     #[tokio::test(flavor = "multi_thread")]
     async fn http_poll_transition_with_storage_autosave_no_deadlock() {
@@ -4392,10 +4508,10 @@ mod persist_tests {
             .unwrap();
         // FakeEngine::status 默认 MetadataPending → 推进 Queued→Downloading(Http)
         //（迁移必发生 → 必走 autosave 路径）
-        let work = state.poll_http_task_states();
+        let work = state.poll_engine_states();
         let effects = tokio::time::timeout(std::time::Duration::from_secs(5), work)
             .await
-            .expect("poll_http_task_states 死锁（Bug B 重入回归）");
+            .expect("poll_engine_states 死锁（Bug B 重入回归）");
         assert_eq!(effects.len(), 1, "应推进一条任务状态");
         assert!(store.exists(), "状态推进应触发持久化落盘");
     }
@@ -4671,7 +4787,7 @@ mod ftp_tests {
     }
 
     /// 端到端验收（卡 D）：FTP 目录任务（2 文件）→ add 后 task.files 同步 →
-    /// poll_http_task_states 推进 Completed → 快照含文件信息且逐文件 done==size；
+    /// poll_engine_states 推进 Completed → 快照含文件信息且逐文件 done==size；
     /// 同时一个 HTTP 任务（独立 Http 槽）不受影响。
     #[tokio::test]
     async fn ftp_dir_completes_and_http_unaffected() {
@@ -4723,7 +4839,7 @@ mod ftp_tests {
         // 3) 轮询推进 FTP 到 Completed（FTP 引擎无 alert，靠 poll 推进——同 HTTP 链路）
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
-            let _ = state.poll_http_task_states().await;
+            let _ = state.poll_engine_states().await;
             if let Some(snap) = state.task_snapshot(&ftp_tid).await {
                 if snap.state == "Completed" {
                     // 快照含文件信息，且逐文件 done==size
@@ -5576,7 +5692,7 @@ mod name_backfill_tests {
         fake.set_status_name("cd-derived.bin");
 
         // 首轮：迁移（Queued→Downloading，FakeEngine 恒 MetadataPending）+ 回填
-        let effects = state.poll_http_task_states().await;
+        let effects = state.poll_engine_states().await;
         assert_eq!(effects.len(), 1, "首轮应有状态迁移");
         {
             let rec = state.tasks.lock().get(&tid).cloned().unwrap();
@@ -5592,7 +5708,7 @@ mod name_backfill_tests {
         }
 
         // 幂等：次轮零迁移零重复回填（to==from 纯无操作）
-        let effects2 = state.poll_http_task_states().await;
+        let effects2 = state.poll_engine_states().await;
         assert!(effects2.is_empty(), "to==from 纯回填轮次不产生迁移广播");
         let rec2 = state.tasks.lock().get(&tid).cloned().unwrap();
         assert_eq!(rec2.task.metadata.name.as_deref(), Some("cd-derived.bin"));
@@ -5625,7 +5741,7 @@ mod name_backfill_tests {
             .unwrap();
         fake.set_status_name("engine-name.bin");
 
-        state.poll_http_task_states().await;
+        state.poll_engine_states().await;
         let rec = state.tasks.lock().get(&tid).cloned().unwrap();
         assert_eq!(
             rec.task.metadata.name.as_deref(),
@@ -5647,9 +5763,168 @@ mod name_backfill_tests {
             .await
             .unwrap();
         // 引擎不透出 name（status_name 恒 None）→ 不回填不事件
-        state.poll_http_task_states().await;
+        state.poll_engine_states().await;
         let rec = state.tasks.lock().get(&tid).cloned().unwrap();
         assert!(rec.task.metadata.name.is_none(), "引擎未报 → 保持 None");
         assert!(!rec.events.iter().any(|e| e.op == "name_backfilled"));
+    }
+}
+
+/// E11 速率缓存：轮询器把引擎快照写入 `engine_status` → `/stats` 聚合生效；
+/// BT 仅缓存不迁移（状态权威 = alert 流）；暂停/终态清零防陈旧速率。
+#[cfg(test)]
+mod rate_cache_tests {
+    use super::*;
+
+    /// 插入指定状态的 BT 任务记录（不联网，engine_tid = infohash）。
+    fn insert_bt_rec_with(state: &DaemonState, id: &str, ih: &str, st: TaskState) {
+        let rec = TaskRecord {
+            task: DownloadTask {
+                id: id.into(),
+                canonical_id: CanonicalId {
+                    kind: CanonicalKind::Bt,
+                    identity: ih.to_string(),
+                    validator: None,
+                    token_sensitive: false,
+                },
+                source: DownloadSource::Magnet(format!("magnet:?xt=urn:btih:{ih}")),
+                identity: ContentIdentity::SingleFile {
+                    size: 0,
+                    etag: None,
+                    sha256: None,
+                    backup_md5: None,
+                },
+                dest_root: PathBuf::from("."),
+                files: vec![],
+                acquisitions: vec![],
+                aggregate: Default::default(),
+                state: st,
+                retry: Default::default(),
+                created_at: std::time::Instant::now(),
+                file_priorities: None,
+                sequential: false,
+                metadata: TaskMetadata {
+                    name: None,
+                    added_at_unix: 0,
+                },
+                limits: None,
+            },
+            engine_tid: Some(ih.to_string()),
+            engine_kind: EngineKind::Bt,
+            engine_status: None,
+            events: vec![],
+        };
+        state.tasks.lock().insert(id.into(), rec);
+    }
+
+    #[tokio::test]
+    async fn poll_caches_rates_into_stats_and_pause_zeroes() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task("https://example.com/f.bin".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(state.stats().down_bytes_s, 0, "轮询前缓存为空 → 聚合速率 0");
+
+        fake.set_status_rates(1000, 50);
+        state.poll_engine_states().await;
+        let st = state.stats();
+        assert_eq!(st.down_bytes_s, 1000, "HTTP 引擎报的下行速率应入 /stats");
+        assert_eq!(st.up_bytes_s, 50);
+        {
+            let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+            let es = rec.engine_status.expect("缓存应有引擎快照");
+            assert_eq!(es.down_rate, 1000);
+            assert_eq!(es.up_rate, 50);
+        }
+
+        // 暂停：清零缓存速率（轮询器不再光顾暂停任务，不清则聚合虚高）
+        state.pause(&tid).await.unwrap();
+        let st = state.stats();
+        assert_eq!(st.down_bytes_s, 0, "暂停后聚合下行速率必须清零");
+        assert_eq!(st.up_bytes_s, 0, "暂停后聚合上行速率必须清零");
+        assert_eq!(
+            state.task_logs(&tid).unwrap()["state"],
+            serde_json::json!("Paused")
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_refreshes_rates_each_round() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        state
+            .add_http_task("https://example.com/f.bin".into(), None)
+            .await
+            .unwrap();
+
+        fake.set_status_rates(500, 0);
+        state.poll_engine_states().await;
+        assert_eq!(state.stats().down_bytes_s, 500);
+
+        fake.set_status_rates(0, 0);
+        state.poll_engine_states().await;
+        assert_eq!(state.stats().down_bytes_s, 0, "缓存跟随引擎每轮刷新");
+    }
+
+    #[tokio::test]
+    async fn bt_rates_cached_without_transition() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        insert_bt_rec_with(
+            &state,
+            "t-bt",
+            "ABC123",
+            TaskState::Downloading(EngineKind::Bt),
+        );
+        fake.set_status_rates(2000, 1000);
+
+        let effects = state.poll_engine_states().await;
+        assert!(effects.is_empty(), "BT 轮询仅缓存，不产生迁移效果");
+        {
+            let rec = state.tasks.lock().get("t-bt").cloned().unwrap();
+            assert_eq!(
+                rec.task.state,
+                TaskState::Downloading(EngineKind::Bt),
+                "BT 状态权威 = alert 流，轮询不得迁移"
+            );
+            let es = rec.engine_status.expect("BT 快照应入缓存");
+            assert_eq!(es.down_rate, 2000);
+            assert_eq!(es.up_rate, 1000);
+        }
+        let st = state.stats();
+        assert_eq!(st.down_bytes_s, 2000);
+        assert_eq!(st.up_bytes_s, 1000);
+    }
+
+    #[tokio::test]
+    async fn seeding_bt_task_rates_cached() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        insert_bt_rec_with(&state, "t-seed", "DEF456", TaskState::Seeding);
+        fake.set_status_rates(0, 800);
+
+        let effects = state.poll_engine_states().await;
+        assert!(effects.is_empty());
+        let st = state.stats();
+        assert_eq!(st.up_bytes_s, 800, "做种中上行速率应入聚合");
+        assert_eq!(st.down_bytes_s, 0);
+    }
+
+    #[tokio::test]
+    async fn paused_bt_task_not_polled() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        insert_bt_rec_with(&state, "t-paused", "FFF111", TaskState::Paused);
+        fake.set_status_rates(999, 999);
+
+        state.poll_engine_states().await;
+        let rec = state.tasks.lock().get("t-paused").cloned().unwrap();
+        assert!(
+            rec.engine_status.is_none(),
+            "暂停任务不在候选集——缓存不得被写入陈旧速率"
+        );
+        assert_eq!(state.stats().down_bytes_s, 0);
     }
 }
