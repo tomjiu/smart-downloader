@@ -32,9 +32,8 @@ pub fn spawn_http_events(
                 });
                 match &effect.to {
                     TaskState::Completed => {
-                        hub.publish(SchedulerEvent::Completed {
-                            task_id: effect.task_id,
-                        });
+                        // E17：完成事件统一出口（广播 + Webhook）
+                        state.publish_task_completed(&effect.task_id);
                     }
                     TaskState::Failed => {
                         hub.publish(SchedulerEvent::Failed {

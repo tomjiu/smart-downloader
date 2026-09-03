@@ -70,9 +70,8 @@ pub fn spawn_alert_loop(
                 });
                 match &effect.to {
                     TaskState::Seeding => {
-                        hub.publish(SchedulerEvent::Completed {
-                            task_id: effect.task_id.clone(),
-                        });
+                        // E17：完成事件统一出口（广播 + Webhook；BT 下载完成 = 进做种）
+                        state.publish_task_completed(&effect.task_id);
                     }
                     TaskState::Failed => {
                         hub.publish(SchedulerEvent::Failed {

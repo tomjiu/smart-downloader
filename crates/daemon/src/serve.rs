@@ -128,13 +128,15 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         .with_dest_root(cfg.download.dest_root.clone())
         .with_http_token(http_token.clone())
         .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
-        .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s);
+        .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s)
+        .with_webhook_url((!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone()));
     #[cfg(not(feature = "bt"))]
     let mut state = DaemonState::new(http_engine, providers)
         .with_dest_root(cfg.download.dest_root.clone())
         .with_http_token(http_token.clone())
         .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
-        .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s);
+        .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s)
+        .with_webhook_url((!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone()));
 
     // 4. BT 引擎（先取 core 句柄，供 alert 事件流）
     #[cfg(feature = "bt")]
