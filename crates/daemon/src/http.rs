@@ -1135,6 +1135,55 @@ struct BatchTaskReq {
     ids: Vec<String>,
     #[serde(default)]
     delete_data: bool,
+    /// E19：条件选择（与 `ids` 二选一：同时提供或均缺失 → 400）。命中集
+    /// 全量执行 action；仅支持 pause/resume（remove 走显式 ids，非破坏性原则）。
+    #[serde(default)]
+    select: Option<BatchSelect>,
+}
+
+/// 条件选择器（E19）：与 `GET /tasks` 过滤参数同口径——`state`/`engine`
+/// 走合法标签校验（逗号分隔多值，大小写不敏感）；`tag` 逗号分隔任意串；
+/// `search` 子串。至少提供一个条件（全空 → 400，防 `{}` 误匹配全量任务）。
+#[derive(Deserialize, Default)]
+struct BatchSelect {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    engine: Option<String>,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    search: Option<String>,
+}
+
+fn parse_batch_select(s: &BatchSelect) -> Result<ListQuery, String> {
+    let empty = s.state.is_none() && s.engine.is_none() && s.tag.is_none() && s.search.is_none();
+    if empty {
+        return Err("选择条件不能全空（state/engine/tag/search 至少一项）".into());
+    }
+    Ok(ListQuery {
+        states: parse_label_list(&s.state, &known_state_labels(), "state")?,
+        engines: parse_label_list(&s.engine, &known_engine_labels(), "engine")?,
+        limit: None,
+        offset: 0,
+        search: s
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
+        tags: s
+            .tag
+            .as_deref()
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
 }
 
 /// 批量 id 上限（批量语义是便利入口不是全表操作入口；防误传全量 id 集合）。
@@ -1375,6 +1424,36 @@ async fn batch_tasks(
         )
             .into_response(),
     };
+    // E19：ids 与 select 二选一
+    if let Some(select) = body.select.as_ref() {
+        if !body.ids.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "ids 与 select 只能二选一" })),
+            )
+                .into_response();
+        }
+        let q = match parse_batch_select(select) {
+            Ok(q) => q,
+            Err(msg) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": msg })),
+                )
+                    .into_response()
+            }
+        };
+        return match state.batch_select(&q, action).await {
+            Ok(outcome) => Json(outcome).into_response(),
+            Err(e) => {
+                let status = match e {
+                    DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+            }
+        };
+    }
     if body.ids.is_empty() {
         return (
             StatusCode::BAD_REQUEST,
