@@ -52,3 +52,4 @@ futures = { workspace = true }
 tokio-tungstenite = "0.20"
 base64 = "0.22"
 sha2 = "0.10"
+md-5 = "0.10"

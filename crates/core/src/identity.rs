@@ -41,6 +41,14 @@ pub enum ContentIdentity {
         size: u64,
         etag: Option<String>,
         sha256: Option<String>,
+        /// 主源 SHA1 校验（E25，40 位十六进制）。与 sha256/md5 互斥
+        /// （add 层 validate 保证，至多一个 Some）。
+        #[serde(default)]
+        sha1: Option<String>,
+        /// 主源 MD5 校验（E25，32 位十六进制）。与 sha256/sha1 互斥
+        /// （add 层 validate 保证，至多一个 Some）。
+        #[serde(default)]
+        md5: Option<String>,
         /// 备用源内容 MD5（夸克 backup_md5 机制：切换备用源后以其校验）。
         #[serde(default)]
         backup_md5: Option<String>,

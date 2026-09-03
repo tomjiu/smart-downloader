@@ -27,6 +27,8 @@ fn bt_partial_task(dest_root: std::path::PathBuf) -> smart_dl_core::task::Downlo
             size: 0,
             etag: None,
             sha256: None,
+            sha1: None,
+            md5: None,
             backup_md5: None,
         },
         dest_root,

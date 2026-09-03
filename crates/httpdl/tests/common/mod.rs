@@ -40,6 +40,8 @@ pub fn make_http_task_to(
             size: 0,
             etag: None,
             sha256: None,
+            sha1: None,
+            md5: None,
             backup_md5: None,
         },
         dest_root,
@@ -75,6 +77,48 @@ pub fn make_http_task_sha256(
         size: 0,
         etag: None,
         sha256: Some(sha256.to_string()),
+        sha1: None,
+        md5: None,
+        backup_md5: None,
+    };
+    t
+}
+
+/// 带主源 sha1 的任务（E25 verify 用例）。
+pub fn make_http_task_sha1(
+    id: &str,
+    url: &str,
+    dest_root: PathBuf,
+    name: &str,
+    sha1: &str,
+) -> DownloadTask {
+    let mut t = make_http_task_to(id, url, dest_root, Some(name));
+    t.identity = ContentIdentity::SingleFile {
+        size: 0,
+        etag: None,
+        sha256: None,
+        sha1: Some(sha1.to_string()),
+        md5: None,
+        backup_md5: None,
+    };
+    t
+}
+
+/// 带主源 md5 的任务（E25 verify 用例）。
+pub fn make_http_task_md5(
+    id: &str,
+    url: &str,
+    dest_root: PathBuf,
+    name: &str,
+    md5: &str,
+) -> DownloadTask {
+    let mut t = make_http_task_to(id, url, dest_root, Some(name));
+    t.identity = ContentIdentity::SingleFile {
+        size: 0,
+        etag: None,
+        sha256: None,
+        sha1: None,
+        md5: Some(md5.to_string()),
         backup_md5: None,
     };
     t
@@ -102,6 +146,8 @@ pub fn make_http_task_backup(
         size: 0,
         etag: None,
         sha256: Some(sha256.to_string()),
+        sha1: None,
+        md5: None,
         backup_md5: Some(backup_md5.to_string()),
     };
     t
@@ -127,6 +173,8 @@ pub fn make_ftp_task(id: &str, url: &str, dest_root: PathBuf, name: &str) -> Dow
             size: 0,
             etag: None,
             sha256: None,
+            sha1: None,
+            md5: None,
             backup_md5: None,
         },
         dest_root,
