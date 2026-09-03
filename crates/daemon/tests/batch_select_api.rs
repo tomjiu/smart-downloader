@@ -169,3 +169,37 @@ async fn batch_select_validation_rejected() {
     let outcome: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(outcome["succeeded"], 0);
 }
+
+/// E22 Prometheus 指标端点：/metrics 暴露 text/plain 格式任务/速率指标
+/// （从 stats() 聚合派生）。
+#[tokio::test]
+async fn metrics_endpoint_exposes_prometheus_format() {
+    let base = serve().await;
+    let client = reqwest::Client::new();
+    let srv = TestServer::start(common::patterned(1024)).await;
+    let id = add_task(&client, &base, &srv.url(), 1).await;
+    let _ = id;
+
+    let resp = client.get(format!("{base}/metrics")).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        ct.starts_with("text/plain"),
+        "content-type 应 text/plain: {ct}"
+    );
+    let body = resp.text().await.unwrap();
+    assert!(body.contains("# HELP smart_dl_tasks_total"));
+    assert!(body.contains("# TYPE smart_dl_tasks_total gauge"));
+    // queued 任务计数（新任务记录态 Queued）
+    assert!(
+        body.contains("dimension=\"state\",label=\"Queued\""),
+        "应含 Queued 状态指标: {body}"
+    );
+    assert!(body.contains("direction=\"down\""));
+    assert!(body.contains("direction=\"up\""));
+}

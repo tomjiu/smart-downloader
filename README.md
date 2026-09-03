@@ -107,6 +107,7 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 | `/bt/metadata` | POST | magnet 元数据抓取（摘要 + torrent_b64） |
 | `/config` | GET | 当前配置（限速两键随运行中热改同步） |
 | `/stats` · `/version` · `/health` | GET | 运维三件套 |
+| `/metrics` | GET | Prometheus 指标（text/plain；任务按状态/引擎计数 + 聚合速率） |
 | `/providers` | GET | Provider 状态 |
 | `/events` | GET | 事件历史查询（seq 游标分页 + task_id/type 过滤 + 缺口报警） |
 | `/events/stream` | GET | 事件流（SSE：历史重放 + 活流尾随，Last-Event-ID 断线续传） |
