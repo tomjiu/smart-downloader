@@ -302,6 +302,20 @@ pub trait DownloadEngine: Send + Sync {
         Err(EngineError::Unsupported)
     }
 
+    /// 任务级代理热改（E8）：`Some(url)` = 切任务专用 client（覆盖全局，语义
+    /// 与 add 时设定一致）；`None` = 清除回引擎共享 client。HTTP 引擎实现：
+    /// 非法 URL → `Other`（调用方定性入参错误，不动现任务）；下载中任务
+    /// epoch+1 重入——旧循环在 gen/epoch 检查点自杀，新循环从段账本恢复并
+    /// 用新 client；暂停/终态任务只改配置（下次 spawn 生效）。不支持引擎
+    /// （BT 代理属会话级 / FTP）→ `Unsupported`。
+    async fn set_task_proxy(
+        &self,
+        _id: &EngineTaskId,
+        _proxy: Option<String>,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
     /// 迅雷任务导入（M9）：接受 xunlei-convert 生成的 fastresume bencode。
     /// 默认实现返回 `not supported`；BT 引擎（libtorrent）应Override为 `add_torrent_resume`。
     async fn add_xunlei_resume(&self, _data: Vec<u8>) -> Result<EngineTaskId, EngineError> {

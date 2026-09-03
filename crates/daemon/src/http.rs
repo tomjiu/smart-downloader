@@ -168,6 +168,44 @@ async fn task_sequential(
     }
 }
 
+/// 任务级代理热改（`POST /tasks/:id/proxy`，E8）：`{"proxy": "http(s)://..."}`
+/// = 设置任务专用 client（覆盖全局）；`{"proxy": null}` 或 `{}` = 清除回共享
+/// client。仅 HTTP 任务（其余 409）；非法 URL 400（不发起连接，纯本地构建
+/// 试水）；下载中任务立即生效（旧循环检查点退出，进度凭段账本恢复）。
+#[derive(Deserialize)]
+pub struct SetProxyReq {
+    /// None（缺省/null）= 清除；空串拒绝（与 add 口径一致）。
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+
+async fn task_set_proxy(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SetProxyReq>,
+) -> impl IntoResponse {
+    match state.set_task_proxy(&id, req.proxy).await {
+        Ok(()) => match state.task_snapshot(&id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
 /// 任务级子文件优先级（`POST /tasks/:id/files/priority`，P1 能力增强，仅 BT）。
 /// priority 语义同 libtorrent：0=不下载 / 1=低 / 4=默认 / 7=最高。
 #[derive(Deserialize)]
@@ -1064,6 +1102,7 @@ macro_rules! router_base {
             .route("/tasks/:id/fallback", post(task_fallback))
             .route("/tasks/:id/limit", post(task_limit))
             .route("/tasks/:id/sequential", post(task_sequential))
+            .route("/tasks/:id/proxy", post(task_set_proxy))
             .route("/tasks/:id/files/priority", post(task_file_priority))
             .route("/tasks/:id/webseeds", post(task_webseeds))
             .route("/bt/metadata", post(bt_magnet_metadata))

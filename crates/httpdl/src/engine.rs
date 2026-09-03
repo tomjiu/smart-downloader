@@ -826,6 +826,50 @@ impl DownloadEngine for HttpEngine {
         }
     }
 
+    /// 任务级代理热改（E8 trait 扩展，仅 HTTP 引擎支持）。
+    ///
+    /// 语义分档：
+    /// - `Some(url)` 非法（reqwest 解析失败）→ `Other`，**不动现任务**（配置
+    ///   错误在调用方定性为入参 400，任务保持原状继续原 client 传输）。
+    /// - 下载中（`Downloading`）任务：锁内换 `proxy` 字段 + epoch+1，锁外
+    ///   `spawn_download` 重入（resume 同款路径）——新循环捕获新 client（从
+    ///   段账本恢复已完成段），旧循环在下一 gen/epoch 检查点自杀且永不
+    ///   finalize（并发收尾幂等，P4 既有收敛语义）。
+    /// - 暂停 / 终态（Completed/Error）任务：只改配置字段——下次 resume/
+    ///   spawn 自然用新 client；对已完成任务改 proxy 无传输意义但保持配置
+    ///   回显一致（审计口径：API 写了什么快照就是什么）。
+    async fn set_task_proxy(
+        &self,
+        id: &EngineTaskId,
+        proxy: Option<String>,
+    ) -> Result<(), EngineError> {
+        // 先试水新 client（非法 → 拒绝且零副作用；合法 → 构建产物即弃，
+        // spawn_download 会按任务字段重建——构建成本 ~µs 级，不值得跨锁传）
+        if let Some(p) = &proxy {
+            let _ = build_proxied_client(p).map_err(EngineError::Other)?;
+        }
+        let restart = {
+            let mut tasks = self.inner.tasks.lock();
+            let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
+            t.proxy = proxy;
+            let running = t.state == EngineState::Downloading;
+            if running {
+                t.epoch += 1;
+            }
+            running
+        };
+        if restart {
+            // 锁外取当前 gen/epoch（set 与 spawn 间无 await 点，无竞态窗口）
+            let (gen, epoch) = {
+                let tasks = self.inner.tasks.lock();
+                let t = tasks.get(id).ok_or(EngineError::NotFound)?;
+                (t.gen, t.epoch)
+            };
+            self.spawn_download(id.clone(), gen, epoch);
+        }
+        Ok(())
+    }
+
     async fn peers(&self, _id: &EngineTaskId) -> Result<Vec<PeerInfo>, EngineError> {
         Ok(vec![])
     }

@@ -1558,3 +1558,79 @@ async fn task_name_exposed_in_list_and_snapshot_e2e() {
         .unwrap();
     assert_eq!(row["name"], "named-by-api.bin", "列表必须透出任务名: {row}");
 }
+
+/// E8 任务级代理热改 API：合法 URL 200 + 快照返回；空串/端口越界 400（纯本地
+/// 校验不发起连接）；缺省 body = 清除语义 200；不存在任务 404。
+#[tokio::test]
+async fn set_task_proxy_api_e2e() {
+    let body = patterned(8 * 1024);
+    let srv = TestServer::start(body).await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let dest = std::env::temp_dir().join(format!("e8-proxy-{}", std::process::id()));
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "url": srv.url(), "dest": dest.to_str().unwrap() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 设置：合法 URL（不可达没关系——校验是纯本地构建试水）→ 200 + 快照
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/proxy"))
+        .json(&serde_json::json!({ "proxy": "socks5://127.0.0.1:1080" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "合法代理 URL 应 200"
+    );
+    let snap: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(snap["task_id"], tid.as_str(), "成功响应必须是任务快照");
+
+    // 非法：空串（清除语义由 null 承担）与端口越界 → 400
+    for bad in ["", "http://127.0.0.1:70000"] {
+        let resp = client
+            .post(format!("{base}/tasks/{tid}/proxy"))
+            .json(&serde_json::json!({ "proxy": bad }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "{bad:?}");
+        let text = resp.text().await.unwrap();
+        assert!(!text.is_empty(), "{bad:?} 的 400 必须带错误说明");
+    }
+
+    // 清除：缺省 body / null → 200
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/proxy"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "缺省 = 清除语义");
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/proxy"))
+        .json(&serde_json::json!({ "proxy": null }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "null = 清除语义");
+
+    // 不存在的任务 → 404
+    let resp = client
+        .post(format!("{base}/tasks/t404/proxy"))
+        .json(&serde_json::json!({ "proxy": "http://127.0.0.1:1080" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
