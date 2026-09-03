@@ -21,10 +21,27 @@ pub struct TorrentStatus {
     pub num_seeds: i32,
     pub metadata_received: bool,
     pub paused: bool,
+    /// torrent 名（E28，torrent metadata；就绪前 None/空）。任务名回填链路
+    /// 的数据源——daemon 轮询消费（E9 幂等语义）。
+    pub name: Option<String>,
 }
 
 impl From<lt_torrent_status> for TorrentStatus {
     fn from(st: lt_torrent_status) -> Self {
+        // E28：C 定长 NUL 结尾缓冲 → Option<String>（空串归一 None）
+        let name: Option<String> = {
+            let bytes: Vec<u8> = st
+                .name
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as u8)
+                .collect();
+            if bytes.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
         TorrentStatus {
             state: st.state,
             progress: st.progress,
@@ -36,6 +53,7 @@ impl From<lt_torrent_status> for TorrentStatus {
             num_seeds: st.num_seeds,
             metadata_received: st.metadata_received != 0,
             paused: st.paused != 0,
+            name,
         }
     }
 }

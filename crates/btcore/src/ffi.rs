@@ -335,6 +335,7 @@ impl Session {
             num_seeds: 0,
             metadata_received: 0,
             paused: 0,
+            name: [0; 256],
         };
         let code = unsafe { lt_status(self.raw, i.as_ptr(), &mut st) };
         call(code, || Ok(st))
