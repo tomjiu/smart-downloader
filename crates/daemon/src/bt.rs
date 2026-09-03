@@ -14,7 +14,7 @@ use smart_dl_btcore::{AlertKind, BtCore, TorrentStatus};
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
     Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
-    EngineTaskId, FileProgress, PeerInfo,
+    EngineTaskId, FileProgress, PeerInfo, TrackerEntry,
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -396,6 +396,23 @@ impl DownloadEngine for BtEngine {
         self.core
             .add_url_seed(id, url)
             .map_err(|e| EngineError::Other(core_err(&e)))
+    }
+
+    /// tracker 运行时增删查（E29）：批量追加 / URL 精确删除（无匹配
+    /// NotFound 定性）/ 列举当前 announce 表。
+    async fn add_trackers(&self, id: &EngineTaskId, urls: &[String]) -> Result<(), EngineError> {
+        for url in urls {
+            self.core.add_tracker(id, url).map_err(bt_engine_err)?;
+        }
+        Ok(())
+    }
+
+    async fn remove_tracker(&self, id: &EngineTaskId, url: &str) -> Result<(), EngineError> {
+        self.core.remove_tracker(id, url).map_err(bt_engine_err)
+    }
+
+    async fn list_trackers(&self, id: &EngineTaskId) -> Result<Vec<TrackerEntry>, EngineError> {
+        self.core.list_trackers(id).map_err(bt_engine_err)
     }
 
     async fn add_peer(

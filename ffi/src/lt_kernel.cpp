@@ -686,6 +686,54 @@ lt_err lt_peers(lt_session* s, const char* ih, lt_peer* buf, size_t cap, size_t*
     }
 }
 
+/* —— tracker 运行时增删查（E29；契约与 lt_peers 同两段式）—— */
+lt_err lt_list_trackers(lt_session* s, const char* ih, lt_tracker_info* out, int cap, int* out_len) {
+    if (!s || !ih || !out_len) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        const std::vector<lt::announce_entry> v = h.trackers();
+        const size_t total = v.size();
+        if (total == 0) { *out_len = 0; return LT_OK; }
+        if (!out || (size_t)cap < total) { *out_len = (int)total; return LT_ERR_BUFFER_TOO_SMALL; }
+        for (size_t i = 0; i < total; ++i) {
+            lt_tracker_info& o = out[i];
+            std::memset(&o, 0, sizeof(o));
+            std::strncpy(o.url, v[i].url.c_str(), sizeof(o.url) - 1);
+            o.tier = v[i].tier;
+        }
+        *out_len = (int)total;
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+lt_err lt_remove_tracker(lt_session* s, const char* ih, const char* url) {
+    if (!s || !ih || !url) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        // libtorrent 2.0 无 remove_tracker（1.1 曾提供）→ 版本可移植方案：
+        // replace_trackers 过滤式删除（按 URL 精确匹配）。
+        // daemon 语义要求"删不存在的 tracker"可定性 404（libtorrent 原生
+        // 删除对无匹配静默 no-op，故先扫描确认存在）。
+        const std::vector<lt::announce_entry> v = h.trackers();
+        std::vector<lt::announce_entry> kept;
+        kept.reserve(v.size());
+        bool found = false;
+        for (const lt::announce_entry& e : v) {
+            if (e.url == url) { found = true; continue; }
+            kept.push_back(e);
+        }
+        if (!found) { set_err(s, "tracker not found"); return LT_ERR_NOT_FOUND; }
+        h.replace_trackers(kept);
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
 lt_err lt_request_save_resume(lt_session* s, const char* ih) {
     if (!s || !ih) return LT_ERR_ARG;
     try {

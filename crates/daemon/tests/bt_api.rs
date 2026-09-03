@@ -849,3 +849,157 @@ async fn magnet_sequential_flag_before_metadata_ready() {
     let snap: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(snap["sequential"], serde_json::json!(true));
 }
+
+// ==================== E29：tracker 运行时增删查（HTTP API 全链） ====================
+
+#[tokio::test]
+async fn trackers_add_list_remove_e2e() {
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 建 magnet 任务
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "url": MAGNET }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 初始表为空（种子 magnet 无 tr 参数）
+    let list: serde_json::Value = client
+        .get(format!("{base}/tasks/{tid}/trackers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(list.as_array().unwrap().is_empty(), "初始应为空: {list}");
+
+    // 批量追加两条
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/trackers"))
+        .json(&serde_json::json!({
+            "urls": ["http://tracker.example/announce", "udp://t2.example:1337/announce"]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "追加应 200");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["added"], 2, "追加两条: {body}");
+
+    // 列举含两条
+    let list: serde_json::Value = client
+        .get(format!("{base}/tasks/{tid}/trackers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let urls: Vec<&str> = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["url"].as_str().unwrap())
+        .collect();
+    assert_eq!(urls.len(), 2, "{list}");
+    assert!(urls.contains(&"http://tracker.example/announce"));
+
+    // 精确删除一条
+    let resp = client
+        .delete(format!("{base}/tasks/{tid}/trackers"))
+        .query(&[("url", "http://tracker.example/announce")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "删除应 200");
+
+    // 再删同一条 → 404（无匹配定性）
+    let resp = client
+        .delete(format!("{base}/tasks/{tid}/trackers"))
+        .query(&[("url", "http://tracker.example/announce")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "重复删除应 404"
+    );
+
+    // 表中仅剩 T2
+    let list: serde_json::Value = client
+        .get(format!("{base}/tasks/{tid}/trackers"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(list.as_array().unwrap().len(), 1, "{list}");
+
+    // 空 urls → 400
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/trackers"))
+        .json(&serde_json::json!({ "urls": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "空 urls 400"
+    );
+}
+
+#[tokio::test]
+async fn trackers_on_http_task_is_409() {
+    // HTTP 任务不支持 tracker 管理 → UnsupportedOp 定性 409
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let srv = TestServer::start(common::patterned(8 * 1024)).await;
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "url": srv.url() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/trackers"))
+        .json(&serde_json::json!({ "urls": ["http://t.example/announce"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "HTTP 任务应 409"
+    );
+
+    let resp = client
+        .get(format!("{base}/tasks/{tid}/trackers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "HTTP 任务应 409"
+    );
+}

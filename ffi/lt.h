@@ -105,6 +105,17 @@ typedef struct {
 
 lt_err lt_peers(lt_session* s, const char* ih, lt_peer* buf, size_t cap, size_t* out_count);
 
+/* —— tracker 运行时增删查（E29，BT 任务级；契约与 lt_peers 同两段式）——
+   cap=0/out=NULL → 探测数量（空表 → LT_OK + *out_len=0）；
+   cap < 实际数 → LT_ERR_BUFFER_TOO_SMALL + *out_len=实际数；
+   否则填充 min(cap, 实际数) 项 + *out_len=填充数 → LT_OK。 */
+typedef struct {
+    char url[256];   /* announce URL（NUL 结尾，截断安全） */
+    int  tier;       /* libtorrent tier（优先级组，小者优先） */
+} lt_tracker_info;
+lt_err lt_list_trackers(lt_session* s, const char* ih, lt_tracker_info* out, int cap, int* out_len);
+lt_err lt_remove_tracker(lt_session* s, const char* ih, const char* url); /* 无匹配 URL → LT_ERR_NOT_FOUND */
+
 /* —— alert 队列（D31 预算 ≤12 种；扁平化值拷贝，所有权归 wrapper；溢出计数）—— */
 typedef enum {
     LT_ALERT_TRACKER  = 1,

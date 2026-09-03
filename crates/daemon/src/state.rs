@@ -10,7 +10,7 @@ use smart_dl_core::task::{DownloadTask, TaskId, TaskMetadata};
 use smart_dl_core::task::{FileState, TaskFile};
 use smart_dl_core::types::{
     Auth, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
-    EngineTaskId, FileProgress,
+    EngineTaskId, FileProgress, TrackerEntry,
 };
 use smart_dl_provider::{
     FallbackCoordinator, FallbackOutcome, HttpSink, ProviderError, ProviderRuntime, RemoteProvider,
@@ -3372,6 +3372,107 @@ impl DaemonState {
             rec.push_event("webseed", Some(format!("+{added}")));
         }
         Ok(added)
+    }
+
+    /// 列举任务 tracker 表（E29，仅 BT 任务；metadata 未就绪也可查）。
+    pub async fn list_trackers(&self, id: &str) -> Result<Vec<TrackerEntry>, DaemonError> {
+        let rec = self
+            .tasks
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        if rec.engine_kind != EngineKind::Bt {
+            return Err(DaemonError::UnsupportedOp(format!(
+                "仅 BT 任务支持 tracker 管理（{id} 为 {:?}）",
+                rec.engine_kind
+            )));
+        }
+        let tid = rec
+            .engine_tid
+            .clone()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        let engine = self.engine_for(EngineKind::Bt)?;
+        engine
+            .list_trackers(&tid)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))
+    }
+
+    /// 批量追加 tracker（E29，仅 BT 任务）：URL 非空 + 无空白校验；
+    /// 返回实际追加数。追加即时生效（libtorrent announce 表，metadata
+    /// 未就绪也可设）。运行时追加不持久化（重启后以 magnet/.torrent 自带
+    /// 表为准——与 webseed 注入同口径）。
+    pub async fn add_trackers(&self, id: &str, urls: &[String]) -> Result<usize, DaemonError> {
+        if urls.is_empty() {
+            return Err(DaemonError::InvalidSource("urls 不能为空".into()));
+        }
+        for u in urls {
+            if u.trim() != u || u.is_empty() || u.split_whitespace().count() != 1 {
+                return Err(DaemonError::InvalidSource(format!(
+                    "tracker URL 非法（空白/空串）: {u:?}"
+                )));
+            }
+        }
+        let rec = self
+            .tasks
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        if rec.engine_kind != EngineKind::Bt {
+            return Err(DaemonError::UnsupportedOp(format!(
+                "仅 BT 任务支持 tracker 管理（{id} 为 {:?}）",
+                rec.engine_kind
+            )));
+        }
+        let tid = rec
+            .engine_tid
+            .clone()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        let engine = self.engine_for(EngineKind::Bt)?;
+        engine
+            .add_trackers(&tid, urls)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        if let Some(rec) = self.tasks.lock().get_mut(id) {
+            rec.push_event("tracker", Some(format!("+{}", urls.len())));
+        }
+        Ok(urls.len())
+    }
+
+    /// 删 tracker（E29，仅 BT 任务）：URL 精确匹配；无匹配 → NotFound（404）。
+    pub async fn remove_tracker(&self, id: &str, url: &str) -> Result<(), DaemonError> {
+        let rec = self
+            .tasks
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        if rec.engine_kind != EngineKind::Bt {
+            return Err(DaemonError::UnsupportedOp(format!(
+                "仅 BT 任务支持 tracker 管理（{id} 为 {:?}）",
+                rec.engine_kind
+            )));
+        }
+        let tid = rec
+            .engine_tid
+            .clone()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        let engine = self.engine_for(EngineKind::Bt)?;
+        engine
+            .remove_tracker(&tid, url)
+            .await
+            .map_err(|e| match e {
+                smart_dl_core::types::EngineError::NotFound => {
+                    DaemonError::NotFound(format!("tracker 不存在: {url}"))
+                }
+                other => DaemonError::Engine(other.to_string()),
+            })?;
+        if let Some(rec) = self.tasks.lock().get_mut(id) {
+            rec.push_event("tracker", Some(format!("-{url}")));
+        }
+        Ok(())
     }
 
     /// 删除任务（E7 前 semantics：保留已下载数据）。
