@@ -92,10 +92,10 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/tasks` | GET / POST | 任务列表（`?state=`/`?engine=` 过滤、`?search=` 关键字、`?tag=` 标签 any-of、`?limit`/`?offset` 分页）/ 建任务（HTTP、FTP 目录、magnet、.torrent） |
+| `/tasks` | GET / POST | 任务列表（`?state=`/`?engine=` 过滤、`?search=` 关键字、`?tag=` 标签 any-of、`?limit`/`?offset` 分页）/ 建任务（HTTP、FTP 目录、magnet、.torrent；`start_at_unix` 定时启动，未来时刻到点前不入引擎） |
 | `/tasks/batch` | POST | 批量操作：显式 `ids`（≤100，pause/resume/remove）或条件 `select`（state/engine/tag/search 任一，仅 pause/resume 非破坏动作） |
 | `/tasks/:id` | GET / DELETE | 快照（含 files 明细与实时速率）/ 删除 |
-| `/tasks/:id/pause` · `/resume` | POST | 生命周期 |
+| `/tasks/:id/pause` · `/resume` | POST | 生命周期（定时等待中任务：pause = 取消自动启动，resume = 立即激活） |
 | `/tasks/:id/name` | POST | 任务重命名（显示层；`{"name": null}` 清除回退派生链） |
 | `/tasks/:id/tags` | POST | 任务标签设置（替换式；trim/去重，≤16 个×64 字符；null/空表清除） |
 | `/tasks/:id/logs` | GET | 任务日志 |
@@ -115,7 +115,7 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 
 ## 配置
 
-TOML 配置（默认 `./config.toml`，任务状态 `./tasks.json`）：`[download]`（dest_root/并发/限速/代理）、`[bt]`（save_path/DHT/LSD/UPnP/做种）、`[provider]`（fallback 链）、`[server]`（bind/token）、`[webhook]`（任务完成通知 URL，POST JSON，fire-and-forget）。支持热重载。
+TOML 配置（默认 `./config.toml`，任务状态 `./tasks.json`）：`[download]`（dest_root/并发/限速/代理）、`[bt]`（save_path/DHT/LSD/UPnP/做种）、`[provider]`（fallback 链）、`[server]`（bind/token）、`[webhook]`（任务完成通知 URL，POST JSON，fire-and-forget）、`[scheduler]`（start_jitter_seconds 错峰随机延迟上限，秒；0 = 关）。支持热重载。
 
 ## 文档地图
 

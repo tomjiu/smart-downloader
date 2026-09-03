@@ -56,6 +56,7 @@ pub fn make_http_task_to(
             added_at_unix: 0,
             tags: Vec::new(),
             finished_at_unix: 0,
+            start_at_unix: 0,
         },
         limits: None,
     }
@@ -142,6 +143,7 @@ pub fn make_ftp_task(id: &str, url: &str, dest_root: PathBuf, name: &str) -> Dow
             added_at_unix: 0,
             tags: Vec::new(),
             finished_at_unix: 0,
+            start_at_unix: 0,
         },
         limits: None,
     }

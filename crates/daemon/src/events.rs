@@ -58,6 +58,11 @@ pub enum SchedulerEvent {
         max_download_kb_s: u32,
         max_upload_kb_s: u32,
     },
+    /// 定时任务到点激活（E23）：start_at 未来不入引擎，到期由调度循环
+    /// 接入（引擎 add 成功后发出；记录态由轮询器对齐引擎实时值）。
+    TaskActivated {
+        task_id: String,
+    },
 }
 
 impl SchedulerEvent {
@@ -82,7 +87,8 @@ impl SchedulerEvent {
             | SchedulerEvent::Error { task_id, .. }
             | SchedulerEvent::Completed { task_id }
             | SchedulerEvent::Failed { task_id, .. }
-            | SchedulerEvent::DuplicateRejected { task_id, .. } => Some(task_id),
+            | SchedulerEvent::DuplicateRejected { task_id, .. }
+            | SchedulerEvent::TaskActivated { task_id } => Some(task_id),
             SchedulerEvent::ProviderStatus { .. } | SchedulerEvent::GlobalLimitsChanged { .. } => {
                 None
             }
@@ -105,6 +111,7 @@ impl SchedulerEvent {
             SchedulerEvent::DuplicateRejected { .. } => "duplicate_rejected",
             SchedulerEvent::ProviderStatus { .. } => "provider_status",
             SchedulerEvent::GlobalLimitsChanged { .. } => "global_limits_changed",
+            SchedulerEvent::TaskActivated { .. } => "task_activated",
         }
     }
 }
@@ -125,6 +132,7 @@ pub fn known_event_type_labels() -> Vec<String> {
         "duplicate_rejected",
         "provider_status",
         "global_limits_changed",
+        "task_activated",
     ]
     .iter()
     .map(|s| s.to_string())

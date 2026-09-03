@@ -170,6 +170,10 @@ fn type_labels_cover_all_variants_and_match_serde_tag() {
             max_download_kb_s: 1024,
             max_upload_kb_s: 512,
         },
+        // E23：定时任务到点激活
+        SchedulerEvent::TaskActivated {
+            task_id: "t".into(),
+        },
     ];
     for ev in &extra {
         let label = ev.type_label();
@@ -179,6 +183,6 @@ fn type_labels_cover_all_variants_and_match_serde_tag() {
         );
         assert!(seen.insert(label), "known 内标签重复: {label}");
     }
-    // 全集长度 = 8 常规 + 3 特殊构造
-    assert_eq!(known.len(), 11);
+    // 全集长度 = 8 常规 + 4 特殊构造（E16 GlobalLimitsChanged + E23 TaskActivated）
+    assert_eq!(known.len(), 12);
 }
