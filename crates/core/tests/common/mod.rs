@@ -68,6 +68,7 @@ pub fn make_task(id: &str, name: &str) -> DownloadTask {
             name: Some(name.to_string()),
             added_at_unix: 1,
             tags: Vec::new(),
+            finished_at_unix: 0,
         },
         limits: None,
     }

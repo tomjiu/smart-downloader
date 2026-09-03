@@ -14,6 +14,7 @@ pub struct Config {
     pub provider: ProviderCfg,
     pub provider_xunlei: ProviderXunleiCfg,
     pub webhook: WebhookCfg,
+    pub cleanup: CleanupCfg,
     pub lock: LockCfg,
     pub storage: StorageCfg,
 }
@@ -113,6 +114,17 @@ pub struct WebhookCfg {
     pub url: String,
 }
 
+/// 已完成任务自动清理配置（E20）：按完成龄期清扫 Completed 任务。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct CleanupCfg {
+    /// Completed 任务保留天数（从完成时刻起算）；0 = 禁用（默认）。
+    /// 清扫间隔固定 10min；文件默认保留（keep_data）。
+    pub auto_remove_completed_days: u32,
+    /// 自动清理时是否同时删除已下载数据；true = 保留文件（默认）。
+    pub auto_remove_keep_data: bool,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct LockCfg {
@@ -155,6 +167,7 @@ impl Default for Config {
             },
             provider_xunlei: ProviderXunleiCfg::default(),
             webhook: WebhookCfg::default(),
+            cleanup: CleanupCfg::default(),
             lock: LockCfg {
                 path: PathBuf::from("./daemon.lock"),
             },
@@ -239,6 +252,8 @@ impl Config {
             // 身份档位名（非敏感；无 token 布尔那样有路径泄露风险）。
             "provider_xunlei_tier": self.resolve_xunlei_tier_name(),
             "webhook_url": self.webhook.url,
+            "auto_remove_completed_days": self.cleanup.auto_remove_completed_days,
+            "auto_remove_keep_data": self.cleanup.auto_remove_keep_data,
             // 仅暴露「登录态文件是否存在」布尔，不泄露路径字符串本身。
             "provider_xunlei_token_exists": self
                 .provider_xunlei

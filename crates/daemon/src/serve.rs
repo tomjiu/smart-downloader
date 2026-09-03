@@ -129,14 +129,16 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         .with_http_token(http_token.clone())
         .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
         .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s)
-        .with_webhook_url((!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone()));
+        .with_webhook_url((!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone()))
+        .with_cleanup(cfg.cleanup.clone());
     #[cfg(not(feature = "bt"))]
     let mut state = DaemonState::new(http_engine, providers)
         .with_dest_root(cfg.download.dest_root.clone())
         .with_http_token(http_token.clone())
         .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
         .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s)
-        .with_webhook_url((!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone()));
+        .with_webhook_url((!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone()))
+        .with_cleanup(cfg.cleanup.clone());
 
     // 4. BT 引擎（先取 core 句柄，供 alert 事件流）
     #[cfg(feature = "bt")]
@@ -308,6 +310,18 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
                     let t = tid.clone();
                     let _ = tokio::task::spawn_blocking(move || b.save_resume_now(&t)).await;
                 }
+            }
+        });
+    }
+
+    // 4d-. 已完成任务自动清扫循环（E20）：10min 周期扫描（配置 0 = 空转
+    // no-op）；配置随 TOML 热重载生效，循环每轮读取当前生效值。
+    {
+        let st = state_arc.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                let _ = st.sweep_completed_cleanup().await;
             }
         });
     }
