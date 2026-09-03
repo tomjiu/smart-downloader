@@ -32,6 +32,7 @@ url = { workspace = true }
 sha1 = { workspace = true }
 base64 = { workspace = true }
 fs2 = { workspace = true }
+futures = { workspace = true } # SSE 事件流（unfold stream，E12）
 toml = "0.8"
 reqwest = { workspace = true }
 smart-dl-core = { path = "../core" }

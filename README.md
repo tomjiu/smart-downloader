@@ -104,6 +104,8 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 | `/config` | GET | 当前配置 |
 | `/stats` · `/version` · `/health` | GET | 运维三件套 |
 | `/providers` | GET | Provider 状态 |
+| `/events` | GET | 事件历史查询（seq 游标分页 + task_id/type 过滤 + 缺口报警） |
+| `/events/stream` | GET | 事件流（SSE：历史重放 + 活流尾随，Last-Event-ID 断线续传） |
 | `/ws` | GET | 事件流（WebSocket，背压保护） |
 
 ## 配置

@@ -1970,3 +1970,238 @@ async fn stats_aggregates_live_down_rate_e2e() {
         "pause 后聚合下行速率必须清零"
     );
 }
+
+/// E12 SSE 读取助手：raw TcpStream 发 GET（reqwest 无 stream feature），
+/// 在 `dur` 时间窗内收集响应字节后断开（SSE 流无自然终点）。
+/// 返回 (整段文本, Content-Type 头值)。
+async fn sse_read_for(
+    addr: std::net::SocketAddr,
+    path_qs: &str,
+    last_event_id: Option<&str>,
+    dur: std::time::Duration,
+) -> (String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut req = format!("GET {path_qs} HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\nConnection: close\r\n");
+    if let Some(id) = last_event_id {
+        req.push_str(&format!("Last-Event-ID: {id}\r\n"));
+    }
+    req.push_str("\r\n");
+    sock.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    let deadline = std::time::Instant::now() + dur;
+    let mut tmp = [0u8; 8192];
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(std::time::Duration::from_millis(150), sock.read(&mut tmp)).await
+        {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&tmp[..n]),
+            Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+    drop(sock);
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    let ct = text
+        .lines()
+        .find(|l| l.to_ascii_lowercase().starts_with("content-type:"))
+        .map(|l| l.splitn(2, ':').nth(1).unwrap_or("").trim().to_string())
+        .unwrap_or_default();
+    (text, ct)
+}
+
+/// 解析 SSE 文本 → (data, id, event, 注释) 列表。按 `\n\n` 分帧、只收完整帧
+/// （TCP 读窗可能在行间截断——尾部残帧丢弃，id+data 齐备才算完整事件帧）。
+fn parse_sse(text: &str) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>) {
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or(text);
+    let mut data = Vec::new();
+    let mut ids = Vec::new();
+    let mut events = Vec::new();
+    let mut comments = Vec::new();
+    for frame in body.split("\n\n") {
+        let (mut f_data, mut f_id, mut f_event, mut f_comment) = (None, None, None, None);
+        for line in frame.lines() {
+            if let Some(v) = line.strip_prefix("data:") {
+                f_data = Some(v.trim().to_string());
+            } else if let Some(v) = line.strip_prefix("id:") {
+                f_id = Some(v.trim().to_string());
+            } else if let Some(v) = line.strip_prefix("event:") {
+                f_event = Some(v.trim().to_string());
+            } else if let Some(v) = line.strip_prefix(':') {
+                f_comment = Some(v.trim().to_string());
+            }
+        }
+        if let (Some(d), Some(i)) = (f_data, f_id) {
+            data.push(d);
+            ids.push(i);
+            if let Some(e) = f_event {
+                events.push(e);
+            }
+        } else if let Some(c) = f_comment {
+            comments.push(c);
+        }
+    }
+    (data, ids, events, comments)
+}
+
+/// E12: GET /events/stream——连接即重放历史（非破坏）+ SSE 帧形
+/// （id: seq / event: type_label / data: envelope JSON 与 WS 帧同形）
+/// + type 过滤在重放生效。
+#[tokio::test]
+async fn events_stream_replay_shape_and_filter_e2e() {
+    use smart_dl_core::state_machine::TaskState;
+
+    let (addr, state) = serve().await;
+    state.hub().publish(SchedulerEvent::TaskCreated {
+        task_id: "t1".into(),
+    });
+    state.hub().publish(SchedulerEvent::Progress {
+        task_id: "t1".into(),
+        done: 5,
+        total: 10,
+    });
+    state.hub().publish(SchedulerEvent::TaskCreated {
+        task_id: "t2".into(),
+    });
+
+    // type=task_created 过滤：重放仅 2 帧（Progress 被滤掉）
+    let (text, ct) = sse_read_for(
+        addr,
+        "/events/stream?type=task_created",
+        None,
+        std::time::Duration::from_millis(700),
+    )
+    .await;
+    assert!(
+        ct.starts_with("text/event-stream"),
+        "SSE Content-Type 应为 text/event-stream: {ct}"
+    );
+    let (data, ids, events, _) = parse_sse(&text);
+    assert_eq!(data.len(), 2, "type 过滤应只放行 2 帧: {text}");
+    assert_eq!(ids, vec!["1", "3"], "id 行 = seq，升序");
+    assert_eq!(
+        events,
+        vec!["task_created", "task_created"],
+        "event 行 = type_label"
+    );
+    for d in &data {
+        let v: serde_json::Value = serde_json::from_str(d).unwrap();
+        assert!(v["seq"].is_u64(), "data 与 WS 帧同形（seq 字段）: {d}");
+        assert_eq!(v["event"]["type"], "task_created");
+    }
+}
+
+/// E12: Last-Event-ID 断线续传——EventSource 重连自动携带，服务端从
+/// seq > id 处续推；`after` 参数显式覆盖优先。
+#[tokio::test]
+async fn events_stream_last_event_id_resume_e2e() {
+    let (addr, state) = serve().await;
+    for i in 1..=4 {
+        state.hub().publish(SchedulerEvent::TaskCreated {
+            task_id: format!("t{i}"),
+        });
+    }
+    let (text, _) = sse_read_for(
+        addr,
+        "/events/stream",
+        Some("2"),
+        std::time::Duration::from_millis(600),
+    )
+    .await;
+    let (data, ids, _, _) = parse_sse(&text);
+    assert_eq!(
+        ids,
+        vec!["3", "4"],
+        "Last-Event-ID: 2 → 只推 seq>2: {ids:?}"
+    );
+    assert_eq!(data.len(), 2);
+
+    // after 参数覆盖 Last-Event-ID
+    let (text, _) = sse_read_for(
+        addr,
+        "/events/stream?after=3",
+        Some("1"),
+        std::time::Duration::from_millis(600),
+    )
+    .await;
+    let (data, ids, _, _) = parse_sse(&text);
+    assert_eq!(ids, vec!["4"], "after 优先于 Last-Event-ID: {ids:?}");
+    assert_eq!(data.len(), 1);
+}
+
+/// E12: 非法 type → 400（流建立前拒绝，带合法值全集提示）。
+#[tokio::test]
+async fn events_stream_bad_type_400_e2e() {
+    let (addr, _state) = serve().await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("http://{addr}/events/stream?type=bogus,nope"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let msg = resp.text().await.unwrap();
+    assert!(
+        msg.contains("task_created"),
+        "错误信息应带合法值全集: {msg}"
+    );
+}
+
+/// E12: 活流尾随——连接后发布的事件经 200ms 轮询增量推达（不只重放）。
+#[tokio::test]
+async fn events_stream_live_tail_e2e() {
+    let (addr, state) = serve().await;
+    // 先连接（重放为空），随后发布 → 读窗内应收到
+    let reader = tokio::spawn(sse_read_for(
+        addr,
+        "/events/stream",
+        None,
+        std::time::Duration::from_millis(2500),
+    ));
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    state.hub().publish(SchedulerEvent::Completed {
+        task_id: "live-1".into(),
+    });
+    let (text, _) = reader.await.unwrap();
+    let (data, ids, events, _) = parse_sse(&text);
+    assert!(
+        ids.contains(&"1".to_string()),
+        "连接后发布的事件应被推达: {ids:?}"
+    );
+    assert_eq!(data.len(), 1);
+    assert_eq!(events, vec!["completed"]);
+    let v: serde_json::Value = serde_json::from_str(&data[0]).unwrap();
+    assert_eq!(v["event"]["task_id"], "live-1");
+}
+
+/// E12: 缺口——Last-Event-ID 指向已被冲掉的区间 → 注释行 gap 报警 +
+/// 从缓冲最旧重放（seq 回退客户端可观测，同 REST truncated 判定输入）。
+#[tokio::test]
+async fn events_stream_gap_replays_from_oldest_e2e() {
+    let (addr, state) = serve().await;
+    // 4100 条冲掉 seq 1..=4（缓冲 4096）
+    for i in 1..=4100u64 {
+        state.hub().publish(SchedulerEvent::TaskCreated {
+            task_id: format!("t{i}"),
+        });
+    }
+    assert_eq!(state.hub().oldest_seq(), Some(5), "缓冲应冲掉前 4 条");
+    let (text, _) = sse_read_for(
+        addr,
+        "/events/stream",
+        Some("2"),
+        std::time::Duration::from_millis(900),
+    )
+    .await;
+    let (data, ids, _, comments) = parse_sse(&text);
+    assert!(
+        comments.iter().any(|c| c.starts_with("gap:")),
+        "应有 gap 注释行报警: {comments:?}"
+    );
+    assert_eq!(
+        ids.first(),
+        Some(&"5".to_string()),
+        "首帧应从缓冲最旧 seq=5 重放"
+    );
+    assert!(ids.len() >= 2, "重放应持续输出（读窗内数百帧）");
+    assert!(data.len() == ids.len(), "data 与 id 一一对应");
+}
