@@ -219,6 +219,35 @@ pub struct RenameTaskReq {
     pub name: Option<String>,
 }
 
+/// 任务标签设置（E18，`POST /tasks/:id/tags`）：**替换式**全量覆盖。
+/// `tags` 缺省/null 或空数组 = 清除全部；逐项 trim/去重，单项 1..=64 字符、
+/// 最多 16 个（超限 400）。
+#[derive(Deserialize)]
+pub struct TagsReq {
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+/// 任务标签设置（`POST /tasks/:id/tags`，E18）：返回归一化后的标签全集。
+async fn task_set_tags(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<TagsReq>,
+) -> impl IntoResponse {
+    match state.set_task_tags(&id, req.tags) {
+        Ok(tags) => Json(serde_json::json!({ "tags": tags })).into_response(),
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
 async fn task_rename(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -1002,6 +1031,9 @@ struct ListTasksQuery {
     /// E14：关键字子串搜索（匹配任务名/来源 URL，大小写不敏感；空白 = 不过滤）。
     #[serde(default)]
     search: Option<String>,
+    /// E18：标签 any-of 过滤（逗号分隔多值；大小写不敏感；空白段丢弃）。
+    #[serde(default)]
+    tag: Option<String>,
 }
 
 /// `limit` 上限（防一次性拉全表打爆内存；UI 每页 50 量级，500 留足余量）。
@@ -1055,6 +1087,19 @@ fn validate_list_query(q: &ListTasksQuery) -> Result<ListQuery, String> {
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        // E18：逗号分隔 → trim → 丢空白段（标签为用户自定义任意串，
+        // 不走 known-label 校验；全空 = 不过滤）
+        tags: q
+            .tag
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
     })
 }
 
@@ -1409,6 +1454,7 @@ macro_rules! router_base {
             .route("/tasks/:id/sequential", post(task_sequential))
             .route("/tasks/:id/proxy", post(task_set_proxy))
             .route("/tasks/:id/name", post(task_rename))
+            .route("/tasks/:id/tags", post(task_set_tags))
             .route("/tasks/:id/files/priority", post(task_file_priority))
             .route("/tasks/:id/webseeds", post(task_webseeds))
             .route("/bt/metadata", post(bt_magnet_metadata))
