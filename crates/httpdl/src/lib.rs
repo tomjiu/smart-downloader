@@ -19,7 +19,7 @@ pub mod verify;
 #[cfg(feature = "ftp")]
 pub mod protocol;
 
-pub use engine::{build_proxied_client, proxy_auth_of, HttpEngine};
+pub use engine::{build_proxied_client, proxy_auth_of, url_basename, HttpEngine};
 
 #[cfg(feature = "ftp")]
 pub use protocol::ftp::FtpEngine;

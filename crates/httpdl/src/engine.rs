@@ -514,9 +514,10 @@ fn finish(inner: &Arc<EngineInner>, tid: &str, state: EngineState, error: Option
     }
 }
 
-/// URL 路径末段（E4 弱信号文件名候选）：剥 query/hash，空段（目录型 URL）
-/// → None。不做 percent-decode（避免双重解码；服务端真名由 CD 路径负责）。
-fn url_basename(url: &str) -> Option<String> {
+/// URL 路径末段（E4 弱信号文件名候选；E31 probe 预览同源复用）：剥 query/hash，
+/// 空段（目录型 URL）→ None。不做 percent-decode（避免双重解码；服务端真名
+/// 由 CD 路径负责）。
+pub fn url_basename(url: &str) -> Option<String> {
     let path = url.split(['?', '#']).next().unwrap_or(url);
     let base = path.trim_end_matches('/').rsplit('/').next()?;
     let base = base.trim();

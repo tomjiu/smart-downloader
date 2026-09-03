@@ -19,6 +19,8 @@ pub struct Probe {
     /// 服务端声明文件名（Content-Disposition；已剥目录成分/控制符，仍需
     /// sanitize_rel 终审）。无声明 → None（引擎侧回退 URL 末段）。
     pub filename: Option<String>,
+    /// Content-Type 原始串（E31 probe 预览透出；引擎内部不消费，None = 无）。
+    pub content_type: Option<String>,
 }
 
 /// 探测单个 URL。`headers` 为任务级自定义头（如 Referer/Cookie）。
@@ -54,6 +56,11 @@ pub async fn probe_range(
         .get(reqwest::header::CONTENT_DISPOSITION)
         .and_then(|v| v.to_str().ok())
         .and_then(parse_content_disposition_filename);
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
 
     match status {
         reqwest::StatusCode::PARTIAL_CONTENT => {
@@ -64,6 +71,7 @@ pub async fn probe_range(
                 last_modified,
                 total,
                 filename,
+                content_type,
             })
         }
         reqwest::StatusCode::OK => Ok(Probe {
@@ -72,6 +80,7 @@ pub async fn probe_range(
             last_modified,
             total: resp.content_length(),
             filename,
+            content_type,
         }),
         reqwest::StatusCode::RANGE_NOT_SATISFIABLE => Ok(Probe {
             range_supported: false,
@@ -80,6 +89,7 @@ pub async fn probe_range(
             // 416 通常带 Content-Range: bytes */TOTAL → 仍可取总长
             total: content_range_total(resp.headers()),
             filename,
+            content_type,
         }),
         other => Err(EngineError::Other(format!("probe status {other}"))),
     }
@@ -226,6 +236,7 @@ mod tests {
             total: Some(1024),
             last_modified: None,
             filename: None,
+            content_type: None,
         };
         // 同强 ETag + 同长 + 双 Range → 通过
         assert!(multi_source_ok(&base, &base.clone()));
