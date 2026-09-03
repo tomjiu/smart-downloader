@@ -136,12 +136,15 @@ pub struct TaskSummary {
 
 /// 列表过滤/分页查询（E7）。`states`/`engines` 空 = 不过滤；匹配均大小写不敏感。
 /// `limit`/`offset` 由 HTTP 层校验（limit 1..=500，offset ≥ 0 由类型保证）后下推。
+/// `search`（E14）：关键字子串匹配任务名或来源 URL（均大小写不敏感；
+/// None/空串 = 不过滤），语料经 `DownloadSource::search_urls` 脱敏。
 #[derive(Clone, Debug, Default)]
 pub struct ListQuery {
     pub states: Vec<String>,
     pub engines: Vec<String>,
     pub limit: Option<usize>,
     pub offset: usize,
+    pub search: Option<String>,
 }
 
 /// 合法状态标签全集（E7 `?state=` 校验依据；与 `state_label` 输出同步——
@@ -1826,6 +1829,27 @@ impl DaemonState {
                 (q.states.is_empty() || q.states.iter().any(|s| s.eq_ignore_ascii_case(&st)))
                     && (q.engines.is_empty()
                         || q.engines.iter().any(|e| e.eq_ignore_ascii_case(en)))
+                    // E14：名字或脱敏 URL 子串命中即保留（大小写不敏感；
+                    // 空针 contains 恒真 → 自然退化为不过滤）
+                    && match &q.search {
+                        None => true,
+                        Some(needle) => {
+                            let n = needle.trim().to_lowercase();
+                            let name_hit = rec
+                                .task
+                                .metadata
+                                .name
+                                .as_deref()
+                                .is_some_and(|s| s.to_lowercase().contains(&n));
+                            let url_hit = rec
+                                .task
+                                .source
+                                .search_urls()
+                                .iter()
+                                .any(|u| u.to_lowercase().contains(&n));
+                            name_hit || url_hit
+                        }
+                    }
             })
             .map(|(_, rec)| rec)
             .collect();
@@ -5540,6 +5564,91 @@ mod list_batch_tests {
         }
         let engines = known_engine_labels();
         assert_eq!(engines, vec!["bt", "http", "ftp", "provider", "xunlei-nas"]);
+    }
+
+    /// E14 搜索：名字 / URL 子串命中、大小写不敏感、无命中空集、
+    /// 空白关键字 trim 后退化为不过滤（空针 contains 恒真）。
+    #[tokio::test]
+    async fn list_filtered_search_matches_name_and_url() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        state
+            .add_http_task("https://srv-a.lan/Alpha.ISO".into(), None)
+            .await
+            .unwrap();
+        state
+            .add_http_task_opts(
+                "https://other.lan/beta.zip".into(),
+                None,
+                AddHttpOpts {
+                    name: Some("Movie Night.mkv".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        state
+            .add_http_task("https://srv-b.lan/gamma.bin".into(), None)
+            .await
+            .unwrap();
+
+        let ids = |q: ListQuery| -> Vec<String> {
+            state
+                .list_filtered(&q)
+                .0
+                .into_iter()
+                .map(|r| r.task_id)
+                .collect()
+        };
+
+        // URL 命中（查询小写 vs 源 MixedCase → 大小写不敏感）
+        assert_eq!(
+            ids(ListQuery {
+                search: Some("alpha.iso".into()),
+                ..Default::default()
+            })
+            .len(),
+            1,
+            "URL 子串命中（大小写不敏感）"
+        );
+
+        // 名字命中（该任务 URL 不含 movie → 只能来自名字语料）
+        assert_eq!(
+            ids(ListQuery {
+                search: Some("MOVIE".into()),
+                ..Default::default()
+            })
+            .len(),
+            1,
+            "名字子串命中（大小写不敏感）"
+        );
+
+        // 同前缀多主机：两台 srv-* 都命中
+        assert_eq!(
+            ids(ListQuery {
+                search: Some("srv-".into()),
+                ..Default::default()
+            })
+            .len(),
+            2,
+            "URL 前缀命中应覆盖两台 srv-* 主机"
+        );
+
+        // 无命中 → 空集 + total=0
+        let (page, total) = state.list_filtered(&ListQuery {
+            search: Some("nonexistent-keyword".into()),
+            ..Default::default()
+        });
+        assert!(page.is_empty());
+        assert_eq!(total, 0);
+
+        // 空白关键字 = 不过滤（全量 3）
+        let (page, total) = state.list_filtered(&ListQuery {
+            search: Some("   ".into()),
+            ..Default::default()
+        });
+        assert_eq!(total, 3);
+        assert_eq!(page.len(), 3, "空白关键字 trim 后为空 → 不过滤");
     }
 }
 

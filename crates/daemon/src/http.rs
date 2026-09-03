@@ -927,6 +927,9 @@ struct ListTasksQuery {
     limit: Option<usize>,
     #[serde(default)]
     offset: Option<usize>,
+    /// E14：关键字子串搜索（匹配任务名/来源 URL，大小写不敏感；空白 = 不过滤）。
+    #[serde(default)]
+    search: Option<String>,
 }
 
 /// `limit` 上限（防一次性拉全表打爆内存；UI 每页 50 量级，500 留足余量）。
@@ -973,11 +976,19 @@ fn validate_list_query(q: &ListTasksQuery) -> Result<ListQuery, String> {
         engines,
         limit: q.limit,
         offset: q.offset.unwrap_or(0),
+        // E14：trim 后为空视为未提供（宽容处理，与“空 = 不过滤”语义一致）
+        search: q
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
     })
 }
 
-/// 任务列表（E7 过滤/分页）：无参数 → 全量数组（兼容不变）；有分页参数 →
-/// 附 `X-Total-Count`（过滤后总数）。排序恒为创建序（task_id 数值后缀）。
+/// 任务列表（E7 过滤/分页；E14 增 `?search=` 关键字过滤）：无参数 → 全量数组
+/// （兼容不变）；有分页参数 → 附 `X-Total-Count`（过滤后总数，含 search 过滤）。
+/// 排序恒为创建序（task_id 数值后缀）。
 async fn list_tasks(
     Query(q): Query<ListTasksQuery>,
     State(state): State<Arc<DaemonState>>,

@@ -138,6 +138,30 @@ impl DownloadSource {
             other => format!("{other:?}"),
         }
     }
+
+    /// 搜索语料（E14）：来源中可供关键字匹配的 URL 集合——Http 主源 + 备用源、
+    /// Ftp url、Magnet/Thunder/XunleiShare/Ed2k 链接；TorrentFile 纯二进制
+    /// 无 URL → 空集。脱敏复用 `redact_url`（userinfo/敏感 query → [REDACTED]），
+    /// 与快照展示口径一致——按凭据片段搜索命中不了，防止 search 侧信道泄漏。
+    pub fn search_urls(&self) -> Vec<String> {
+        match self {
+            DownloadSource::Magnet(u)
+            | DownloadSource::Thunder(u)
+            | DownloadSource::XunleiShare(u)
+            | DownloadSource::Ed2k(u) => vec![redact_url(u)],
+            DownloadSource::TorrentFile(_) => vec![],
+            DownloadSource::Http {
+                url, backup_url, ..
+            } => {
+                let mut v = vec![redact_url(url)];
+                if let Some(b) = backup_url {
+                    v.push(redact_url(b));
+                }
+                v
+            }
+            DownloadSource::Ftp { url, .. } => vec![redact_url(url)],
+        }
+    }
 }
 
 /// 引擎能力位（§4）。
@@ -370,6 +394,34 @@ mod redact_tests {
         assert!(!d.contains(":p@"), "userinfo 不得出现: {d}");
         assert!(!d.contains("\"b\""), "auth 值不得出现: {d}");
         assert!(d.contains("[REDACTED]"), "应含 REDACTED 标记: {d}");
+    }
+
+    /// E14 搜索语料：Http 主源 + 备用源全集、userinfo/敏感 query 脱敏、
+    /// TorrentFile 空语料——按凭据片段搜索命中不了（防 search 侧信道）。
+    #[test]
+    fn search_urls_redacts_and_covers_backup() {
+        let http = DownloadSource::Http {
+            url: "http://u:p@host.lan/file.iso?token=zzz".into(),
+            headers: vec![],
+            auth: None,
+            backup_url: Some("http://bak.lan/file.iso".into()),
+            proxy: None,
+        };
+        let urls = http.search_urls();
+        assert_eq!(urls.len(), 2, "主源 + 备用源: {urls:?}");
+        assert!(
+            urls.iter()
+                .all(|u| !u.contains(":p@") && !u.contains("zzz")),
+            "凭据/敏感 query 不得进入搜索语料: {urls:?}"
+        );
+        assert!(urls[0].contains("host.lan/file.iso"));
+        assert!(urls[1].contains("bak.lan"));
+
+        assert!(DownloadSource::TorrentFile(vec![1, 2, 3])
+            .search_urls()
+            .is_empty());
+        let mg = DownloadSource::Magnet("magnet:?xt=urn:btih:ABC".into());
+        assert_eq!(mg.search_urls(), vec!["magnet:?xt=urn:btih:ABC"]);
     }
 
     /// E5 任务级代理：proxy URL（可含 user:pass@）参与 serde 往返，

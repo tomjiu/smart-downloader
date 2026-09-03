@@ -76,6 +76,99 @@ async fn add_task(
     (status, body)
 }
 
+/// E14 `?search=` e2e：名字/URL 子串命中（大小写不敏感）、无命中空集、
+/// 空白退化为不过滤、与分页共存（X-Total-Count 反映搜索后总数）。
+/// URL 维度判别用 TestServer 端口号（`:port` 为 url 的唯一子串）。
+#[tokio::test]
+async fn list_tasks_search_e2e() {
+    async fn list_ids(client: &reqwest::Client, base: &str, qs: &str) -> Vec<String> {
+        let v: serde_json::Value = client
+            .get(format!("{base}/tasks{qs}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["task_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    let srv1 = TestServer::start(patterned(8 * 1024)).await;
+    let srv2 = TestServer::start(patterned(8 * 1024)).await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 两个任务：各自独立 TestServer（canonical 互异）；带显式名
+    let mut ids = Vec::new();
+    for (srv, name) in [(&srv1, "alpha-report.bin"), (&srv2, "beta-movie.mkv")] {
+        let dest = std::env::temp_dir().join(format!("e14-search-{}", ids.len()));
+        let resp = client
+            .post(format!("{base}/tasks"))
+            .json(&serde_json::json!({
+                "url": srv.url(),
+                "dest": dest.to_str().unwrap(),
+                "name": name,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+        ids.push(
+            resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+
+    // 名字命中（查询大写 → 大小写不敏感）
+    assert_eq!(
+        list_ids(&client, &base, "?search=REPORT").await,
+        vec![ids[0].clone()]
+    );
+    // 名字命中（另一任务）
+    assert_eq!(
+        list_ids(&client, &base, "?search=movie").await,
+        vec![ids[1].clone()]
+    );
+    // URL 命中：端口子串唯一定位 TestServer
+    let port1 = srv1.addr.port().to_string();
+    assert_eq!(
+        list_ids(&client, &base, &format!("?search=:{port1}")).await,
+        vec![ids[0].clone()]
+    );
+
+    // 无命中 → 空数组
+    assert!(list_ids(&client, &base, "?search=nonexistent-keyword")
+        .await
+        .is_empty());
+
+    // 空白关键字 → 不过滤（全量 2）
+    assert_eq!(list_ids(&client, &base, "?search=%20%20").await.len(), 2);
+
+    // 搜索 + 分页共存：X-Total-Count 反映搜索后总数（=1），非页长
+    let resp = client
+        .get(format!("{base}/tasks?search=report&limit=1&offset=0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("x-total-count")
+            .and_then(|v| v.to_str().ok()),
+        Some("1"),
+        "X-Total-Count 必须是搜索后总数"
+    );
+    let arr: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(arr.as_array().unwrap().len(), 1);
+    assert_eq!(arr[0]["task_id"], ids[0].as_str());
+}
+
 #[tokio::test]
 async fn add_task_then_get_snapshot_and_list() {
     let body = patterned(64 * 1024);
