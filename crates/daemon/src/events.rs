@@ -81,6 +81,45 @@ impl SchedulerEvent {
             SchedulerEvent::ProviderStatus { .. } => None,
         }
     }
+
+    /// 事件类型标签（E10）：与 serde `tag = "type"` `rename_all =
+    /// snake_case` 的线格式一致——match 全变体且无通配臂，新增变体漏标
+    /// 由编译期拦截（对齐 E7 known_state_labels 防漂移模式）。
+    pub fn type_label(&self) -> &'static str {
+        match self {
+            SchedulerEvent::TaskCreated { .. } => "task_created",
+            SchedulerEvent::StateChanged { .. } => "state_changed",
+            SchedulerEvent::Progress { .. } => "progress",
+            SchedulerEvent::Speed { .. } => "speed",
+            SchedulerEvent::HealthEvent { .. } => "health_event",
+            SchedulerEvent::Error { .. } => "error",
+            SchedulerEvent::Completed { .. } => "completed",
+            SchedulerEvent::Failed { .. } => "failed",
+            SchedulerEvent::DuplicateRejected { .. } => "duplicate_rejected",
+            SchedulerEvent::ProviderStatus { .. } => "provider_status",
+        }
+    }
+}
+
+/// 合法事件类型标签全集（E10 `GET /events?type=` 校验输入；顺序与枚举
+/// 声明序一致，返回形状对齐 E7 known_state_labels）。一致性由测试锁定：
+/// 与 `type_label()` 全变体映射逐项相等。
+pub fn known_event_type_labels() -> Vec<String> {
+    [
+        "task_created",
+        "state_changed",
+        "progress",
+        "speed",
+        "health_event",
+        "error",
+        "completed",
+        "failed",
+        "duplicate_rejected",
+        "provider_status",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// 带 monotonic seq 的事件信封（D36）。

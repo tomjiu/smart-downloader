@@ -1744,3 +1744,164 @@ async fn task_name_backfilled_from_content_disposition_e2e() {
         .unwrap();
     assert_eq!(row["name"], "cd-served.bin", "列表必须透出回填名: {row}");
 }
+
+/// E10: GET /events——seq 游标分页 + task_id/type 过滤 + 校验/缺口报警。
+/// 事件经 state.hub() 注入合成序列（无后台 poll 干扰，断言确定性）。
+#[tokio::test]
+async fn events_api_pagination_filter_and_validation_e2e() {
+    use smart_dl_core::state_machine::TaskState;
+
+    let (addr, state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 合成 6 条确定性事件：t1 四条（created/progress/state/completed）+ t2 两条
+    state.hub().publish(SchedulerEvent::TaskCreated {
+        task_id: "t1".into(),
+    });
+    state.hub().publish(SchedulerEvent::Progress {
+        task_id: "t1".into(),
+        done: 5,
+        total: 10,
+    });
+    state.hub().publish(SchedulerEvent::StateChanged {
+        task_id: "t1".into(),
+        from: TaskState::Queued,
+        to: TaskState::Paused,
+    });
+    state.hub().publish(SchedulerEvent::Completed {
+        task_id: "t1".into(),
+    });
+    state.hub().publish(SchedulerEvent::TaskCreated {
+        task_id: "t2".into(),
+    });
+    state.hub().publish(SchedulerEvent::Failed {
+        task_id: "t2".into(),
+        reason: "boom".into(),
+    });
+
+    // 1) 无参全量（缺省 limit 100 > 6）+ 信封形状与 WS 帧一致
+    let body: serde_json::Value = client
+        .get(format!("{base}/events"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["events"].as_array().unwrap().len(), 6, "{body}");
+    assert_eq!(body["next_after"], 6);
+    assert_eq!(body["has_more"], false);
+    assert_eq!(body["truncated"], false, "缓冲未冲掉任何事件 → 无缺口");
+    assert_eq!(body["oldest_seq"], 1);
+    assert_eq!(body["events"][0]["seq"], 1);
+    assert_eq!(body["events"][0]["event"]["type"], "task_created");
+    assert_eq!(body["events"][3]["event"]["type"], "completed");
+
+    // 2) limit=2 游标分页：3 页拉完，has_more 递减
+    let p1: serde_json::Value = client
+        .get(format!("{base}/events?limit=2"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(p1["events"].as_array().unwrap().len(), 2);
+    assert_eq!(p1["next_after"], 2);
+    assert_eq!(p1["has_more"], true);
+    let cursor = p1["next_after"].as_u64().unwrap();
+    let p2: serde_json::Value = client
+        .get(format!("{base}/events?limit=2&after={cursor}"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(p2["next_after"], 4);
+    assert_eq!(p2["has_more"], true);
+    let p3: serde_json::Value = client
+        .get(format!("{base}/events?limit=2&after=4"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(p3["events"].as_array().unwrap().len(), 2);
+    assert_eq!(p3["has_more"], false);
+
+    // 3) task_id 过滤：t1 → 4 条且逐条 task_id 命中
+    let f: serde_json::Value = client
+        .get(format!("{base}/events?task_id=t1"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = f["events"].as_array().unwrap();
+    assert_eq!(rows.len(), 4, "{f}");
+    assert!(rows.iter().all(|e| e["event"]["task_id"] == "t1"));
+
+    // 4) type 多值过滤 + 大小写不敏感（task_created ×2 + completed ×1）
+    let f: serde_json::Value = client
+        .get(format!("{base}/events?type=task_created,COMPLETED"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(f["events"].as_array().unwrap().len(), 3, "{f}");
+
+    // 5) 组合过滤：task_id=t1 & type=task_created → 恰 1 条
+    let f: serde_json::Value = client
+        .get(format!("{base}/events?task_id=t1&type=task_created"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(f["events"].as_array().unwrap().len(), 1);
+    assert_eq!(f["events"][0]["event"]["task_id"], "t1");
+
+    // 6) 非法 type → 400 且错误信息含合法值全集（防盲猜）
+    let resp = client
+        .get(format!("{base}/events?type=nope"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let msg = resp.text().await.unwrap();
+    assert!(msg.contains("provider_status"), "错误需带合法值全集: {msg}");
+
+    // 7) limit 非法（0 / 超 1000）→ 400
+    let r0 = client
+        .get(format!("{base}/events?limit=0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r0.status(), reqwest::StatusCode::BAD_REQUEST);
+    let r1001 = client
+        .get(format!("{base}/events?limit=1001"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r1001.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 8) after 越过尾部 → 空页 + next_after 原样回显（游标语义）
+    let tail: serde_json::Value = client
+        .get(format!("{base}/events?after=99"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(tail["events"].as_array().unwrap().len(), 0);
+    assert_eq!(tail["next_after"], 99);
+    assert_eq!(tail["has_more"], false);
+}

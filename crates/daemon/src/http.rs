@@ -1,10 +1,11 @@
 //! HTTP API（axum，M6）：任务 CRUD + 快照 + Provider 运行态 + WS 升级端点（M7）。
 
+use crate::events::{known_event_type_labels, Envelope};
 #[cfg(feature = "nas")]
 use crate::nas;
 use crate::state::{DaemonError, DaemonState};
 use crate::ws::Throttler;
-#[cfg(feature = "nas")]
+// E10：list_events 返回 Response；原仅 nas 使用，现两 feature 均用 → 提出 cfg。
 use axum::response::Response;
 use axum::{
     extract::{
@@ -684,8 +685,9 @@ async fn remove_task(
 }
 
 /// WS 升级端点（D36 socket 端点，M7）：连接即推全量（重连重同步），随后
-/// 轮询增量 + 1s 快照节流（Progress/Speed 合并）。单消费者语义（D22 本机单
-/// 用户）；多连接时后来的连接会 drain 走队列，属可接受偏差。
+/// 轮询增量 + 1s 快照节流（Progress/Speed 合并）。E10：首推/轮询均改非破坏
+/// 读（read_after/snapshot_upto）——多连接不再互踩（原 drain 单消费者语义
+/// 升级）；事件缓冲非清空，历史可事后经 GET /events 查询。
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<DaemonState>>,
@@ -696,9 +698,10 @@ async fn ws_handler(
 async fn ws_session(mut socket: WebSocket, state: Arc<DaemonState>) {
     let hub = state.hub();
 
-    // 1) 连接即推送全量（掉队客户端重连重同步入口）
+    // 1) 连接即推送全量（掉队客户端重连重同步入口；E10 非破坏读——
+    //    多连接各自拉到同一份历史，不再互踩）
     let mut last_seq = 0u64;
-    for env in hub.drain() {
+    for env in hub.read_after(0, usize::MAX) {
         if send_text(&mut socket, &env).await.is_none() {
             return;
         }
@@ -1007,6 +1010,73 @@ struct BatchTaskReq {
 /// 批量 id 上限（批量语义是便利入口不是全表操作入口；防误传全量 id 集合）。
 const BATCH_IDS_CAP: usize = 100;
 
+/// `GET /events` 查询参数（E10）：`after` seq 游标（默认 0 = 全量重同步）、
+/// `limit` 页长（默认 100）、`task_id`/`type` 可选过滤（`type` 逗号分隔多值，
+/// 大小写不敏感，对齐 E7 风格）。
+#[derive(Deserialize, Default)]
+struct ListEventsQuery {
+    #[serde(default)]
+    after: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default, rename = "type")]
+    event_type: Option<String>,
+}
+
+/// `GET /events` 页长上限（E10：UI 每页 50–100 量级；4096 全量可分页拉取）。
+const EVENTS_LIMIT_CAP: usize = 1000;
+/// `GET /events` 缺省页长（不传 limit 也限页，防一次性拉全缓冲）。
+const EVENTS_LIMIT_DEFAULT: usize = 100;
+
+/// 事件历史查询（E10）：非破坏读 WsHub 环形缓冲；seq 游标分页 + task_id/
+/// type 过滤 + `truncated` 缺口报警（缓冲已冲掉目标区间 → 客户端应放弃
+/// 增量补拉改走全量重同步）。过滤在分页前生效（limit = 过滤后条数）。
+async fn list_events(
+    Query(q): Query<ListEventsQuery>,
+    State(state): State<Arc<DaemonState>>,
+) -> Response {
+    let types = match parse_label_list(&q.event_type, &known_event_type_labels(), "type") {
+        Ok(t) => t,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    if let Some(l) = q.limit {
+        if l == 0 || l > EVENTS_LIMIT_CAP {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("limit 须在 1..={EVENTS_LIMIT_CAP}"),
+            )
+                .into_response();
+        }
+    }
+    let limit = q.limit.unwrap_or(EVENTS_LIMIT_DEFAULT);
+    let after = q.after.unwrap_or(0);
+    let hub = state.hub();
+    let pred = |env: &Envelope| {
+        let task_ok = q
+            .task_id
+            .as_deref()
+            .is_none_or(|want| env.event.task_id() == Some(want));
+        let type_ok = types.is_empty()
+            || types
+                .iter()
+                .any(|t| env.event.type_label().eq_ignore_ascii_case(t));
+        task_ok && type_ok
+    };
+    let (events, has_more) = hub.read_filtered(after, limit, pred);
+    let next_after = events.last().map(|e| e.seq).unwrap_or(after);
+    let truncated = hub.gap_after(after);
+    Json(serde_json::json!({
+        "events": events,
+        "next_after": next_after,
+        "has_more": has_more,
+        "oldest_seq": hub.oldest_seq(),
+        "truncated": truncated,
+    }))
+    .into_response()
+}
+
 async fn batch_tasks(
     State(state): State<Arc<DaemonState>>,
     axum::Json(body): axum::Json<BatchTaskReq>,
@@ -1111,6 +1181,7 @@ macro_rules! router_base {
             .route("/version", get(version_endpoint))
             .route("/health", get(health_endpoint))
             .route("/providers", get(providers))
+            .route("/events", get(list_events))
             .route("/ws", get(ws_handler))
     };
 }
