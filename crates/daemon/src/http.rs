@@ -77,6 +77,10 @@ pub struct AddTaskReq {
     /// 缺省 = 引擎派生链（Content-Disposition → URL 末段 → download.bin）。
     #[serde(default)]
     pub name: Option<String>,
+    /// 文件冲突策略（E21，仅 HTTP 显式名任务生效）：`overwrite`（默认）/
+    /// `rename`（自动改名 name(1).ext）/ `skip`（已存在则任务直接 Completed）。
+    #[serde(default)]
+    pub conflict_policy: Option<String>,
 }
 
 #[cfg(feature = "xunlei-import")]
@@ -943,6 +947,19 @@ async fn add_task(
                     backup_url: req.backup_url,
                     backup_md5: req.backup_md5,
                     name: req.name,
+                    conflict: match req.conflict_policy.as_deref() {
+                        None => None,
+                        Some(other) => match crate::state::ConflictPolicy::parse(other) {
+                            Some(c) => Some(c),
+                            None => {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    Json(serde_json::json!({ "error":
+                                        format!("未知 conflict_policy {other:?}（合法值: overwrite, rename, skip）") })),
+                                );
+                            }
+                        },
+                    },
                 },
             )
             .await
