@@ -169,6 +169,91 @@ async fn list_tasks_search_e2e() {
     assert_eq!(arr[0]["task_id"], ids[0].as_str());
 }
 
+/// E15 重命名 e2e：设置 → 200 快照带新名 → 列表/搜索（E14）联动 →
+/// 清除（null 与 {} 两形态）→ name 省略；空白 400 / 非法路径分量 400 /
+/// 未知任务 404。落盘路径不受影响属引擎 add 时决策（不在 API 可断言面）。
+#[tokio::test]
+async fn task_rename_e2e() {
+    let srv = TestServer::start(patterned(8 * 1024)).await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let (status, b) = add_task(&client, &base, &srv.url()).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "add 应 201: {b}");
+    let tid = b["task_id"].as_str().unwrap().to_string();
+
+    // 设置新名 → 200 + 快照带新名
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/name"))
+        .json(&serde_json::json!({ "name": "renamed-display.bin" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let snap: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(snap["name"], "renamed-display.bin", "重命名后快照应带新名");
+
+    // 列表 + E14 搜索联动：按新名命中
+    let list: serde_json::Value = client
+        .get(format!("{base}/tasks?search=renamed-display"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let arr = list.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "搜索应命中重命名后的任务");
+    assert_eq!(arr[0]["name"], "renamed-display.bin");
+
+    // 空白 400（清除语义由 null 承担）
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/name"))
+        .json(&serde_json::json!({ "name": "   " }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 非法路径分量 400（V3 终审同 add）
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/name"))
+        .json(&serde_json::json!({ "name": "../evil" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 清除：null 形态 → name 字段省略
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/name"))
+        .json(&serde_json::json!({ "name": null }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let snap: serde_json::Value = resp.json().await.unwrap();
+    assert!(snap.get("name").is_none(), "清除后 name 字段应省略: {snap}");
+
+    // 清除：{} 缺省形态（重复清除幂等 200）
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/name"))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    // 未知任务 404
+    let resp = client
+        .post(format!("{base}/tasks/t404/name"))
+        .json(&serde_json::json!({ "name": "x.bin" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
 #[tokio::test]
 async fn add_task_then_get_snapshot_and_list() {
     let body = patterned(64 * 1024);

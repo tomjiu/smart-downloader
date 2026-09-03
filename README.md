@@ -95,6 +95,7 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 | `/tasks` | GET / POST | 任务列表（`?state=`/`?engine=` 过滤、`?search=` 关键字、`?limit`/`?offset` 分页）/ 建任务（HTTP、FTP 目录、magnet、.torrent） |
 | `/tasks/:id` | GET / DELETE | 快照（含 files 明细与实时速率）/ 删除 |
 | `/tasks/:id/pause` · `/resume` | POST | 生命周期 |
+| `/tasks/:id/name` | POST | 任务重命名（显示层；`{"name": null}` 清除回退派生链） |
 | `/tasks/:id/logs` | GET | 任务日志 |
 | `/tasks/:id/limit` | POST | 任务级限速（BT 双向 / HTTP 下载向） |
 | `/tasks/:id/files/priority` | POST | BT 子文件优先级（持久化 + 恢复重放） |

@@ -2246,6 +2246,37 @@ impl DaemonState {
         Ok(())
     }
 
+    /// 任务重命名（E15）：`POST /tasks/:id/name`。显示层改名——落盘路径在
+    /// 引擎 add 时即已决定（httpdl `resolved_name` 决策链），改名不迁移已
+    /// 落盘/在传文件；名字是列表/快照透出与 E14 搜索语料（name 分量）。
+    /// `None` = 清除显式名（E9 回填仅在"名字为空且引擎报名"的轮询点发生，
+    /// 活跃任务下一轮可能自动补回派生名——清除语义即"交还派生链"）。
+    /// 事件 detail 只记 set/cleared（与 proxy_changed 同口径，名字本体走
+    /// 快照/列表查询，不进事件链路）。
+    pub fn set_task_name(&self, id: &str, name: Option<String>) -> Result<(), DaemonError> {
+        if let Some(n) = &name {
+            if n.trim().is_empty() {
+                return Err(DaemonError::InvalidSource(
+                    "name 不能为空白（清除语义请传 null）".into(),
+                ));
+            }
+            // V3 终审同函数：与 add 入参同一裁决点（非法路径分量即拒）
+            smart_dl_core::session::output::sanitize_rel(n)
+                .map_err(|e| DaemonError::InvalidSource(format!("name 非法: {e}")))?;
+        }
+        {
+            let mut tasks = self.tasks.lock();
+            let rec = tasks
+                .get_mut(id)
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            let detail = if name.is_some() { "set" } else { "cleared" };
+            rec.task.metadata.name = name;
+            rec.push_event("name_changed", Some(detail.into()));
+        }
+        self.autosave();
+        Ok(())
+    }
+
     /// 子文件优先级重放收敛（单轮）：对恢复时 metadata 未就绪而挂起的任务，
     /// 探测就绪性（readback 非空）→ 成功后全量重放并移除 pending。
     /// 返回本轮成功重放的任务 id 列表（测试/日志用）。
@@ -5911,6 +5942,96 @@ mod name_backfill_tests {
         let rec = state.tasks.lock().get(&tid).cloned().unwrap();
         assert!(rec.task.metadata.name.is_none(), "引擎未报 → 保持 None");
         assert!(!rec.events.iter().any(|e| e.op == "name_backfilled"));
+    }
+}
+
+/// E15 任务重命名：显示层改名 + 清除回退 + 入参校验（V3 终审同函数）。
+/// 落盘路径在引擎 add 时已定，改名不迁移文件（显示/检索字段）。
+#[cfg(test)]
+mod task_rename_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rename_sets_name_list_search_and_event() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task("https://x.lan/f.bin".into(), None)
+            .await
+            .unwrap();
+
+        state
+            .set_task_name(&tid, Some("renamed.bin".into()))
+            .unwrap();
+        // 快照透出（E7 链路）
+        let snap = state.task_snapshot(&tid).await.unwrap();
+        assert_eq!(snap.name.as_deref(), Some("renamed.bin"));
+        // 列表透出
+        let list = state.list();
+        assert!(list
+            .iter()
+            .any(|r| r.task_id == tid && r.name.as_deref() == Some("renamed.bin")));
+        // E14 搜索语料联动：按新名命中（大小写不敏感）
+        let (page, total) = state.list_filtered(&ListQuery {
+            search: Some("RENAMED".into()),
+            ..Default::default()
+        });
+        assert_eq!(total, 1);
+        assert_eq!(page[0].task_id, tid);
+        // 事件链（detail 只记 set/cleared，名字本体不进事件）
+        let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+        assert!(rec
+            .events
+            .iter()
+            .any(|e| e.op == "name_changed" && e.detail.as_deref() == Some("set")));
+    }
+
+    #[tokio::test]
+    async fn rename_validation_clear_and_notfound() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task("https://x.lan/f.bin".into(), None)
+            .await
+            .unwrap();
+
+        // 空白拒绝（清除语义由 None 承担）
+        let e = state.set_task_name(&tid, Some("   ".into())).unwrap_err();
+        assert!(matches!(e, DaemonError::InvalidSource(_)));
+        // 非法路径分量拒绝（sanitize_rel 与 add 同一裁决点）
+        let e = state
+            .set_task_name(&tid, Some("../evil".into()))
+            .unwrap_err();
+        assert!(matches!(e, DaemonError::InvalidSource(_)));
+        assert!(
+            state
+                .tasks
+                .lock()
+                .get(&tid)
+                .unwrap()
+                .task
+                .metadata
+                .name
+                .is_none(),
+            "非法改名必须零副作用"
+        );
+
+        // 设置 → 清除 → 快照 name 省略 + cleared 事件
+        state.set_task_name(&tid, Some("tmp.bin".into())).unwrap();
+        state.set_task_name(&tid, None).unwrap();
+        let snap = state.task_snapshot(&tid).await.unwrap();
+        assert_eq!(snap.name, None);
+        let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+        assert!(rec
+            .events
+            .iter()
+            .any(|e| e.op == "name_changed" && e.detail.as_deref() == Some("cleared")));
+
+        // 未知任务
+        assert!(matches!(
+            state.set_task_name("t404", Some("x".into())),
+            Err(DaemonError::NotFound(_))
+        ));
     }
 }
 
