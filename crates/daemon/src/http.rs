@@ -12,14 +12,16 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, Query, State,
     },
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
-    response::IntoResponse,
+    response::{sse::Event as SseEvent, IntoResponse, Sse},
     routing::{get, post},
     Json, Router,
 };
 use base64::Engine as _;
 use serde::Deserialize;
+use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1077,6 +1079,156 @@ async fn list_events(
     .into_response()
 }
 
+/// `GET /events/stream` 查询参数：`after` 游标（显式覆盖 Last-Event-ID 头，
+/// 调试友好）/ `task_id` / `type` 过滤（语义同 GET /events）。无 after 时读
+/// `Last-Event-ID` 请求头（EventSource 断线重连自动携带），都无 = 0（全量
+/// 历史重放）；头解析失败视为未携带（EventSource 只发合法值）。
+#[derive(Deserialize, Default)]
+struct EventsStreamQuery {
+    #[serde(default)]
+    after: Option<u64>,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default, rename = "type")]
+    event_type: Option<String>,
+}
+
+/// SSE 轮询周期（与 WS 会话同口径：200ms 增量轮询 + 1s 快照节流）。
+const SSE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// SSE 每轮批量拉取上限（200ms × 256 = 1280 ev/s 稳态，远超背压丢弃口径）。
+const SSE_BATCH: usize = 256;
+
+/// Envelope → SSE 帧：`id: <seq>`（EventSource 断线自动回传 Last-Event-ID）、
+/// `event: <type_label>`（EventSource addEventListener 按类型路由）、
+/// `data: <envelope JSON>`（与 WS 帧、GET /events 条目同形——单套解析复用）。
+/// 序列化失败 → None（跳帧，不毒化流）。
+fn envelope_to_sse(env: &Envelope) -> Option<SseEvent> {
+    let data = serde_json::to_string(env).ok()?;
+    Some(
+        SseEvent::default()
+            .id(env.seq.to_string())
+            .event(env.event.type_label())
+            .data(data),
+    )
+}
+
+/// SSE 流状态机（unfold）：pending 先排空（重放/当前批），空则等下一轮
+/// 轮询增量；客户端断开 = 响应体 dropped → unfold future 被 poll 中止，
+/// 状态自然释放（无泄漏后台任务）。
+struct SseStreamState {
+    state: Arc<DaemonState>,
+    cursor: u64,
+    pred: Box<dyn Fn(&Envelope) -> bool + Send>,
+    pending: VecDeque<SseEvent>,
+    throttler: Throttler,
+    last_flush: Instant,
+    tick: tokio::time::Interval,
+}
+
+/// SSE 事件流端点（E12）：`text/event-stream` 长连接——连接即重放历史
+/// （非破坏读，与 WS 首推同口径），随后 200ms 轮询增量 + 1s 节流
+/// （Progress/Speed 合并，与 WS 同口径；重放不节流）。缺口（gap_after）→
+/// 注释行 `: gap` 报警 + 从缓冲最旧重放（客户端可按首帧 seq 回退或注释行
+/// 判定增量补拉失效，同 REST `truncated` 的判定输入）。与 WS 的差异：
+/// 单向推送（无上行）、HTTP/1.1 友好（代理穿透/浏览器 EventSource 原生）、
+/// keep-alive 注释保活。路由在 auth_mw 之下，与全端点同保护。
+async fn events_stream(
+    Query(q): Query<EventsStreamQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+) -> Response {
+    let types = match parse_label_list(&q.event_type, &known_event_type_labels(), "type") {
+        Ok(t) => t,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    let last_event_id = headers
+        .get(header::HeaderName::from_static("last-event-id"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let requested = q.after.or(last_event_id).unwrap_or(0);
+    let hub = state.hub();
+    let pred = move |env: &Envelope| {
+        let task_ok = q
+            .task_id
+            .as_deref()
+            .is_none_or(|want| env.event.task_id() == Some(want));
+        let type_ok = types.is_empty()
+            || types
+                .iter()
+                .any(|t| env.event.type_label().eq_ignore_ascii_case(t));
+        task_ok && type_ok
+    };
+
+    // 缺口检测（连接时点快照口径）：目标区间已被冲掉 → 从缓冲最旧重放，
+    // 并以注释行报警（客户端亦可按首帧 seq 回退自行判定）。
+    let (cursor, gap) = if hub.gap_after(requested) {
+        (
+            hub.oldest_seq()
+                .unwrap_or_else(|| hub.last_seq() + 1)
+                .saturating_sub(1),
+            true,
+        )
+    } else {
+        (requested, false)
+    };
+
+    // 连接即重放历史（非破坏读；不节流，与 WS 首推同口径）。
+    let mut pending = VecDeque::new();
+    if gap {
+        pending.push_back(SseEvent::default().comment(format!(
+            "gap: events after {requested} were evicted, replaying from oldest buffered seq"
+        )));
+    }
+    let mut cursor = cursor;
+    let (replay, _) = hub.read_filtered(cursor, usize::MAX, &pred);
+    for env in replay {
+        cursor = env.seq;
+        if let Some(ev) = envelope_to_sse(&env) {
+            pending.push_back(ev);
+        }
+    }
+
+    let stream = futures::stream::unfold(
+        SseStreamState {
+            state,
+            cursor,
+            pred: Box::new(pred),
+            pending,
+            throttler: Throttler::new(),
+            last_flush: Instant::now(),
+            tick: tokio::time::interval(SSE_POLL_INTERVAL),
+        },
+        |mut st| async move {
+            loop {
+                if let Some(ev) = st.pending.pop_front() {
+                    return Some((Ok::<_, Infallible>(ev), st));
+                }
+                st.tick.tick().await;
+                let (batch, _) = st.state.hub().read_filtered(st.cursor, SSE_BATCH, &st.pred);
+                for env in batch {
+                    st.cursor = env.seq;
+                    if Throttler::is_throttlable(&env.event) {
+                        st.throttler.upsert(env); // 合并，等 1s flush（与 WS 同口径）
+                    } else if let Some(ev) = envelope_to_sse(&env) {
+                        st.pending.push_back(ev);
+                    }
+                }
+                if !st.throttler.is_empty() && st.last_flush.elapsed() >= Duration::from_secs(1) {
+                    for env in st.throttler.drain_pending() {
+                        if let Some(ev) = envelope_to_sse(&env) {
+                            st.pending.push_back(ev);
+                        }
+                    }
+                    st.last_flush = Instant::now();
+                }
+            }
+        },
+    );
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
 async fn batch_tasks(
     State(state): State<Arc<DaemonState>>,
     axum::Json(body): axum::Json<BatchTaskReq>,
@@ -1182,6 +1334,7 @@ macro_rules! router_base {
             .route("/health", get(health_endpoint))
             .route("/providers", get(providers))
             .route("/events", get(list_events))
+            .route("/events/stream", get(events_stream))
             .route("/ws", get(ws_handler))
     };
 }
