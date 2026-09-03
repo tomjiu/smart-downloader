@@ -59,6 +59,58 @@ enum WorkerExit {
     Paused,
 }
 
+/// worker 镜像偏好轮转（E24）：起点 = worker_no % len（确定性均匀分摊）。
+/// 单元素表恒等返回克隆（零变化）。供 download_dynamic spawn 时调用与单测。
+fn rotate_mirrors(mirrors: &[String], worker_no: usize) -> Vec<String> {
+    if mirrors.len() <= 1 {
+        return mirrors.to_vec();
+    }
+    let k = worker_no % mirrors.len();
+    mirrors[k..]
+        .iter()
+        .chain(mirrors[..k].iter())
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn single_mirror_rotation_is_identity() {
+        let m = v(&["a"]);
+        for w in 0..4 {
+            assert_eq!(rotate_mirrors(&m, w), m);
+        }
+        // 空表（防御）恒空
+        assert!(rotate_mirrors(&[], 3).is_empty());
+    }
+
+    #[test]
+    fn dual_mirror_rotation_spreads_workers() {
+        let m = v(&["a", "b"]);
+        assert_eq!(rotate_mirrors(&m, 0), v(&["a", "b"]));
+        assert_eq!(rotate_mirrors(&m, 1), v(&["b", "a"]));
+        assert_eq!(rotate_mirrors(&m, 2), v(&["a", "b"]));
+        assert_eq!(rotate_mirrors(&m, 3), v(&["b", "a"]));
+        // 三源：起点 0/1/2 循环
+        let m3 = v(&["a", "b", "c"]);
+        assert_eq!(rotate_mirrors(&m3, 1), v(&["b", "c", "a"]));
+        assert_eq!(rotate_mirrors(&m3, 2), v(&["c", "a", "b"]));
+        // 轮转结果恒为原表重排（无丢失/重复）
+        for w in 0..6 {
+            let mut r = rotate_mirrors(&m3, w);
+            r.sort();
+            assert_eq!(r, m3);
+        }
+    }
+}
+
 /// 动态分段下载：worker 数 N=clamp(total/64MB, 2, 8)，段粒度 min_split。
 /// `ledger` = Some 时从已完成段恢复并逐段持久化进度（None = 一次性下载，
 /// 不落账本）。`pause` = Some 时段边界检查暂停标志。`progress` = 每段完成
@@ -115,10 +167,15 @@ pub async fn download_dynamic(
     };
     let n_workers = segment_count(total);
     let mut workers = tokio::task::JoinSet::new();
-    for _ in 0..n_workers {
+    for worker_no in 0..n_workers {
         let client = client.clone();
         let part = part.to_path_buf();
         let mirrors = mirrors.to_vec();
+        // E24 多源并行：worker 按序号轮转 mirror 起点偏好（w%len），
+        // 多源表在 worker 池上摊平（真并行分摊而非全部挤首选源）；
+        // 段失败仍按轮转后的顺序逐源回退。单源表轮转恒等（零变化）。
+        // 评分排序（download_loop）已把健康源排前，轮转在其上做均匀分摊。
+        let mirrors = rotate_mirrors(&mirrors, worker_no);
         let headers = headers.to_vec();
         let limiter = limiter.clone();
         let manager = manager.clone();

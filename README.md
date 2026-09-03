@@ -8,7 +8,7 @@ Rust 多引擎下载器：HTTP(S) / FTP / BitTorrent（libtorrent 基座）统�
 
 | 引擎 | 能力 |
 |------|------|
-| **HTTP/HTTPS**（`smart-dl-httpdl`） | 多连接 Range 并行、动态分段（SegmentManager 动态领取 + 流式写盘）、段账本断点续传（`<part>.progress` 记录已完成段，跨重启恢复；ETag 失配/账本非法即作废重下）、真实进度与真暂停（段边界生效）、镜像与换源、`backup_url`/`backup_md5` 备用源兜底、失败缩小粒度重试、429 退避、跨段共享限速、sha256 可选校验 |
+| **HTTP/HTTPS**（`smart-dl-httpdl`） | 多连接 Range 并行、动态分段（SegmentManager 动态领取 + 流式写盘）、段账本断点续传（`<part>.progress` 记录已完成段，跨重启恢复；ETag 失配/账本非法即作废重下）、真实进度与真暂停（段边界生效）、镜像与换源、`backup_url`/`backup_md5` 备用源兜底、**多源并行**（双源强 ETag 相等 + Range/总长一致才启用跨源分段混拼，worker 轮转分摊；严于 aria2 的无条件多源）、失败缩小粒度重试、429 退避、跨段共享限速、sha256 可选校验 |
 | **FTP**（httpdl `ftp` feature） | 单文件 + 目录递归下载、断点续传、生命周期管理 |
 | **BitTorrent**（`smart-dl-btcore`） | libtorrent FFI 薄核：magnet / .torrent 建任务、元数据抓取（`POST /bt/metadata`）、fastresume 持久化与恢复、web seed 注入（P2SP）、任务级限速（双向）、子文件优先级（持久化 + 恢复重放）、校验/做种停止、DHT/LSD/UPnP 开关 |
 | **daemon**（`smart-dl-daemon`） | 任务生命周期（add/pause/resume/remove/list/status/logs）、并发队列（BT≤3 / HTTP·FTP≤8）、事件 WS（背压保护）、配置热重载、Provider fallback 兜底、运维 API（`/stats` `/version` `/health`）、全局代理 + 双引擎限速 |

@@ -6,7 +6,7 @@
 
 use crate::download::{download_dynamic, update_score, DynamicLedger, DynamicOutcome, SCORE_MIN};
 use crate::ledger;
-use crate::range::{probe_range, Probe};
+use crate::range::{multi_source_ok, probe_range, Probe};
 use crate::rate::{RateLimiter, RateSample};
 use crate::segment_manager::DEFAULT_MIN_SPLIT;
 use crate::verify::{verify_file, verify_file_md5};
@@ -621,6 +621,32 @@ impl DownloadEngine for HttpEngine {
         };
         let total = probe.total.unwrap_or(0);
 
+        // E24 多源并行：主源探测成功且配置备用源 → 备用源也探测；双源均为
+        // **强 ETag 且相等**（服务器生成的内容指纹一致，跨源内容混拼的安全性
+        // 证据，严于 aria2 的无条件多源）且 Range/总长一致 → mirrors 双源
+        // 起步（worker 轮转分摊段，段失败仍逐源回退；校验链不变——内容同质，
+        // 主源身份照用）。其余情形（弱/缺 ETag/不一致/备用源探测失败）保持
+        // 单源 + 兑底语义，零行为变化。探测仅 1 字节 Range 请求，时序成本
+        // 可忽略（兑底路径本就串行探测备用源）。
+        let dual_mirrors = if fell_back_to.is_none() {
+            if let Some(bu) = &backup_url {
+                match probe_range(&client, bu, &headers).await {
+                    Ok(bp) if multi_source_ok(&probe, &bp) => {
+                        println!(
+                            "[httpdl] {}: 双源同质（强 ETag 相等），多源并行下载启用",
+                            task.id
+                        );
+                        Some(vec![url.clone(), bu.clone()])
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         // 落盘名决策（E4）：
         // - 用户显式名（metadata.name）→ 权威，非法即拒任务（V3 语义不变）；
         // - 未提供 → 自动派生链：探测响应 Content-Disposition 文件名（服务端
@@ -688,9 +714,13 @@ impl DownloadEngine for HttpEngine {
         // 探测韧性初始化：主源失败已落备用源 → mirrors 以备用源起步，身份切换
         // （sha256 → None / md5 ← backup_md5）与运行时切备用源完全同语义；
         // backup_used = true —— 运行时再遇校验失败不再重复切向同一备用源。
+        // E24：双源同质门控通过 → 双 mirrors（身份仍为主源口径，内容一致）。
         let (init_mirrors, init_sha256, init_md5, init_backup_used) = match &fell_back_to {
             Some(bu) => (vec![bu.clone()], None, backup_md5.clone(), true),
-            None => (vec![url.clone()], sha256, None, false),
+            None => match dual_mirrors {
+                Some(m) => (m, sha256, None, false),
+                None => (vec![url.clone()], sha256, None, false),
+            },
         };
 
         let tid = task.id.clone();

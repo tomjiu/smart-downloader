@@ -172,6 +172,9 @@ async fn no_backup_keeps_legacy_downgrade_path() {
 #[tokio::test]
 async fn backup_unused_when_main_ok() {
     // 主源内容正确 → 不触发备用源（备用服务器不应收到请求）。
+    // E24 适配：备用源用不同 ETag（多源门控拒绝）——否则同强 ETag 的双源
+    // 会被合法地分段分摊（E24 新语义），原「零接触」断言不再成立；
+    // 本测试锁定的语义是「兕底切换不被触发」，不同 ETag 下不变。
     let size = MB;
     let good = integration::http_server::patterned(size);
     let srv_main = HttpTestServer::start(HttpServerConfig {
@@ -183,6 +186,7 @@ async fn backup_unused_when_main_ok() {
     let srv_backup = HttpTestServer::start(HttpServerConfig {
         size,
         patterned_content: true,
+        etag: Some("etag-backup-different"),
         ..Default::default()
     })
     .await;
@@ -204,13 +208,14 @@ async fn backup_unused_when_main_ok() {
     assert!(st.error.is_none());
     let got = std::fs::read(dir.path().join("bk5.bin")).unwrap();
     assert_eq!(got, good);
-    // 备用服务器零请求
+    // 备用服务器仅 add 期探测 1 次（E24：主源成功也会探测备用源做同质性
+    // 门控），无下载段请求
     assert_eq!(
         srv_backup
             .request_count
             .load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "主源正常时不得触碰备用源"
+        1,
+        "主源正常时备用源只应有探测请求，无下载段"
     );
 }
 
@@ -230,6 +235,9 @@ async fn backup_without_sha256_still_fails_over_on_content_mismatch() {
     let srv_backup = HttpTestServer::start(HttpServerConfig {
         size,
         patterned_content: true,
+        // E24 适配：不同 ETag（主源零/备用源 patterned 内容本就不同，
+        // 同默认 ETag 会误启多源混拼破坏本测试的「单源原样落位」前提）
+        etag: Some("etag-backup-different"),
         ..Default::default()
     })
     .await;
@@ -255,11 +263,12 @@ async fn backup_without_sha256_still_fails_over_on_content_mismatch() {
     assert!(st.error.is_none(), "无校验目标 → 不校验不告警");
     let got = std::fs::read(dir.path().join("bk6.bin")).unwrap();
     assert_eq!(got, bad, "主源内容原样落位");
+    // E24：备用源只有 add 期探测（1 次），无下载段请求
     assert_eq!(
         srv_backup
             .request_count
             .load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "无校验目标 → 不触发备用源"
+        1,
+        "无校验目标 → 不触发备用源下载"
     );
 }

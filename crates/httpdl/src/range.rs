@@ -83,6 +83,27 @@ fn content_range_total(headers: &reqwest::header::HeaderMap) -> Option<u64> {
         .and_then(|t| t.parse().ok())
 }
 
+/// 强 ETag 判定（E24）：`W/` 前缀 = 弱 ETag（同一资源不同表示都可同值，
+/// 不可作内容一致性证据）；空/缺失同样不合格。
+pub(crate) fn is_strong_etag(e: &Option<String>) -> bool {
+    e.as_deref()
+        .is_some_and(|v| !v.is_empty() && !v.starts_with("W/"))
+}
+
+/// 多源并行身份门控（E24）：双源**强 ETag 相等**（服务器生成的内容指纹
+/// 一致——跨源混拼段的安全性证据）且均支持 Range 且总长一致。任一不满足
+/// → 保持单源 + 兜底语义（跨源内容可能不同，混拼 = 静默损坏）。
+pub(crate) fn multi_source_ok(primary: &Probe, backup: &Probe) -> bool {
+    is_strong_etag(&primary.etag)
+        && is_strong_etag(&backup.etag)
+        && primary.etag == backup.etag
+        && primary.range_supported
+        && backup.range_supported
+        && primary.total.is_some()
+        && backup.total.is_some()
+        && primary.total == backup.total
+}
+
 /// CD 文件名清洗：剥目录成分（`/` `\` 都算——CD 可来自任意服务器）、剥引号
 /// 与空白、去控制字符、限长。返回 None = 无可用文件名（引擎侧逐级回退）。
 fn cd_clean_filename(raw: &str) -> Option<String> {
@@ -172,6 +193,62 @@ fn parse_content_disposition_filename(cd: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strong_etag_judgement() {
+        // E24：强/弱/缺失 ETag 判定
+        assert!(is_strong_etag(&Some("\"abc123\"".into())));
+        assert!(is_strong_etag(&Some("33a64df551425fcc".into())));
+        assert!(
+            !is_strong_etag(&Some("W/\"abc123\"".into())),
+            "弱 ETag 不合格"
+        );
+        assert!(!is_strong_etag(&Some(String::new())), "空 ETag 不合格");
+        assert!(!is_strong_etag(&None), "缺失 ETag 不合格");
+    }
+
+    #[test]
+    fn multi_source_gate_truth_table() {
+        let base = Probe {
+            range_supported: true,
+            etag: Some("\"v1\"".into()),
+            total: Some(1024),
+            filename: None,
+        };
+        // 同强 ETag + 同长 + 双 Range → 通过
+        assert!(multi_source_ok(&base, &base.clone()));
+        // ETag 不一致 → 拒绝
+        let other = Probe {
+            etag: Some("\"v2\"".into()),
+            ..base.clone()
+        };
+        assert!(!multi_source_ok(&base, &other));
+        // 弱 ETag → 拒绝
+        let weak = Probe {
+            etag: Some("W/\"v1\"".into()),
+            ..base.clone()
+        };
+        assert!(!multi_source_ok(&base, &weak));
+        assert!(!multi_source_ok(&weak, &base));
+        // 缺 ETag → 拒绝
+        let none = Probe {
+            etag: None,
+            ..base.clone()
+        };
+        assert!(!multi_source_ok(&base, &none));
+        // 总长不一致 → 拒绝
+        let short = Probe {
+            total: Some(512),
+            ..base.clone()
+        };
+        assert!(!multi_source_ok(&base, &short));
+        // 备用源不支持 Range → 拒绝（段请求会 200 全量，混拼写错位）
+        let norange = Probe {
+            range_supported: false,
+            ..base.clone()
+        };
+        assert!(!multi_source_ok(&base, &norange));
+    }
 
     #[test]
     fn cd_plain_quoted_and_bare() {
