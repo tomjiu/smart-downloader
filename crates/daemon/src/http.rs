@@ -747,6 +747,48 @@ async fn stats_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoRespo
     Json(state.stats())
 }
 
+/// Prometheus 指标（`GET /metrics`，E22）：text/plain 指标暴露格式（v1 从
+/// `stats()` 聚合派生——任务总数/按状态/按引擎/聚合速率）。标签值均来自
+/// 内部稳定标签（state/engine），无需转义。运维抓取口径：
+/// `scrape_configs: [{static_configs: [{targets: [daemon]}]}]`。
+async fn metrics_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let st = state.stats();
+    let mut out = String::with_capacity(1024);
+    out.push_str("# HELP smart_dl_tasks_total Number of download tasks by state and engine.\n");
+    out.push_str("# TYPE smart_dl_tasks_total gauge\n");
+    // 状态维度
+    for (label, n) in &st.by_state {
+        out.push_str(&format!(
+            "smart_dl_tasks_total{{dimension=\"state\",label=\"{label}\"}} {n}\n"
+        ));
+    }
+    // 引擎维度
+    for (label, n) in &st.by_engine {
+        out.push_str(&format!(
+            "smart_dl_tasks_total{{dimension=\"engine\",label=\"{label}\"}} {n}\n"
+        ));
+    }
+    // 聚合速率（bytes/s）
+    out.push_str("# HELP smart_dl_speed_bytes_per_second Aggregate transfer speed.\n");
+    out.push_str("# TYPE smart_dl_speed_bytes_per_second gauge\n");
+    out.push_str(&format!(
+        "smart_dl_speed_bytes_per_second{{direction=\"down\"}} {}\n",
+        st.down_bytes_s
+    ));
+    out.push_str(&format!(
+        "smart_dl_speed_bytes_per_second{{direction=\"up\"}} {}\n",
+        st.up_bytes_s
+    ));
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        out,
+    )
+        .into_response()
+}
+
 /// 版本与编译特性（对齐部署矩阵：二进制是哪个 feature 组合的构建）。
 async fn version_endpoint() -> impl IntoResponse {
     Json(serde_json::json!({
@@ -1540,6 +1582,7 @@ macro_rules! router_base {
             .route("/config", get(config_endpoint))
             .route("/config/limit", post(config_set_limit))
             .route("/stats", get(stats_endpoint))
+            .route("/metrics", get(metrics_endpoint))
             .route("/version", get(version_endpoint))
             .route("/health", get(health_endpoint))
             .route("/providers", get(providers))
