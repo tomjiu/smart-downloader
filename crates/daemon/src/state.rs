@@ -1281,12 +1281,17 @@ impl DaemonState {
     }
 
     /// 生效的 dest 白名单（V2）：未显式注入时兜底 default_dest_root。
+    ///
+    /// 锁序约定（docs/LOCK_MODEL.md）：顺序获取 `allowed_roots` → guard
+    /// 语句尾即释放 → 按需获取 `default_dest_root`，两把锁任何路径不同时
+    /// 持有——全域锁模型维持「任何时刻至多持一把锁」强不变量（2026-09
+    /// 锁模型审计中唯一的多锁同持边，现已消除）。
     fn dest_roots(&self) -> Vec<PathBuf> {
-        let g = self.allowed_roots.lock();
+        let g = self.allowed_roots.lock().clone();
         if g.is_empty() {
             vec![self.default_dest_root.lock().clone()]
         } else {
-            g.clone()
+            g
         }
     }
 
