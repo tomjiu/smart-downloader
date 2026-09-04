@@ -9340,16 +9340,24 @@ mod post_download_tests {
         let id = completed_task_with_file(&state, "d.bin", "done.bin", b"payload").await;
         state.publish_task_completed(&id);
 
-        // 钩子在后台线程执行 → 轮询等待 dump 文件
+        // 钩子在后台线程执行 → 轮询等待 dump 文件内容就绪。
+        // `env > dump` 重定向：文件创建 ≠ 内容写毕（CI 高负载下写入窗口
+        // 可达数百 ms，曾致读空误报"应有 SD_TASK_ID"）→ 等内容而非等存在。
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !dump.exists() {
+        let env = loop {
             assert!(
                 std::time::Instant::now() < deadline,
                 "钩子 10s 内未产出环境 dump"
             );
+            if dump.exists() {
+                if let Ok(content) = std::fs::read_to_string(&dump) {
+                    if content.contains("SD_TASK_ID=") {
+                        break content;
+                    }
+                }
+            }
             std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        let env = std::fs::read_to_string(&dump).unwrap();
+        };
         assert!(env.contains("SD_TASK_ID="), "应有 SD_TASK_ID: {env}");
         assert!(
             env.contains(&format!(
