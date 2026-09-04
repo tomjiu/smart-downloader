@@ -273,10 +273,12 @@ pub struct lt_torrent_status {
     pub metadata_received: ::std::os::raw::c_int,
     pub paused: ::std::os::raw::c_int,
     pub name: [::std::os::raw::c_char; 256usize],
+    pub all_time_download: i64,
+    pub all_time_upload: i64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of lt_torrent_status"][::std::mem::size_of::<lt_torrent_status>() - 312usize];
+    ["Size of lt_torrent_status"][::std::mem::size_of::<lt_torrent_status>() - 328usize];
     ["Alignment of lt_torrent_status"][::std::mem::align_of::<lt_torrent_status>() - 8usize];
     ["Offset of field: lt_torrent_status::state"]
         [::std::mem::offset_of!(lt_torrent_status, state) - 0usize];
@@ -300,6 +302,10 @@ const _: () = {
         [::std::mem::offset_of!(lt_torrent_status, paused) - 52usize];
     ["Offset of field: lt_torrent_status::name"]
         [::std::mem::offset_of!(lt_torrent_status, name) - 56usize];
+    ["Offset of field: lt_torrent_status::all_time_download"]
+        [::std::mem::offset_of!(lt_torrent_status, all_time_download) - 312usize];
+    ["Offset of field: lt_torrent_status::all_time_upload"]
+        [::std::mem::offset_of!(lt_torrent_status, all_time_upload) - 320usize];
 };
 unsafe extern "C" {
     pub fn lt_status(

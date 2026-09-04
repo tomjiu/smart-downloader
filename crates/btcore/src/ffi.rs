@@ -336,6 +336,8 @@ impl Session {
             metadata_received: 0,
             paused: 0,
             name: [0; 256],
+            all_time_download: 0,
+            all_time_upload: 0,
         };
         let code = unsafe { lt_status(self.raw, i.as_ptr(), &mut st) };
         call(code, || Ok(st))

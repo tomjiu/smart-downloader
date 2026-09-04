@@ -350,6 +350,10 @@ lt_err lt_status(lt_session* s, const char* ih, lt_torrent_status* out) {
         out->up_rate = st.upload_rate;
         out->num_peers = st.num_peers;
         out->num_seeds = st.num_seeds;
+        /* E33: 全生命周期累计上/下行透出（上传/分享率统计链路的数据源）。
+           libtorrent 1.x 起恒有该字段，无需版本守卫。 */
+        out->all_time_download = st.all_time_download;
+        out->all_time_upload = st.all_time_upload;
         return LT_OK;
     } catch (...) {
         return LT_ERR_ENGINE;
