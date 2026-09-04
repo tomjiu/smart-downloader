@@ -2965,8 +2965,13 @@ impl DaemonState {
         // E23：未接入引擎的任务（调度等待 Queued / 调度等待期被暂停 Paused）
         // → resume = 立即激活（消费定时，直接开始）。激活后记录态置
         // Downloading（对齐引擎侧 resume 语义；HTTP add 自启下载循环，BT 内
-        // 核由 add 后正常下载链路接管）。其余无句柄终态（E21 skip Completed /
-        // 激活失败 Failed）→ 404 口径拒绝。
+        // 核由 add 后正常下载链路接管）。
+        // E32：终态 Failed（无句柄——激活失败/E30 激活失败路径）→ resume =
+        // 手动重试：重新接入引擎。auto_retry 预算【不重置】——耗尽后手动
+        // 重试仅再给一次机会，任务再败时 fail_or_schedule_retry 依既有计数
+        // 直接终态（防预算白给循环）；有句柄 Failed 走下方引擎侧 resume
+        // （httpdl epoch 重入 + 段账本续传，BT handle 恢复）语义不变。
+        // 其余无句柄终态（E21 skip Completed / Stopped）→ 404 口径拒绝。
         let pending = {
             let tasks = self.tasks.lock();
             match tasks.get(id) {
@@ -2981,7 +2986,10 @@ impl DaemonState {
             }
         };
         if let Some((task, kind)) = pending {
-            if !matches!(task.state, TaskState::Queued | TaskState::Paused) {
+            if !matches!(
+                task.state,
+                TaskState::Queued | TaskState::Paused | TaskState::Failed
+            ) {
                 return Err(DaemonError::NotFound(id.to_string()));
             }
             let from = task.state.clone();
@@ -2993,7 +3001,11 @@ impl DaemonState {
             {
                 let mut tasks = self.tasks.lock();
                 if let Some(rec) = tasks.get_mut(id) {
-                    rec.push_event("resume", None);
+                    if from == TaskState::Failed {
+                        rec.push_event("retry", Some("手动重试（resume）".into()));
+                    } else {
+                        rec.push_event("resume", None);
+                    }
                     rec.task.state = TaskState::Downloading(kind);
                 }
             }
@@ -7674,6 +7686,135 @@ mod auto_retry_tests {
         let s = summaries.iter().find(|s| s.task_id == tid).unwrap();
         assert_eq!(s.retries, 1);
         assert_eq!(s.max_retries, 3);
+    }
+
+    #[tokio::test]
+    async fn resume_failed_without_handle_retries_manually() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        // 白盒建「预算耗尽 Failed」任务（无句柄——激活失败路径形态）
+        let tid = "t902".to_string();
+        state.tasks.lock().insert(
+            tid.clone(),
+            TaskRecord {
+                task: DownloadTask {
+                    id: tid.clone(),
+                    canonical_id: CanonicalId {
+                        kind: CanonicalKind::Http,
+                        identity: "https://example.com/f.bin".into(),
+                        validator: None,
+                        token_sensitive: false,
+                    },
+                    source: DownloadSource::Http {
+                        url: "https://example.com/f.bin".into(),
+                        headers: vec![],
+                        auth: None,
+                        backup_url: None,
+                        proxy: None,
+                    },
+                    identity: ContentIdentity::SingleFile {
+                        size: 0,
+                        etag: None,
+                        sha256: None,
+                        sha1: None,
+                        md5: None,
+                        backup_md5: None,
+                    },
+                    dest_root: PathBuf::from("."),
+                    files: vec![],
+                    acquisitions: vec![],
+                    aggregate: Default::default(),
+                    state: TaskState::Failed,
+                    retry: RetryState {
+                        retries: 1,
+                        max_retries: 1,
+                    },
+                    created_at: std::time::Instant::now(),
+                    file_priorities: None,
+                    sequential: false,
+                    metadata: TaskMetadata {
+                        name: None,
+                        added_at_unix: 0,
+                        tags: Vec::new(),
+                        finished_at_unix: 0,
+                        start_at_unix: 0,
+                        next_retry_at_unix: 0,
+                    },
+                    limits: None,
+                },
+                engine_tid: None,
+                engine_kind: EngineKind::Http,
+                engine_status: None,
+                events: vec![],
+            },
+        );
+
+        // 手动重试：resume 成功 → 引擎重新接入 → Downloading
+        state.resume(&tid).await.unwrap();
+        {
+            let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+            assert_eq!(rec.task.state, TaskState::Downloading(EngineKind::Http));
+            assert!(rec.engine_tid.is_some(), "重试必须重建引擎句柄");
+            assert_eq!(fake.added().len(), 1);
+            assert!(
+                rec.events.iter().any(|e| e.op == "retry"),
+                "Failed 来源的 resume 必须落 retry 事件（区分普通恢复）: {:?}",
+                rec.events.iter().map(|e| e.op.clone()).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_retry_keeps_exhausted_budget_no_infinite_loop() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task_opts(
+                "https://example.com/f.bin".into(),
+                None,
+                AddHttpOpts {
+                    auto_retry: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // 首轮失败：预算内 → 重试安排；二轮失败：耗尽 → Failed（句柄保留）
+        state.tasks.lock().get_mut(&tid).unwrap().task.state =
+            TaskState::Downloading(EngineKind::Http);
+        fake.set_status_state(EngineState::Error);
+        state.poll_engine_states().await;
+        state
+            .tasks
+            .lock()
+            .get_mut(&tid)
+            .unwrap()
+            .task
+            .metadata
+            .next_retry_at_unix = 1;
+        state.activate_due_tasks().await;
+        state.tasks.lock().get_mut(&tid).unwrap().task.state =
+            TaskState::Downloading(EngineKind::Http);
+        state.poll_engine_states().await;
+        assert_eq!(
+            state.tasks.lock().get(&tid).unwrap().task.state,
+            TaskState::Failed
+        );
+
+        // E32 手动重试（有句柄 → 引擎侧 resume 分支）→ 再失败：
+        // auto_retry 预算【不重置】→ fail_or_schedule_retry 直接终态（无循环）
+        state.resume(&tid).await.unwrap();
+        assert_eq!(
+            state.tasks.lock().get(&tid).unwrap().task.state,
+            TaskState::Downloading(EngineKind::Http)
+        );
+        let effects = state.poll_engine_states().await;
+        assert_eq!(effects[0].to, TaskState::Failed, "预算耗尽 → 不再自动重试");
+        assert_eq!(
+            state.tasks.lock().get(&tid).unwrap().task.retry.retries,
+            1,
+            "retries 停在 max，手动重试不白给预算"
+        );
     }
 }
 
