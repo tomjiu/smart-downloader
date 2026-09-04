@@ -2,16 +2,16 @@
 
 Rust 多引擎下载器：HTTP(S) / FTP / BitTorrent（libtorrent 基座）统一调度，axum daemon 提供 REST API + WebSocket 事件流，内置任务队列、断点续传、限速、代理与备用源兜底。
 
-> 当前状态：主线能力已封版（HTTP 动态分段、BT fastresume、任务级限速/文件优先级、运维 API 三件套、CI 双平台矩阵）。整体路线图与未实现清单见 [`docs/BACKLOG.md`](docs/BACKLOG.md)。
+> 当前状态：主线能力已封版（HTTP 动态分段、BT fastresume、任务级限速/文件优先级、运维 API 三件套、CI 双平台矩阵）；常规能力增强线 E1–E33 已全部合并（2026-09-02 ~ 09-04：任务管理面/事件三通道/速率全链路/重试体系/定时错峰/完成 Webhook 与钩子/BT tracker 运行时等，逐批档案见 [`docs/IMPLEMENTED.md`](docs/IMPLEMENTED.md) #21）。整体路线图与未实现清单见 [`docs/BACKLOG.md`](docs/BACKLOG.md)。
 
 ## 能力总览
 
 | 引擎 | 能力 |
 |------|------|
-| **HTTP/HTTPS**（`smart-dl-httpdl`） | 多连接 Range 并行、动态分段（SegmentManager 动态领取 + 流式写盘）、段账本断点续传（`<part>.progress` 记录已完成段，跨重启恢复；ETag 失配/账本非法即作废重下）、真实进度与真暂停（段边界生效）、镜像与换源、`backup_url`/`backup_md5` 备用源兜底、**多源并行**（双源强 ETag 相等 + Range/总长一致才启用跨源分段混拼，worker 轮转分摊；严于 aria2 的无条件多源）、失败缩小粒度重试、429 退避、跨段共享限速、sha256 可选校验 |
+| **HTTP/HTTPS**（`smart-dl-httpdl`） | 多连接 Range 并行、动态分段（SegmentManager 动态领取 + 流式写盘）、段账本断点续传（`<part>.progress` 记录已完成段，跨重启恢复；**ETag + Last-Modified 双指纹**确认服务器文件未变，任一变化/账本非法即作废重下）、真实进度与真暂停（段边界生效）、镜像与换源、`backup_url`/`backup_md5` 备用源兜底、**多源并行**（双源强 ETag 相等 + Range/总长一致才启用跨源分段混拼，worker 轮转分摊；严于 aria2 的无条件多源）、失败缩小粒度重试、429 退避、跨段共享限速、sha256/sha1/md5 可选校验（互斥）、文件冲突策略（overwrite/rename/skip）、顺序下载（在飞窗口收紧，边下边播） |
 | **FTP**（httpdl `ftp` feature） | 单文件 + 目录递归下载、断点续传、生命周期管理 |
-| **BitTorrent**（`smart-dl-btcore`） | libtorrent FFI 薄核：magnet / .torrent 建任务、元数据抓取（`POST /bt/metadata`）、fastresume 持久化与恢复、web seed 注入（P2SP）、任务级限速（双向）、子文件优先级（持久化 + 恢复重放）、校验/做种停止、DHT/LSD/UPnP 开关 |
-| **daemon**（`smart-dl-daemon`） | 任务生命周期（add/pause/resume/remove/list/status/logs）、并发队列（BT≤3 / HTTP·FTP≤8）、事件 WS（背压保护）、配置热重载、Provider fallback 兜底、运维 API（`/stats` `/version` `/health`）、全局代理 + 双引擎限速 |
+| **BitTorrent**（`smart-dl-btcore`） | libtorrent FFI 薄核：magnet / .torrent 建任务、元数据抓取（`POST /bt/metadata`）、fastresume 持久化与恢复、web seed 注入（P2SP）、任务级限速（双向）、子文件优先级（持久化 + 恢复重放）、校验/做种停止、DHT/LSD/UPnP 开关、tracker 运行时增删查、magnet 任务名回填、累计上传/下载/分享率透出（all_time 计数） |
+| **daemon**（`smart-dl-daemon`） | 任务生命周期（add/pause/resume/remove/list/status/logs；终态 Failed 可 resume 手动重试）、并发队列（BT≤3 / HTTP·FTP≤8）、事件三通道（WS 双向 / REST 补拉 / SSE 尾随）、配置热重载、Provider fallback 兜底、运维 API（`/stats` `/version` `/health` `/metrics`）、全局代理 + 双引擎限速（运行中热改）、失败自动重试（指数退避）、定时启动 + 错峰、完成 Webhook + 完成后钩子、已完成任务自动清扫 |
 | **链接解析**（`smart-dl-core`） | `thunder://`、`qqdl://`、`fs2you://`、magnet URI（v1/v2 识别）、ed2k 链接（name/size/md4 结构化）、迅雷网盘分享链接 |
 
 ## Workspace 结构
@@ -92,13 +92,16 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/tasks` | GET / POST | 任务列表（`?state=`/`?engine=` 过滤、`?search=` 关键字、`?tag=` 标签 any-of、`?limit`/`?offset` 分页）/ 建任务（HTTP、FTP 目录、magnet、.torrent；`start_at_unix` 定时启动，未来时刻到点前不入引擎） |
+| `/tasks` | GET / POST | 任务列表（`?state=`/`?engine=` 过滤、`?search=` 关键字、`?tag=` 标签 any-of、`?limit`/`?offset` 分页 + `X-Total-Count`）/ 建任务（HTTP、FTP 目录、magnet、.torrent；能力字段：任务级代理/自定义 headers/Basic 凭据/顺序下载/trackers/限速/校验 sha256·sha1·md5/`backup_url`+`backup_md5`/显式 `name`/`conflict_policy`/`start_at_unix` 定时/`auto_retry` 自动重试预算） |
 | `/tasks/batch` | POST | 批量操作：显式 `ids`（≤100，pause/resume/remove）或条件 `select`（state/engine/tag/search 任一，仅 pause/resume 非破坏动作） |
-| `/tasks/:id` | GET / DELETE | 快照（含 files 明细与实时速率）/ 删除 |
-| `/tasks/:id/pause` · `/resume` | POST | 生命周期（定时等待中任务：pause = 取消自动启动，resume = 立即激活） |
+| `/tasks/:id` | GET / DELETE | 快照（files 明细 + 实时速率 + 累计流量/分享率 + 标签 + 顺序下载标志）/ 删除（`?delete_data=true` 引擎侧同删已下载数据） |
+| `/tasks/:id/pause` · `/resume` | POST | 生命周期（定时等待中任务：pause = 取消自动启动，resume = 立即激活；终态 Failed 任务 resume = 手动重试重新接入引擎） |
 | `/tasks/:id/name` | POST | 任务重命名（显示层；`{"name": null}` 清除回退派生链） |
 | `/tasks/:id/tags` | POST | 任务标签设置（替换式；trim/去重，≤16 个×64 字符；null/空表清除） |
 | `/tasks/:id/logs` | GET | 任务日志 |
+| `/tasks/:id/proxy` | POST | 任务级代理运行中热改（仅 HTTP；epoch 重入 + 段账本续传，换代理不断传） |
+| `/tasks/:id/sequential` | POST | 顺序下载切换（边下边播：HTTP 在飞窗口收紧；BT sequential flag；FTP 不支持 409） |
+| `/tasks/:id/trackers` | GET / POST / DELETE | BT tracker 运行时管理（列举 announce 表 / 批量追加 / URL 精确删除，无匹配 404） |
 | `/tasks/:id/limit` | POST | 任务级限速（BT 双向 / HTTP 下载向） |
 | `/config/limit` | POST | 全局限速总阀门热改（合计下行 + BT 上行；缺省字段 = 沿用当前值，双缺省 = 查询） |
 | `/tasks/:id/files/priority` | POST | BT 子文件优先级（持久化 + 恢复重放） |
@@ -109,13 +112,14 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 | `/stats` · `/version` · `/health` | GET | 运维三件套 |
 | `/metrics` | GET | Prometheus 指标（text/plain；任务按状态/引擎计数 + 聚合速率） |
 | `/providers` | GET | Provider 状态 |
+| `/probe` | POST | 探测预览：不建任务取 URL 元数据（大小/服务端文件名/Range/ETag/Last-Modified/Content-Type + `suggest_name`；headers/代理/Basic 凭据同 add 语义；v1 仅 HTTP 源） |
 | `/events` | GET | 事件历史查询（seq 游标分页 + task_id/type 过滤 + 缺口报警） |
 | `/events/stream` | GET | 事件流（SSE：历史重放 + 活流尾随，Last-Event-ID 断线续传） |
 | `/ws` | GET | 事件流（WebSocket，背压保护） |
 
 ## 配置
 
-TOML 配置（默认 `./config.toml`，任务状态 `./tasks.json`）：`[download]`（dest_root/并发/限速/代理）、`[bt]`（save_path/DHT/LSD/UPnP/做种）、`[provider]`（fallback 链）、`[server]`（bind/token）、`[webhook]`（任务完成通知 URL，POST JSON，fire-and-forget）、`[post_download]`（完成后自动处理：move_to 移动到目标目录 + hook 外部程序，环境变量 SD_TASK_ID/SD_TASK_NAME/SD_FILE_PATH/SD_ENGINE 传任务上下文；空 = 禁用）、`[scheduler]`（start_jitter_seconds 错峰随机延迟上限，秒；0 = 关）。支持热重载。
+TOML 配置（默认 `./config.toml`，任务状态 `./tasks.json`）：`[download]`（dest_root/并发/限速/代理/disk_precheck_strict 磁盘预检严格模式）、`[bt]`（save_path/DHT/LSD/UPnP/做种）、`[provider]`（fallback 链）、`[server]`（bind/token）、`[webhook]`（任务完成通知 URL，POST JSON，fire-and-forget）、`[cleanup]`（auto_remove_completed_days 已完成任务 N 天后自动清扫，0 = 禁用；auto_remove_keep_data 默认保留文件）、`[post_download]`（完成后自动处理：move_to 移动到目标目录 + hook 外部程序，环境变量 SD_TASK_ID/SD_TASK_NAME/SD_FILE_PATH/SD_ENGINE 传任务上下文；空 = 禁用）、`[scheduler]`（start_jitter_seconds 错峰随机延迟上限，秒；0 = 关）。支持热重载。
 
 ## 文档地图
 
