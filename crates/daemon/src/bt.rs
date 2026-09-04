@@ -46,6 +46,9 @@ fn map_status(st: &TorrentStatus) -> EngineStatus {
         up_rate: st.up_rate.max(0) as u64,
         num_peers: st.num_peers.max(0) as u32,
         num_seeds: st.num_seeds.max(0) as u32,
+        // E33：全生命周期累计上/下行（BT all_time_* 口径，暂停不清零）
+        total_downloaded: st.all_time_download.max(0) as u64,
+        total_uploaded: st.all_time_upload.max(0) as u64,
         error: (state == EngineState::Error).then(|| "bt error".to_string()),
         // E28：BT 任务名回填接入 —— torrent metadata name 经 FFI status 透出，
         // daemon E9 轮询幂等回填（同 CD 链口径：一次成功后 name 非 None 自然停）

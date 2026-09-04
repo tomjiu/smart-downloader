@@ -115,6 +115,18 @@ pub struct TaskSnapshot {
     /// None = 引擎不可达/任务未接入引擎，序列化时省略。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rates: Option<TaskRates>,
+    /// 累计统计（E33，BT 透出）：任务全生命周期累计下行/上行字节——BT 来自
+    /// libtorrent all_time_download/all_time_upload（随 resume data 跨会话
+    /// 持久），与 rates 取自同一次引擎快照。HTTP/FTP 等单向引擎无对等统计
+    /// 恒 0（序列化省略）。累计非瞬时值，暂停不清零（与 rates 语义相反）。
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub total_downloaded: u64,
+    #[serde(skip_serializing_if = "is_zero_u64")]
+    pub total_uploaded: u64,
+    /// 分享率（E33）：total_uploaded / total_downloaded，down 为 0 时 None
+    /// （无数据/尚未产生下行，纯上传侧比率无意义）。None 序列化省略。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub share_ratio: Option<f64>,
     /// 任务级限速配置（KiB/s；None = 未设置走全局）。set 语义见
     /// `DaemonState::set_task_limits`。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -160,6 +172,17 @@ pub struct TaskRates {
     pub down_bytes_s: u64,
     /// 上行速率（B/s；仅 BT 等双向引擎非零）。
     pub up_bytes_s: u64,
+}
+
+/// 分享率计算（E33）：`uploaded / downloaded`；`down == 0`（无数据或尚未
+/// 产生下行）时 None——除零与「纯上传侧比率」都不给值，序列化时省略。
+/// 保留 3 位小数（qBittorrent 同级精度），负值/NaN 在源头（u64 字段）不可能。
+pub fn share_ratio(uploaded: u64, downloaded: u64) -> Option<f64> {
+    if downloaded == 0 {
+        None
+    } else {
+        Some(((uploaded as f64) / (downloaded as f64) * 1000.0).round() / 1000.0)
+    }
 }
 
 /// 列表条目。
@@ -2687,6 +2710,12 @@ impl DaemonState {
             error: status.as_ref().and_then(|s| s.error.clone()),
             files: status.as_ref().map(|s| s.files.clone()).unwrap_or_default(),
             rates,
+            // E33：累计统计与分享率（同一次引擎快照取样，非 2s 轮询缓存）
+            total_downloaded: status.as_ref().map(|s| s.total_downloaded).unwrap_or(0),
+            total_uploaded: status.as_ref().map(|s| s.total_uploaded).unwrap_or(0),
+            share_ratio: status
+                .as_ref()
+                .and_then(|s| share_ratio(s.total_uploaded, s.total_downloaded)),
             limits: rec.task.limits.clone(),
             file_priorities: rec.task.file_priorities.clone(),
             sequential: rec.task.sequential,
@@ -5247,6 +5276,8 @@ pub struct FakeEngine {
     status_name: parking_lot::Mutex<Option<String>>,
     /// status() 速率回显（(down, up) B/s，E11 速率缓存测试用；默认 (0,0) 旧行为）。
     status_rates: parking_lot::Mutex<(u64, u64)>,
+    /// status() 累计统计回显（(down, up) 字节，E33 上传/分享率测试用；默认 (0,0)）。
+    status_totals: parking_lot::Mutex<(u64, u64)>,
     /// status().state 可编程回显（E30 重试 e2e；None = 保持默认）。
     status_state: parking_lot::Mutex<Option<EngineState>>,
     /// 已下发的 set_global_limits 调用（(down, up)，E16 总阀门断言用）。
@@ -5275,6 +5306,7 @@ impl FakeEngine {
             proxy_sets: parking_lot::Mutex::new(Vec::new()),
             status_name: parking_lot::Mutex::new(None),
             status_rates: parking_lot::Mutex::new((0, 0)),
+            status_totals: parking_lot::Mutex::new((0, 0)),
             status_state: parking_lot::Mutex::new(None),
             global_sets: parking_lot::Mutex::new(Vec::new()),
             global_limits_err: parking_lot::Mutex::new(None),
@@ -5331,6 +5363,11 @@ impl FakeEngine {
     /// 设置 status() 速率回显（(down, up) B/s；E11 速率缓存测试用）。
     pub fn set_status_rates(&self, down: u64, up: u64) {
         *self.status_rates.lock() = (down, up);
+    }
+
+    /// 设置 status() 累计统计回显（(down, up) 字节；E33 上传/分享率测试用）。
+    pub fn set_status_totals(&self, down: u64, up: u64) {
+        *self.status_totals.lock() = (down, up);
     }
 
     /// 设置 status().state 回显（E30 重试 e2e：模拟引擎报 Error）。
@@ -5422,9 +5459,12 @@ impl DownloadEngine for FakeEngine {
         _id: &EngineTaskId,
     ) -> Result<EngineStatus, smart_dl_core::types::EngineError> {
         let (down_rate, up_rate) = *self.status_rates.lock();
+        let (total_downloaded, total_uploaded) = *self.status_totals.lock();
         let mut st = EngineStatus {
             down_rate,
             up_rate,
+            total_downloaded,
+            total_uploaded,
             files: self.status_files.lock().clone(),
             name: self.status_name.lock().clone(),
             ..EngineStatus::default()
@@ -8245,6 +8285,91 @@ mod rate_cache_tests {
             }),
             "暂停任务快照速率必须清零（防平滑窗口陈旧值毛刺）"
         );
+    }
+
+    /// E33：BT 累计统计与分享率透出——快照字段、JSON 形状（非零才出现）、
+    /// share_ratio 精度三合一。FakeEngine 模拟引擎侧 all_time_* 回显。
+    #[tokio::test]
+    async fn snapshot_exposes_bt_totals_and_share_ratio() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        insert_bt_rec_with(
+            &state,
+            "t-bt",
+            "TOTL01",
+            TaskState::Downloading(EngineKind::Bt),
+        );
+        // (累计下行 2MB, 累计上行 512KB) → 分享率 0.25
+        fake.set_status_totals(2 * 1024 * 1024, 512 * 1024);
+        let snap = state.task_snapshot("t-bt").await.unwrap();
+        assert_eq!(snap.total_downloaded, 2 * 1024 * 1024);
+        assert_eq!(snap.total_uploaded, 512 * 1024);
+        assert_eq!(snap.share_ratio, Some(0.25));
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(json.contains("\"total_downloaded\":2097152"), "{json}");
+        assert!(json.contains("\"total_uploaded\":524288"), "{json}");
+        assert!(json.contains("\"share_ratio\":0.25"), "{json}");
+    }
+
+    /// E33：零值省略——无累计数据（HTTP 引擎默认/引擎不可达）时三字段均不
+    /// 出现在 JSON 里（非破坏增量，旧消费者零感知）。
+    #[tokio::test]
+    async fn snapshot_omits_totals_when_zero() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        let tid = state
+            .add_http_task("https://example.com/f.bin".into(), None)
+            .await
+            .unwrap();
+        let snap = state.task_snapshot(&tid).await.unwrap();
+        assert_eq!(snap.total_downloaded, 0);
+        assert_eq!(snap.total_uploaded, 0);
+        assert_eq!(snap.share_ratio, None);
+        let json = serde_json::to_string(&snap).unwrap();
+        assert!(!json.contains("total_downloaded"), "{json}");
+        assert!(!json.contains("total_uploaded"), "{json}");
+        assert!(!json.contains("share_ratio"), "{json}");
+    }
+
+    /// E33：累计语义与速率相反——记录级 Paused 只清瞬时速率（E13），累计
+    /// 统计是全生命周期事实（做种贡献），暂停不清零。
+    #[tokio::test]
+    async fn snapshot_keeps_totals_for_paused_record() {
+        let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+        let state = DaemonState::new(fake.clone(), vec![]);
+        insert_bt_rec_with(
+            &state,
+            "t-bt",
+            "KEPT01",
+            TaskState::Downloading(EngineKind::Bt),
+        );
+        fake.set_status_totals(1_000_000, 2_000_000);
+        state.pause("t-bt").await.unwrap();
+        let snap = state.task_snapshot("t-bt").await.unwrap();
+        assert_eq!(snap.state, "Paused");
+        // 速率清零（E13 语义不变）……
+        assert_eq!(
+            snap.rates,
+            Some(TaskRates {
+                down_bytes_s: 0,
+                up_bytes_s: 0
+            })
+        );
+        // ……累计与分享率保留
+        assert_eq!(snap.total_downloaded, 1_000_000);
+        assert_eq!(snap.total_uploaded, 2_000_000);
+        assert_eq!(snap.share_ratio, Some(2.0));
+    }
+
+    /// E33：share_ratio 纯函数——零除保护 + 3 位小数舍入（qB 同级精度）。
+    #[test]
+    fn share_ratio_rules() {
+        assert_eq!(share_ratio(0, 0), None, "无下行 → None");
+        assert_eq!(share_ratio(500, 0), None, "纯上传侧比率无意义 → None");
+        assert_eq!(share_ratio(500_000, 2_000_000), Some(0.25));
+        assert_eq!(share_ratio(2_000_000, 500_000), Some(4.0));
+        assert_eq!(share_ratio(1, 3), Some(0.333), "1/3 舍入到 3 位小数");
+        assert_eq!(share_ratio(2, 3), Some(0.667), "2/3 进位到 3 位小数");
     }
 }
 

@@ -187,3 +187,40 @@ fn pause_resume_flow() {
     assert_eq!(st.progress, 1.0);
     assert!(!st.paused, "resume 后 status.paused 应为 false");
 }
+
+/// E33：全生命周期累计上/下行透出（lt_torrent_status::all_time_*）。
+/// 注意冲账时机：libtorrent 的 all_time 计数器（m_total_downloaded +=
+/// m_stat.last_payload_downloaded()）只在 session second_tick（≈1s 节拍）
+/// 落账——progress 到 1.0 后立即读可能仍是 0（本次 2MB 环回下载实测如
+/// 此）。累计统计的展示语义本就是秒级（qBittorrent 同款轮询口径），
+/// 快照读数容忍一个 tick 的滞后属可接受设计，此处轮询等待冲账。
+#[test]
+fn all_time_totals_exposed() {
+    let (c, _save) = core("totals");
+    let seeder = seed::TestSeeder::start();
+    let ih = c.add_magnet(seeder.magnet(), &[]).expect("add_magnet");
+    let (ip, port) = seeder.addr();
+    c.resume(&ih).expect("resume");
+    c.add_peer(&ih, &ip, port).expect("add_peer");
+    download_to_complete(&c, &ih);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let st = loop {
+        let st = c.status(&ih).expect("status");
+        if st.all_time_download > 0 {
+            break st;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "15s 内 all_time_download 未冲账为非零（tick 未落账）: {st:?}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert!(
+        st.all_time_download >= st.downloaded,
+        "累计下行应 >= 本次 done（含 hashfail/重复收块历史口径）: {} < {}",
+        st.all_time_download,
+        st.downloaded
+    );
+    assert!(st.all_time_upload >= 0);
+}

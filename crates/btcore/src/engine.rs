@@ -26,6 +26,11 @@ pub struct TorrentStatus {
     /// torrent 名（E28，torrent metadata；就绪前 None/空）。任务名回填链路
     /// 的数据源——daemon 轮询消费（E9 幂等语义）。
     pub name: Option<String>,
+    /// 全生命周期累计下行（E33；libtorrent all_time_download，随 resume data
+    /// 跨会话持久）。含 hashfail/断点重复收字节等历史口径，恒 >= 本次 done。
+    pub all_time_download: i64,
+    /// 全生命周期累计上行（E33；做种贡献，暂停不清零）。
+    pub all_time_upload: i64,
 }
 
 impl From<lt_torrent_status> for TorrentStatus {
@@ -56,6 +61,8 @@ impl From<lt_torrent_status> for TorrentStatus {
             metadata_received: st.metadata_received != 0,
             paused: st.paused != 0,
             name,
+            all_time_download: st.all_time_download.max(0),
+            all_time_upload: st.all_time_upload.max(0),
         }
     }
 }

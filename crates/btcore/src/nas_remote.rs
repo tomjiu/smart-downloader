@@ -392,12 +392,17 @@ impl DownloadEngine for NasRemoteEngine {
             total: total as u64,
             down_rate: speed,
             up_rate: 0,
+            // E33：NAS 远端无全生命周期累计口径，恒 0（快照序列化省略）
+            total_downloaded: 0,
+            total_uploaded: 0,
             num_peers: 0,
             num_seeds: 0,
             error: params
                 .get("error")
                 .and_then(|e| e.as_str())
                 .map(|s| s.to_string()),
+            // E9：NAS 引擎不参与名字回填（daemon add 时已派生远端名）
+            name: None,
         })
     }
 

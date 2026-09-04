@@ -230,6 +230,11 @@ pub struct EngineStatus {
     pub total: u64,
     pub down_rate: u64,
     pub up_rate: u64,
+    /// 任务累计统计（E33）：BT = libtorrent all_time_download/all_time_upload
+    /// （全生命周期含历史，随 resume data 跨会话持久，暂停不清零）。
+    /// HTTP/FTP 等单向引擎无对等口径恒 0（daemon 快照序列化时省略）。
+    pub total_downloaded: u64,
+    pub total_uploaded: u64,
     pub num_peers: u32,
     pub num_seeds: u32,
     pub error: Option<String>,

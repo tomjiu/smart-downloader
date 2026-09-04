@@ -66,6 +66,9 @@ typedef struct {
     int     paused;                 /* torrent_handle::pause() 后的 paused 标志 */
     char    name[256];         /* E28: torrent 名（metadata 就绪前为空串；NUL 结尾，
                                   截断安全——内核侧 strncpy + 预置 memset） */
+    int64_t all_time_download, /* E33: 全生命周期累计下行（含历史，随 resume data
+                                  持久；>= 本次 done——hashfail/断点重复收字节计入） */
+            all_time_upload;   /* E33: 全生命周期累计上行（做种贡献；暂停不清零） */
 } lt_torrent_status;
 
 lt_err lt_status(lt_session* s, const char* ih, lt_torrent_status* out);

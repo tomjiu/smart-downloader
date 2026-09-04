@@ -837,6 +837,9 @@ impl DownloadEngine for HttpEngine {
             total: t.total,
             down_rate,
             up_rate: 0,
+            // E33：HTTP 单向引擎无累计统计口径，恒 0（快照序列化省略）
+            total_downloaded: 0,
+            total_uploaded: 0,
             num_peers: 0,
             num_seeds: 0,
             error: t.error.clone(),
