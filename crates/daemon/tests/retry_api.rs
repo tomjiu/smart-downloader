@@ -187,8 +187,13 @@ async fn manual_retry_after_budget_exhausted_completes_when_source_recovers() {
     let snap = wait_until(&client, &base, &tid, |s| s["state"] == "Failed").await;
     assert_eq!(snap["retries"], 1);
 
-    // 等恢复窗口打开（5s 窗口；Failed 时约 t≈2-3s，再等 3s 稳过窗口）
-    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    // 等恢复窗口打开（5s 窗口自首请求起算）。窗口锚点（首请求）与退避锚点
+    // （fail1 + 2s 退避，next_retry_at_unix 整秒 flooring 最坏削 ~1s）相位
+    // 对齐可出负毛边：Failed 最早可出现在 first_hit+1.3s 附近，睡 3s 时
+    // resume + 引擎重探测会落在窗口关闭前 → 任务再标 Failed → resume 404
+    // （Windows 慢 runner CI 实测踩中一次）。睡 6s 保证最坏路径 margin
+    // ≥2.3s；wait_until 预算 30s 不受影响。
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
 
     // E32：手动重试（resume）→ 源已恢复 → 下载成功 → Completed
     let resp = client
