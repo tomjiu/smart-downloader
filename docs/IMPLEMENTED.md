@@ -342,3 +342,107 @@ FFI `lt_set_sequential` 已备但 daemon 层零接线（无入口、无持久化
 **验证**：非 bt workspace **631/631**（基线 624 + 7）；bt 构建 daemon **183/183**
 （含 bt_api 16）；btcore 33 全绿；fmt 全清；clippy 非 bt workspace 与 daemon(bt)
 --all-targets 零新增警告。
+
+### 21. 常规能力增强批次 E1–E33（2026-09-02 ~ 09-04，PR #22–#57 全部合并）
+
+**背景**：22 项愿望清单（5 梯队）逐项落地 + 事件面三通道 + 速率全链路真实化。
+方向约束：只做固有常规能力（HTTP/BT/daemon API）增强，排除迅雷新方向。全部按
+「实现 → 测试 → fmt → clippy 五门禁 → 独立 PR → CI 三 job（ubuntu/windows/bt
+integration）全绿 → merge → 合并提交 check-runs 复核」流程逐批推进。
+
+**批次总表**（批次 | 能力 | PR | 合并提交）：
+
+| 批次 | 能力 | PR | 合并提交 |
+|------|------|----|---------|
+| E1+E2 | 并发探测加速 + 备用源兜底接线 | #22 | `9815302` |
+| E3 | 校验失败隔离试错轮换 | #23 | `1139573` |
+| E4 | Content-Disposition 文件名派生 | #24 | `e76d4a4` |
+| E5 | 任务级代理（add 设定，仅 HTTP） | #25 | `1ab0018` |
+| E6 | add API 能力对齐（headers/Basic 凭据/sha256/backup/显式 name） | #26 | `7b74842` |
+| E7 | 任务管理面（过滤/分页/批量/delete_data） | #27 | `80f6b4b` |
+| E8 | 任务级代理运行中热改（epoch 重入 + 段账本续传不断传） | #28 | `40aef31` |
+| E9 | 任务名运行时回填（CD 派生链透出；#30 bt 编译修复） | #29 | `9d67568` |
+| E10 | 事件历史缓冲 4096 + REST `GET /events` | #31 | `df88bda` |
+| E11 | stats 速率真实化全链路（engine_status 缓存就绪） | #32 | `a577681` |
+| E12 | SSE 事件流 `/events/stream`（#34 lint 修复） | #33 | `6840757` |
+| E13 | 任务快照实时速率透出 | #35 | `aa20a43` |
+| E14 | 任务搜索 `?search=`（名字/URL 大小写不敏感子串） | #36 | `1601263` |
+| E15 | 任务重命名 `POST /tasks/:id/name` | #37 | `402f20a` |
+| E16 | 全局限速总阀门运行中热改 `POST /config/limit` | #38 | `581c6ca` |
+| E17 | 完成通知 Webhook（`[webhook] url`） | #39 | `a3e687b` |
+| E18 | 任务标签（`?tag=` 过滤 + `POST /tasks/:id/tags`） | #40 | `68c693b` |
+| E19 | 条件批量 `select`（states/engines/tags/search 任一） | #41 | `9a12bf0` |
+| E20 | 已完成任务自动清扫（`[cleanup]`） | #42 | `047867f` |
+| E22 | Prometheus `/metrics` | #43 | `dd66e6a` |
+| E21 | 文件冲突策略 overwrite/rename/skip | #44 | `b1d12ed` |
+| E23 | 定时启动 `start_at_unix` + 错峰 jitter | #45 | `63ec9e7` |
+| E24 | 多源并行（双源强 ETag 相等才跨源混拼） | #46 | `a600f6b` |
+| E25 | 校验算法扩展 sha1/md5（与 sha256 互斥） | #47 | `e6960c6` |
+| E26 | 断点续传双指纹加固（ETag + Last-Modified） | #48 | `9a026bc` |
+| E27 | 完成后自动处理（move_to + hook，`[post_download]`） | #49 | `da5675e` |
+| E28 | BT 任务名回填（magnet metadata 到达） | #50 | `3b5b944` |
+| E29 | BT tracker 运行时管理（GET/POST/DELETE trackers） | #51 | `6914e04` |
+| E30 | 失败自动重试预算（指数退避；#53 fmt、#55 post-hook flaky 修复） | #52 | `6d55dd8` |
+| E31 | 探测预览 `POST /probe`（不建任务） | #54 | `78ed137` |
+| E32 | 终态手动重试（resume 复用） | #56 | `1766696` |
+| E33 | 上传/分享率统计（all_time 累计透出） | #57 | `0c5cb52` |
+
+**行为契约要点**（跨批次交互语义，实操查阅用）：
+
+- **事件面三通道**：WS（双向，背压保护）+ REST `GET /events`（seq 游标分页，
+  task_id/type 过滤，`truncated` 缺口报警 = 应放弃增量改全量重同步）+ SSE
+  `/events/stream`（历史重放 + 活流尾随，`Last-Event-ID` 断线续传）。三通道
+  共用同一 Envelope 解析与 WsHub 环形缓冲（容量 4096）。
+- **速率链路**：引擎侧采样 → daemon engine_status 缓存（E11）→ `/stats` 聚合
+  与 `GET /tasks/:id` 快照 `rates{down_bytes_s,up_bytes_s}`（E13，0 值序列化
+  省略）；BT 侧 libtorrent `all_time_download/upload`（FFI shim 扩展，E33）
+  → `total_downloaded/total_uploaded/share_ratio`（3 位小数，down=0 → None
+  省略）。注意：LT all_time 计数器在 session second_tick（≈1s）才冲账，进度
+  到 1.0 后立即读恒 0——消费方需轮询等待。
+- **任务名派生链**：用户显式 `name`（E6）> Content-Disposition（E4）> URL
+  末段 > `download.bin`；BT magnet 任务 metadata 到达后回填（E28）；rename
+  API（E15）覆盖显示名，`{"name": null}` 清除回退派生链。`?search=`（E14）
+  语料 = 任务名 + 来源 URL（经 `search_urls` 脱敏），大小写不敏感子串。
+- **代理**：任务级 `proxy`（E5，add 设定，仅 HTTP）+ 运行中热改
+  `POST /tasks/:id/proxy`（E8）：epoch 重入 + 段账本续传，换代理不断传。
+- **列表/批量**：`GET /tasks` 无参数完全兼容；`?state=`/`?engine=`/`?tag=`
+  逗号分隔多值（维度内 OR、维度间 AND，大小写不敏感，合法标签从全变体生成）；
+  `?limit=1..=500`/`?offset` + `X-Total-Count`；排序恒为 task_id 数值后缀升序。
+  `POST /tasks/batch`：显式 `ids`（≤100，pause/resume/remove）或条件 `select`
+  （E19，同 ListQuery 选择器，仅 pause/resume 非破坏动作）；单项失败不短路，
+  恒 200 逐项回执。`DELETE /tasks/:id?delete_data=true` 引擎侧同删数据。
+- **冲突策略**（E21，仅 HTTP 显式名任务）：`overwrite`（默认）/ `rename`
+  （`name(1).ext` 起取首个空闲）/ `skip`（既有文件保持原样，任务直接
+  Completed，完成事件/Webhook/钩子照发；post_download move_to 尊重 skip）。
+- **定时/错峰**（E23）：`start_at_unix` 未来时刻到点前不入引擎（停留 Queued，
+  pause = 取消定时，resume = 立即激活）；`[scheduler] start_jitter_seconds`
+  仅在 start_at 缺省时叠加（0..=N 秒随机）。宽容语义：过去时刻不 400。
+- **重试体系**：E30 自动重试 `auto_retry`（0..=10，越界 400；仅 HTTP/FTP），
+  指数退避 2s/4s/8s…封顶 60s，预算耗尽落 Failed；E32 手动重试 = 终态 Failed
+  任务 `resume`（重新接入引擎），**不重置** auto_retry 预算（防白给循环）。
+- **校验**（E25/E6）：`sha256`/`sha1`/`md5` 三选一互斥（同时多个 → 400）；
+  `backup_md5` 必须与 `backup_url` 成对。E3：校验失败隔离试错轮换（坏源
+  退避，不烧备用源）。E26：续传前 ETag + Last-Modified 双指纹确认服务器
+  文件未变，任一变化作废段账本重下（防跨文件拼接脏数据）。
+- **多源并行**（E24）：仅当双源强 ETag 相等且 Range 支持与总长一致才启用
+  跨源分段混拼（worker 轮转分摊）——严于 aria2 的无条件多源。
+- **完成面**：E17 Webhook（fire-and-forget，单次 5s 超时，失败仅日志）；
+  E27 `[post_download]`：`move_to`（同盘 rename，跨盘 copy+delete，同名自动
+  改名）+ `hook`（不带 shell 直启，env 传 SD_TASK_ID/SD_TASK_NAME/
+  SD_FILE_PATH/SD_ENGINE）；E20 `[cleanup]`：Completed 保留 N 天（0=禁用），
+  清扫间隔 10min，`auto_remove_keep_data` 默认保留文件。
+- **BT 专项**：E29 tracker 运行时 `GET`（announce 表）/`POST`（批量追加，
+  非法 URL 400）/`DELETE ?url=`（精确匹配，无匹配 404）；E33 分享率见速率
+  链路；发现层开关（DHT/LSD/UPnP）配置段早已有（见 #2 批次）。
+- **运维**：E22 `/metrics` Prometheus 文本格式（任务按状态/引擎计数 + 聚合
+  速率）；E31 `/probe`（GET Range: bytes=0-0 探测大小/服务端文件名/Range/
+  ETag/Last-Modified/Content-Type + `suggest_name` 与引擎派生链一致，不建
+  任务；v1 仅 HTTP 源）。E16 `/config/limit`：合计下行 + BT 上行，缺省字段
+  = 沿用当前值，双缺省 = 查询。
+
+**验证**：非 bt workspace 基线 624（sequential 批次时点）→ **850/850**（E33
+收官，`cargo test --workspace --exclude smart-dl-btcore`）；bt 构建 daemon
+322 + btcore 35（本地 LT 2.0.11，含真实 seeder 环回下载断言 all_time 冲账）；
+fmt 全清；clippy 五门禁（workspace+ftp / daemon ftp,nas / ftp,nas / bt
+--all-targets）零警告。每批独立 PR，CI 三 job 全绿后才合并，合并提交
+check-runs 逐一复核（E13–E33 段：#35–#57）。
