@@ -1902,7 +1902,7 @@ import socket
 
 # ============= 迅雷客户端身份 (来自 alist, 已开源) =============
 CLIENT_ID = "Xp6vsxz_7IYVw2BB"
-CLIENT_SECRET = "Xp6vsy4tN9toTVdMSpomVdXpRmES"
+CLIENT_SECRET = "<redacted>"
 CLIENT_VERSION = "8.31.0.9726"
 PACKAGE_NAME = "com.xunlei.downloadprovider"
 APPID = "40"
@@ -2210,7 +2210,7 @@ from pathlib import Path
 
 # ============= 迅雷客户端身份 (alist 已开源) =============
 CLIENT_ID = "Xp6vsxz_7IYVw2BB"
-CLIENT_SECRET = "Xp6vsy4tN9toTVdMSpomVdXpRmES"
+CLIENT_SECRET = "<redacted>"
 CLIENT_VERSION = "8.31.0.9726"
 PACKAGE_NAME = "com.xunlei.downloadprovider"
 APPID = "40"
@@ -2567,7 +2567,7 @@ from pathlib import Path
 
 # 沿用 v1 的常量
 CLIENT_ID = "Xp6vsxz_7IYVw2BB"
-CLIENT_SECRET = "Xp6vsy4tN9toTVdMSpomVdXpRmES"
+CLIENT_SECRET = "<redacted>"
 CLIENT_VERSION = "8.31.0.9726"
 PACKAGE_NAME = "com.xunlei.downloadprovider"
 APPID = "40"
@@ -2860,7 +2860,7 @@ from cryptography.hazmat.backends import default_backend
 
 # 沿用 v1/v2 常量
 CLIENT_ID = "Xp6vsxz_7IYVw2BB"
-CLIENT_SECRET = "Xp6vsy4tN9toTVdMSpomVdXpRmES"
+CLIENT_SECRET = "<redacted>"
 CLIENT_VERSION = "8.31.0.9726"
 PACKAGE_NAME = "com.xunlei.downloadprovider"
 APPID = "40"
