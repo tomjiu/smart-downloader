@@ -25,6 +25,11 @@ use tokio::task::JoinSet;
 /// 421/连接失败重试次数（连接层退避）。
 const CONNECT_ATTEMPTS: u32 = 4;
 
+/// FTP 段下载流式写入块大小：固定 64KB 缓冲（与 HTTP 侧 resp.chunk() 同级），
+/// 避免整段驻留内存（8 worker × 16MB 段 = 峰值 128MB+）。部分写入无害：
+/// 失败段不入账本，重试/恢复路径 seek 回 seg.start 全量重写。
+const FTP_CHUNK: usize = 64 * 1024;
+
 /// FTP URL 目标：单文件或目录。
 #[derive(Debug, PartialEq, Eq)]
 enum FtpTarget {
@@ -470,35 +475,33 @@ async fn download_segment(
     let mut data = TcpStream::connect(data_addr)
         .await
         .map_err(|e| e.to_string())?;
-    let need = seg.len() as usize;
-    let mut buf = vec![0u8; need];
-    let mut got = 0usize;
-    while got < need {
-        let n = data
-            .read(&mut buf[got..])
-            .await
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Err(format!("data connection closed early: {got}/{need}"));
-        }
-        // E16 全局限速：逐块消费全局预算（限速器内部计数，速率 0 早退零开销）
-        limiter.wait(n as u64).await;
-        got += n;
-    }
-    let _ = read_response(&mut s.reader).await; // 226
-    s.quit().await;
-
-    // 写 .part 段位置（段不相交 → 无锁）
+    // 流式直写 .part 段位置（与 HTTP 侧流式语义对齐；段不相交 → 无锁）。
+    // 固定 64KB 块缓冲，段长不再驻内存；失败时部分写入由重试/恢复路径
+    // seek 回 seg.start 全量重写（段未入账本前不构成有效凭据）。
+    use std::io::{Seek, SeekFrom, Write};
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(part)
         .map_err(|e| e.to_string())?;
-    use std::io::{Seek, SeekFrom, Write};
     f.seek(SeekFrom::Start(seg.start))
         .map_err(|e| e.to_string())?;
-    f.write_all(&buf).map_err(|e| e.to_string())?;
+    let need = seg.len() as usize;
+    let mut chunk = vec![0u8; FTP_CHUNK];
+    let mut got = 0usize;
+    while got < need {
+        let n = data.read(&mut chunk).await.map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err(format!("data connection closed early: {got}/{need}"));
+        }
+        // E16 全局限速：逐块消费全局预算（限速器内部计数，速率 0 早退零开销）
+        limiter.wait(n as u64).await;
+        f.write_all(&chunk[..n]).map_err(|e| e.to_string())?;
+        got += n;
+    }
+    let _ = read_response(&mut s.reader).await; // 226
+    s.quit().await;
     Ok(())
 }
 
