@@ -85,7 +85,9 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         .build()
         .map_err(|e| ServeError::Engine(format!("HTTP client 构建失败: {e}")))?;
     let http_engine: Arc<dyn smart_dl_core::types::DownloadEngine> = Arc::new(
-        smart_dl_httpdl::HttpEngine::new_limited(client, cfg.download.max_download_kb_s),
+        // B1：clone 一份给 DaemonState（metalink 引导 XML 拉取同源口径），
+        // 原件移交 HTTP 引擎（探测/段下载）。
+        smart_dl_httpdl::HttpEngine::new_limited(client.clone(), cfg.download.max_download_kb_s),
     );
     // 3b. 云兜底 provider 列表（`[provider]` 配置；仅 MockProvider 现成实现——
     // 开发/演示占位，真实 provider（迅雷云盘等）落地后按类型构造）
@@ -134,6 +136,7 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         .with_http_token(http_token.clone())
         .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
         .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s)
+        .with_bootstrap_client(client.clone())
         .with_webhook_url((!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone()))
         .with_post_download(
             (!cfg.post_download.move_to.is_empty()).then(|| cfg.post_download.move_to.clone()),
@@ -147,6 +150,7 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         .with_http_token(http_token.clone())
         .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
         .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s)
+        .with_bootstrap_client(client)
         .with_webhook_url((!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone()))
         .with_post_download(
             (!cfg.post_download.move_to.is_empty()).then(|| cfg.post_download.move_to.clone()),

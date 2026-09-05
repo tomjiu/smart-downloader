@@ -580,6 +580,10 @@ pub struct DaemonState {
     webhook_url: Mutex<Option<String>>,
     /// Webhook 投递 client（共享连接池；完成频率低，单实例足够）。
     webhook_client: reqwest::Client,
+    /// Metalink 引导 XML 拉取 client（B1）：serve 注入引擎全局 client 克隆
+    /// （同源代理/cookie jar/超时口径）；None（部分测试/嵌入式调用）时
+    /// fetch_metalink_xml 按需新建裸 client 兜底。
+    bootstrap_client: Option<reqwest::Client>,
     /// 完成后移动目标目录（E27）：Some = 完成后把落盘文件移入该目录；
     /// None = 禁用。serve 从 `[post_download] move_to` 注入。
     post_move_to: Mutex<Option<PathBuf>>,

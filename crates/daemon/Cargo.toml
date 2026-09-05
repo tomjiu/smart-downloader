@@ -35,6 +35,7 @@ fs2 = { workspace = true }
 futures = { workspace = true } # SSE 事件流（unfold stream，E12）
 toml = "0.8"
 reqwest = { workspace = true }
+quick-xml = { workspace = true }
 smart-dl-core = { path = "../core" }
 smart-dl-httpdl = { path = "../httpdl" }
 smart-dl-provider = { path = "../provider" }

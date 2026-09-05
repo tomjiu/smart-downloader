@@ -13,6 +13,8 @@ pub mod health;
 pub mod http;
 pub mod http_events;
 pub mod lockfile;
+/// Metalink4（RFC 5854）解析与 add 链路展开（B1）。
+pub mod metalink;
 /// NAS 版迅雷引擎托管（xllite/pan-cli，Linux-only）。附录 E-2026-08-30。
 #[cfg(feature = "nas")]
 pub mod nas;
