@@ -81,7 +81,7 @@ async fn healthy_mirror1_never_uses_mirror2() {
         .update_sources(&tid, vec![m1.url("/file"), m2.url("/file")])
         .await
         .unwrap();
-    let st = wait_terminal(&engine, &tid).await;
+    let _st = wait_terminal(&engine, &tid).await;
 
     // 源探测韧性更新：update_sources 现并发探测全部候选 → mirror2 必然收到
     // 1 次 Range: bytes=0-0 探测请求。本测试锁定的契约收窄为「无段数据流量」：

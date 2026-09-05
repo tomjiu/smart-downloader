@@ -224,8 +224,8 @@ async fn unproxied_task_fails_on_unreachable_target() {
 
 /// E8 热改测试基建口径：32MB（2 段 × 16MB min_split，segment_count 最小 2 并发）
 /// + 全局限速 4MiB/s（总时长 ~8s）+ 固定 300ms 后热改——此时两段均在飞
-/// （每段 ~4s），"下载中"由总时长保证，不依赖进度轮询（进度按段完成上报，
-/// 16MB 段粒度下中途恒为 0）。
+///   （每段 ~4s），"下载中"由总时长保证，不依赖进度轮询（进度按段完成上报，
+///   16MB 段粒度下中途恒为 0）。
 const E8_SIZE: u64 = 32 * 1024 * 1024;
 const E8_RATE_KB_S: u32 = 4096;
 

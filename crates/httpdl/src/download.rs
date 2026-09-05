@@ -75,44 +75,6 @@ fn rotate_mirrors(mirrors: &[String], worker_no: usize) -> Vec<String> {
         .collect()
 }
 
-#[cfg(test)]
-mod rotation_tests {
-    use super::*;
-
-    fn v(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn single_mirror_rotation_is_identity() {
-        let m = v(&["a"]);
-        for w in 0..4 {
-            assert_eq!(rotate_mirrors(&m, w), m);
-        }
-        // 空表（防御）恒空
-        assert!(rotate_mirrors(&[], 3).is_empty());
-    }
-
-    #[test]
-    fn dual_mirror_rotation_spreads_workers() {
-        let m = v(&["a", "b"]);
-        assert_eq!(rotate_mirrors(&m, 0), v(&["a", "b"]));
-        assert_eq!(rotate_mirrors(&m, 1), v(&["b", "a"]));
-        assert_eq!(rotate_mirrors(&m, 2), v(&["a", "b"]));
-        assert_eq!(rotate_mirrors(&m, 3), v(&["b", "a"]));
-        // 三源：起点 0/1/2 循环
-        let m3 = v(&["a", "b", "c"]);
-        assert_eq!(rotate_mirrors(&m3, 1), v(&["b", "c", "a"]));
-        assert_eq!(rotate_mirrors(&m3, 2), v(&["c", "a", "b"]));
-        // 轮转结果恒为原表重排（无丢失/重复）
-        for w in 0..6 {
-            let mut r = rotate_mirrors(&m3, w);
-            r.sort();
-            assert_eq!(r, m3);
-        }
-    }
-}
-
 /// 动态分段下载：worker 数 N=clamp(total/64MB, 2, 8)，段粒度 min_split。
 /// `ledger` = Some 时从已完成段恢复并逐段持久化进度（None = 一次性下载，
 /// 不落账本）。`pause` = Some 时段边界检查暂停标志。`progress` = 每段完成
@@ -378,4 +340,42 @@ async fn download_segment_streaming(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn single_mirror_rotation_is_identity() {
+        let m = v(&["a"]);
+        for w in 0..4 {
+            assert_eq!(rotate_mirrors(&m, w), m);
+        }
+        // 空表（防御）恒空
+        assert!(rotate_mirrors(&[], 3).is_empty());
+    }
+
+    #[test]
+    fn dual_mirror_rotation_spreads_workers() {
+        let m = v(&["a", "b"]);
+        assert_eq!(rotate_mirrors(&m, 0), v(&["a", "b"]));
+        assert_eq!(rotate_mirrors(&m, 1), v(&["b", "a"]));
+        assert_eq!(rotate_mirrors(&m, 2), v(&["a", "b"]));
+        assert_eq!(rotate_mirrors(&m, 3), v(&["b", "a"]));
+        // 三源：起点 0/1/2 循环
+        let m3 = v(&["a", "b", "c"]);
+        assert_eq!(rotate_mirrors(&m3, 1), v(&["b", "c", "a"]));
+        assert_eq!(rotate_mirrors(&m3, 2), v(&["c", "a", "b"]));
+        // 轮转结果恒为原表重排（无丢失/重复）
+        for w in 0..6 {
+            let mut r = rotate_mirrors(&m3, w);
+            r.sort();
+            assert_eq!(r, m3);
+        }
+    }
 }
