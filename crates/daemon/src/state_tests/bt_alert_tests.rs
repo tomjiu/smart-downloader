@@ -112,6 +112,126 @@ fn error_alert_fails_with_message() {
 }
 
 #[test]
+fn error_alert_within_budget_schedules_retry() {
+    // E30 对齐（A2）：alert 快路径失败拦截——预算未用尽 → Queued 重试排队，
+    // 清引擎句柄 + 安排退避到期 + 落 auto_retry 事件（与轮询路径同口径）。
+    let mut rec = bt_rec(TaskState::Downloading(EngineKind::Bt), "E30A");
+    rec.task.retry = RetryState {
+        retries: 0,
+        max_retries: 2,
+    };
+    rec.engine_status = Some(EngineStatus {
+        down_rate: 12345,
+        up_rate: 678,
+        error: None,
+        ..Default::default()
+    });
+    let state = make_state_with(rec);
+    let alert = Alert {
+        kind: AlertKind::State,
+        ih: "e30a".into(),
+        msg: "torrent error: storage full".into(),
+        at: 0,
+        resume_ready: false,
+    };
+    let eff = state.apply_bt_alert(&alert).unwrap();
+    assert_eq!(eff.to, TaskState::Queued, "拦截后广播重试排队而非 Failed");
+    assert_eq!(eff.from, TaskState::Downloading(EngineKind::Bt));
+    let rec_lock = state.tasks.lock();
+    let rec = rec_lock.get("t1").unwrap();
+    assert_eq!(rec.task.state, TaskState::Queued);
+    assert_eq!(rec.task.retry.retries, 1, "消耗一次预算");
+    assert!(rec.engine_tid.is_none(), "重试等待必须清引擎句柄");
+    assert!(
+        rec.task.metadata.next_retry_at_unix > crate::state::now_unix(),
+        "next_retry 应为未来时刻"
+    );
+    assert!(rec.events.iter().any(|e| e.op == "auto_retry"));
+    let es = rec.engine_status.as_ref().unwrap();
+    assert_eq!(es.error.as_deref(), Some("torrent error: storage full"));
+    assert_eq!(
+        (es.down_rate, es.up_rate),
+        (0, 0),
+        "引擎停转后速率必须清零（E11 同源，防 /stats 虚高）"
+    );
+}
+
+#[test]
+fn error_alert_exhausted_budget_is_terminal() {
+    // 预算用尽 → Failed 终态，不再安排重试
+    let mut rec = bt_rec(TaskState::Downloading(EngineKind::Bt), "E30B");
+    rec.task.retry = RetryState {
+        retries: 2,
+        max_retries: 2,
+    };
+    let state = make_state_with(rec);
+    let alert = Alert {
+        kind: AlertKind::State,
+        ih: "e30b".into(),
+        msg: "torrent error: unrecoverable".into(),
+        at: 0,
+        resume_ready: false,
+    };
+    let eff = state.apply_bt_alert(&alert).unwrap();
+    assert_eq!(eff.to, TaskState::Failed);
+    let rec_lock = state.tasks.lock();
+    let rec = rec_lock.get("t1").unwrap();
+    assert_eq!(rec.task.state, TaskState::Failed);
+    assert_eq!(rec.task.retry.retries, 2, "retries 停在 max");
+    assert!(
+        rec.events.iter().all(|e| e.op != "auto_retry"),
+        "终态无重试事件"
+    );
+}
+
+#[test]
+fn error_alert_on_paused_stays_terminal() {
+    // 活跃态门控：Paused 下的 Error 不拦截（暂停任务不得被重试悄悄复活），
+    // 保持旧直终语义（与轮询路径守卫 Queued|Downloading 一致）
+    let mut rec = bt_rec(TaskState::Paused, "E30C");
+    rec.task.retry = RetryState {
+        retries: 0,
+        max_retries: 3,
+    };
+    let state = make_state_with(rec);
+    let alert = Alert {
+        kind: AlertKind::State,
+        ih: "e30c".into(),
+        msg: "torrent error: while paused".into(),
+        at: 0,
+        resume_ready: false,
+    };
+    let eff = state.apply_bt_alert(&alert).unwrap();
+    assert_eq!(eff.to, TaskState::Failed, "Paused 直终不拦截");
+    let rec_lock = state.tasks.lock();
+    let rec = rec_lock.get("t1").unwrap();
+    assert_eq!(rec.task.state, TaskState::Failed);
+    assert_eq!(rec.task.retry.retries, 0, "预算不消耗");
+}
+
+#[test]
+fn error_alert_on_seeding_stays_terminal() {
+    // Seeding 下的 Error 同样不拦截（做种失败不自动重下）
+    let mut rec = bt_rec(TaskState::Seeding, "E30D");
+    rec.task.retry = RetryState {
+        retries: 0,
+        max_retries: 3,
+    };
+    let state = make_state_with(rec);
+    let alert = Alert {
+        kind: AlertKind::State,
+        ih: "e30d".into(),
+        msg: "torrent error: while seeding".into(),
+        at: 0,
+        resume_ready: false,
+    };
+    let eff = state.apply_bt_alert(&alert).unwrap();
+    assert_eq!(eff.to, TaskState::Failed);
+    let rec_lock = state.tasks.lock();
+    assert_eq!(rec_lock.get("t1").unwrap().task.retry.retries, 0);
+}
+
+#[test]
 fn paused_alert_ignored() {
     // v1 不处理 Paused alert（pause 由 API 直调时同步发布事件）
     let state = make_state_with(bt_rec(TaskState::Downloading(EngineKind::Bt), "P1"));
