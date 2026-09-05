@@ -578,3 +578,26 @@ stays_terminal` / `error_alert_on_seeding_stays_terminal`；既有
 httpdl(ftp) 184/0（+4）· daemon default 266/0 · ftp,nas 277/0 · bt 328/0 ·
 fmt · 双 clippy 口径 0 告警。daemon `/tasks/:id/limit`、`/tasks/:id/sequential`
 端点走 trait 分发，FTP 支持自动生效（无需 daemon 改动）。
+
+### 26. `/metrics` 任务速率 histogram（A 档快赢 #4，2026-09-05）
+
+**背景**：E22 的 `/metrics` 仅有 gauge 面（任务计数 + 聚合速率），无分布视图
+——多任务并发时聚合值掩盖单任务速率形态（限速是否生效、慢尾任务占比）无法
+观测。
+
+**行为契约**：
+- 新增两条 histogram（text/plain 0.0.4，Prometheus 抓取兼容）：
+  - `smart_dl_task_down_speed_bytes_per_second`（单任务下载速率分布）
+  - `smart_dl_task_up_speed_bytes_per_second`（单任务上传速率分布，BT 做种观测）
+- 按 `engine` 标签分独立 series（bt/http/ftp/provider/xunlei-nas，BTreeMap
+  输出序稳定）；桶边界 64KB/256KB/1MB/4MB/16MB/64MB（bytes/s，累计口径，
+  渲染器补 +Inf/sum/count）。
+- **样本口径**：仅含任一方向速率 > 0 的任务（`task_speed_samples()`）——
+  count = 当前传输中任务数，空闲任务堆积不灌爆低桶；各方向 histogram 只取
+  该方向速率 > 0 的样本（BT 纯上传任务不进 down 分布）。
+- `/stats` JSON 面保持既有字段不变（histogram 为 /metrics 专属派生）。
+
+**验证**：http.rs 渲染单测 4 测（累计桶/零样本排除/方向列选取/空样本仅
+HELP+TYPE/engine 序稳定）+ state_tests/metrics_tests 2 测（全零与无缓存排除/
+空态）。门禁：daemon default 272/0（+6）· ftp,nas 283/0（+6）· bt 334/0
+（+6）· fmt · workspace clippy 0 告警。

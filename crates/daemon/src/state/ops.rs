@@ -1573,6 +1573,22 @@ impl DaemonState {
         st
     }
 
+    /// 任务级速率样本（A4 `/metrics` histogram 数据源）：`(engine 标签,
+    /// down, up)` 三元组。仅含引擎缓存中**任一方向速率 > 0** 的任务（活跃
+    /// 传输分布口径；全零任务不进样本——histogram count = 传输中任务数，
+    /// 空闲任务堆积不会灌爆低桶）。`/stats` JSON 面保持既有字段不变。
+    pub fn task_speed_samples(&self) -> Vec<(&'static str, u64, u64)> {
+        let tasks = self.tasks.lock();
+        tasks
+            .values()
+            .filter_map(|rec| {
+                let s = rec.engine_status.as_ref()?;
+                (s.down_rate > 0 || s.up_rate > 0)
+                    .then(|| (kind_label(&rec.engine_kind), s.down_rate, s.up_rate))
+            })
+            .collect()
+    }
+
     pub async fn pause(&self, id: &str) -> Result<(), DaemonError> {
         // E23：调度等待中任务（engine_tid 空 + Queued）无引擎句柄可暂停——
         // 语义 = 取消自动启动（记录置 Paused；start_at 保留供展示，激活器

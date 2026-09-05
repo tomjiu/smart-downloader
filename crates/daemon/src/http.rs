@@ -948,7 +948,7 @@ async fn stats_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoRespo
 /// `scrape_configs: [{static_configs: [{targets: [daemon]}]}]`。
 async fn metrics_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let st = state.stats();
-    let mut out = String::with_capacity(1024);
+    let mut out = String::with_capacity(2048);
     out.push_str("# HELP smart_dl_tasks_total Number of download tasks by state and engine.\n");
     out.push_str("# TYPE smart_dl_tasks_total gauge\n");
     // 状态维度
@@ -974,6 +974,23 @@ async fn metrics_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoRes
         "smart_dl_speed_bytes_per_second{{direction=\"up\"}} {}\n",
         st.up_bytes_s
     ));
+    // A4：任务级速率分布 histogram（按 engine 标签分 series；count = 传输中
+    // 任务数——全零速率任务不进样本，见 task_speed_samples 口径注释）
+    let samples = state.task_speed_samples();
+    render_speed_histogram(
+        &mut out,
+        "smart_dl_task_down_speed_bytes_per_second",
+        "Per-task download speed distribution (active transfers only).",
+        0,
+        &samples,
+    );
+    render_speed_histogram(
+        &mut out,
+        "smart_dl_task_up_speed_bytes_per_second",
+        "Per-task upload speed distribution (active transfers only).",
+        1,
+        &samples,
+    );
     (
         [(
             axum::http::header::CONTENT_TYPE,
@@ -982,6 +999,59 @@ async fn metrics_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoRes
         out,
     )
         .into_response()
+}
+
+/// 任务速率 histogram 桶边界（bytes/s，累计口径；+Inf 由渲染器补齐）：
+/// 64KB / 256KB / 1MB / 4MB / 16MB / 64MB——覆盖拨号到万内网典型档位，
+/// 稀疏上段防桶爆炸（Prometheus 常规规模）。
+const SPEED_BUCKETS: &[u64] = &[
+    65_536, 262_144, 1_048_576, 4_194_304, 16_777_216, 67_108_864,
+];
+
+/// 渲染一条任务速率 histogram（纯函数，单测直测）。`dir_idx`：0=down 1=up。
+/// 每方向仅统计该方向速率 > 0 的样本；按 engine 标签分组出独立 series
+///（BTreeMap 保证输出序稳定），le 标签为累计口径，末尾补 +Inf/sum/count。
+fn render_speed_histogram(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    dir_idx: usize,
+    samples: &[(&'static str, u64, u64)],
+) {
+    // (engine → (累计桶计数, sum, count))
+    let mut by_engine: std::collections::BTreeMap<
+        &'static str,
+        ([u64; SPEED_BUCKETS.len()], u64, u64),
+    > = Default::default();
+    for &(engine, down, up) in samples {
+        let v = if dir_idx == 0 { down } else { up };
+        if v == 0 {
+            continue;
+        }
+        let e = by_engine.entry(engine).or_default();
+        for (i, b) in SPEED_BUCKETS.iter().enumerate() {
+            if v <= *b {
+                e.0[i] += 1;
+            }
+        }
+        e.1 += v;
+        e.2 += 1;
+    }
+    out.push_str(&format!("# HELP {name} {help}\n"));
+    out.push_str(&format!("# TYPE {name} histogram\n"));
+    for (engine, (buckets, sum, count)) in &by_engine {
+        for (i, b) in SPEED_BUCKETS.iter().enumerate() {
+            out.push_str(&format!(
+                "{name}_bucket{{engine=\"{engine}\",le=\"{b}\"}} {}\n",
+                buckets[i]
+            ));
+        }
+        out.push_str(&format!(
+            "{name}_bucket{{engine=\"{engine}\",le=\"+Inf\"}} {count}\n"
+        ));
+        out.push_str(&format!("{name}_sum{{engine=\"{engine}\"}} {sum}\n"));
+        out.push_str(&format!("{name}_count{{engine=\"{engine}\"}} {count}\n"));
+    }
 }
 
 /// 版本与编译特性（对齐部署矩阵：二进制是哪个 feature 组合的构建）。
@@ -1975,5 +2045,64 @@ async fn nas_token(State(_): State<Arc<DaemonState>>, Json(req): Json<NasTokenRe
             Json(serde_json::json!({ "ok": false, "error": e })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod metrics_render_tests {
+    use super::*;
+
+    #[test]
+    fn histogram_down_direction_buckets_and_excludes_zero() {
+        // down 方向：仅统计 down>0 样本；bt（down=0）不出现在 down series
+        let samples = vec![
+            ("http", 65_536u64, 0u64),
+            ("http", 1_048_576, 0),
+            ("bt", 0, 999),
+        ];
+        let mut out = String::new();
+        render_speed_histogram(&mut out, "m_down", "help text", 0, &samples);
+        assert!(out.contains("# TYPE m_down histogram"));
+        // 累计口径：65_536 落首桶（le 相等含），1_048_576 落至第三桶
+        assert!(out.contains("m_down_bucket{engine=\"http\",le=\"65536\"} 1"));
+        assert!(out.contains("m_down_bucket{engine=\"http\",le=\"262144\"} 1"));
+        assert!(out.contains("m_down_bucket{engine=\"http\",le=\"1048576\"} 2"));
+        assert!(out.contains("m_down_bucket{engine=\"http\",le=\"+Inf\"} 2"));
+        assert!(out.contains("m_down_sum{engine=\"http\"} 1114112"));
+        assert!(out.contains("m_down_count{engine=\"http\"} 2"));
+        // down=0 的 bt 样本不得进入 down histogram
+        assert!(!out.contains("engine=\"bt\""), "down=0 样本泄漏: {out}");
+    }
+
+    #[test]
+    fn histogram_up_direction_selects_up_column() {
+        let samples = vec![("http", 100, 0), ("bt", 50, 4_194_304)];
+        let mut out = String::new();
+        render_speed_histogram(&mut out, "m_up", "help text", 1, &samples);
+        assert!(out.contains("m_up_bucket{engine=\"bt\",le=\"4194304\"} 1"));
+        assert!(out.contains("m_up_count{engine=\"bt\"} 1"));
+        // up=0 的 http 样本不进 up histogram
+        assert!(!out.contains("engine=\"http\""), "up=0 样本泄漏: {out}");
+    }
+
+    #[test]
+    fn histogram_all_zero_samples_emit_help_type_only() {
+        let samples = vec![("http", 0u64, 0u64)];
+        let mut out = String::new();
+        render_speed_histogram(&mut out, "m_empty", "help text", 0, &samples);
+        assert!(out.contains("# HELP m_empty help text"));
+        assert!(out.contains("# TYPE m_empty histogram"));
+        assert!(!out.contains("_bucket"), "空样本不得出 bucket 行: {out}");
+    }
+
+    #[test]
+    fn histogram_engine_series_sorted_stable() {
+        // BTreeMap：engine series 输出序稳定（bt < http 字典序）
+        let samples = vec![("http", 100, 0), ("bt", 100, 0)];
+        let mut out = String::new();
+        render_speed_histogram(&mut out, "m", "h", 0, &samples);
+        let bt_pos = out.find("engine=\"bt\"").unwrap();
+        let http_pos = out.find("engine=\"http\"").unwrap();
+        assert!(bt_pos < http_pos, "engine series 须按字典序稳定输出");
     }
 }
