@@ -1321,6 +1321,109 @@ impl DaemonState {
         Ok(task_id)
     }
 
+    /// Metalink 引导 XML 拉取（B1，`.meta4`/`.metalink` URL 入口）：bootstrap
+    /// client（serve 注入 = 引擎全局 client 克隆，代理/cookie/超时同源）；
+    /// 未注入时按需新建裸 client 兜底（部分测试/嵌入式调用）。2xx 外状态
+    /// → InvalidSource；响应体不裁剪（大小护栏交给后续 parse 的 XML 错误
+    /// 上限——quick-xml 流式解析，超大输入天然可处理）。
+    pub(crate) async fn fetch_metalink_xml(&self, url: &str) -> Result<String, DaemonError> {
+        let client = match &self.bootstrap_client {
+            Some(c) => c.clone(),
+            None => reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|e| {
+                    DaemonError::InvalidSource(format!("bootstrap client 构建失败: {e}"))
+                })?,
+        };
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| DaemonError::InvalidSource(format!("metalink 引导拉取失败: {e}")))?;
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| DaemonError::InvalidSource(format!("metalink 引导拉取失败: {e}")))?;
+        resp.text()
+            .await
+            .map_err(|e| DaemonError::InvalidSource(format!("metalink 引导响应读取失败: {e}")))
+    }
+
+    /// 创建 Metalink4 任务集（B1）：解析 RFC 5854 XML → 逐 `<file>` 展开为
+    /// HTTP 任务，全链复用既有能力——主 URL = priority 最高（数值最小）者，
+    /// 次高者作 backup_url（E2/E3 mirror failover 直通）；内建哈希择强
+    /// （sha256 > sha1 > md5）直通 E3 校验链；文件名取 name 属性末段
+    /// （`MetalinkFile::display_name`，V3 终审）。
+    ///
+    /// 语义边界：
+    /// - 任务级字段（sequential/proxy/headers/basic_auth/conflict/start_at/
+    ///   auto_retry）逐文件继承 opts；哈希/名字/URL 每文件各异由 XML 覆写。
+    /// - 仅展开 http(s) URL（`http_sorted_urls`）；ftp:// 等混合协议 URL
+    ///   过滤不参与。文件无可用 URL → InvalidSource（含文件名定位）。
+    /// - 展开失败即中止（已创建任务保留，不回滚——引擎句柄回收代价大，
+    ///   错误信息带已创建计数）；metalink 来自同一发布者，部分失败通常
+    ///   意味着整份描述文件不可用。
+    /// - `<size>` 空间预检：add_http_task_opts 的 HTTP 大小在响应头才知
+    ///   （B10 同口径），XML size 未直接参与预检，仅随探测链由引擎校验。
+    pub(crate) async fn add_metalink_tasks(
+        &self,
+        xml: &str,
+        dest_root: Option<String>,
+        opts: AddHttpOpts,
+    ) -> Result<Vec<TaskId>, DaemonError> {
+        let files = crate::metalink::parse_metalink4(xml).map_err(DaemonError::InvalidSource)?;
+        let mut ids: Vec<TaskId> = Vec::with_capacity(files.len());
+        for f in &files {
+            let name = f.display_name().map_err(DaemonError::InvalidSource)?;
+            let urls = f.http_sorted_urls();
+            let primary = urls.first().map(|u| u.url.clone()).ok_or_else(|| {
+                DaemonError::InvalidSource(format!(
+                    "metalink <file name={:?}> 无可用 http(s) <url>",
+                    f.name
+                ))
+            })?;
+            let backup_url = urls.get(1).map(|u| u.url.clone());
+            // 哈希择强填单槽位（AddHttpOpts 主源互斥）；backup_md5 恒不设
+            // ——metalink 哈希是内容级（主备同内容），备用源校验由引擎既有
+            // 身份切换逻辑接管。
+            let (sha256, sha1, md5) = match f.best_hash() {
+                Some(("sha256", h)) => (Some(h.to_string()), None, None),
+                Some(("sha1", h)) => (None, Some(h.to_string()), None),
+                Some(("md5", h)) => (None, None, Some(h.to_string())),
+                // best_hash 契约仅返回以上三档；wildcard 为类型完备性兜底
+                _ => (None, None, None),
+            };
+            let id = self
+                .add_http_task_opts(
+                    primary,
+                    dest_root.clone(),
+                    AddHttpOpts {
+                        backup_url,
+                        sha256,
+                        sha1,
+                        md5,
+                        name: Some(name),
+                        backup_md5: None,
+                        ..opts.clone()
+                    },
+                )
+                .await
+                .map_err(|e| match e {
+                    DaemonError::Duplicate(existing) => DaemonError::InvalidSource(format!(
+                        "metalink 展开中断：<file name={:?}> 与已有任务 {existing} 重复",
+                        f.name
+                    )),
+                    other => DaemonError::InvalidSource(format!(
+                        "metalink 展开中断（已创建 {} 个任务，不回滚）: {other}",
+                        ids.len()
+                    )),
+                })?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
     /// 任务快照（实时读引擎状态；未完成时引擎可能已移动）。
     pub async fn task_snapshot(&self, id: &str) -> Option<TaskSnapshot> {
         let rec = self.tasks.lock().get(id).cloned()?;

@@ -29,6 +29,7 @@ impl DaemonState {
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .build()
                 .unwrap_or_default(),
+            bootstrap_client: None,
             post_move_to: Mutex::new(None),
             post_hook: Mutex::new(None),
             cleanup: Mutex::new(crate::config::CleanupCfg::default()),
@@ -71,6 +72,13 @@ impl DaemonState {
     /// 注入磁盘预检严格模式（V10-2）：true = 空间不可探测时拒绝入队。
     pub fn with_disk_precheck_strict(mut self, strict: bool) -> Self {
         self.disk_precheck_strict = strict;
+        self
+    }
+
+    /// 注入 Metalink 引导 XML 拉取 client（B1）：serve 传入引擎全局 client
+    /// 克隆（同源代理/cookie jar/超时口径，见 serve.rs 组装处）。
+    pub fn with_bootstrap_client(mut self, client: reqwest::Client) -> Self {
+        self.bootstrap_client = Some(client);
         self
     }
 

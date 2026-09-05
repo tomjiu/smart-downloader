@@ -33,9 +33,16 @@ pub struct AddTaskReq {
     pub url: Option<String>,
     #[serde(default)]
     pub dest: Option<String>,
-    /// .torrent 文件内容（标准 base64）。与 `url` 二选一，优先 torrent。
+    /// .torrent 文件内容（标准 base64）。与 `url`/`metalink_b64` 三选一，
+    /// 优先级 torrent > metalink > url。
     #[serde(default)]
     pub torrent_b64: Option<String>,
+    /// Metalink4 描述文件内容（B1，RFC 5854 XML，UTF-8，标准 base64）。
+    /// 与 `url`/`torrent_b64` 三选一；解析后逐 `<file>` 展开为 HTTP 任务
+    /// （主 URL + 次高 priority 备源 + 内建哈希直通校验链）。
+    /// 响应含 `task_ids`/`count`（`task_id` = 首个，向后兼容单任务语义）。
+    #[serde(default)]
+    pub metalink_b64: Option<String>,
     /// 任务级下载限速 KiB/s（0 = 不限；缺省 = 走全局）。任务创建成功后应用。
     #[serde(default)]
     pub down_kb_s: Option<u32>,
@@ -1160,11 +1167,76 @@ async fn send_text(socket: &mut WebSocket, env: &crate::events::Envelope) -> Opt
     socket.send(Message::Text(text)).await.ok()
 }
 
+/// `.meta4`/`.metalink` 后缀识别（B1）：剥 query/fragment 后大小写无关。
+/// 仅按 URL 形态判定，不看 Content-Type（描述文件常由静态服务托管，CT 缺失
+/// 或非标准很常见；误判后果 = 把 XML 当下载目标，探测/哈希校验自然失败）。
+fn metalink_url_suffix(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let lower = path.to_lowercase();
+    lower.ends_with(".meta4") || lower.ends_with(".metalink")
+}
+
+/// url / metalink_b64 分支共享的任务级 opts 构造（B1 收口：conflict 解析
+/// 错误统一早退响应）。
+fn build_add_http_opts(
+    req: &AddTaskReq,
+    auto_retry: u32,
+) -> Result<crate::state::AddHttpOpts, (StatusCode, Json<serde_json::Value>)> {
+    Ok(crate::state::AddHttpOpts {
+        sequential: req.sequential,
+        proxy: req.proxy.clone(),
+        headers: req
+            .headers
+            .as_ref()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default(),
+        basic_auth: req
+            .username
+            .clone()
+            .map(|u| (u, req.password.clone().unwrap_or_default())),
+        sha256: req.sha256.clone(),
+        sha1: req.sha1.clone(),
+        md5: req.md5.clone(),
+        backup_url: req.backup_url.clone(),
+        backup_md5: req.backup_md5.clone(),
+        name: req.name.clone(),
+        conflict: match req.conflict_policy.as_deref() {
+            None => None,
+            Some(other) => match crate::state::ConflictPolicy::parse(other) {
+                Some(c) => Some(c),
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error":
+                            format!("未知 conflict_policy {other:?}（合法值: overwrite, rename, skip）") })),
+                    ));
+                }
+            },
+        },
+        start_at_unix: req.start_at_unix,
+        auto_retry,
+    })
+}
+
 async fn add_task(
     State(state): State<Arc<DaemonState>>,
     Json(req): Json<AddTaskReq>,
 ) -> impl IntoResponse {
-    let result = if let Some(b64) = req.torrent_b64 {
+    // E30：auto_retry 范围门（0..=10；防极端配置拖垮调度循环）。B1 起三选一
+    // 各分支共享（metalink 展开的 HTTP 任务同样消费 auto_retry）。
+    let auto_retry = req.auto_retry.unwrap_or(0);
+    if auto_retry > 10 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error":
+                format!("auto_retry 取值 0..=10，收到 {auto_retry}") })),
+        );
+    }
+
+    // 源三选一（优先级 torrent > metalink > url）；统一产出任务 id 列表
+    // （单源任务 = 单元素；metalink = 逐 <file> 展开，B1）。
+    let result: Result<Vec<String>, crate::state::DaemonError> = if let Some(b64) = req.torrent_b64
+    {
         match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
             Ok(bytes) => {
                 #[cfg(feature = "bt")]
@@ -1172,6 +1244,7 @@ async fn add_task(
                     state
                         .add_torrent_task_opts(bytes, req.dest, req.sequential, req.start_at_unix)
                         .await
+                        .map(|id| vec![id])
                 }
                 #[cfg(not(feature = "bt"))]
                 {
@@ -1185,81 +1258,84 @@ async fn add_task(
                 "torrent_b64 不是合法 base64".into(),
             )),
         }
+    } else if let Some(b64) = req.metalink_b64.clone() {
+        // B1：metalink 描述文件（本地内容，RFC 5854 XML，UTF-8）逐 <file>
+        // 展开。req 级哈希/名字/backup_url 与 XML 并存时以 XML 为准（逐
+        // 文件各异更权威）；headers/auth/proxy/sequential/conflict/
+        // start_at/auto_retry 逐文件继承。
+        match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(xml) => match build_add_http_opts(&req, auto_retry) {
+                    Ok(opts) => state.add_metalink_tasks(&xml, req.dest, opts).await,
+                    Err(resp) => return resp,
+                },
+                Err(_) => Err(crate::state::DaemonError::InvalidSource(
+                    "metalink_b64 不是合法 UTF-8（RFC 5854 XML 应为 UTF-8 编码）".into(),
+                )),
+            },
+            Err(_) => Err(crate::state::DaemonError::InvalidSource(
+                "metalink_b64 不是合法 base64".into(),
+            )),
+        }
     } else {
-        let Some(url) = req.url else {
+        let Some(url) = req.url.clone() else {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "需要 url 或 torrent_b64" })),
+                Json(serde_json::json!({ "error": "需要 url / torrent_b64 / metalink_b64 之一" })),
             );
         };
-        // E30：auto_retry 范围门（0..=10；防极端配置拖垮调度循环）
-        let auto_retry = req.auto_retry.unwrap_or(0);
-        if auto_retry > 10 {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error":
-                    format!("auto_retry 取值 0..=10，收到 {auto_retry}") })),
-            );
+        let opts = match build_add_http_opts(&req, auto_retry) {
+            Ok(o) => o,
+            Err(resp) => return resp,
+        };
+        if metalink_url_suffix(&url) {
+            // B1：.meta4/.metalink URL → 引导 XML 拉取（bootstrap client
+            // 与引擎共享同源代理/cookie/超时口径）→ 展开为任务集。
+            match state.fetch_metalink_xml(&url).await {
+                Ok(xml) => state.add_metalink_tasks(&xml, req.dest, opts).await,
+                Err(e) => Err(e),
+            }
+        } else {
+            state
+                .add_link_task_opts(url, req.dest, opts)
+                .await
+                .map(|id| vec![id])
         }
-        state
-            .add_link_task_opts(
-                url,
-                req.dest,
-                crate::state::AddHttpOpts {
-                    sequential: req.sequential,
-                    proxy: req.proxy,
-                    headers: req
-                        .headers
-                        .map(|m| m.into_iter().collect())
-                        .unwrap_or_default(),
-                    basic_auth: req.username.map(|u| (u, req.password.unwrap_or_default())),
-                    sha256: req.sha256,
-                    sha1: req.sha1,
-                    md5: req.md5,
-                    backup_url: req.backup_url,
-                    backup_md5: req.backup_md5,
-                    name: req.name,
-                    conflict: match req.conflict_policy.as_deref() {
-                        None => None,
-                        Some(other) => match crate::state::ConflictPolicy::parse(other) {
-                            Some(c) => Some(c),
-                            None => {
-                                return (
-                                    StatusCode::BAD_REQUEST,
-                                    Json(serde_json::json!({ "error":
-                                        format!("未知 conflict_policy {other:?}（合法值: overwrite, rename, skip）") })),
-                                );
-                            }
-                        },
-                    },
-                    start_at_unix: req.start_at_unix,
-                    auto_retry,
-                },
-            )
-            .await
     };
     match result {
-        Ok(task_id) => {
+        Ok(ids) => {
             // 建任务时可选任务级限速：复用 set_task_limits 全链（合并/持久化/重放）。
-            // 任务已存在 → 限速失败不回滚任务，返回错误体提示单独重试 limit 调用。
+            // metalink 任务集逐个应用（单个失败即止，后续任务未设限；已创建任务
+            // 不回滚，返回错误体提示单独重试 limit 调用）。
             let limits_err = if req.down_kb_s.is_some() || req.up_kb_s.is_some() {
-                state
-                    .set_task_limits(&task_id, req.down_kb_s, req.up_kb_s)
-                    .await
-                    .err()
+                let mut first: Option<(String, crate::state::DaemonError)> = None;
+                for id in &ids {
+                    if let Err(e) = state.set_task_limits(id, req.down_kb_s, req.up_kb_s).await {
+                        first = Some((id.clone(), e));
+                        break;
+                    }
+                }
+                first
             } else {
                 None
             };
+            let count = ids.len();
+            let first_id = ids.first().cloned().unwrap_or_default();
             match limits_err {
                 None => (
                     StatusCode::CREATED,
-                    Json(serde_json::json!({ "task_id": task_id })),
+                    Json(serde_json::json!({
+                        "task_id": first_id,
+                        "task_ids": ids,
+                        "count": count,
+                    })),
                 ),
-                Some(e) => (
+                Some((id, e)) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({
-                        "task_id": task_id,
-                        "error": format!("任务已创建但限速设置失败: {e}（可单独重试 POST /tasks/:id/limit）")
+                        "task_id": first_id,
+                        "task_ids": ids,
+                        "error": format!("任务已创建但限速设置失败（{id}）: {e}（可单独重试 POST /tasks/:id/limit）")
                     })),
                 ),
             }

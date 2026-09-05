@@ -142,6 +142,13 @@ impl HttpEngine {
         Self::new_limited(client, 0)
     }
 
+    /// 引擎共享 client 只读访问（B1 metalink 引导 XML 下载复用）：全局代理 /
+    /// cookie jar / 超时口径与任务探测下载全链同源，避免 daemon 侧另建临时
+    /// client 造成两套网络配置。仅读语义，调用方不得复用为引擎写路径。
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
     /// `download_kb_s` = 全局下载限速 KiB/s（0 = 不限）。
     pub fn new_limited(client: reqwest::Client, download_kb_s: u32) -> Self {
         HttpEngine {

@@ -625,3 +625,38 @@ HELP+TYPE/engine 序稳定）+ state_tests/metrics_tests 2 测（全零与无缓
 断言任务 Completed + 内容一致 + cookie 请求 ≥1 + 引导后无 cookie 请求 == 0
 （jar 确实在探测→下载链路传递）。门禁：httpdl(ftp) 185/0（+1）· daemon
 default 272/0 · bt 334/0 · fmt · 双 clippy 口径 0 告警。
+
+### 28. Metalink4 支持（B 档 #1，2026-09-05）
+
+**背景**：多镜像发布场景（Linux 发行版 / 开源大文件）用户需手工挑一个 URL
+逐个添加，无镜像聚合描述文件展开能力；aria2/motrix 均原生支持 metalink。
+
+**实现**（`daemon/metalink.rs` + add 链路接入，PR #76）：
+- **解析器**：quick-xml 0.37 事件流状态机（RFC 5854），按 local name 匹配
+  标签（默认命名空间 + 带前缀 `<ml:file>` 均兼容）；`<file name=/>` `<size>`
+  `<hash type=/>` `<url priority= location=>` 全字段收集；`sha-256`/`sha-1`
+  连字符变体归一化；文档级元数据（publisher 等）忽略；`<size>`/priority
+  非法数字 → Err（拒静默吞错，防破坏校验/预检语义）。
+- **展开语义**（`add_metalink_tasks`）：逐 `<file>` 展开为一个 HTTP 任务——
+  主 URL = priority 最高（数值最小，None 排后稳定排序），次高者作 backup_url
+  （E2/E3 mirror failover 直通）；内建哈希择强（sha256 > sha1 > md5）直通
+  E3 校验链（主备同内容，backup_md5 恒不设）；文件名取 name 属性末段
+  （子目录展开 v1 不做，`display_name` 过 `sanitize_rel` V3 终审，穿越段
+  随「仅取末段」语义天然丢弃）；仅 http(s) URL 参与（ftp:// 等混合协议
+  过滤，v1 无 FTP 任务生成面）。
+- **API 三选一**（`POST /tasks`，优先级 torrent > metalink > url）：
+  ① `metalink_b64`（本地 .meta4/.metalink 内容，UTF-8 XML）；
+  ② `url` 以 `.meta4`/`.metalink` 结尾（剥 query/fragment 大小写无关）→
+  daemon bootstrap client 引导拉取（serve 注入引擎全局 client 克隆——
+  全局代理/cookie jar/超时同源；未注入时裸 client 兜底）→ 展开任务集；
+  ③ 常规 url 照旧。响应统一 `task_id`（首个，向后兼容）+ `task_ids` +
+  `count`；任务级字段（sequential/proxy/headers/auth/conflict/start_at/
+  auto_retry/limits）逐文件继承。
+- **失败语义**：XML 解析错误/文件无可用 http(s) URL → 400（含文件名定位）；
+  展开中途失败即中止，已创建任务保留不回滚（错误信息带已创建计数）。
+
+**验证**：`metalink.rs` 单测 10（字段/排序/择强/命名空间前缀/转义/多文件/
+混合协议过滤/坏输入/元数据忽略/末段语义）+ `tests/metalink_api.rs` e2e 3
+（metalink_b64 展开+sha256 校验+failover、.meta4 URL 引导拉取、坏 XML 400）。
+门禁：daemon default 285/0（+13）· ftp,nas 296/0（+13）· bt --all-targets
+347/0（+13）· httpdl(ftp) 185/0 · btcore 37/0 · fmt · CI 双 clippy 口径 0 告警。
