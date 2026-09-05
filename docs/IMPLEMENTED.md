@@ -446,3 +446,39 @@ integration）全绿 → merge → 合并提交 check-runs 复核」流程逐批
 fmt 全清；clippy 五门禁（workspace+ftp / daemon ftp,nas / ftp,nas / bt
 --all-targets）零警告。每批独立 PR，CI 三 job 全绿后才合并，合并提交
 check-runs 逐一复核（E13–E33 段：#35–#57）。
+
+### 22. 技术债批次（2026-09-05，PR #61–#67）
+
+技术债清单五项收官（清单背景见 2026-08-30 审计报告与 LOCK_MODEL.md）：
+
+- **#1 锁模型 hardening**（PR #61）：消除唯一多锁同持边，锁序审计结论
+  固化 `docs/LOCK_MODEL.md`。
+- **#2 state.rs 三步拆分**（PR #62 → #63 → #65，纯移动零语义）：
+  第一步测试区外置单文件（-54%）→ 第二步生产区按领域拆 `state/` 子模块
+  （bt_alerts / lifecycle / ops / persistence，state.rs -86%）→ 第三步
+  测试区目录化（`state_tests/` 一 mod 一文件 24 文件 + 外壳 mod.rs，
+  路径零变化，glob 解析链同构）。state.rs 最终 636 行骨架。
+- **#3 消 flaky**（PR #64）：根因 = libtorrent 2.0 session_params 默认
+  监听 0.0.0.0:6881 且 ffi 无 settings 导出，同 binary 并行测试抢端口。
+  解法 = `tests/common/lt_gate.rs` 进程内 tokio Mutex 串行门（跨 binary
+  天然串行，无需文件锁），`scripts/insert_lt_gate.py` 函数级污染分析
+  （BtEngine::new 为源 + 调用链传播）幂等插入 **83 处**
+  （http_api 47 / bt_api 18 / fastresume 6 / fallback 5 / bt_metadata 4 /
+  xunlei 3，纯逻辑测试自动跳过）。锁序约定：先 lt_gate 后 seeder 文件锁。
+- **#4 FTP 分段对齐**（PR #67）：FTP 从静态 2-8 段顺序下载对齐到 HTTP
+  直链的动态分段语义——SegmentManager FIFO（16MB 粒度，<16MB 单段）+
+  JoinSet worker 池（segment_count 同公式）+ 段账本续传全链（.part 长度
+  前缀语义废弃，账本唯一凭据）。契约测试：账本恢复只拉缺失段 / 多段并行
+  完整性 / 损坏账本作废。
+- **测试卫生**（PR #66）：CLI e2e add 测试注入独立 tempdir——消
+  `crates/daemon/file` 仓库内垃圾（default_dest_root 缺省 "." 的副产物，
+  「提交前必须 rm 测试垃圾」纪律即源于此）。
+- **#5 BT 本地门槛**：`scripts/ci/bt-linux-setup.sh` 补 rustc 1.98 链接
+  布局规避（linker-wrap.sh：剥 -fuse-ld=lld / -B gcc-ld /
+  -nodefaultlibs + 本地前缀 -L 前置注入——no-root 场景实测必踩），
+  本地搭建指引固化 `docs/BT_LOCAL_BUILD.md`。
+
+**验证**：全口径 fmt --check 绿；clippy CI 口径（workspace+httpdl/ftp、
+daemon ftp|nas|ftp,nas、btcore --all-targets、daemon bt --all-targets）
+零警告；测试面 daemon default 264 / ftp,nas 275 / bt 322 / btcore 35 /
+httpdl(ftp) 179 / lib 单元 134 全绿。每项独立 PR + CI 三 job 全绿后合并。

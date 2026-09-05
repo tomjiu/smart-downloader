@@ -139,6 +139,30 @@ echo "==> 编译自检：ldd seed_main 解析"
 # ---------------------------------------------------------------------------
 # 4) 环境变量快照
 # ---------------------------------------------------------------------------
+# rustc 1.98 链接布局规避（no-root 本地前缀场景实测必踩，rootful 无害冗余）：
+# 1) 剥 -fuse-ld=lld（系统无 ld.lld → collect2 "cannot find 'ld'"）
+# 2) 剥 -B<...>/gcc-ld（rustc 强制 rust-lld）→ g++ 默认 GNU ld（传统 -L 语义）
+# 3) 剥 -nodefaultlibs（g++ 默认 C++ 闭包尾部兜底 liblt_kernel.a 的 DSO missing）
+# 4) 本地前缀 -L 注入首个 -l 之前（rustc 1.98 把 native -L 排在 -l 之后，
+#    ld/lld 单遍扫描解析失败 → unable to find library -ltorrent-rasterbar）
+cat > "$DEST/linker-wrap.sh" <<WEOF
+#!/bin/bash
+out=(); injected=0
+for a in "\$@"; do
+  case "\$a" in
+    -fuse-ld=*|-nodefaultlibs) continue ;;
+    -B*) continue ;;
+  esac
+  if [[ "\$a" == -l* && \$injected -eq 0 ]]; then
+    out+=(-L"$LIB_DIR" -L"$FAKEVCPKG")
+    injected=1
+  fi
+  out+=("\$a")
+done
+exec g++ "\${out[@]}"
+WEOF
+chmod +x "$DEST/linker-wrap.sh"
+
 cat > "$DEST/env.sh" <<EOF
 # bt-linux-setup.sh 产物 —— source 本文件后可直接跑 BT 集成测试
 export LT_KERNEL_LIB_DIR="$LIB_DIR"
@@ -146,8 +170,9 @@ export LT_VCPKG_LIB_DIR="$FAKEVCPKG"
 export SEED_MAIN="$LIB_DIR/seed_main"
 export LD_LIBRARY_PATH="$SYS_LIB:\${LD_LIBRARY_PATH:-}"
 # 新版 rustc（>=1.90）默认 linker=rust-lld，不自动链 C++ 运行时；
-# FFI 静态库含 C++ 符号 → 用 g++ 作链接驱动（自动带 libstdc++/libgcc）
-export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=g++
+# FFI 静态库含 C++ 符号 → g++ 驱动 wrapper（自动带 libstdc++/libgcc，
+# 并规避 rustc 1.98 的 -L/-l 排序与 lld 强制问题，见 linker-wrap.sh 头注）
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="$DEST/linker-wrap.sh"
 EOF
 
 cat <<EOF
