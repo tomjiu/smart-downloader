@@ -128,6 +128,9 @@ pub fn build_proxied_client(proxy_url: &str) -> Result<reqwest::Client, String> 
     reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .read_timeout(std::time::Duration::from_secs(30))
+        // A5（cookie jar）：任务级 client 各自独立 jar（与全局 client 隔离），
+        // 探测/段请求/重定向自动携带与更新；Cookie 任务头仍可显式覆盖。
+        .cookie_store(true)
         .proxy(proxy)
         .build()
         .map_err(|e| e.to_string())
