@@ -429,16 +429,24 @@ pub async fn download_hls(
         let _ = std::fs::remove_file(&part);
     }
 
-    // 追加打开（续传沿用，全新建 0）
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&part)
-        .map_err(|e| EngineError::Other(format!("part open: {e}")))?;
+    // 打开 .part：续传 = append（位置在末尾）；全新/作废 = write+truncate
+    //（Windows append 句柄仅 FILE_APPEND_DATA 权限，set_len(0) 会 Access
+    // denied——CI windows 实证；直接以 truncate 语义打开，避免二次 set_len）
+    let mut f = if segments_done == 0 {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&part)
+            .map_err(|e| EngineError::Other(format!("part open: {e}")))?
+    } else {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&part)
+            .map_err(|e| EngineError::Other(format!("part open: {e}")))?
+    };
     if segments_done == 0 {
-        // 全新/作废：append 模式下 truncate 无意义，显式置空
-        f.set_len(0)
-            .map_err(|e| EngineError::Other(format!("part truncate: {e}")))?;
         on_progress(0); // 起点锚（total=0 未知口径）
     } else {
         on_progress(bytes_done); // 恢复口径回填
