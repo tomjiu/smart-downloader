@@ -4,6 +4,7 @@
 
 #![cfg(feature = "bt")]
 
+mod common;
 #[path = "../../../tests/integration/seed/mod.rs"]
 mod seed;
 
@@ -68,6 +69,7 @@ fn wait_complete(core: &smart_dl_btcore::BtCore, ih: &str) {
 
 #[tokio::test]
 async fn fastresume_saved_on_remove_then_reloaded() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 完整下载 → remove 落盘 .fastresume → 新引擎（模拟重启）add 同一 magnet → 回灌：
     // metadata 立即可用（无 seeder 也无需重新抓取）+ infohash 一致
     let save = seed::TempDir::new().expect("tempdir");
@@ -102,6 +104,7 @@ async fn fastresume_saved_on_remove_then_reloaded() {
 
 #[tokio::test]
 async fn pause_saves_fastresume() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // pause 时也保存进度凭据（best-effort，含未完成场景）
     let save = seed::TempDir::new().expect("tempdir");
     let engine = BtEngine::new(save.path(), None, 0, 0, false, false, false).unwrap();
@@ -121,6 +124,7 @@ async fn pause_saves_fastresume() {
 
 #[tokio::test]
 async fn delete_data_removes_fastresume() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // remove(delete_data=true) → 数据删除 → 续传凭据一并清理
     let save = seed::TempDir::new().expect("tempdir");
     let engine = BtEngine::new(save.path(), None, 0, 0, false, false, false).unwrap();
@@ -170,6 +174,7 @@ fn wait_progress(core: &smart_dl_btcore::BtCore, ih: &str) {
 
 #[tokio::test]
 async fn paused_task_stays_paused_after_restart() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 全链：add → 实际下载 → daemon pause（内核暂停 + paused=true 落盘）→
     // "重启"（新引擎 + restore_from）→ 暂停意图重放：内核保持 paused、
     // 记录态 Paused、意图重新登记（Bug A 压制句柄可用）。
@@ -237,6 +242,7 @@ async fn paused_task_stays_paused_after_restart() {
 
 #[tokio::test]
 async fn running_task_resumes_downloading_after_restart() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 全链对照面：未暂停任务重启后必须真正恢复运行（内核 resume 重放）——
     // 此前 add 路径内核 paused 且 restore 从不 resume，恢复任务永不下载。
     let save = seed::TempDir::new().expect("tempdir");
@@ -288,6 +294,7 @@ async fn running_task_resumes_downloading_after_restart() {
 
 #[tokio::test]
 async fn torrent_name_surfaces_in_engine_status() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // E28：torrent metadata name → FFI status → EngineStatus.name（BT 任务
     // 名回填链路的数据源就绪）；与 .torrent 内声明名交叉一致
     let save = seed::TempDir::new().expect("tempdir");

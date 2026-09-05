@@ -41,6 +41,7 @@ const MAGNET: &str = "magnet:?xt=urn:btih:0d2c9c9d5c2d3e8f9a1b2c3d4e5f6a7b8c9d0e
 
 #[tokio::test]
 async fn magnet_add_creates_bt_task() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, state, _save) = serve_bt().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -91,6 +92,7 @@ async fn magnet_add_creates_bt_task() {
 
 #[tokio::test]
 async fn same_magnet_deduped_409() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, _state, _save) = serve_bt().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -118,6 +120,7 @@ async fn same_magnet_deduped_409() {
 
 #[tokio::test]
 async fn torrent_file_add_creates_task() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 最小 .torrent（手写 bencode）→ torrent_b64 上传 → 201 + engine=bt
     let mut t = b"d4:infod6:lengthi123e4:name4:test12:piece lengthi16384e6:pieces20:".to_vec();
     t.extend_from_slice(&[0xAB; 20]);
@@ -183,6 +186,7 @@ async fn torrent_file_add_creates_task() {
 
 #[tokio::test]
 async fn invalid_base64_rejected() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, _state, _save) = serve_bt().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -198,6 +202,7 @@ async fn invalid_base64_rejected() {
 
 #[tokio::test]
 async fn http_task_with_nested_dest_auto_created() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // B10：dest 指向不存在目录 → 自动创建 + 201（HTTP 任务 per-task dest 真实生效；
     // BT 引擎 v1 全局落盘不接受自定义 dest，见 bt_task_with_custom_dest_rejected）
     let body = common::patterned(8 * 1024);
@@ -228,6 +233,7 @@ async fn http_task_with_nested_dest_auto_created() {
 
 #[tokio::test]
 async fn magnet_and_http_coexist() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 同一 daemon 内 BT + HTTP 任务并存（引擎统一抽象）
     let body = common::patterned(16 * 1024);
     let srv = TestServer::start(body).await;
@@ -268,6 +274,7 @@ async fn magnet_and_http_coexist() {
 
 #[tokio::test]
 async fn magnet_remove_ok() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, _state, _save) = serve_bt().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -300,6 +307,7 @@ async fn magnet_remove_ok() {
 
 #[tokio::test]
 async fn bt_task_with_custom_dest_rejected() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // BT 引擎 v1 全局落盘（serve bt.save_path）：任务级 dest 与全局目录不一致 → 400。
     // custom 取白名单根（= 引擎 save_path）的子目录：先过 dest 白名单（V2），
     // 再被引擎层落盘约束拒绝——精确测「全局落盘」文案而非白名单越界文案。
@@ -328,6 +336,7 @@ async fn bt_task_with_custom_dest_rejected() {
 
 #[tokio::test]
 async fn readd_same_magnet_after_restart_ok() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 重启续传前提：新 session 同一 save_path 重新 add 同一 magnet → 成功（libtorrent
     // 磁盘检查复用已下载块）。daemon 持久化恢复走的就是这条路径。
     let dir = tempfile::tempdir().unwrap();
@@ -358,6 +367,7 @@ async fn readd_same_magnet_after_restart_ok() {
 
 #[tokio::test]
 async fn bt_task_limit_up_and_down_merge() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // BT 任务双方向限速：up 是 BT 独有能力（HTTP 任务 up → 409，见 http_api）。
     // 假 btih 磁链在 libtorrent 侧有真实 torrent handle（metadata 未就绪），
     // per-torrent set_download/upload_limit 对 handle 有效 → 引擎层调用必须成功。
@@ -424,6 +434,7 @@ fn minimal_torrent_b64() -> String {
 
 #[tokio::test]
 async fn torrent_file_task_sets_and_readbacks_priority() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 真实 torrent（metadata 即时就绪）→ file 0 设为 0（skip）→ 回显当前优先级表
     let (addr, _state, _save) = serve_bt().await;
     let base = format!("http://{addr}");
@@ -509,6 +520,7 @@ async fn torrent_file_task_sets_and_readbacks_priority() {
 
 #[tokio::test]
 async fn magnet_task_file_priority_metadata_pending_409() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // magnet 任务 metadata 未就绪 → files 未规划 → 409（明确语义，非 500）
     let (addr, _state, _save) = serve_bt().await;
     let base = format!("http://{addr}");
@@ -542,6 +554,7 @@ async fn magnet_task_file_priority_metadata_pending_409() {
 
 #[tokio::test]
 async fn file_priority_index_out_of_range_400() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, _state, _save) = serve_bt().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -607,6 +620,7 @@ async fn serve_bt_in(
 
 #[tokio::test]
 async fn file_priority_persisted_and_replayed_after_restart() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 全生命周期 e2e：设置优先级 → tasks.json 落盘 file_priorities →
     // "重启"（新 BtEngine + restore_from）→ metadata 就绪任务立即重放 →
     // 引擎侧 readback 收敛到持久化值。
@@ -745,6 +759,7 @@ async fn file_priority_persisted_and_replayed_after_restart() {
 
 #[tokio::test]
 async fn torrent_task_sequential_flag_roundtrip_via_ffi() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 真实 torrent（metadata 即时就绪）→ sequential true/false 往返。
     // 端点 200 = FFI lt_set_sequential 真实生效（引擎错误会上抛 500），
     // 2.0.x 走 torrent_flags::sequential_download（on/off 均可）。
@@ -816,6 +831,7 @@ async fn torrent_task_sequential_flag_roundtrip_via_ffi() {
 
 #[tokio::test]
 async fn magnet_sequential_flag_before_metadata_ready() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // magnet（假 btih，metadata 永不到达）：handle 级 flag 不依赖 metadata
     // → 端点必须 200（错误会上抛）。验证「未就绪也可设」契约。
     let (addr, _state, _save) = serve_bt().await;
@@ -854,6 +870,7 @@ async fn magnet_sequential_flag_before_metadata_ready() {
 
 #[tokio::test]
 async fn trackers_add_list_remove_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, _state, _save) = serve_bt().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -962,6 +979,7 @@ async fn trackers_add_list_remove_e2e() {
 
 #[tokio::test]
 async fn trackers_on_http_task_is_409() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // HTTP 任务不支持 tracker 管理 → UnsupportedOp 定性 409
     let (addr, _state, _save) = serve_bt().await;
     let base = format!("http://{addr}");

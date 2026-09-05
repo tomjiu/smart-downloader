@@ -3,6 +3,7 @@
 //!   成功路径（真实 seeder）由 btcore/tests/magnet_metadata.rs 覆盖。
 //! - 无 `bt`：端点恒 400（提示编译开关）。
 
+mod common;
 use smart_dl_daemon::http;
 use smart_dl_daemon::state::DaemonState;
 use std::sync::Arc;
@@ -301,6 +302,7 @@ mod bt_enabled {
 
     #[tokio::test]
     async fn bad_magnet_is_400() {
+        let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
         let _ser = ENDPOINT_SER.lock().await;
         let addr = serve_with_bt().await;
         let client = reqwest::Client::new();
@@ -321,6 +323,7 @@ mod bt_enabled {
 
     #[tokio::test]
     async fn bad_peer_is_400() {
+        let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
         let _ser = ENDPOINT_SER.lock().await;
         let addr = serve_with_bt().await;
         let client = reqwest::Client::new();
@@ -344,6 +347,7 @@ mod bt_enabled {
 
     #[tokio::test]
     async fn busy_gate_409_then_reusable_after_completion() {
+        let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
         let _ser = ENDPOINT_SER.lock().await;
         // 门禁语义（V16）：进行中 → 409；完成/取消（RAII permit drop）后端点可再用。
         // 门禁是进程级 static 单例 → 占门禁的 e2e 场景集中在本测试串行验证，
@@ -427,6 +431,7 @@ mod bt_enabled {
 
     #[tokio::test]
     async fn save_to_escape_is_400_before_fetch() {
+        let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
         let _ser = ENDPOINT_SER.lock().await;
         // V15：越界 save_to 在抓取开始前 400 快速失败（若校验回归，此处会等满
         // 5s 得到 408，断言失败）。不占门禁（校验在 try_acquire 之前）。
