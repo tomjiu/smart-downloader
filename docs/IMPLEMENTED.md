@@ -729,3 +729,35 @@ SAMPLE-AES 拒绝/结构非法/master 选流/URL 解析/识别/落盘名/AES rou
 Error、pause→resume roundtrip）。门禁：httpdl(ftp) 203/0（+16）· core
 255/0 · daemon default 285/0 · ftp,nas 296/0 · bt 347/0 · fmt · CI 双
 clippy 0 告警。
+
+### 31. 百度网盘分享解析（B3-a，2026-09-05）
+
+**范围**：分享链接 → 免登录文件清单（verify → BDCLND → 分享页 meta → share/list）；
+dlink 直链转换需登录态（实测 errno -6），归 B3-b 待 BDUSS 真机校准。
+协议证据：`docs/research/baidu/share_protocol.md`（A 级，真实链接 curl + Rust 双验证）。
+
+**实现**（`crates/provider/src/baidu/` + CLI）：
+- `share.rs`：`parse_share_link` 双形态统一规约——`/s/1<code>`（去 `1` 前缀存 code）
+  与 `/share/init?surl=<code>`；提取码经 url::Url 保留原始大小写（百度大小写敏感）。
+- `client.rs`：`BaiduClient`——verify **POST**（GET 同参数实测 errno -12 风控；
+  body `pwd=`，Referer=init 页，app_id=250528）→ randsk 种 BDCLND（host-only）；
+  分享页 HTML 提取 shareid/uk（JS 赋值 `shareid:".."` 与 JSON 字符串两形状，
+  `"uk":0` 数字噪声以引号值形状匹配规避）；`/share/list` root=1 / dir= 双形态，
+  字符串数字字段 `de_string` 兼容（实测 size/isdir/fs_id 均字符串）。
+- `types.rs`：`BaiduError` 分类（WrongPasscode/-12、NeedVerify/9019、MetaParse、Protocol）；
+  UA/app_id 常量（实测值）。
+- CLI：`smart-dl-daemon baidu-resolve <url> [--pwd CODE] [--dir /path] [--json]`
+  （main.rs 分发前拦截，本地执行不依赖 daemon 进程；同 xunlei-login 模式）。
+
+**行为契约**
+- 短时间连续 verify 会触发百度风控（分享页退化为无 shareid 风控页，数分钟自愈）→
+  `MetaParse` 归类（"分享可能已失效或风控"）。
+- 公开分享（无提取码）跳过 verify 直取 meta。
+- dlink/转存/RemoteProvider 契约接入 = B3-b（BDUSS cookie 配置面一并做）。
+
+**验证**：provider baidu 单测 14（解析 7 + HTML 提取 3 + axum mock 全流程 4，
+mock 形状与实测协议一致）+ daemon baidu_resolve 1 + CLI parse；
+**真实链接 e2e**：`baidu-resolve` 对用户真实分享直连成功（提取码校验 →
+shareid/uk → 根目录 + `--dir` 子目录清单 + `--json`）。门禁：fmt · CI 双
+clippy 0 · httpdl(ftp) 203/0 · core 255/0 · btcore 37/0 · provider 162/0 ·
+daemon default 286/0（+1）· ftp,nas 297/0（+1）· bt --all-targets 348/0（+1）。

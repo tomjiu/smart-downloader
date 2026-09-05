@@ -9,7 +9,6 @@ use common::make_http_task_to;
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{DownloadEngine, DownloadSource, EngineState};
 use smart_dl_httpdl::HttpEngine;
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -47,15 +46,13 @@ async fn serve_hls() -> (
     let seg3 = aes_enc(PLAIN3, &KEY, &iv3);
     let key = KEY.to_vec();
 
-    fn counting(
+    async fn counting(
         counts: Arc<std::sync::Mutex<std::collections::HashMap<String, usize>>>,
         name: &'static str,
         body: Vec<u8>,
-    ) -> impl Future<Output = Vec<u8>> {
-        async move {
-            *counts.lock().unwrap().entry(name.to_string()).or_default() += 1;
-            body
-        }
+    ) -> Vec<u8> {
+        *counts.lock().unwrap().entry(name.to_string()).or_default() += 1;
+        body
     }
 
     let counts_key = counts.clone();

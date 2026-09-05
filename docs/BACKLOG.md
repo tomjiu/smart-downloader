@@ -68,7 +68,7 @@
 > 当前主线不变：仍以迅雷（云盘处理）为主。
 
 - 夸克网盘转换
-- 百度网盘 112 链接转换
+- 百度网盘 112 链接转换 → **解析层已完成（2026-09-05，B3-a）**：分享链接（`/s/1xxx`/`/share/init?surl=`）→ 免登录 verify → BDCLND → share/list 文件清单（真实链接 e2e；协议证据 `docs/research/baidu/share_protocol.md`）。dlink 直链转换需登录态（实测 errno -6），**待用户提供 BDUSS 做 B3-b 真机校准**；「112 链接」格式定义仍无公开资料，拿到样本后在 `provider/src/baidu/share.rs` 单点增补
 - 多服务商节点发现 → 加速下载（架构预留扩展点）
 
 ### F0. 能力地图与客户端分析总纲

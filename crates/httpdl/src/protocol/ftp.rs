@@ -1609,7 +1609,7 @@ mod tests {
         let (_, _, t, _) = parse_ftp_url("ftp://host").unwrap();
         assert_eq!(t, FtpTarget::Dir("/".to_string()));
 
-        let (h, p, t, tls) = parse_ftp_url("ftp://host/file.bin").unwrap();
+        let (_h, _p, _t, tls) = parse_ftp_url("ftp://host/file.bin").unwrap();
         assert!(!tls);
     }
 

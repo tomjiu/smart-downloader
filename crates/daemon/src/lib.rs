@@ -1,6 +1,7 @@
 //! 守护进程（M6 交付）：事件协议（D36）/ WS 背压 / CLI（D26）/ 健康（§11）/
 //! HTTP API + 任务状态（M2–M5 集成）。
 
+pub mod baidu_resolve;
 #[cfg(feature = "bt")]
 pub mod bt;
 #[cfg(feature = "bt")]
