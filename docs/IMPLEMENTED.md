@@ -660,3 +660,34 @@ default 272/0 · bt 334/0 · fmt · 双 clippy 口径 0 告警。
 （metalink_b64 展开+sha256 校验+failover、.meta4 URL 引导拉取、坏 XML 400）。
 门禁：daemon default 285/0（+13）· ftp,nas 296/0（+13）· bt --all-targets
 347/0（+13）· httpdl(ftp) 185/0 · btcore 37/0 · fmt · CI 双 clippy 口径 0 告警。
+
+### 29. FTPS 支持（B 档 #2，2026-09-05）
+
+**背景**：FTP 引擎仅明文传输，凭据（USER/PASS 明文过网）与数据均无加密；
+主流 FTP 服务（FileZilla Server / proftpd / vsftpd TLS 启用）均提供显式
+FTPS，aria2/wget/curl 原生支持。
+
+**实现**（RFC 4217 显式模式，PR #77）：
+- **`ftps://` 全链识别**：core `parse_ftp_auth`（scheme 无关剥离，auth 段
+  同构）+ `normalize_user_link`（ftps → NormalizedSource::Ftp）+ daemon
+  `add_ftp_task` 前缀校验放宽；默认端口仍 21（显式 AUTH TLS 惯例，与
+  FileZilla/wget 一致；隐式 990 后续按需）。
+- **控制连接升级**（httpdl `FtpSession::connect(use_tls)`）：明文 banner →
+  AUTH TLS（234）→ TLS 握手（tokio-rustls 0.26/ring，与 reqwest rustls-tls
+  同一 rustls 0.23 编译单元；rustls 栈经 re-export 使用零新增版本）→
+  PBSZ 0 → PROT P；任一步被拒即连接失败。传输流抽象 `FtpIo` trait object：
+  明文 TcpStream 与 TlsStream 同一读写口径（read_response/write_cmd 泛型化）。
+- **数据连接 PROT P**：PASV 后 TcpStream connect → 立即 TLS 握手（SNI 同
+  控制连接），download_segment/probe_list 全数据路径覆盖；PROT C（明文
+  数据）不支持。
+- **证书校验严格开启**：webpki-roots 固定根集（v1 不暴露 insecure 口子；
+  自签/私有 CA 场景后续按需加自定义根集配置面；测试经 `#[cfg(test)]`
+  TEST_CONNECTOR 注入钩子，生产零影响）。
+- TLS 依赖挂 `httpdl/ftp` feature 的 optional deps（非 ftp 构建零开销）。
+
+**验证**：内嵌 FTPS 服务器 e2e（rcgen 自签证书 + tokio-rustls server，
+RFC 4217/959 最小协议循环）——download_segment 全路径（AUTH TLS 升级 +
+PBSZ/PROT P + 数据连接 TLS + REST/RETR）落盘内容逐字节断言；解析单测
+（parse_ftp_url ftps 标志/默认端口、parse_ftp_auth ftps 同构、normalize
+ftps 分类）。门禁：httpdl(ftp) 187/0（+2）· core 255/0（+2）· daemon
+default 285/0 · ftp,nas 296/0 · bt 347/0 · fmt · CI 双 clippy 0 告警。

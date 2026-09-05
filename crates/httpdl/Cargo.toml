@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-# FTP 引擎（D12：并入 httpdl，feature-gated）
-ftp = []
+# FTP 引擎（D12：并入 httpdl，feature-gated）。FTPS（B2）随同门控：
+# TLS 栈（tokio-rustls/webpki-roots）为 optional 依赖，仅 ftp 构建引入。
+ftp = ["dep:tokio-rustls", "dep:webpki-roots"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -20,9 +21,13 @@ sha1 = "0.10"
 md-5 = "0.10"
 smart-dl-core = { path = "../core" }
 parking_lot = { workspace = true }
+tokio-rustls = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
 
 [dev-dependencies]
 axum = "0.7"
 tempfile = "3"
 serde_json = { workspace = true }
 futures = { workspace = true }
+# FTPS e2e：自签证书生成（测试 server 侧 + 客户端信任链）
+rcgen = "0.13"

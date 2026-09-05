@@ -21,9 +21,69 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::task::JoinSet;
+
+/// FTP 传输流抽象（B2 FTPS）：控制/数据连接统一为 trait object，
+/// 明文 TcpStream 与 AUTH TLS 升级后的 TlsStream 同一读写口径。
+trait FtpIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> FtpIo for T {}
+
+type BoxFtpIo = Box<dyn FtpIo>;
+
+/// FTPS 客户端 TLS 配置（B2，生产路径）：webpki-roots 固定根集 + ring
+/// provider（与 reqwest rustls-tls 同源，P1-3 安卓交叉兼容）。证书校验
+/// 严格开启（v1 不暴露 insecure 口子；自签名/私有 CA 场景后续按需加
+/// 配置面注入自定义根集）。rustls 栈经 tokio-rustls re-export 使用
+///（不引入直接依赖，与 reqwest 共享同一 rustls 0.23 编译单元）。
+fn ftps_connector() -> Result<tokio_rustls::TlsConnector, String> {
+    use tokio_rustls::rustls::crypto::ring as ring_backend;
+    let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(
+        ring_backend::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .map_err(|e| format!("FTPS 协议版本配置失败: {e}"))?
+    .with_root_certificates(ftps_roots())
+    .with_no_client_auth();
+    Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
+}
+
+fn ftps_roots() -> tokio_rustls::rustls::RootCertStore {
+    tokio_rustls::rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    }
+}
+
+/// 控制连接 AUTH TLS 升级 / 数据连接 PROT P 握手共用：TcpStream → TlsStream。
+/// connector 经 active_connector() 获取（测试可注入自签信任链）。
+async fn ftps_upgrade(
+    host: &str,
+    tcp: TcpStream,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    let connector = active_connector()?;
+    let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| format!("FTPS SNI 非法 {host:?}: {e}"))?;
+    connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| format!("FTPS 握手失败: {e}"))
+}
+
+/// 测试专用 connector 注入点（#[cfg(test)]）：自签证书 e2e 用，生产恒空。
+#[cfg(test)]
+static TEST_CONNECTOR: std::sync::OnceLock<tokio_rustls::TlsConnector> = std::sync::OnceLock::new();
+
+/// 当前生效 connector：测试注入优先，生产回退 webpki-roots。
+fn active_connector() -> Result<tokio_rustls::TlsConnector, String> {
+    #[cfg(test)]
+    {
+        if let Some(c) = TEST_CONNECTOR.get() {
+            return Ok(c.clone());
+        }
+    }
+    ftps_connector()
+}
 
 /// 421/连接失败重试次数（连接层退避）。
 const CONNECT_ATTEMPTS: u32 = 4;
@@ -59,6 +119,8 @@ struct FtpTask {
     user: String,
     pass: String,
     path: String,
+    /// B2 FTPS：ftps:// = 显式 AUTH TLS + PROT P（控制/数据连接全加密）。
+    use_tls: bool,
     /// 单文件任务：目标文件路径；目录任务：目标目录路径。
     dest: PathBuf,
     total: u64,
@@ -140,6 +202,7 @@ impl FtpEngine {
 
     /// 目录分支：LIST 探测（421 → 退避重试）→ 解析文件列表 → 建任务 → spawn 目录循环。
     /// 落位 `dest_root/<目录名>/<文件名>`；目录名取 URL 路径最后一段非空名称（根目录 → host）。
+    #[allow(clippy::too_many_arguments)] // 参数即协议会话要素，拆 struct 反而模糊调用点语义
     async fn add_directory(
         &self,
         task: &DownloadTask,
@@ -148,13 +211,14 @@ impl FtpEngine {
         user: String,
         pass: String,
         path: String,
+        use_tls: bool,
     ) -> Result<EngineTaskId, EngineError> {
         // LIST 探测：连接 + 登录 + PASV + LIST（421 → 退避重试）
         let listing = {
             let mut last = String::new();
             let mut listing: Option<String> = None;
             for attempt in 1..=CONNECT_ATTEMPTS {
-                match probe_list(&host, port, &user, &pass, &path).await {
+                match probe_list(&host, port, &user, &pass, &path, use_tls).await {
                     Ok(text) => {
                         listing = Some(text);
                         break;
@@ -225,6 +289,7 @@ impl FtpEngine {
                     user,
                     pass,
                     path,
+                    use_tls,
                     dest: dest_dir,
                     total,
                     state: EngineState::Downloading,
@@ -281,10 +346,16 @@ fn spawn_ftp_loop<F, Fut>(
     });
 }
 
-/// 解析 `ftp://[user:pass@]host[:port]/path`。
+/// 解析 `ftp(s)://[user:pass@]host[:port]/path`。
 /// 目录（空路径或以 `/` 结尾）→ `FtpTarget::Dir`；否则 `FtpTarget::File`。
-fn parse_ftp_url(url: &str) -> Option<(String, u16, FtpTarget)> {
-    let rest = url.strip_prefix("ftp://")?;
+/// 返回 `(host, port, target, use_tls)`：ftps:// = 显式 AUTH TLS（默认端口
+/// 仍 21，与 FileZilla/wget 惯例一致；隐式 990 后续按需）。
+fn parse_ftp_url(url: &str) -> Option<(String, u16, FtpTarget, bool)> {
+    let rest = url
+        .strip_prefix("ftps://")
+        .map(|r| (r, true))
+        .or_else(|| url.strip_prefix("ftp://").map(|r| (r, false)))?;
+    let (rest, use_tls) = rest;
     // 无 `/` → 空路径（根目录）
     let (auth_host, raw_path) = match rest.split_once('/') {
         Some((ah, p)) => (ah, p),
@@ -307,7 +378,7 @@ fn parse_ftp_url(url: &str) -> Option<(String, u16, FtpTarget)> {
     } else {
         FtpTarget::File(path)
     };
-    Some((host, port, target))
+    Some((host, port, target, use_tls))
 }
 
 /// 目录条目（LIST 解析结果：普通文件）。
@@ -384,22 +455,47 @@ fn dir_name_of(dir_path: &str, host: &str) -> String {
     }
 }
 
-/// 控制连接会话（单命令/响应流）。
+/// 控制连接会话（单命令/响应流；B2：明文或 AUTH TLS 升级后同一口径）。
 struct FtpSession {
-    reader: BufReader<TcpStream>,
+    reader: BufReader<BoxFtpIo>,
 }
 
 impl FtpSession {
-    async fn connect(host: &str, port: u16) -> Result<Self, String> {
-        let stream = TcpStream::connect((host, port))
+    /// 建立控制连接。`use_tls` = 显式 FTPS（RFC 4217）：明文 banner →
+    /// AUTH TLS（234）→ TLS 握手（服务器证书严格校验）→ PBSZ 0 → PROT P
+    /// （后续控制流与全部数据连接均加密）。
+    async fn connect(host: &str, port: u16, use_tls: bool) -> Result<Self, String> {
+        let tcp = TcpStream::connect((host, port))
             .await
             .map_err(|e| e.to_string())?;
-        let mut reader = BufReader::new(stream);
+        // 升级前以裸 TcpStream 交互（banner + AUTH TLS 响应），升级后再装箱
+        let mut reader = BufReader::new(tcp);
         let banner = read_response(&mut reader).await?;
         if banner.starts_with("421") {
             return Err(format!("421 {banner}"));
         }
-        Ok(FtpSession { reader })
+        if use_tls {
+            let resp = write_cmd(&mut reader, "AUTH TLS").await?;
+            if !resp.starts_with("234") {
+                return Err(format!("AUTH TLS 被拒绝: {resp}"));
+            }
+            let tls = ftps_upgrade(host, reader.into_inner()).await?;
+            let mut reader = BufReader::new(Box::new(tls) as BoxFtpIo);
+            // RFC 4217：PBSZ 必须先于 PROT；PBSZ 0 = 流式传输无缓冲协商
+            let pbsz = write_cmd(&mut reader, "PBSZ 0").await?;
+            if !pbsz.starts_with("200") {
+                return Err(format!("PBSZ 被拒绝: {pbsz}"));
+            }
+            let prot = write_cmd(&mut reader, "PROT P").await?;
+            if !prot.starts_with("200") {
+                return Err(format!("PROT P 被拒绝（仅支持私有数据连接）: {prot}"));
+            }
+            Ok(FtpSession { reader })
+        } else {
+            Ok(FtpSession {
+                reader: BufReader::new(Box::new(reader.into_inner()) as BoxFtpIo),
+            })
+        }
     }
 
     async fn login(&mut self, user: &str, pass: &str) -> Result<(), String> {
@@ -439,7 +535,7 @@ impl FtpSession {
     }
 }
 
-async fn read_response(reader: &mut BufReader<TcpStream>) -> Result<String, String> {
+async fn read_response<T: AsyncRead + Unpin>(reader: &mut BufReader<T>) -> Result<String, String> {
     let mut line = String::new();
     let n = reader
         .read_line(&mut line)
@@ -449,6 +545,22 @@ async fn read_response(reader: &mut BufReader<TcpStream>) -> Result<String, Stri
         return Err("connection closed by server".to_string());
     }
     Ok(line.trim_end().to_string())
+}
+
+/// 发送命令行并读单行响应（AUTH TLS 升级前后共用——升级需在 session
+/// 成型前以裸 TcpStream 交互，故与 FtpSession::cmd 分立）。
+async fn write_cmd<T: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<T>,
+    line: &str,
+) -> Result<String, String> {
+    let mut buf = line.to_string();
+    buf.push_str("\r\n");
+    reader
+        .get_mut()
+        .write_all(buf.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    read_response(reader).await
 }
 
 /// 解析 `227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)`。
@@ -479,8 +591,9 @@ async fn download_segment(
     seg: DynSegment,
     part: &Path,
     limiter: &RateLimiter,
+    use_tls: bool,
 ) -> Result<(), String> {
-    let mut s = FtpSession::connect(host, port).await?;
+    let mut s = FtpSession::connect(host, port, use_tls).await?;
     s.login(user, pass).await?;
     let data_addr = s.pasv().await?;
     s.cmd(&format!("REST {}", seg.start)).await?;
@@ -489,9 +602,16 @@ async fn download_segment(
     if !retr.starts_with('1') {
         return Err(retr);
     }
-    let mut data = TcpStream::connect(data_addr)
+    let data_tcp = TcpStream::connect(data_addr)
         .await
         .map_err(|e| e.to_string())?;
+    // PROT P：数据连接全程 TLS（B2）；PROT C（明文数据）不支持——connect
+    // 阶段 PROT P 被拒即整体失败，此处无需分支。
+    let mut data: BoxFtpIo = if use_tls {
+        Box::new(ftps_upgrade(host, data_tcp).await?)
+    } else {
+        Box::new(data_tcp)
+    };
     // 流式直写 .part 段位置（与 HTTP 侧流式语义对齐；段不相交 → 无锁）。
     // 固定 64KB 块缓冲，段长不再驻内存；失败时部分写入由重试/恢复路径
     // seek 回 seg.start 全量重写（段未入账本前不构成有效凭据）。
@@ -545,11 +665,14 @@ async fn download_segment_with_retry(
     part: &Path,
     limiter: &RateLimiter,
     backoff: &Backoff,
+    use_tls: bool,
 ) -> Result<(), String> {
     let mut stack: Vec<DynSegment> = vec![seg];
     while let Some(cur) = stack.pop() {
-        match download_segment_attempts(host, port, user, pass, path, cur, part, limiter, backoff)
-            .await
+        match download_segment_attempts(
+            host, port, user, pass, path, cur, part, limiter, backoff, use_tls,
+        )
+        .await
         {
             Ok(()) => {}
             Err(e) if is_terminal(&e) => {
@@ -588,10 +711,11 @@ async fn download_segment_attempts(
     part: &Path,
     limiter: &RateLimiter,
     backoff: &Backoff,
+    use_tls: bool,
 ) -> Result<(), String> {
     let mut last = String::new();
     for attempt in 1..=CONNECT_ATTEMPTS {
-        match download_segment(host, port, user, pass, path, seg, part, limiter).await {
+        match download_segment(host, port, user, pass, path, seg, part, limiter, use_tls).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if attempt < CONNECT_ATTEMPTS && !is_terminal(&e) {
@@ -627,6 +751,7 @@ async fn download_file(
     min_split: u64,
     sequential: bool,
     on_progress: Arc<dyn Fn(u64) + Send + Sync>,
+    use_tls: bool,
 ) -> Result<(), String> {
     let part = part_path_of(dest);
     let ledger_path = ledger::ledger_path(&part);
@@ -716,7 +841,7 @@ async fn download_file(
                 // 失败缩小粒度重试（P1，与 HTTP download.rs 同构）+ 连接层退避：
                 // 二分重试栈收敛瞬时故障，5xx 终态直接上抛
                 download_segment_with_retry(
-                    &host, port, &user, &pass, &path, seg, &part, &limiter, &backoff,
+                    &host, port, &user, &pass, &path, seg, &part, &limiter, &backoff, use_tls,
                 )
                 .await?;
                 // 段完成：记账 + 账本原子落盘 + 进度回报（锁内一并，
@@ -767,7 +892,7 @@ async fn download_file(
 
 /// 单文件任务的下载循环：download_file 包装 + 任务状态落定。
 async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Backoff) {
-    let (host, port, user, pass, path, dest, total) = {
+    let (host, port, user, pass, path, dest, total, use_tls) = {
         let tasks = inner.tasks.lock();
         let t = tasks.get(&tid).unwrap();
         (
@@ -778,6 +903,7 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
             t.path.clone(),
             t.dest.clone(),
             t.total,
+            t.use_tls,
         )
     };
     let inner2 = inner.clone();
@@ -803,7 +929,7 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
     });
     let r = download_file(
         &host, port, &user, &pass, &path, &dest, total, backoff, &limiter, min_split, sequential,
-        progress,
+        progress, use_tls,
     )
     .await;
     match r {
@@ -815,7 +941,7 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
 /// 目录任务下载循环：逐文件串行 download_file，落位 `<dest>/<文件名>`；
 /// 任一文件终态失败 → 整任务 Error（错误消息带文件名）。
 async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Backoff) {
-    let (host, port, user, pass, dir_dest, files) = {
+    let (host, port, user, pass, dir_dest, files, use_tls) = {
         let tasks = inner.tasks.lock();
         let t = tasks.get(&tid).unwrap();
         (
@@ -828,6 +954,7 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
                 .iter()
                 .map(|f| (f.name.clone(), f.path.clone(), f.size))
                 .collect::<Vec<_>>(),
+            t.use_tls,
         )
     };
     // add 时已建目录；此处幂等兜底（目录被外部删除的场景）
@@ -870,7 +997,7 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
         });
         let r = download_file(
             &host, port, &user, &pass, &fpath, &dest, size, backoff, &limiter, min_split,
-            sequential, progress,
+            sequential, progress, use_tls,
         )
         .await;
         match r {
@@ -1020,19 +1147,22 @@ impl DownloadEngine for FtpEngine {
             DownloadSource::Ftp { url, user, pass } => (url.clone(), user.clone(), pass.clone()),
             _ => return Err(EngineError::Other("source is not ftp".to_string())),
         };
-        let (host, port, target) =
+        let (host, port, target, use_tls) =
             parse_ftp_url(&url).ok_or_else(|| EngineError::Other("invalid ftp url".to_string()))?;
 
         match target {
             // 目录分支：LIST 探测 → 逐文件条目 → 目录下载循环
-            FtpTarget::Dir(path) => self.add_directory(task, host, port, user, pass, path).await,
+            FtpTarget::Dir(path) => {
+                self.add_directory(task, host, port, user, pass, path, use_tls)
+                    .await
+            }
             FtpTarget::File(path) => {
                 // 探测：连接 + 登录 + SIZE（421 → 退避重试）
                 let total = {
                     let mut last = String::new();
                     let mut size: Option<u64> = None;
                     for attempt in 1..=CONNECT_ATTEMPTS {
-                        match probe_size(&host, port, &user, &pass, &path).await {
+                        match probe_size(&host, port, &user, &pass, &path, use_tls).await {
                             Ok(t) => {
                                 size = Some(t);
                                 break;
@@ -1083,6 +1213,7 @@ impl DownloadEngine for FtpEngine {
                             user,
                             pass,
                             path,
+                            use_tls,
                             dest,
                             total,
                             state: EngineState::Downloading,
@@ -1191,8 +1322,9 @@ async fn probe_size(
     user: &str,
     pass: &str,
     path: &str,
+    use_tls: bool,
 ) -> Result<u64, String> {
-    let mut s = FtpSession::connect(host, port).await?;
+    let mut s = FtpSession::connect(host, port, use_tls).await?;
     s.login(user, pass).await?;
     let size = s.size(path).await;
     s.quit().await;
@@ -1211,8 +1343,9 @@ async fn probe_list(
     user: &str,
     pass: &str,
     path: &str,
+    use_tls: bool,
 ) -> Result<String, String> {
-    let mut s = FtpSession::connect(host, port).await?;
+    let mut s = FtpSession::connect(host, port, use_tls).await?;
     s.login(user, pass).await?;
     let data_addr = s.pasv().await?;
     // LIST 必须是 1xx 中间响应（150/125）；550 等错误直接终态失败
@@ -1220,9 +1353,14 @@ async fn probe_list(
     if !resp.starts_with('1') {
         return Err(resp);
     }
-    let mut data = TcpStream::connect(data_addr)
+    let data_tcp = TcpStream::connect(data_addr)
         .await
         .map_err(|e| e.to_string())?;
+    let mut data: BoxFtpIo = if use_tls {
+        Box::new(ftps_upgrade(host, data_tcp).await?)
+    } else {
+        Box::new(data_tcp)
+    };
     let mut bytes = Vec::new();
     data.read_to_end(&mut bytes)
         .await
@@ -1235,6 +1373,188 @@ async fn probe_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FTPS e2e（B2）：内嵌显式 FTPS 服务器（自签证书 + tokio-rustls），
+    /// 走 download_segment 全路径——控制连接 AUTH TLS 升级 + PBSZ/PROT P +
+    /// 数据连接 TLS + REST/RETR 断点偏移，落盘内容逐字节断言。
+    ///
+    /// 服务器协议循环（RFC 4217/959 最小子集）：banner 220 → AUTH TLS 234
+    /// → [TLS] PBSZ 200 / PROT 200 / USER 331 / PASS 230 / TYPE 200 /
+    /// PASV 227（同步起数据监听）→ REST 350 / RETR 150 → 数据连接 TLS
+    /// accept 后发送内容 → 226 → QUIT 221。
+    #[tokio::test]
+    async fn ftps_end_to_end_download_via_download_segment() {
+        // —— 自签证书（SAN 含 127.0.0.1，SNI/校验均走 IP）——
+        let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let cert_der =
+            tokio_rustls::rustls::pki_types::CertificateDer::from(ck.cert.der().to_vec());
+        let key_der =
+            tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der());
+        // 客户端 connector：直接信任自签证书（注入 TEST_CONNECTOR）
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(cert_der.clone()).unwrap();
+        let client_config = tokio_rustls::rustls::ClientConfig::builder_with_provider(
+            tokio_rustls::rustls::crypto::ring::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        TEST_CONNECTOR
+            .set(tokio_rustls::TlsConnector::from(Arc::new(client_config)))
+            .ok();
+
+        // —— server TLS（rustls 同一构建单元；builder 显式 ring provider）——
+        let server_config = tokio_rustls::rustls::ServerConfig::builder_with_provider(
+            tokio_rustls::rustls::crypto::ring::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der.into())
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let content: Arc<Vec<u8>> = Arc::new((0..1024u32).map(|i| (i % 251) as u8).collect());
+
+        // 数据监听先行（PASV 响应需要端口）
+        let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_port = data_listener.local_addr().unwrap().port();
+        let ctrl_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctrl_port = ctrl_listener.local_addr().unwrap().port();
+
+        let content2 = content.clone();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let (sock, _) = ctrl_listener.accept().await.unwrap();
+            let mut reader = BufReader::new(sock);
+            let mut line = String::new();
+            // FTP 服务器先发 banner，客户端 connect 才能读到
+            reader
+                .get_mut()
+                .write_all(b"220 ftps-e2e ready\r\n")
+                .await
+                .unwrap();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                let cmd = line.trim_end().to_string();
+                match cmd.as_str() {
+                    "AUTH TLS" => {
+                        reader
+                            .get_mut()
+                            .write_all(b"234 proceeding\r\n")
+                            .await
+                            .unwrap();
+                        let tls = acceptor.accept(reader.into_inner()).await.unwrap();
+                        let mut reader = BufReader::new(tls);
+                        // 加密段协议循环
+                        loop {
+                            line.clear();
+                            reader.read_line(&mut line).await.unwrap();
+                            let cmd = line.trim_end().to_string();
+                            match cmd.as_str() {
+                                "PBSZ 0" => {
+                                    reader.get_mut().write_all(b"200 ok\r\n").await.unwrap()
+                                }
+                                "PROT P" => {
+                                    reader.get_mut().write_all(b"200 ok\r\n").await.unwrap()
+                                }
+                                "USER anonymous" => reader
+                                    .get_mut()
+                                    .write_all(b"331 need pass\r\n")
+                                    .await
+                                    .unwrap(),
+                                // 客户端 "PASS " + 空密码，trim_end 后为 "PASS"
+                                "PASS" | "PASS " => reader
+                                    .get_mut()
+                                    .write_all(b"230 logged in\r\n")
+                                    .await
+                                    .unwrap(),
+                                "TYPE I" => {
+                                    reader.get_mut().write_all(b"200 ok\r\n").await.unwrap()
+                                }
+                                "PASV" => {
+                                    let p1 = data_port / 256;
+                                    let p2 = data_port % 256;
+                                    reader
+                                        .get_mut()
+                                        .write_all(
+                                            format!(
+                                                "227 Entering Passive Mode (127,0,0,1,{p1},{p2})\r\n"
+                                            )
+                                            .as_bytes(),
+                                        )
+                                        .await
+                                        .unwrap();
+                                }
+                                "REST 0" => reader
+                                    .get_mut()
+                                    .write_all(b"350 restart ok\r\n")
+                                    .await
+                                    .unwrap(),
+                                "RETR /f.bin" => {
+                                    reader
+                                        .get_mut()
+                                        .write_all(b"150 opening data\r\n")
+                                        .await
+                                        .unwrap();
+                                    // 数据连接：客户端连上后立即 TLS（PROT P）
+                                    let (dsock, _) = data_listener.accept().await.unwrap();
+                                    let mut dtls = acceptor.accept(dsock).await.unwrap();
+                                    dtls.write_all(&content2).await.unwrap();
+                                    dtls.shutdown().await.unwrap();
+                                    reader
+                                        .get_mut()
+                                        .write_all(b"226 transfer done\r\n")
+                                        .await
+                                        .unwrap();
+                                }
+                                "QUIT" => {
+                                    reader.get_mut().write_all(b"221 bye\r\n").await.unwrap();
+                                    return;
+                                }
+                                _ => reader
+                                    .get_mut()
+                                    .write_all(b"502 not impl\r\n")
+                                    .await
+                                    .unwrap(),
+                            }
+                        }
+                    }
+                    _ => reader
+                        .get_mut()
+                        .write_all(b"502 need AUTH TLS\r\n")
+                        .await
+                        .unwrap(),
+                }
+            }
+        });
+
+        // —— 客户端全路径：connect(true) → login → pasv/REST/RETR → 数据 TLS ——
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("f.bin.part");
+        let seg = DynSegment {
+            start: 0,
+            end: content.len() as u64 - 1,
+        };
+        download_segment(
+            "127.0.0.1",
+            ctrl_port,
+            "anonymous",
+            "",
+            "/f.bin",
+            seg,
+            &part,
+            &RateLimiter::new(0),
+            true,
+        )
+        .await
+        .unwrap();
+        let got = std::fs::read(&part).unwrap();
+        assert_eq!(got, *content, "FTPS 数据连接内容逐字节一致（TLS 解密正确）");
+        server.abort();
+    }
 
     /// LIST 解析：两个文件行 + `total` 头 + 子目录被过滤 + 多空格分隔。
     #[test]
@@ -1277,18 +1597,33 @@ mod tests {
     /// 目录识别：以 `/` 结尾或空路径 → Dir；否则 File；非法 URL → None。
     #[test]
     fn parse_ftp_url_distinguishes_file_and_dir() {
-        let (h, p, t) = parse_ftp_url("ftp://u:p@host:2121/pub/dir/").unwrap();
+        let (h, p, t, tls) = parse_ftp_url("ftp://u:p@host:2121/pub/dir/").unwrap();
         assert_eq!((h.as_str(), p), ("host", 2121));
         assert_eq!(t, FtpTarget::Dir("/pub/dir/".to_string()));
+        assert!(!tls);
 
-        let (_, _, t) = parse_ftp_url("ftp://host/").unwrap();
+        let (_, _, t, _) = parse_ftp_url("ftp://host/").unwrap();
         assert_eq!(t, FtpTarget::Dir("/".to_string()));
 
         // 无路径（空路径）→ 根目录
-        let (_, _, t) = parse_ftp_url("ftp://host").unwrap();
+        let (_, _, t, _) = parse_ftp_url("ftp://host").unwrap();
         assert_eq!(t, FtpTarget::Dir("/".to_string()));
 
-        let (h, p, t) = parse_ftp_url("ftp://host/file.bin").unwrap();
+        let (h, p, t, tls) = parse_ftp_url("ftp://host/file.bin").unwrap();
+        assert!(!tls);
+    }
+
+    #[test]
+    fn parse_ftp_url_ftps_flag() {
+        let (h, p, t, tls) = parse_ftp_url("ftps://u:p@host:990/file.bin").unwrap();
+        assert_eq!((h.as_str(), p), ("host", 990));
+        assert_eq!(t, FtpTarget::File("/file.bin".to_string()));
+        assert!(tls);
+
+        // 默认端口仍 21（显式 AUTH TLS 惯例）
+        let (h, p, _, tls) = parse_ftp_url("ftps://host/dir/").unwrap();
+        assert_eq!((h.as_str(), p), ("host", 21));
+        assert!(tls);
         assert_eq!((h.as_str(), p), ("host", 21));
         assert_eq!(t, FtpTarget::File("/file.bin".to_string()));
 
