@@ -65,7 +65,12 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     // 避免误杀正常的长耗时大文件下载。
     let mut client_builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .read_timeout(Duration::from_secs(30));
+        .read_timeout(Duration::from_secs(30))
+        // A5（cookie jar）：引擎共享 client 启用内存 cookie 存储——探测/段请求/
+        // 重定向自动携带与更新（浏览器会话语义，登录型源一次会话全通）；
+        // 同站跨任务共享 jar（同一 client）。任务级代理 client 同口径（见
+        // httpdl build_proxied_client）；Cookie 任务头仍可显式覆盖。
+        .cookie_store(true);
     if !cfg.download.proxy.is_empty() {
         let proxy = reqwest::Proxy::all(&cfg.download.proxy)
             .map_err(|e| ServeError::Engine(format!("代理解析失败: {e}")))?;

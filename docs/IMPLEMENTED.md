@@ -601,3 +601,27 @@ fmt · 双 clippy 口径 0 告警。daemon `/tasks/:id/limit`、`/tasks/:id/sequ
 HELP+TYPE/engine 序稳定）+ state_tests/metrics_tests 2 测（全零与无缓存排除/
 空态）。门禁：daemon default 272/0（+6）· ftp,nas 283/0（+6）· bt 334/0
 （+6）· fmt · workspace clippy 0 告警。
+
+### 27. cookie jar（reqwest cookies，A 档快赢 #5，2026-09-05）
+
+**背景**：HTTP cookie 仅能经任务级自定义头手工携带（H-8）——登录型源
+（Set-Cookie 会话）探测通过后段请求 403，用户必须自己抓 cookie 填头；
+重定向链上的会话 cookie 也无法自动维持。
+
+**行为契约**：
+- workspace reqwest 启用 `cookies` feature；两处下载链路 client 启用
+  `cookie_store(true)`：
+  - daemon serve 引擎共享 client（serve.rs）：内存 jar，同站跨任务共享
+    （浏览器会话语义——登录一次全站任务通吃）；
+  - httpdl `build_proxied_client`（任务级代理 client）：每任务独立 jar，
+    与全局 client 隔离。
+- 语义：探测/段请求/重定向自动携带与更新 cookie；Set-Cookie 自动入 jar；
+  任务级 Cookie 头仍可显式覆盖（H-8 通道保持，两者叠加时服务端以后到为准）。
+- 边界：`/probe` 端点的单发请求 client 与 NAS 管理面 client 不启用（一次性
+  请求 jar 无意义/管理面非下载链路）。
+
+**验证**：新增 `tests/cookie_jar.rs` e2e——服务端首个无 cookie 请求（add
+探测）为引导请求（200/206 + Set-Cookie），其后任何无 cookie 请求 403 计数；
+断言任务 Completed + 内容一致 + cookie 请求 ≥1 + 引导后无 cookie 请求 == 0
+（jar 确实在探测→下载链路传递）。门禁：httpdl(ftp) 185/0（+1）· daemon
+default 272/0 · bt 334/0 · fmt · 双 clippy 口径 0 告警。
