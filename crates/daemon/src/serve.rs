@@ -143,7 +143,11 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
             (!cfg.post_download.hook.is_empty()).then(|| cfg.post_download.hook.clone()),
         )
         .with_cleanup(cfg.cleanup.clone())
-        .with_start_jitter(cfg.scheduler.start_jitter_seconds);
+        .with_start_jitter(cfg.scheduler.start_jitter_seconds)
+        .with_limits_cfg(cfg.limits.clone())
+        .with_queue_cfg(cfg.queue.clone())
+        .with_config_path(cfg_path.clone())
+        .with_live_config(cfg.clone());
     #[cfg(not(feature = "bt"))]
     let mut state = DaemonState::new(http_engine, providers)
         .with_dest_root(cfg.download.dest_root.clone())
@@ -157,7 +161,11 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
             (!cfg.post_download.hook.is_empty()).then(|| cfg.post_download.hook.clone()),
         )
         .with_cleanup(cfg.cleanup.clone())
-        .with_start_jitter(cfg.scheduler.start_jitter_seconds);
+        .with_start_jitter(cfg.scheduler.start_jitter_seconds)
+        .with_limits_cfg(cfg.limits.clone())
+        .with_queue_cfg(cfg.queue.clone())
+        .with_config_path(cfg_path.clone())
+        .with_live_config(cfg.clone());
 
     // 4. BT 引擎（先取 core 句柄，供 alert 事件流）
     #[cfg(feature = "bt")]
@@ -184,6 +192,9 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
                 .map_err(ServeError::Engine)?,
             );
             let core = bt.core(); // Arc<BtCore>：alert 轮询句柄（trait 化前保存）
+                                  // S1：启动期会话连接参数（监听端口/全局连接数上限；0 = 不下发）
+            bt.apply_startup_conn(cfg.bt.listen_port, cfg.bt.max_connections)
+                .map_err(ServeError::Engine)?;
             bt_typed = Some(bt.clone()); // Bug A：alert 循环的暂停意图压制句柄
             let bt_arc: Arc<dyn smart_dl_core::types::DownloadEngine> = bt.clone();
             state = state.with_bt(bt_arc);
@@ -397,6 +408,23 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
                         tracing::warn!("配置热重载解析失败（保留旧配置）: {e}");
                         last = Some(text); // 避免同一坏内容反复告警
                     }
+                }
+            }
+        });
+    }
+
+    // S1：备用限速窗口 ticker（30s）——`[limits] alt_enabled` 开启时按
+    // HH:MM 窗口/星期自动切换基准/备用限速（跨零点回卷支持）。幂等：
+    // 无差异零副作用；窗口边界抖动由 [from, to) 半开区间消除。
+    {
+        let st = state_arc.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if let Err(e) = st.tick_alt_limits().await {
+                    tracing::warn!("备用限速评估失败（保留引擎侧旧值）: {e}");
                 }
             }
         });

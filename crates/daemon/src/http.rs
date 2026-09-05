@@ -944,6 +944,41 @@ async fn config_set_limit(
     }
 }
 
+/// `GET /settings`：设置面全量快照（S1）——各设置域当前值（基准限速 +
+/// 引擎实际生效值 + 备用窗口命中态 + 持久化目标路径）。
+async fn settings_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    Json(state.settings_snapshot())
+}
+
+/// `PUT /settings` 查询参数：`?persist=`（缺省 true；body 内 `persist` 字段优先）。
+#[derive(Deserialize)]
+struct SettingsQuery {
+    persist: Option<bool>,
+}
+
+/// `PUT /settings`（S1 设置面）：部分更新 + 可选落盘持久化。
+/// 验证失败 → 400（零副作用）；引擎下发失败 → 500；成功 → 应用报告
+/// （applied / restart_required / persisted / limits）+ `settings_changed` 事件。
+async fn settings_put(
+    State(state): State<Arc<DaemonState>>,
+    Query(q): Query<SettingsQuery>,
+    Json(req): Json<crate::state::SettingsReq>,
+) -> impl IntoResponse {
+    match state.apply_settings(req, q.persist.unwrap_or(true)).await {
+        Ok(report) => Json(report).into_response(),
+        Err(DaemonError::InvalidSource(m)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": m })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 /// 全局统计（任务按状态/引擎聚合 + 聚合速率，速率口径 1s 快照）。
 async fn stats_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     Json(state.stats())
@@ -1952,6 +1987,7 @@ macro_rules! router_base {
             .route("/bt/metadata", post(bt_magnet_metadata))
             .route("/config", get(config_endpoint))
             .route("/config/limit", post(config_set_limit))
+            .route("/settings", get(settings_endpoint).put(settings_put))
             .route("/stats", get(stats_endpoint))
             .route("/metrics", get(metrics_endpoint))
             .route("/version", get(version_endpoint))

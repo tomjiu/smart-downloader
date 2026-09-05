@@ -245,9 +245,16 @@ impl Session {
 
     /// 传输层开关：uTP（incoming/outgoing 同进退）+ MSE 加密三态。
     /// 会话默认 uTP 关 + 加密允许（M0 确定性语义）；本方法显式覆盖。
-    pub fn apply_transport(&self, enable_utp: bool, enc_policy: EncryptPolicy) -> Result<()> {
+    pub fn apply_transport(&self, enable_utp: bool, enc_policy: ffi::EncryptPolicy) -> Result<()> {
         let code =
             unsafe { lt_apply_transport(self.raw, enable_utp as c_int, enc_policy.as_c_int()) };
+        call(code, || Ok(()))
+    }
+
+    /// 会话连接参数（S1）：监听端口 + 全局连接数上限。
+    /// port = 0 / max_connections = 0 → 该项不下发（内核默认/上次设置）。
+    pub fn apply_conn(&self, port: u16, max_connections: u32) -> Result<()> {
+        let code = unsafe { lt_apply_conn(self.raw, port as c_int, max_connections as c_int) };
         call(code, || Ok(()))
     }
 

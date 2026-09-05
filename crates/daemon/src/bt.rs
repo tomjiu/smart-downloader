@@ -13,8 +13,8 @@
 use smart_dl_btcore::{AlertKind, BtCore, TorrentStatus};
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
-    Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
-    EngineTaskId, FileProgress, PeerInfo, TrackerEntry,
+    BtSessionPatch, Capability, DownloadEngine, DownloadSource, EngineError, EngineKind,
+    EngineState, EngineStatus, EngineTaskId, FileProgress, PeerInfo, TrackerEntry,
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -80,6 +80,9 @@ pub struct BtEngine {
     /// re-apply（libtorrent settings_pack 全量语义）——保存启动时代理与双
     /// 方向速率，热改限速时代理原样重放（BT 代理属会话级，E8 边界不变）。
     network: parking_lot::Mutex<BtNetwork>,
+    /// 会话级发现/传输/连接设置快照（S1）：apply_bt_session 部分补丁合并
+    /// 基准（apply_discovery/apply_transport 全量签名需要四/双值）。
+    session: parking_lot::Mutex<BtSessionCfg>,
 }
 
 /// BtEngine 会话级网络策略快照（E16）。`proxy_url` 保存原始 URL 串（None =
@@ -89,6 +92,20 @@ struct BtNetwork {
     proxy_url: Option<String>,
     down_kb_s: u32,
     up_kb_s: u32,
+}
+
+/// BtEngine 会话级设置快照（S1）：发现/传输/连接三组当前值。
+/// `listen_port`/`max_connections` = 0 语义与内核一致（不下发）。
+#[derive(Debug, Clone)]
+struct BtSessionCfg {
+    enable_dht: bool,
+    enable_lsd: bool,
+    enable_upnp: bool,
+    enable_pex: bool,
+    enable_utp: bool,
+    encrypt: String,
+    listen_port: u16,
+    max_connections: u32,
 }
 
 impl BtEngine {
@@ -145,7 +162,37 @@ impl BtEngine {
                 down_kb_s,
                 up_kb_s,
             }),
+            session: parking_lot::Mutex::new(BtSessionCfg {
+                enable_dht,
+                enable_lsd,
+                enable_upnp,
+                enable_pex,
+                enable_utp,
+                encrypt: encrypt.to_string(),
+                listen_port: 0,
+                max_connections: 0,
+            }),
         })
+    }
+
+    /// 启动期会话连接参数注入（S1）：serve 装配从 `[bt] listen_port /
+    /// max_connections` 调用（>0 才下发）；运行中变更走 apply_bt_session。
+    pub fn apply_startup_conn(&self, listen_port: u16, max_connections: u32) -> Result<(), String> {
+        if listen_port == 0 && max_connections == 0 {
+            return Ok(());
+        }
+        {
+            let mut s = self.session.lock();
+            if listen_port > 0 {
+                s.listen_port = listen_port;
+            }
+            if max_connections > 0 {
+                s.max_connections = max_connections;
+            }
+        }
+        self.core
+            .apply_conn(listen_port, max_connections)
+            .map_err(|e| format!("bt apply_conn: {e:?}"))
     }
 
     pub fn core(&self) -> Arc<BtCore> {
@@ -488,6 +535,96 @@ impl DownloadEngine for BtEngine {
         };
         // 启动时代理原样重放（会话级边界不变，E8）；重新 parse 失败 → Other
         //（启动时已校验过，此处兜底）
+        let proxy_cfg = match net.proxy_url.as_deref() {
+            Some(u) => match smart_dl_btcore::ffi::parse_proxy(u) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    return Err(EngineError::Other(format!(
+                        "bt proxy 解析失败 {u:?}: {e:?}"
+                    )))
+                }
+            },
+            None => None,
+        };
+        self.core
+            .apply_network(proxy_cfg.as_ref(), net.down_kb_s, net.up_kb_s)
+            .map_err(|e| EngineError::Other(format!("bt apply_network: {e:?}")))
+    }
+
+    /// BT 会话级设置热改（S1 trait 扩展）：发现/传输/连接三组按需下发。
+    /// 部分补丁先合并进会话快照，再以全量语义重放（apply_discovery /
+    /// apply_transport / apply_conn 均为 settings_pack 全量签名）。任一组
+    /// 下发失败即返回错误（后续组不再尝试）——调用方 daemon 层降级 warn，
+    /// 不阻塞设置保存；快照只记录成功组（失败组保持旧值，重试幂等）。
+    async fn apply_bt_session(&self, patch: BtSessionPatch) -> Result<(), EngineError> {
+        let snap = self.session.lock().clone();
+        let mut merged = snap.clone();
+        merged.enable_dht = patch.enable_dht.unwrap_or(snap.enable_dht);
+        merged.enable_lsd = patch.enable_lsd.unwrap_or(snap.enable_lsd);
+        merged.enable_upnp = patch.enable_upnp.unwrap_or(snap.enable_upnp);
+        merged.enable_pex = patch.enable_pex.unwrap_or(snap.enable_pex);
+        merged.enable_utp = patch.enable_utp.unwrap_or(snap.enable_utp);
+        merged.encrypt = patch
+            .encrypt
+            .clone()
+            .map(|e| e.trim().to_string())
+            .unwrap_or(snap.encrypt);
+        merged.listen_port = patch.listen_port.unwrap_or(snap.listen_port);
+        merged.max_connections = patch.max_connections.unwrap_or(snap.max_connections);
+
+        // 1) 发现层（DHT/LSD/UPnP/PEX）
+        let discovery_changed = merged.enable_dht != snap.enable_dht
+            || merged.enable_lsd != snap.enable_lsd
+            || merged.enable_upnp != snap.enable_upnp
+            || merged.enable_pex != snap.enable_pex;
+        if discovery_changed {
+            self.core
+                .apply_discovery(
+                    merged.enable_dht,
+                    merged.enable_lsd,
+                    merged.enable_upnp,
+                    merged.enable_pex,
+                )
+                .map_err(|e| EngineError::Other(format!("bt apply_discovery: {e:?}")))?;
+        }
+        // 2) 传输层（uTP + MSE 加密）：加密值校验后解析
+        let transport_changed =
+            merged.enable_utp != snap.enable_utp || merged.encrypt != snap.encrypt;
+        if transport_changed {
+            let enc_policy = smart_dl_btcore::engine::parse_encrypt_policy(&merged.encrypt)
+                .ok_or_else(|| {
+                    EngineError::Other(format!(
+                        "bt.encrypt 解析失败 {:?}: 仅支持 disable/allow/require",
+                        merged.encrypt
+                    ))
+                })?;
+            self.core
+                .apply_transport(merged.enable_utp, enc_policy)
+                .map_err(|e| EngineError::Other(format!("bt apply_transport: {e:?}")))?;
+        }
+        // 3) 连接参数（监听端口 / 全局连接数上限；0 = 该项不下发）
+        let conn_changed = merged.listen_port != snap.listen_port
+            || merged.max_connections != snap.max_connections;
+        if conn_changed {
+            self.core
+                .apply_conn(merged.listen_port, merged.max_connections)
+                .map_err(|e| EngineError::Other(format!("bt apply_conn: {e:?}")))?;
+        }
+        // 全部成功才提交快照（失败组保持旧值，重试幂等）
+        *self.session.lock() = merged;
+        Ok(())
+    }
+
+    /// 引擎级全局代理热改（S1 trait 扩展）：更新 network 快照后整包 re-apply
+    /// （settings_pack 全量语义，限速原样重放）；None = 清除代理（直连）。
+    async fn set_global_proxy(&self, proxy: Option<&str>) -> Result<(), EngineError> {
+        let net = {
+            let mut n = self.network.lock();
+            n.proxy_url = proxy
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            n.clone()
+        };
         let proxy_cfg = match net.proxy_url.as_deref() {
             Some(u) => match smart_dl_btcore::ffi::parse_proxy(u) {
                 Ok(c) => Some(c),
