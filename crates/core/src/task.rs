@@ -40,7 +40,9 @@ pub struct DownloadTask {
     pub file_priorities: Option<Vec<u32>>,
     /// 顺序下载（边下边播）。false = 默认并行策略（旧 tasks.json 无此字段自动补
     /// false）。引擎语义：HTTP = 限制在飞段窗口（前缀尽快完整，FIFO 领取不变）；
-    /// BT = libtorrent sequential_download flag；FTP = 不支持（Unsupported）。
+    /// BT = libtorrent sequential_download flag；FTP = 在飞段窗口收紧（与 HTTP
+    /// 同值同语义，2026-09-05 A3 起支持；运行中热改下一轮拾取，FTP 单轮下载
+    /// 实际生效点为 add/恢复重放）。
     /// 持久化 + 恢复重放：restore_from 对 sequential=true 的任务原样重放。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sequential: bool,

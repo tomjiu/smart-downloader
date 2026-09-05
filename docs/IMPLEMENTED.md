@@ -550,3 +550,31 @@ bt --all-targets 324/0、ftp,nas 277/0（各基线 +2：`bt_transport_toml_overr
 stays_terminal` / `error_alert_on_seeding_stays_terminal`；既有
 `error_alert_fails_with_message`（预算 0）不变绿。btcore 37/0 / daemon default
 266/0 / bt --all-targets 328/0（+4）/ fmt / workspace clippy 0 告警。
+
+### 25. FTP 任务级限速 + 顺序下载补齐（A 档快赢 #3，2026-09-05）
+
+**背景**：任务级限速（E16）与顺序下载（sequential，N3）此前为 HTTP/BT 双引擎
+实现，FTP 明示「不支持」（`EngineInner` 注释 + `task.rs` 字段注释）——FTP 任务
+无法单独限速、边下边播窗口不可用。
+
+**行为契约**：
+- **任务级限速**（`set_limits`，与 HTTP 引擎同口径）：任务专属 limiter 登记
+  `limiters` 表（`RateLimiter::new_chained` 串联引擎全局上游——总阀门对任务级
+  限速任务同样生效）；已登记 → 原地热调（运行中任务经 Arc 共享即时生效）；
+  未登记（含运行中走全局的任务）→ 新登记，下一次重下轮拾取。`up` 方向显式
+  拒绝（Other，FTP 无上传）；缺失任务 NotFound；remove 时登记一并回收。
+  下载循环 spawn 取用口径与 HTTP 相同（limiters.get 优先，回退全局）。
+- **顺序下载**（`set_sequential` + `task.sequential` add 直读）：复用 HTTP 的
+  在飞闸门模式——`SEQUENTIAL_WINDOW`（=2）Semaphore，permit 从领取前持有到
+  complete 后释放（RAII，失败/panic 无泄漏）；「先拿 permit 再领取段」保证
+  窗口语义（先领后等会让窗口外表内的段占用 FIFO 游标）。FTP 目录任务按文件
+  串行（既有语义），sequential 收紧的是文件内段在飞窗口。运行中热改 = 字段
+  回显（FTP 单轮下载，实际生效点 = add / 恢复重放）。
+- `task.rs` sequential 字段注释同步（FTP = 支持，与 HTTP 同值同语义）。
+
+**验证**：新增 `tests/ftp_task_controls.rs` 4 测——up 拒绝 + NotFound / 限速
+双路径（insert+热调）下完成且内容一致 / sequential 多段（16KB 粒度 ×4 段）
+窗口下完成且内容一致（retr≥4）/ set_sequential 回显 + NotFound。门禁：
+httpdl(ftp) 184/0（+4）· daemon default 266/0 · ftp,nas 277/0 · bt 328/0 ·
+fmt · 双 clippy 口径 0 告警。daemon `/tasks/:id/limit`、`/tasks/:id/sequential`
+端点走 trait 分发，FTP 支持自动生效（无需 daemon 改动）。

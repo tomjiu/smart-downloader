@@ -42,7 +42,8 @@
 | ~xunlei-import 端到端测试~ | ~~`POST /tasks/xunlei-import` 代码存在但无 e2e 测试~~ **已完成（2026-08-27）**：新增 `crates/daemon/tests/xunlei_import_api.rs`，覆盖合法样本导入、bad base64、xltd 数量不匹配 |
 | ed2k 协议 | ~~明确不支持~~ **链接解析已完成（2026-08-30，`core/src/source_parse/ed2k.rs`：name/size/md4 结构化 + 明确错误分类）**；完整 eMule/eDonkey 客户端协议仍列远期（数周级），并入"跨协议"远期专项（见 F 段）|
 
-已有（防重复列）：**BT PEX/uTP/MSE 加密配置面（2026-09-05，`[bt]` 三键 + FFI `lt_apply_transport`；PEX 经 per-torrent disable_pex 实现，内核 2.0.x 无会话级开关）**、并发队列（BT≤3/HTTP·FTP≤8）、HTTP 多连接并行/镜像/换源、**HTTP 动态分段（SegmentManager 动态领取 + 流式写盘，`109692c`）**、**任务级顺序下载（HTTP 在飞窗口 + BT sequential flag，2026-09-02，CAPABILITY_MAP N3 双引擎落地）**、**失败缩小粒度重试（`b70923e`）**、**backup_url/backup_md5 备用源兜底（`963f9dd`）**、sha256 可选校验、BT 校验/做种停止、事件队列背压、全局代理 + 双引擎限速（启动时生效）。
+已有（防重复列）：**BT PEX/uTP/MSE 加密配置面（2026-09-05，`[bt]` 三键 + FFI `lt_apply_transport`；PEX 经 per-torrent disable_pex 实现，内核 2.0.x 无会话级开关）**、并发队列（BT≤3/HTTP·FTP≤8）、HTTP 多连接并行/镜像/换源、**HTTP 动态分段（SegmentManager 动态领取 + 流式写盘，`109692c`）**、**任务级顺序下载（HTTP/FTP 在飞窗口 + BT sequential flag，2026-09-02 双引擎落地、2026-09-05 A3 扩 FTP 三引擎齐备，CAPABILITY_MAP N3）**
+**FTP 任务级限速 + 顺序下载补齐（2026-09-05 A3：set_limits/set_sequential 与 HTTP 同口径，limiters 表串联全局总阀门；sequential = 段在飞窗口收紧同语义）**、**失败缩小粒度重试（`b70923e`）**、**backup_url/backup_md5 备用源兜底（`963f9dd`）**、sha256 可选校验、BT 校验/做种停止、事件队列背压、全局代理 + 双引擎限速（启动时生效）。
 
 ### 手动验证待办（脚本已备，待人工在真实网络执行）
 
