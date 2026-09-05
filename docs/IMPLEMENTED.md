@@ -691,3 +691,41 @@ PBSZ/PROT P + 数据连接 TLS + REST/RETR）落盘内容逐字节断言；解�
 （parse_ftp_url ftps 标志/默认端口、parse_ftp_auth ftps 同构、normalize
 ftps 分类）。门禁：httpdl(ftp) 187/0（+2）· core 255/0（+2）· daemon
 default 285/0 · ftp,nas 296/0 · bt 347/0 · fmt · CI 双 clippy 0 告警。
+
+### 30. HLS（m3u8）下载支持（C 档 #1，2026-09-05）
+
+**背景**：流媒体点播（VOD）场景 `.m3u8` 清单只能用播放器播放，无下载器
+把"清单 → 分段拉取 → 解密 → 合流"链路自动化；aria2/ffmpeg 各覆盖一半
+（aria2 无解密合流、ffmpeg 无断点续传/限速/任务管理）。
+
+**实现**（RFC 8216 子集，PR #78）：
+- **识别与分流**：`HttpEngine::add` 对 URL 路径 `.m3u8` 后缀（剥 query/frag
+  大小写无关）的任务分流 HLS 路径——不走 Range 探测/分段链（清单是文本，
+  total/Range 语义无意义）；任务级代理/headers/限速全链同源。
+- **清单解析**（`hls.rs`）：master playlist 变体 → BANDWIDTH 最高者展开
+  一层；media playlist 解析 EXTINF/EXT-X-MEDIA-SEQUENCE/EXT-X-KEY/
+  EXT-X-ENDLIST；**仅接受 VOD**（无 ENDLIST = live → 任务 Error：清单随
+  时间变化续传语义不成立）；EXT-X-BYTERANGE / EXT-X-MAP / SAMPLE-AES →
+  明确不支持报错。
+- **AES-128-CBC 解密**（RustCrypto aes+cbc）：EXT-X-KEY 的 key URI 拉取
+  一次缓存（同 key 多段共享）；IV 显式声明或缺省 = 段 media sequence
+  大端 16B 推导；PKCS7 unpadding（每段独立密文单元）；密钥行内状态切换
+  （同清单多 key 段混布支持）。
+- **顺序下载 + 段账本续传**：段顺序 append `.part`（TS 拼接对顺序敏感，
+  v1 不并发段）；`.part.hls-ledger` JSON 记录清单指纹（sha256 playlist
+  文本+URL）/已完成段数/字节数，每段落盘即记账；恢复 = 重拉清单 → 指纹
+  对账（失配作废重下）→ 从断点段续传，已完成段零重复请求（e2e 计数断言）。
+- **pause/resume**：abort flag 段间检查点（`hls-aborted` 约定错误静默
+  退出，状态由 pause()/remove() 管理）；resume epoch+1 重 spawn 凭账本
+  续传——与 HTTP 段账本同模式。
+- **落盘名**：显式名权威；派生 = 入口 URL 清单名去 `.m3u8` + `.ts`
+  （变体运行时展开，media 内容合流进同一交付文件）；total = 0（段长
+  事先未知，BT metadata 前同"未知长度"语义），done 按字节累计。
+- 依赖：aes 0.8 + cbc 0.1（RustCrypto 纯 Rust 小依赖，无 feature 门）。
+
+**验证**：解析单测 12（VOD/AES 显式+缺省 IV/live 拒绝/BYTERANGE/MAP/
+SAMPLE-AES 拒绝/结构非法/master 选流/URL 解析/识别/落盘名/AES roundtrip）
++ e2e 4（master 展开+2 段解密逐字节、段账本续传零重复拉取、live 任务
+Error、pause→resume roundtrip）。门禁：httpdl(ftp) 203/0（+16）· core
+255/0 · daemon default 285/0 · ftp,nas 296/0 · bt 347/0 · fmt · CI 双
+clippy 0 告警。

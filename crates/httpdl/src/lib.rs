@@ -8,6 +8,8 @@ extern crate self as httpdl;
 
 pub mod download;
 pub mod engine;
+/// HLS（RFC 8216）VOD 下载支持（C-HLS）。
+pub mod hls;
 pub mod ledger;
 pub mod range;
 pub mod rate;
