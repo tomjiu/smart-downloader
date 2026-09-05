@@ -19,6 +19,10 @@ tracing = { workspace = true }
 sha2 = "0.10"
 sha1 = "0.10"
 md-5 = "0.10"
+# HLS（C-HLS，RFC 8216）：AES-128-CBC 段解密（RustCrypto，纯 Rust 小依赖；
+# cbc 0.1 与 aes 0.8/cipher 0.4 配套，0.2 尚为 rc）
+aes = "0.8"
+cbc = "0.1"
 smart-dl-core = { path = "../core" }
 parking_lot = { workspace = true }
 tokio-rustls = { workspace = true, optional = true }
