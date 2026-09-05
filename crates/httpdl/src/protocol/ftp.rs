@@ -2,6 +2,7 @@
 //! 被动模式（PASV）、REST 断点续传（.part）、421 退避重试、目录下载（LIST 单层）；
 //! 不支持 SFTP/FTPS 隐式/目录递归/FXP。
 
+use crate::download::SEQUENTIAL_WINDOW;
 use crate::ledger;
 use crate::rate::{RateLimiter, RateSample};
 use crate::retry::Backoff;
@@ -68,14 +69,25 @@ struct FtpTask {
     error: Option<String>,
     /// 目录任务的文件级进度（单文件任务为空）。
     files: Vec<FtpFile>,
+    /// 任务级下载限速（KiB/s 配置回显；None = 走全局）。实际生效速在
+    /// limiters 表的 RateLimiter 上（set_limits 运行中即时改率）。
+    limit_kb_s: Option<u32>,
+    /// 顺序下载（边下边播）：true = download_file 在飞段窗口收紧
+    /// （SEQUENTIAL_WINDOW，与 HTTP 同值同语义：前缀尽快完整，FIFO 领取
+    /// 不变）。set_sequential 运行中改写 → 下一次重下轮拾取；新建任务
+    /// add() 直接读 task.sequential → 立即生效。
+    sequential: bool,
 }
 
 struct EngineInner {
     tasks: Mutex<HashMap<EngineTaskId, FtpTask>>,
     /// 引擎全局限速器（E16 总阀门）：0 = 不限（wait 早退零开销）；
-    /// set_global_limits 运行中热调。FTP 无任务级限速（引擎能力边界），
-    /// 所有 FTP 任务的合计带宽由本 limiter 统一约束。
+    /// set_global_limits 运行中热调。任务级限速经 limiters 表串联本
+    /// limiter（上游），所有 FTP 任务的合计带宽仍受总阀门约束。
     limiter: Arc<RateLimiter>,
+    /// 任务级限速登记表（E16）：set_limits 登记 → 下载循环 spawn 时取用；
+    /// Arc 共享使已登记任务运行中热调（set_rate_kb_s）即时生效。
+    limiters: Mutex<HashMap<EngineTaskId, Arc<RateLimiter>>>,
     /// 动态分段粒度（字节，0 = 默认 16MB；与 HTTP 直链同粒度同源）。
     /// 测试注入小粒度以覆盖多段/账本路径。
     min_split: u64,
@@ -111,6 +123,7 @@ impl FtpEngine {
             inner: Arc::new(EngineInner {
                 tasks: Mutex::new(HashMap::new()),
                 limiter: Arc::new(RateLimiter::new(download_kb_s)),
+                limiters: Mutex::new(HashMap::new()),
                 min_split: 0,
             }),
         }
@@ -219,6 +232,8 @@ impl FtpEngine {
                     rate: RateSample::default(),
                     error: None,
                     files,
+                    limit_kb_s: None,
+                    sequential: task.sequential,
                 },
             );
         }
@@ -610,6 +625,7 @@ async fn download_file(
     backoff: Backoff,
     limiter: &RateLimiter,
     min_split: u64,
+    sequential: bool,
     on_progress: Arc<dyn Fn(u64) + Send + Sync>,
 ) -> Result<(), String> {
     let part = part_path_of(dest);
@@ -652,6 +668,15 @@ async fn download_file(
         on_progress(done0);
     }
 
+    // 顺序模式在飞闸门（与 HTTP download_dynamic 同构）：permit 从领取前
+    // 持有到 complete 后释放（RAII），失败/panic 退出路径同样随作用域释放，
+    // 无泄漏。在飞段数 ≤ SEQUENTIAL_WINDOW → 前缀尽快完整（边下边播）。
+    let seq_gate: Option<Arc<tokio::sync::Semaphore>> = if sequential {
+        Some(Arc::new(tokio::sync::Semaphore::new(SEQUENTIAL_WINDOW)))
+    } else {
+        None
+    };
+
     // worker 数：与 HTTP 同一公式（静态 2-8）。<16MB 单段时多出的 worker
     // 领不到段（Drained）即退，零开销。
     let n_workers = segment_count(total);
@@ -664,10 +689,22 @@ async fn download_file(
         let part = part.clone();
         let limiter = limiter.clone();
         let manager = manager.clone();
+        let seq_gate = seq_gate.clone();
         let ledger_path = ledger_path.clone();
         let on_progress = on_progress.clone();
         workers.spawn(async move {
             loop {
+                // 顺序模式：先拿 permit 再领取段，保证「在飞段数 ≤ 窗口」
+                //（先领后等会导致窗口外表内的段已占用 FIFO 游标）。
+                let _permit = match &seq_gate {
+                    Some(g) => Some(
+                        g.clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| "sequential gate closed".to_string())?,
+                    ),
+                    None => None,
+                };
                 // FIFO 领取：段天然无重叠 → .part 分区写无需文件锁
                 let seg: DynSegment = {
                     let mut m = manager.lock();
@@ -745,7 +782,18 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
     };
     let inner2 = inner.clone();
     let tid2 = tid.clone();
-    let limiter = inner.limiter.clone();
+    // 任务级限速优先，未登记回退全局（与 HTTP engine 同口径）；登记条目
+    // 已在 set_limits 时串联全局上游（E16），此处直接取用即可。
+    let limiter = inner
+        .limiters
+        .lock()
+        .get(&tid)
+        .cloned()
+        .unwrap_or_else(|| inner.limiter.clone());
+    let sequential = {
+        let tasks = inner.tasks.lock();
+        tasks.get(&tid).map(|t| t.sequential).unwrap_or(false)
+    };
     let min_split = inner.min_split;
     let progress: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |n| {
         let mut tasks = inner2.tasks.lock();
@@ -754,7 +802,8 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
         }
     });
     let r = download_file(
-        &host, port, &user, &pass, &path, &dest, total, backoff, &limiter, min_split, progress,
+        &host, port, &user, &pass, &path, &dest, total, backoff, &limiter, min_split, sequential,
+        progress,
     )
     .await;
     match r {
@@ -791,13 +840,24 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
         );
         return;
     }
+    // 目录任务按文件串行（既有语义），sequential 语义 = 文件内段在飞窗口收紧
+    let sequential = {
+        let tasks = inner.tasks.lock();
+        tasks.get(&tid).map(|t| t.sequential).unwrap_or(false)
+    };
     for (name, fpath, size) in files {
         let dest = dir_dest.join(&name);
         set_file_state(&inner, &tid, &name, EngineState::Downloading);
         let inner2 = inner.clone();
         let tid2 = tid.clone();
         let name2 = name.clone();
-        let limiter = inner.limiter.clone();
+        // 任务级限速优先，未登记回退全局（与单文件循环同口径）
+        let limiter = inner
+            .limiters
+            .lock()
+            .get(&tid)
+            .cloned()
+            .unwrap_or_else(|| inner.limiter.clone());
         let min_split = inner.min_split;
         let progress: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |n| {
             let mut tasks = inner2.tasks.lock();
@@ -809,7 +869,8 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
             }
         });
         let r = download_file(
-            &host, port, &user, &pass, &fpath, &dest, size, backoff, &limiter, min_split, progress,
+            &host, port, &user, &pass, &fpath, &dest, size, backoff, &limiter, min_split,
+            sequential, progress,
         )
         .await;
         match r {
@@ -903,6 +964,57 @@ impl DownloadEngine for FtpEngine {
         Ok(())
     }
 
+    /// 任务级下载限速（trait 扩展，与 HTTP 引擎同口径）：任务专属 limiter
+    /// 登记进 limiters 表（串联全局上游，总阀门对任务级限速任务同样生效）；
+    /// 已登记 → 原地热调（运行中任务经 Arc 共享即时生效）；未登记（含
+    /// 运行中走全局的任务）→ 新登记，下一次重下轮拾取。仅 down 方向。
+    async fn set_limits(
+        &self,
+        id: &EngineTaskId,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<(), EngineError> {
+        if up_kb_s.is_some() {
+            return Err(EngineError::Other(
+                "HTTP/FTP 引擎无上传方向，up_kb_s 不适用".to_string(),
+            ));
+        }
+        let Some(kb) = down_kb_s else { return Ok(()) }; // 双 None = no-op
+        {
+            let mut tasks = self.inner.tasks.lock();
+            let Some(t) = tasks.get_mut(id) else {
+                return Err(EngineError::NotFound);
+            };
+            // 配置回显记到任务快照上（审计/透出口径）
+            t.limit_kb_s = Some(kb);
+        }
+        let mut limiters = self.inner.limiters.lock();
+        match limiters.get(id) {
+            Some(lim) => lim.set_rate_kb_s(kb), // 已有限速器 → 原地热调
+            None => {
+                limiters.insert(
+                    id.clone(),
+                    Arc::new(RateLimiter::new_chained(kb, &self.inner.limiter)),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// 任务级顺序下载开关（trait 扩展）：字段改写，下一次重下轮拾取；
+    /// 运行中的当前轮不变（收尾在飞段）。新建任务在 add() 直接读
+    /// task.sequential → 立即生效（FTP 单轮下载，无 resume 重入路径）。
+    async fn set_sequential(&self, id: &EngineTaskId, on: bool) -> Result<(), EngineError> {
+        let mut tasks = self.inner.tasks.lock();
+        match tasks.get_mut(id) {
+            Some(t) => {
+                t.sequential = on;
+                Ok(())
+            }
+            None => Err(EngineError::NotFound),
+        }
+    }
+
     async fn add(&self, task: &DownloadTask) -> Result<EngineTaskId, EngineError> {
         let (url, user, pass) = match &task.source {
             DownloadSource::Ftp { url, user, pass } => (url.clone(), user.clone(), pass.clone()),
@@ -978,6 +1090,8 @@ impl DownloadEngine for FtpEngine {
                             rate: RateSample::default(),
                             error: None,
                             files: vec![],
+                            limit_kb_s: None,
+                            sequential: task.sequential,
                         },
                     );
                 }
@@ -1040,6 +1154,8 @@ impl DownloadEngine for FtpEngine {
     async fn remove(&self, id: &EngineTaskId, _delete_data: bool) -> Result<(), EngineError> {
         let mut tasks = self.inner.tasks.lock();
         tasks.remove(id).ok_or(EngineError::NotFound)?;
+        // 任务级限速登记一并回收（防表无限增长；与 HTTP engine 同口径）
+        self.inner.limiters.lock().remove(id);
         Ok(())
     }
 
