@@ -9,7 +9,9 @@ mod integration;
 use common::{make_ftp_task, wait_terminal};
 use integration::ftp_server::{patterned, FtpServerConfig, FtpTestServer};
 use smart_dl_core::types::{DownloadEngine, EngineError, EngineState};
+use smart_dl_httpdl::retry::Backoff;
 use smart_dl_httpdl::FtpEngine;
+use std::time::Duration;
 
 #[tokio::test]
 async fn pasv_download_small_file_matches_source() {
@@ -115,4 +117,57 @@ async fn missing_file_550_reports_error() {
     let st = wait_terminal(&engine, &tid).await;
     assert_eq!(st.state, EngineState::Error, "550 必须终态失败");
     assert!(st.error.is_some());
+}
+
+#[tokio::test]
+async fn failed_large_segment_recovers_by_halving() {
+    // P1 失败缩小粒度重试（与 HTTP 侧 failed_large_segment_recovers_by_halving 对齐）：
+    // REST 起点 16MB 且请求长度 ≥ 8MB → 421（非终态）。32MB 文件默认 16MB 分段 →
+    // 整段 [16MB,32MB) 失败 → 拆半收敛：left [16MB,24MB) 仍命中（8MB ≥ 8MB）再拆 →
+    // left2 [16MB,20MB) 放行；right2 [20MB,24MB) 与 right [24MB,32MB) 起点不命中放行。
+    let mb = 1024 * 1024u64;
+    let size = 32 * mb;
+    let src = patterned(size);
+    let srv = FtpTestServer::start(FtpServerConfig {
+        size,
+        content: Some(src.clone()),
+        fail_ranges: vec![16 * mb],
+        // 次数上限 = 两层大段尝试的退避预算（整段 4 次 + left 4 次），
+        // 耗尽后 left2 [16MB,20MB) 放行 → 拆分收敛
+        fail_ranges_max_hits: Some(8),
+        ..Default::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    // 毫秒级退避：421 重试路径真实走连接层退避，但不拖慢测试
+    let engine = FtpEngine::with_backoff(Backoff {
+        base: Duration::from_millis(10),
+        max: Duration::from_millis(20),
+    });
+    let task = make_ftp_task(
+        "f9",
+        &srv.url("/data.bin"),
+        dir.path().to_path_buf(),
+        "out9.bin",
+    );
+    let tid = engine.add(&task).await.unwrap();
+
+    let st = wait_terminal(&engine, &tid).await;
+    assert_eq!(
+        st.state,
+        EngineState::Completed,
+        "缩小粒度重试应完成: {:?}",
+        st.error
+    );
+    let got = std::fs::read(dir.path().join("out9.bin")).unwrap();
+    assert_eq!(got, src, "缩小粒度重试后文件必须完整");
+
+    // 拆分过程留痕：整段（16MB）、left 再拆（20MB）、right（24MB）都应出现在 REST 起点里
+    let starts = srv.rest_offsets.lock();
+    for want in [0u64, 16 * mb, 20 * mb, 24 * mb] {
+        assert!(
+            starts.contains(&want),
+            "REST 起点缺失 {want}，拆分过程未按预期发生（实际 {starts:?}）"
+        );
+    }
 }

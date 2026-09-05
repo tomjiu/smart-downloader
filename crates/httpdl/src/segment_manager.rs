@@ -12,6 +12,10 @@
 
 use std::collections::VecDeque;
 
+/// 失败缩小粒度重试的最小粒度（P1）：低于该粒度不再拆分（对齐设计 §3.1 的 1MB 防碎片）。
+/// HTTP（download.rs）与 FTP（protocol/ftp.rs）两侧共用同一口径。
+pub(crate) const MIN_RETRY_GRANULARITY: u64 = 1024 * 1024;
+
 /// 段（闭区间 [start, end]，长度 = end - start + 1）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Segment {
