@@ -63,7 +63,7 @@ fn btcore_metadata_api_roundtrip() {
     let save = seed::TempDir::new().expect("tempdir");
     let core = BtCore::new(save.path(), "meta-api").expect("session");
     let _ = core.set_alert_mask(0xFFFF);
-    core.apply_discovery(false, false, false)
+    core.apply_discovery(false, false, false, false)
         .expect("discovery");
 
     let ih = core.add_magnet(seeder.magnet(), &[]).expect("add_magnet");

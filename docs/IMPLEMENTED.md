@@ -482,3 +482,45 @@ check-runs 逐一复核（E13–E33 段：#35–#57）。
 daemon ftp|nas|ftp,nas、btcore --all-targets、daemon bt --all-targets）
 零警告；测试面 daemon default 264 / ftp,nas 275 / bt 322 / btcore 35 /
 httpdl(ftp) 179 / lib 单元 134 全绿。每项独立 PR + CI 三 job 全绿后合并。
+
+> **#22 补记（同日后续 PR）**：#68（BT 本地门槛文档化 `docs/BT_LOCAL_BUILD.md`，
+> 上表已并入 #5 条目）/ #69（httpdl 存量 lint 清零：items-after-test-module 归位、
+> mirror_failover 未消费绑定、task_proxy doc 续行缩进）/ #70（FTP 失败缩小
+> 粒度重试对齐 HTTP + RETR 过量发送死锁修复：读满子段配额即 drop，服务器
+> EPIPE 收尾；测试基建 fail_ranges 注入）——三者均已合并，全口径门禁同上。
+
+### 23. BT 传输/发现配置面补全：PEX / uTP / MSE 加密三态（A 档快赢 #1，2026-09-05）
+
+**行为契约**：
+- 配置面 `[bt]` 新增三键（均启动时一次 apply，不参与热重载）：
+  - `enable_pex`（默认 false）：PEX（peer 交换）。**内核特殊处理**：libtorrent
+    2.0.x 无 settings_pack 会话级 PEX 开关（默认开），`lt_apply_discovery` 置 0 时
+    会话记录意图（`lt_session::pex_disabled`），对**其后新增任务**（magnet/.torrent/
+    resume 三入口）注入 per-torrent `disable_pex` flag；不回溯既有任务（daemon 在
+    任务装配前 apply，故覆盖全部任务）。**行为变化**：daemon 默认 PEX 由内核默认
+    开 → 配置默认关（对齐 M0「发现层默认全关」与私有 tracker 友好）。
+  - `enable_utp`（默认 false）：uTP 双向开关（`enable_incoming_utp`/
+    `enable_outgoing_utp` 同进退），保持 v1 内核「默认纯 TCP」决策。
+  - `encrypt`（默认 `allow`）：MSE（Protocol Encryption）三态——`disable` 纯明文
+    （拒 MSE）/ `allow` 明文+加密皆收（内核默认行为不变）/ `require` 强制加密
+    （明文直接拒）。映射内核 `in/out_enc_policy`（pe_disabled/pe_enabled/pe_forced）；
+    `allowed_enc_level`/`prefer_rc4` 不暴露（保持 pe_both/false）。
+- 契约层：`ffi/lt.h` 新增 `lt_apply_transport(session, enable_utp, enc_policy)`；
+  `lt_apply_discovery` 扩参第 4 位 `enable_pex`；bindings.rs 提交版手动同步。
+- btcore：`ffi::EncryptPolicy`（repr(u32) 0/1/2 对齐内核三态）+ `engine::
+  parse_encrypt_policy`（disable/allow/require，前后空白容忍）；`BtCore::
+  apply_discovery(4 参)` / `apply_transport`。
+- daemon：`BtCfg` 手动 Default（encrypt 缺省必须 "allow" 而非空串；字段级
+  `serde(default = "default_bt_encrypt")` + 容器级 serde(default) 共存）；
+  `Config::load` fail-fast 校验（非法值启动即报错，白名单与 btcore 同口径——
+  btcore 是 feature 门控依赖，config 层本地同步）；`BtEngine::new` 扩参 10 参
+  （`#[allow(clippy::too_many_arguments)]`）；`/config` 快照新增
+  `bt_enable_pex` / `bt_enable_utp` / `bt_encrypt` 三键。
+- `config.toml.example` [bt] 段同步三键注释。
+
+**验证**：btcore 37/0（基线 35 + `apply_transport_smoke_roundtrip`（uTP 两态 ×
+加密三态全组合）+ `parse_encrypt_policy_variants`）；daemon default 266/0、
+bt --all-targets 324/0、ftp,nas 277/0（各基线 +2：`bt_transport_toml_overrides`
+（含 encrypt 缺省回填 allow 断言）+ `bt_encrypt_invalid_rejected`（4 非法值 +
+空白容忍））；fmt/双 clippy 口径 0 告警。G1 手动脚本不受影响（对照 run 全关
+语义不变）。

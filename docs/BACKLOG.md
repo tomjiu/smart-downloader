@@ -1,6 +1,7 @@
 # 未实现清单（整体）— 迅雷 + 通用 + 未来愿景
 
 > 更新：2026-08-27。已完成主线（thunder 解码 / HTTP 断点续传 / BT / fastresume / 热重载 / 状态推进）+ C 类通用缺口中的**代理 + 引擎层限速**（3fac8e3）+ **M6 云兜底调度接线**（c19313a）+ 2026-08-25 四卡落地：**FTP 目录下载**（httpdl 引擎 + daemon 路由）、**BT DHT/LSD/UPnP 配置开关**（FFI `lt_apply_discovery` 全链路）、**.torrent 多文件空间预检**、**TaskSnapshot.files 透出** + 2026-08-27：**httpdl 动态分段（P0，方案A）**（109692c）。
+> 更新：2026-09-05（二）。**BT 传输/发现配置面补全**（PEX/uTP/MSE 加密三态，`lt_apply_transport` + `lt_apply_discovery` 扩参全链路，PEX 经 per-torrent disable_pex 落地——2.0.x 无会话级开关；daemon 默认 PEX 由内核默认开转为配置默认关，对齐 M0 全关语义）。
 > 更新：2026-09-04。**常规能力增强线 E1–E33 全部合并**（PR #22–#57，22 项愿望清单收官：任务管理面/事件三通道/速率全链路/重试/定时错峰/完成 Webhook 与钩子/冲突策略/多源并行/校验扩展/双指纹续传/BT tracker 运行时/Prometheus/探测预览/分享率统计），逐批档案见 [`IMPLEMENTED.md`](IMPLEMENTED.md) #21。
 > **迅雷云盘线现状一句话**：F2/F2.1 的「私有流格式」前提已被考古证伪推翻，F3/F5 PoC 均已通过，主线进入 **Rust 实装 + 活票验收**阶段。
 > **已完成事项的集中档案见 [`IMPLEMENTED.md`](IMPLEMENTED.md)**（行为契约/配置/API/验证证据）。
@@ -41,7 +42,7 @@
 | ~xunlei-import 端到端测试~ | ~~`POST /tasks/xunlei-import` 代码存在但无 e2e 测试~~ **已完成（2026-08-27）**：新增 `crates/daemon/tests/xunlei_import_api.rs`，覆盖合法样本导入、bad base64、xltd 数量不匹配 |
 | ed2k 协议 | ~~明确不支持~~ **链接解析已完成（2026-08-30，`core/src/source_parse/ed2k.rs`：name/size/md4 结构化 + 明确错误分类）**；完整 eMule/eDonkey 客户端协议仍列远期（数周级），并入"跨协议"远期专项（见 F 段）|
 
-已有（防重复列）：并发队列（BT≤3/HTTP·FTP≤8）、HTTP 多连接并行/镜像/换源、**HTTP 动态分段（SegmentManager 动态领取 + 流式写盘，`109692c`）**、**任务级顺序下载（HTTP 在飞窗口 + BT sequential flag，2026-09-02，CAPABILITY_MAP N3 双引擎落地）**、**失败缩小粒度重试（`b70923e`）**、**backup_url/backup_md5 备用源兜底（`963f9dd`）**、sha256 可选校验、BT 校验/做种停止、事件队列背压、全局代理 + 双引擎限速（启动时生效）。
+已有（防重复列）：**BT PEX/uTP/MSE 加密配置面（2026-09-05，`[bt]` 三键 + FFI `lt_apply_transport`；PEX 经 per-torrent disable_pex 实现，内核 2.0.x 无会话级开关）**、并发队列（BT≤3/HTTP·FTP≤8）、HTTP 多连接并行/镜像/换源、**HTTP 动态分段（SegmentManager 动态领取 + 流式写盘，`109692c`）**、**任务级顺序下载（HTTP 在飞窗口 + BT sequential flag，2026-09-02，CAPABILITY_MAP N3 双引擎落地）**、**失败缩小粒度重试（`b70923e`）**、**backup_url/backup_md5 备用源兜底（`963f9dd`）**、sha256 可选校验、BT 校验/做种停止、事件队列背压、全局代理 + 双引擎限速（启动时生效）。
 
 ### 手动验证待办（脚本已备，待人工在真实网络执行）
 

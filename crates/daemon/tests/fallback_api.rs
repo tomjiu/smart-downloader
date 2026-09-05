@@ -18,7 +18,10 @@ async fn serve(
     dest: std::path::PathBuf,
     providers: Vec<Arc<dyn smart_dl_provider::RemoteProvider>>,
 ) -> (std::net::SocketAddr, Arc<DaemonState>) {
-    let bt = smart_dl_daemon::bt::BtEngine::new(&dest, None, 0, 0, false, false, false).unwrap();
+    let bt = smart_dl_daemon::bt::BtEngine::new(
+        &dest, None, 0, 0, false, false, false, false, false, "allow",
+    )
+    .unwrap();
     let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
     let state = Arc::new(
         DaemonState::new(Arc::new(http), providers)

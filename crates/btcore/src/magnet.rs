@@ -87,7 +87,7 @@ pub fn fetch_metadata(
     let core = BtCore::new(scratch_dir, "magnet-fetch")
         .map_err(|e| FetchError::Other(format!("临时 session 初始化失败: {e:?}")))?;
     // 会话默认发现层全关（M0 确定性语义）；此处按 opts 显式打开 DHT。
-    core.apply_discovery(opts.enable_dht, false, false)
+    core.apply_discovery(opts.enable_dht, false, false, false)
         .map_err(|e| FetchError::Other(format!("discovery 设置失败: {e:?}")))?;
     // alert 全开（诊断友好；抓取循环只看 status，alert 随 session Drop 丢弃）
     let _ = core.set_alert_mask(0xFFFF);

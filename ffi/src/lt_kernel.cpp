@@ -58,6 +58,10 @@ struct lt_session {
     std::map<std::string, std::vector<char>> resume_map;
     // read_piece 轮询（v2）：lt_read_piece 触发 async read_piece；drain 时存 "ih:idx" → 数据
     std::map<std::string, std::vector<char>> read_map;
+    // PEX 会话策略：内核 2.0.x 无 settings_pack 会话级开关（PEX 默认开），
+    // 由 lt_apply_discovery 记录意图，新增任务时注入 per-torrent disable_pex
+    // flag（不回溯既有任务；daemon 在任务装配前 apply 故覆盖全部任务）。
+    bool pex_disabled = false;
 
     explicit lt_session(const char* path)
         : ses(lt::session_params())
@@ -239,10 +243,11 @@ lt_err lt_apply_network(lt_session* s,
     }
 }
 
-lt_err lt_apply_discovery(lt_session* s, int enable_dht, int enable_lsd, int enable_upnp) {
+lt_err lt_apply_discovery(lt_session* s, int enable_dht, int enable_lsd, int enable_upnp,
+                          int enable_pex) {
     if (!s) return LT_ERR_ARG;
     try {
-        // 会话默认全关（M0 确定性语义，见 lt_session_new）；此处显式覆盖三项。
+        // 会话默认全关（M0 确定性语义，见 lt_session_new）；此处显式覆盖四项。
         // enable_upnp 同时控制 enable_natpmp（端口映射族同进退，见 lt.h 契约注释）。
         lt::settings_pack sp;
         sp.set_bool(lt::settings_pack::enable_dht, enable_dht != 0);
@@ -250,10 +255,50 @@ lt_err lt_apply_discovery(lt_session* s, int enable_dht, int enable_lsd, int ena
         sp.set_bool(lt::settings_pack::enable_upnp, enable_upnp != 0);
         sp.set_bool(lt::settings_pack::enable_natpmp, enable_upnp != 0);
         s->ses.apply_settings(sp);
+        // PEX 特殊：2.0.x 无会话级开关，会话记录意图，新增任务时注入
+        // per-torrent disable_pex flag（见 apply_pex_policy；不回溯既有任务）。
+        s->pex_disabled = (enable_pex == 0);
         return LT_OK;
     } catch (...) {
         return LT_ERR_ENGINE;
     }
+}
+
+lt_err lt_apply_transport(lt_session* s, int enable_utp, int enc_policy) {
+    if (!s) return LT_ERR_ARG;
+    try {
+        // 会话默认 uTP 关 + 加密允许（M0 确定性语义，见 lt_session_new）；此处显式覆盖。
+        // enable_utp 同时控制 incoming/outgoing（uTP 族同进退，见 lt.h 契约注释）。
+        lt::settings_pack sp;
+        sp.set_bool(lt::settings_pack::enable_incoming_utp, enable_utp != 0);
+        sp.set_bool(lt::settings_pack::enable_outgoing_utp, enable_utp != 0);
+        // MSE 加密三态映射（in/out_enc_policy：pe_disabled/pe_enabled/pe_forced）。
+        // allowed_enc_level 保持内核默认 pe_both、prefer_rc4 保持 false，不干预。
+        switch (enc_policy) {
+        case 0:
+            sp.set_int(lt::settings_pack::in_enc_policy, lt::settings_pack::pe_disabled);
+            sp.set_int(lt::settings_pack::out_enc_policy, lt::settings_pack::pe_disabled);
+            break;
+        case 2:
+            sp.set_int(lt::settings_pack::in_enc_policy, lt::settings_pack::pe_forced);
+            sp.set_int(lt::settings_pack::out_enc_policy, lt::settings_pack::pe_forced);
+            break;
+        default:
+            sp.set_int(lt::settings_pack::in_enc_policy, lt::settings_pack::pe_enabled);
+            sp.set_int(lt::settings_pack::out_enc_policy, lt::settings_pack::pe_enabled);
+            break;
+        }
+        s->ses.apply_settings(sp);
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+// PEX 会话策略落地（内核 2.0.x 无 settings_pack 会话开关）：pex_disabled=true
+// 时对新增任务注入 per-torrent disable_pex；默认（false）不动 flags = 内核行为。
+void apply_pex_policy(lt_session* s, lt::add_torrent_params& p) {
+    if (s->pex_disabled) p.flags |= lt::torrent_flags::disable_pex;
 }
 
 lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, char* ih_out) {
@@ -265,6 +310,7 @@ lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, 
         // 从源头阻止 lt 队列在 metadata/checking 完成后自动复活。
         p.flags &= ~lt::torrent_flags::auto_managed;
         p.flags |= lt::torrent_flags::paused;
+        apply_pex_policy(s, p);
         if (web_seeds) {
             for (const char** ws = web_seeds; *ws != nullptr; ++ws) {
                 p.url_seeds.emplace_back(*ws);
@@ -458,6 +504,7 @@ lt_err lt_add_torrent_file(lt_session* s, const uint8_t* meta, size_t len, const
         p.save_path = s->save_path;
         p.flags &= ~lt::torrent_flags::auto_managed;
         p.flags |= lt::torrent_flags::paused;
+        apply_pex_policy(s, p);
         set_web_seeds(p, web_seeds);
         return fill_ih(s, p, web_seeds, ih_out);
     } catch (...) {
@@ -476,6 +523,7 @@ lt_err lt_add_torrent_resume(lt_session* s, const uint8_t* resume_data, size_t l
         p.save_path = s->save_path;
         p.flags &= ~lt::torrent_flags::auto_managed;
         p.flags |= lt::torrent_flags::paused;
+        apply_pex_policy(s, p);
         set_web_seeds(p, web_seeds);
         return fill_ih(s, p, web_seeds, ih_out);
     } catch (...) {

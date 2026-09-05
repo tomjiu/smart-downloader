@@ -34,8 +34,10 @@
 ```
 
 **已实现对照**：Source Pool 的雏形=Provider fallback + webseeds 注入端点；
-Piece 合并=libtorrent 原生；多连接 Range=httpdl。DHT/PEX/uTP=内核内置开关
-（M0 关闭决策，G1 手动验证脚本已备）。
+Piece 合并=libtorrent 原生；多连接 Range=httpdl。DHT/PEX/uTP/MSE 加密=配置开关
+（2026-09-05 落地 `[bt]` 四键配置面：enable_dht/lsd/upnp/pex + enable_utp + encrypt 三态；
+PEX 经 per-torrent disable_pex 实现——内核 2.0.x 无会话级开关；M0 默认全关决策，
+G1 手动验证脚本已备）。
 
 ---
 

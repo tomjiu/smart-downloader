@@ -149,6 +149,24 @@ pub fn parse_proxy(url: &str) -> Result<ProxyCfg> {
     })
 }
 
+/// MSE（Protocol Encryption）握手策略，对应 `lt_apply_transport` 的 enc_policy：
+/// `Disable` = 纯明文（拒绝 MSE 连接）/ `Allow` = 明文+加密皆收（内核默认行为）/
+/// `Require` = 仅加密（明文直接拒绝）。取值与内核 enc_policy 三态一一对应
+///（0=pe_disabled 1=pe_enabled 2=pe_forced），新增变体须同步 lt.h 契约注释。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum EncryptPolicy {
+    Disable = 0,
+    Allow = 1,
+    Require = 2,
+}
+
+impl EncryptPolicy {
+    pub fn as_c_int(self) -> c_int {
+        self as u32 as c_int
+    }
+}
+
 impl Session {
     pub fn new(save_path: &Path, session_id: &str) -> Result<Self> {
         let sp = cstr(&save_path.to_string_lossy())?;
@@ -202,13 +220,16 @@ impl Session {
         call(code, || Ok(()))
     }
 
-    /// 发现层开关：DHT / LSD / UPnP（enable_upnp 同时控制 NAT-PMP——端口映射族）。
-    /// 会话默认全关（M0 确定性语义）；本方法显式覆盖。
+    /// 发现层开关：DHT / LSD / UPnP / PEX（enable_upnp 同时控制 NAT-PMP——端口映射族）。
+    /// 内核默认 DHT/LSD/UPnP 关、PEX 开（M0 确定性语义）；本方法显式覆盖。
+    /// PEX 特殊：内核 2.0.x 无会话级 settings_pack 开关，置 false 经 per-torrent
+    /// disable_pex flag 落地（仅对其后新增任务生效，见 lt.h 契约注释）。
     pub fn apply_discovery(
         &self,
         enable_dht: bool,
         enable_lsd: bool,
         enable_upnp: bool,
+        enable_pex: bool,
     ) -> Result<()> {
         let code = unsafe {
             lt_apply_discovery(
@@ -216,8 +237,17 @@ impl Session {
                 enable_dht as c_int,
                 enable_lsd as c_int,
                 enable_upnp as c_int,
+                enable_pex as c_int,
             )
         };
+        call(code, || Ok(()))
+    }
+
+    /// 传输层开关：uTP（incoming/outgoing 同进退）+ MSE 加密三态。
+    /// 会话默认 uTP 关 + 加密允许（M0 确定性语义）；本方法显式覆盖。
+    pub fn apply_transport(&self, enable_utp: bool, enc_policy: EncryptPolicy) -> Result<()> {
+        let code =
+            unsafe { lt_apply_transport(self.raw, enable_utp as c_int, enc_policy.as_c_int()) };
         call(code, || Ok(()))
     }
 
