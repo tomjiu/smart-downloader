@@ -417,7 +417,8 @@ integration）全绿 → merge → 合并提交 check-runs 复核」流程逐批
 - **定时/错峰**（E23）：`start_at_unix` 未来时刻到点前不入引擎（停留 Queued，
   pause = 取消定时，resume = 立即激活）；`[scheduler] start_jitter_seconds`
   仅在 start_at 缺省时叠加（0..=N 秒随机）。宽容语义：过去时刻不 400。
-- **重试体系**：E30 自动重试 `auto_retry`（0..=10，越界 400；仅 HTTP/FTP），
+- **重试体系**：E30 自动重试 `auto_retry`（0..=10，越界 400；原仅 HTTP/FTP，
+  2026-09-05 A2 起 BT alert 快路径同口径拦截，见 #24），
   指数退避 2s/4s/8s…封顶 60s，预算耗尽落 Failed；E32 手动重试 = 终态 Failed
   任务 `resume`（重新接入引擎），**不重置** auto_retry 预算（防白给循环）。
 - **校验**（E25/E6）：`sha256`/`sha1`/`md5` 三选一互斥（同时多个 → 400）；
@@ -524,3 +525,28 @@ bt --all-targets 324/0、ftp,nas 277/0（各基线 +2：`bt_transport_toml_overr
 （含 encrypt 缺省回填 allow 断言）+ `bt_encrypt_invalid_rejected`（4 非法值 +
 空白容忍））；fmt/双 clippy 口径 0 告警。G1 手动脚本不受影响（对照 run 全关
 语义不变）。
+
+### 24. auto_retry 覆盖 BT 任务（A 档快赢 #2，2026-09-05）
+
+**行为契约**：
+- E30 失败自动重试此前仅拦截 HTTP/FTP：轮询路径（ops poll snapshot → `fail_or_schedule_retry`）
+  与引擎 add 失败路径均引擎无关，但 **BT alert 快路径**（`apply_bt_alert` 收到
+  State:Error alert）直写 Failed 绕过重试——alert 先到即定终，轮询兜底拦截形同虚设。
+- 本次对齐：`apply_bt_alert` 对 Error alert 命中**活跃任务**（Queued/Downloading）时
+  经 `fail_or_schedule_retry` 拦截——预算未用尽 → 清引擎句柄回 Queued 安排指数退避
+  （调度循环 `activate_due_tasks` → `activate_one` 本就引擎无关，BT 经
+  `engine_for(Bt) + add` 重接入，复用 fastresume）；预算用尽 → Failed 终态。
+- **活跃态门控**与轮询路径守卫一致：仅 Queued/Downloading 拦截；Paused/Seeding 下的
+  Error 保持旧直终语义（暂停任务不得被重试悄悄复活；做种失败不自动重下）。
+- 广播与可观测：BtAlertEffect.to 为拦截后实际目标（Queued，非引擎报的 Failed）；
+  `engine_status.error` 按引擎原始去向记录（重试排队也保留最近失败原因）；
+  停转速率清零扩展到重试排队（E11 同源，防 /stats 陈旧速率虚高）。
+- 持久化：重试安排（next_retry_at_unix）随 TaskMetadata autosave 落盘，重启恢复
+  继续等待（E30 既有语义，BT 无新增持久化面）。
+
+**验证**：bt_alert_tests 新增 4 测——`error_alert_within_budget_schedules_retry`
+（拦截 → Queued + 预算消耗 + 句柄清空 + 退避安排 + auto_retry 事件 + error 保留 +
+速率清零）/ `error_alert_exhausted_budget_is_terminal` / `error_alert_on_paused_
+stays_terminal` / `error_alert_on_seeding_stays_terminal`；既有
+`error_alert_fails_with_message`（预算 0）不变绿。btcore 37/0 / daemon default
+266/0 / bt --all-targets 328/0（+4）/ fmt / workspace clippy 0 告警。

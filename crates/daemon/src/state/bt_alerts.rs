@@ -281,6 +281,9 @@ impl DaemonState {
 
     /// 应用一条 BT alert 到匹配任务（engine_tid 大小写不敏感归一化比较）：
     /// 状态迁移（`bt_events::transition_for`）+ 引擎缓存写入；返回效果供广播。
+    /// E30 对齐（A2）：Error alert 命中活跃任务（Queued/Downloading）时经
+    /// `fail_or_schedule_retry` 拦截——预算未用尽回 Queued 安排退避重激活，
+    /// 广播目标为拦截后的实际状态；Paused/Seeding 下保持旧直终语义。
     /// 无匹配任务或无迁移 → `None`（调用方丢弃该 alert）。
     ///
     /// Bug B 根因修复：`autosave()` 必须在 tasks 锁【外】调用——autosave →
@@ -305,19 +308,36 @@ impl DaemonState {
                 }
                 // 命中任务（每条 alert 至多匹配一个 rec）：无迁移 → 丢弃
                 let now = rec.task.state.clone();
-                let Some((from, to)) = crate::bt_events::transition_for(&now, a) else {
+                let Some((from, raw_to)) = crate::bt_events::transition_for(&now, a) else {
                     break;
+                };
+                // E30 对齐（PR #72）：失败拦截与轮询路径（ops poll snapshot）同口径——
+                // 重试预算未用尽 → 清句柄回 Queued 安排指数退避重激活（调度循环
+                // 到期重接入引擎）；预算用尽 → Failed 终态。alert 快路径此前
+                // 直写 Failed 绕过重试（轮询兜底路径虽已拦截，但 alert 先到即定终）。
+                // 活跃态门控与轮询路径守卫一致（仅 Queued/Downloading 拦截）：
+                // Paused/Seeding 下的 Error 保持旧直终语义（暂停任务不得被
+                // 重试悄悄复活；做种失败不自动重下）。
+                let to = if raw_to == TaskState::Failed
+                    && matches!(now, TaskState::Queued | TaskState::Downloading(_))
+                {
+                    rec.fail_or_schedule_retry(Some(&a.msg))
+                } else {
+                    raw_to.clone()
                 };
                 rec.task.state = to.clone();
                 if let Some(es) = rec.engine_status.as_mut() {
-                    if to == TaskState::Failed {
+                    // 错误信息按引擎原始去向记录（重试排队也保留最近失败原因可观测）
+                    if raw_to == TaskState::Failed {
                         es.error = Some(a.msg.clone());
                     }
                     // E11：BT 走向非活跃态时轮询缓存仍持最后窗口速率——
                     // 轮询器不再光顾非活跃任务，不清则 /stats 聚合虚高（陈旧速率）。
                     // Seeding 不清：仍是活跃轮询候选，下一轮以引擎实时值刷新。
+                    // 重试拦截（Queued）同样清零：引擎已停转，重激活前轮询器
+                    // 不再光顾（engine_tid 已清），陈旧速率同理虚高。
                     if matches!(
-                        to,
+                        raw_to,
                         TaskState::Paused
                             | TaskState::Completed
                             | TaskState::Failed
@@ -330,6 +350,8 @@ impl DaemonState {
                 found = Some(BtAlertEffect {
                     task_id: id.clone(),
                     from,
+                    // E30：广播拦截后的实际目标（重试安排 = Queued，非引擎报的
+                    // Failed），与轮询路径 E30 注释同口径
                     to,
                     message: a.msg.clone(),
                 });
