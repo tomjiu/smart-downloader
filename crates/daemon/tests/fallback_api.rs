@@ -50,6 +50,7 @@ async fn add_magnet(base: &str, client: &reqwest::Client) -> String {
 
 #[tokio::test]
 async fn fallback_transfers_direct_link_and_completes() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let size: u64 = 256 * 1024;
     let body = patterned(size);
     let srv = TestServer::start(body.clone()).await;
@@ -116,6 +117,7 @@ async fn fallback_transfers_direct_link_and_completes() {
 
 #[tokio::test]
 async fn fallback_without_providers_errors_cleanly() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let dir = tempfile::tempdir().unwrap();
     let (addr, _state) = serve(dir.path().to_path_buf(), vec![]).await;
     let base = format!("http://{addr}");
@@ -144,6 +146,7 @@ async fn fallback_without_providers_errors_cleanly() {
 
 #[tokio::test]
 async fn fallback_skips_disabled_provider_and_uses_next() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let size: u64 = 256 * 1024;
     let body = patterned(size);
     let srv = TestServer::start(body.clone()).await;
@@ -194,6 +197,7 @@ async fn fallback_skips_disabled_provider_and_uses_next() {
 
 #[tokio::test]
 async fn fallback_skips_quota_exhausted_provider_and_uses_next() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let size: u64 = 256 * 1024;
     let body = patterned(size);
     let srv = TestServer::start(body.clone()).await;
@@ -244,6 +248,7 @@ async fn fallback_skips_quota_exhausted_provider_and_uses_next() {
 
 #[tokio::test]
 async fn fallback_skips_auth_failed_provider_and_uses_next() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let size: u64 = 256 * 1024;
     let body = patterned(size);
     let srv = TestServer::start(body.clone()).await;

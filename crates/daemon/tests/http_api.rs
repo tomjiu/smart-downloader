@@ -81,6 +81,7 @@ async fn add_task(
 /// URL 维度判别用 TestServer 端口号（`:port` 为 url 的唯一子串）。
 #[tokio::test]
 async fn list_tasks_search_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     async fn list_ids(client: &reqwest::Client, base: &str, qs: &str) -> Vec<String> {
         let v: serde_json::Value = client
             .get(format!("{base}/tasks{qs}"))
@@ -174,6 +175,7 @@ async fn list_tasks_search_e2e() {
 /// 未知任务 404。落盘路径不受影响属引擎 add 时决策（不在 API 可断言面）。
 #[tokio::test]
 async fn task_rename_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let srv = TestServer::start(patterned(8 * 1024)).await;
     let (addr, _state) = serve().await;
     let base = format!("http://{addr}");
@@ -256,6 +258,7 @@ async fn task_rename_e2e() {
 
 #[tokio::test]
 async fn add_task_then_get_snapshot_and_list() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let body = patterned(64 * 1024);
     let srv = TestServer::start(body).await;
     let (addr, _state) = serve().await;
@@ -292,6 +295,7 @@ async fn add_task_then_get_snapshot_and_list() {
 
 #[tokio::test]
 async fn duplicate_add_rejected_with_event() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let body = patterned(32 * 1024);
     let srv = TestServer::start(body).await;
     let (addr, state) = serve().await;
@@ -324,6 +328,7 @@ async fn duplicate_add_rejected_with_event() {
 
 #[tokio::test]
 async fn pause_resume_via_http() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let body = patterned(16 * 1024);
     let srv = TestServer::start(body).await;
     let (addr, state) = serve().await;
@@ -351,6 +356,7 @@ async fn pause_resume_via_http() {
 
 #[tokio::test]
 async fn provider_status_snapshot() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // Provider 健康/配额/冷却快照（GET /providers）
     let (addr, _state) = serve().await;
     let base = format!("http://{addr}");
@@ -368,6 +374,7 @@ async fn provider_status_snapshot() {
 
 #[tokio::test]
 async fn unknown_task_returns_404() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, _state) = serve().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -390,6 +397,7 @@ fn hub_wired_into_state() {
 
 #[tokio::test]
 async fn same_resource_different_tokens_deduped_d34() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // D34：canonical 身份剥离 token 参数 → 同资源不同签名 token 判为同一任务（409）
     let body = patterned(16 * 1024);
     let srv = TestServer::start(body).await;
@@ -410,6 +418,7 @@ async fn same_resource_different_tokens_deduped_d34() {
 
 #[tokio::test]
 async fn distinct_query_params_are_distinct_tasks() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 非 token 参数差异 → 不同 canonical → 允许添加
     let body = patterned(16 * 1024);
     let srv = TestServer::start(body).await;
@@ -442,6 +451,7 @@ fn qqdl_link(real: &str) -> String {
 
 #[tokio::test]
 async fn thunder_link_decoded_and_added() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // thunder:// = base64("AA"+url+"ZZ") → 归一化后走 HTTP 引擎 → 201
     let body = patterned(16 * 1024);
     let srv = TestServer::start(body).await;
@@ -473,6 +483,7 @@ async fn thunder_link_decoded_and_added() {
 
 #[tokio::test]
 async fn qqdl_link_decoded_and_added() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // qqdl:// = base64(url)（无 AA/ZZ 壳）→ 201
     let body = patterned(16 * 1024);
     let srv = TestServer::start(body).await;
@@ -487,6 +498,7 @@ async fn qqdl_link_decoded_and_added() {
 #[cfg(feature = "bt")]
 #[tokio::test]
 async fn magnet_ed2k_unknown_rejected_with_clear_error() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 归一化分类：magnet→BT；ed2k→不支持；未知→无法识别
     let (addr, _state) = serve().await;
     let base = format!("http://{addr}");
@@ -534,6 +546,7 @@ async fn magnet_ed2k_unknown_rejected_with_clear_error() {
 
 #[tokio::test]
 async fn config_endpoint_returns_injected_snapshot() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // with_config 注入 → GET /config 返回精简快照
     let engine = HttpEngine::new(reqwest::Client::new());
     let state = Arc::new(
@@ -561,6 +574,7 @@ async fn config_endpoint_returns_injected_snapshot() {
 
 #[tokio::test]
 async fn task_logs_source_is_redacted() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // H-1 回归：`GET /tasks/:id/logs` 的 source 快照必须经 redacted_debug()——
     // 源 URL 中的 userinfo 凭据不得明文外溢（state.rs 曾漏改一处裸 format!(\"{:?}\")）。
     let body = patterned(1024);
@@ -600,6 +614,7 @@ async fn task_logs_source_is_redacted() {
 
 #[tokio::test]
 async fn task_logs_returns_add_event() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // add 任务 → GET /tasks/:id/logs → events 含 add 操作
     let body = patterned(8 * 1024);
     let srv = TestServer::start(body).await;
@@ -630,6 +645,7 @@ async fn task_logs_returns_add_event() {
 
 #[tokio::test]
 async fn fallback_on_missing_task_returns_404() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // M6 已接线：不存在的任务 → 404（不再 501）
     let (addr, _state) = serve().await;
     let base = format!("http://{addr}");
@@ -652,6 +668,7 @@ async fn fallback_on_missing_task_returns_404() {
 
 #[tokio::test]
 async fn fallback_on_http_task_is_rejected() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // M6：兜底仅面向 BT 任务（HTTP 任务直接拒绝）
     let body = patterned(8 * 1024);
     let srv = TestServer::start(body).await;
@@ -742,6 +759,7 @@ async fn wait_event(
 /// Completed + 事件广播；二次轮询无效果（幂等，不重复广播）。
 #[tokio::test]
 async fn http_task_completed_advances_list_state() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let body = patterned(64 * 1024);
     let srv = TestServer::start(body).await;
     let (addr, state) = serve().await;
@@ -774,6 +792,7 @@ async fn http_task_completed_advances_list_state() {
 /// 脆弱服务器：首个请求（probe bytes=0-0）206 通过预检 → 后续下载请求 500（运行期失败）。
 #[tokio::test]
 async fn http_task_failure_marks_failed_in_list() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     use axum::{
         body::Body,
         http::HeaderMap,
@@ -855,6 +874,7 @@ async fn serve_with_token() -> std::net::SocketAddr {
 
 #[tokio::test]
 async fn auth_required_when_token_configured() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let addr = serve_with_token().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -899,6 +919,7 @@ async fn auth_required_when_token_configured() {
 
 #[tokio::test]
 async fn auth_open_when_token_not_configured() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 未配置 token（回环兼容模式）→ 不带 Authorization 也放行
     let (addr, _state) = serve().await;
     let client = reqwest::Client::new();
@@ -932,6 +953,7 @@ fn verify_http_token_unit() {
 /// P2 运维 API：/health 存活探针 + /version 构建信息。
 #[tokio::test]
 async fn health_and_version_report_build_info() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, _state) = serve().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -966,6 +988,7 @@ async fn health_and_version_report_build_info() {
 /// P2 运维 API：/stats 聚合（初始 0 → 加 1 任务后 total=1 且 by_state/by_engine 有值）。
 #[tokio::test]
 async fn stats_reflect_task_counts() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let body = patterned(64 * 1024);
     let srv = TestServer::start(body).await;
     let (addr, _state) = serve().await;
@@ -1013,6 +1036,7 @@ async fn stats_reflect_task_counts() {
 
 #[tokio::test]
 async fn task_limit_set_then_merge_and_snapshot_echo() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let body = patterned(64 * 1024);
     let srv = TestServer::start(body).await;
     let (addr, _state) = serve().await;
@@ -1071,6 +1095,7 @@ async fn task_limit_set_then_merge_and_snapshot_echo() {
 
 #[tokio::test]
 async fn task_limit_up_direction_rejected_for_http_task() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // HTTP 任务无上传方向 → 409（state 层预拒，非 500）
     let body = patterned(16 * 1024);
     let srv = TestServer::start(body).await;
@@ -1097,6 +1122,7 @@ async fn task_limit_up_direction_rejected_for_http_task() {
 
 #[tokio::test]
 async fn task_limit_unknown_task_404() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, _state) = serve().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -1112,6 +1138,7 @@ async fn task_limit_unknown_task_404() {
 
 #[tokio::test]
 async fn add_task_with_down_kb_s_applies_limit() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 建任务请求携带 down_kb_s → 创建即生效（快照回显）
     let body = patterned(16 * 1024);
     let srv = TestServer::start(body).await;
@@ -1147,6 +1174,7 @@ async fn add_task_with_down_kb_s_applies_limit() {
 
 #[tokio::test]
 async fn http_task_file_priority_conflict() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 子文件优先级仅 BT 任务：HTTP 任务 → 409（双构建通用，不依赖 bt feature）
     let body = patterned(16 * 1024);
     let srv = TestServer::start(body).await;
@@ -1201,6 +1229,7 @@ async fn poll_terminal(client: &reqwest::Client, base: &str, tid: &str) -> serde
 /// 错误校验和 → 降级接受仍 Completed + 告警含 sha256（Q-B5 语义经 API 保持）。
 #[tokio::test]
 async fn add_task_with_sha256_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let body = patterned(64 * 1024);
     let mut hasher = Sha256::new();
     hasher.update(&body);
@@ -1261,6 +1290,7 @@ async fn add_task_with_sha256_e2e() {
 /// 即 403）。带正确头 → Completed；不带 → 任务 Failed（探测即拒）。
 #[tokio::test]
 async fn add_task_with_headers_forwarded_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     use axum::extract::Request;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
@@ -1408,6 +1438,7 @@ async fn add_task_with_headers_forwarded_e2e() {
 /// 显式名落盘（E4 metadata.name 权威）。
 #[tokio::test]
 async fn add_task_with_name_and_backup_url_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let body = patterned(64 * 1024);
     let srv = TestServer::start(body).await;
     let (addr, _state) = serve().await;
@@ -1475,6 +1506,7 @@ async fn add_n_tasks(client: &reqwest::Client, base: &str, n: usize, body: &[u8]
 /// 状态过滤不在此赌真实下载竞态（state 层单测覆盖语义），只验证合法值 200。
 #[tokio::test]
 async fn list_tasks_query_filter_pagination_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, _state) = serve().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -1562,6 +1594,7 @@ async fn list_tasks_query_filter_pagination_e2e() {
 /// 不影响全局 200）；malformed 请求 400；全删后列表为空。
 #[tokio::test]
 async fn batch_remove_e2e_and_validation() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, _state) = serve().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -1633,6 +1666,7 @@ async fn batch_remove_e2e_and_validation() {
 /// 与 batch_remove e2e 覆盖）。对存在任务 batch pause → succeeded=2。
 #[tokio::test]
 async fn batch_pause_resume_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, _state) = serve().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -1663,6 +1697,7 @@ async fn batch_pause_resume_e2e() {
 /// （同样 204，数据处置语义由 state 层单测断言）。
 #[tokio::test]
 async fn delete_task_query_delete_data_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, _state) = serve().await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -1685,6 +1720,7 @@ async fn delete_task_query_delete_data_e2e() {
 /// E7 任务名透出：E6 显式名 → 列表条目与快照都带 name 字段。
 #[tokio::test]
 async fn task_name_exposed_in_list_and_snapshot_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let body = patterned(8 * 1024);
     let srv = TestServer::start(body).await;
     let (addr, _state) = serve().await;
@@ -1744,6 +1780,7 @@ async fn task_name_exposed_in_list_and_snapshot_e2e() {
 /// 校验不发起连接）；缺省 body = 清除语义 200；不存在任务 404。
 #[tokio::test]
 async fn set_task_proxy_api_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let body = patterned(8 * 1024);
     let srv = TestServer::start(body).await;
     let (addr, _state) = serve().await;
@@ -1820,6 +1857,7 @@ async fn set_task_proxy_api_e2e() {
 /// 快照/列表透出（显式名与透出链已在 E6/E7 覆盖，此处验证 CD 派生路径）。
 #[tokio::test]
 async fn task_name_backfilled_from_content_disposition_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     use axum::extract::Request;
     use axum::http::{header, StatusCode as SC};
     use axum::response::IntoResponse;
@@ -1930,6 +1968,7 @@ async fn task_name_backfilled_from_content_disposition_e2e() {
 /// 事件经 state.hub() 注入合成序列（无后台 poll 干扰，断言确定性）。
 #[tokio::test]
 async fn events_api_pagination_filter_and_validation_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     use smart_dl_core::state_machine::TaskState;
 
     let (addr, state) = serve().await;
@@ -2093,6 +2132,7 @@ async fn events_api_pagination_filter_and_validation_e2e() {
 /// 故本测试等待阶段用 list（读记录不触引擎），速率等待阶段只打 /stats）。
 #[tokio::test]
 async fn stats_aggregates_live_down_rate_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let total = 1024 * 1024; // 1MiB < DEFAULT_MIN_SPLIT → 单连接整流
     let srv = SlowTestServer::start(patterned(total), 20, 200).await; // ≈4s
     let (addr, state) = serve().await;
@@ -2159,6 +2199,7 @@ async fn stats_aggregates_live_down_rate_e2e() {
 /// pause 后双速立即清零（记录级 Paused 权威裁决，不等引擎窗口自愈）。
 #[tokio::test]
 async fn task_snapshot_exposes_live_rates_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let total = 1024 * 1024; // 1MiB < DEFAULT_MIN_SPLIT → 单连接整流
     let srv = SlowTestServer::start(patterned(total), 20, 200).await; // ≈4s
     let (addr, state) = serve().await;
@@ -2307,6 +2348,7 @@ fn parse_sse(text: &str) -> (Vec<String>, Vec<String>, Vec<String>, Vec<String>)
 /// + type 过滤在重放生效。
 #[tokio::test]
 async fn events_stream_replay_shape_and_filter_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, state) = serve().await;
     state.hub().publish(SchedulerEvent::TaskCreated {
         task_id: "t1".into(),
@@ -2351,6 +2393,7 @@ async fn events_stream_replay_shape_and_filter_e2e() {
 /// seq > id 处续推；`after` 参数显式覆盖优先。
 #[tokio::test]
 async fn events_stream_last_event_id_resume_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, state) = serve().await;
     for i in 1..=4 {
         state.hub().publish(SchedulerEvent::TaskCreated {
@@ -2388,6 +2431,7 @@ async fn events_stream_last_event_id_resume_e2e() {
 /// E12: 非法 type → 400（流建立前拒绝，带合法值全集提示）。
 #[tokio::test]
 async fn events_stream_bad_type_400_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, _state) = serve().await;
     let client = reqwest::Client::new();
     let resp = client
@@ -2406,6 +2450,7 @@ async fn events_stream_bad_type_400_e2e() {
 /// E12: 活流尾随——连接后发布的事件经 200ms 轮询增量推达（不只重放）。
 #[tokio::test]
 async fn events_stream_live_tail_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, state) = serve().await;
     // 先连接（重放为空），随后发布 → 读窗内应收到
     let reader = tokio::spawn(sse_read_for(
@@ -2434,6 +2479,7 @@ async fn events_stream_live_tail_e2e() {
 /// 从缓冲最旧重放（seq 回退客户端可观测，同 REST truncated 判定输入）。
 #[tokio::test]
 async fn events_stream_gap_replays_from_oldest_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let (addr, state) = serve().await;
     // 4100 条冲掉 seq 1..=4（缓冲 4096）
     for i in 1..=4100u64 {
@@ -2469,6 +2515,7 @@ async fn events_stream_gap_replays_from_oldest_e2e() {
 /// 错误 sha1 → 降级接受 + 告警点名 sha1（Q-B5 语义经 API 保持）。
 #[tokio::test]
 async fn add_task_with_md5_sha1_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let body = patterned(64 * 1024);
     let mut hasher = Sha256::new();
     hasher.update(&body);

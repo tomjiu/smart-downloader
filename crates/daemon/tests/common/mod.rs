@@ -1,5 +1,7 @@
 //! M6 测试共享：直链 HTTP server（daemon 任务下载源）。
 
+pub mod lt_gate;
+
 use axum::{
     extract::State,
     http::{header, HeaderMap, StatusCode},
@@ -22,10 +24,12 @@ pub struct DirectLinkServer {
     pub body: Arc<Vec<u8>>,
 }
 
+#[allow(dead_code)] // 仅部分 binary（http_api 等）构造；纯 lt_gate 使用者（bt_metadata 等）全 dead
 pub struct TestServer {
     pub addr: SocketAddr,
 }
 
+#[allow(dead_code)]
 impl TestServer {
     pub async fn start(body: Vec<u8>) -> Self {
         let st = DirectLinkServer {
@@ -45,6 +49,7 @@ impl TestServer {
     }
 }
 
+#[allow(dead_code)] // 同 TestServer：仅 DirectLinkServer 使用者 binary 活跃
 async fn handler(State(st): State<DirectLinkServer>, headers: HeaderMap) -> Response {
     match headers.get(header::RANGE).and_then(|v| v.to_str().ok()) {
         Some(r) => {
