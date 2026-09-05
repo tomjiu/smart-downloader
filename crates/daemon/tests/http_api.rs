@@ -33,6 +33,9 @@ async fn serve() -> (std::net::SocketAddr, Arc<DaemonState>) {
             false,
             false,
             false,
+            false,
+            false,
+            "allow",
         )
         .expect("bt engine");
         DaemonState::new(Arc::new(engine), vec![])

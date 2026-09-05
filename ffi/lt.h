@@ -40,11 +40,24 @@ lt_err lt_apply_network(lt_session* s,
                         const char* proxy_user, const char* proxy_pass,
                         int64_t down_bytes, int64_t up_bytes);
 
-/* —— 发现层开关（DHT / LSD / UPnP）——
-   三个开关独立设置（0=关 1=开）；enable_upnp 同时控制 enable_natpmp
+/* —— 发现层开关（DHT / LSD / UPnP / PEX）——
+   四个开关独立设置（0=关 1=开）；enable_upnp 同时控制 enable_natpmp
    （端口映射族同进退，不提供单独 NAT-PMP 开关）。
-   会话默认全关（M0 确定性语义，见 lt_session_new）；本函数后置覆盖。 */
-lt_err lt_apply_discovery(lt_session* s, int enable_dht, int enable_lsd, int enable_upnp);
+   enable_pex 特殊：内核 2.0.x 无会话级 settings_pack 开关（PEX 默认开）——
+   置 0 时会话记录意图，对其后新增任务注入 per-torrent disable_pex flag
+   （不回溯既有任务；daemon 在任务装配前 apply 故覆盖全部任务）。
+   会话默认 DHT/LSD/UPnP 全关、PEX 开（M0 确定性语义，见 lt_session_new）；
+   本函数后置覆盖。 */
+lt_err lt_apply_discovery(lt_session* s, int enable_dht, int enable_lsd, int enable_upnp,
+                          int enable_pex);
+
+/* —— 传输层开关（uTP / MSE 加密）——
+   enable_utp 同时控制 enable_incoming_utp/enable_outgoing_utp
+   （uTP 族同进退，不提供单向开关）。
+   enc_policy: 0=禁用（纯明文）1=允许（明文+MSE 皆收，内核默认）2=强制（仅加密）。
+   allowed_enc_level / prefer_rc4 不在此暴露（保持内核默认 pe_both/false）；
+   会话默认 uTP 关 + 加密允许（M0 确定性语义）；本函数后置覆盖。 */
+lt_err lt_apply_transport(lt_session* s, int enable_utp, int enc_policy);
 
 /* —— 添加/移除（5）—— */
 lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, char* ih_out /*41 字节*/);

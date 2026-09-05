@@ -27,8 +27,10 @@ fn read_sample(name: &str) -> Vec<u8> {
 
 async fn serve(dest: std::path::PathBuf) -> (std::net::SocketAddr, Arc<DaemonState>) {
     let engine = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
-    let bt = smart_dl_daemon::bt::BtEngine::new(&dest, None, 0, 0, false, false, false)
-        .expect("bt engine");
+    let bt = smart_dl_daemon::bt::BtEngine::new(
+        &dest, None, 0, 0, false, false, false, false, false, "allow",
+    )
+    .expect("bt engine");
     let state = Arc::new(
         DaemonState::new(Arc::new(engine), vec![])
             .with_dest_root(dest.clone())

@@ -218,6 +218,14 @@ unsafe extern "C" {
         enable_dht: ::std::os::raw::c_int,
         enable_lsd: ::std::os::raw::c_int,
         enable_upnp: ::std::os::raw::c_int,
+        enable_pex: ::std::os::raw::c_int,
+    ) -> lt_err;
+}
+unsafe extern "C" {
+    pub fn lt_apply_transport(
+        s: *mut lt_session,
+        enable_utp: ::std::os::raw::c_int,
+        enc_policy: ::std::os::raw::c_int,
     ) -> lt_err;
 }
 unsafe extern "C" {

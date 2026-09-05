@@ -123,6 +123,17 @@ impl From<lt_peer> for PeerInfo {
     }
 }
 
+/// 加密策略字符串 → `EncryptPolicy`（daemon `bt.encrypt` 配置面同口径）：
+/// `disable` / `allow` / `require`（前后空白容忍），其余（含空串）返回 None。
+pub fn parse_encrypt_policy(s: &str) -> Option<ffi::EncryptPolicy> {
+    match s.trim() {
+        "disable" => Some(ffi::EncryptPolicy::Disable),
+        "allow" => Some(ffi::EncryptPolicy::Allow),
+        "require" => Some(ffi::EncryptPolicy::Require),
+        _ => None,
+    }
+}
+
 fn field_str<const N: usize>(arr: &[std::os::raw::c_char; N]) -> String {
     let bytes: Vec<u8> = arr
         .iter()
@@ -158,16 +169,29 @@ impl BtCore {
         self.sess.apply_network(proxy, down_kb_s, up_kb_s)
     }
 
-    /// 发现层开关：DHT / LSD / UPnP（enable_upnp 同时控制 NAT-PMP——端口映射族）。
-    /// 会话默认全关（M0 确定性语义）；本方法显式覆盖。
+    /// 发现层开关：DHT / LSD / UPnP / PEX（enable_upnp 同时控制 NAT-PMP——端口映射族）。
+    /// 内核默认 DHT/LSD/UPnP 关、PEX 开（M0 确定性语义）；本方法显式覆盖。
+    /// PEX 特殊：内核 2.0.x 无会话级开关，置 false 经 per-torrent disable_pex
+    /// flag 落地（仅对其后新增任务生效，见 lt.h 契约注释）。
     pub fn apply_discovery(
         &self,
         enable_dht: bool,
         enable_lsd: bool,
         enable_upnp: bool,
+        enable_pex: bool,
     ) -> ffi::Result<()> {
         self.sess
-            .apply_discovery(enable_dht, enable_lsd, enable_upnp)
+            .apply_discovery(enable_dht, enable_lsd, enable_upnp, enable_pex)
+    }
+
+    /// 传输层开关：uTP（incoming/outgoing 同进退）+ MSE 加密三态。
+    /// 会话默认 uTP 关 + 加密允许（M0 确定性语义）；本方法显式覆盖。
+    pub fn apply_transport(
+        &self,
+        enable_utp: bool,
+        enc_policy: ffi::EncryptPolicy,
+    ) -> ffi::Result<()> {
+        self.sess.apply_transport(enable_utp, enc_policy)
     }
 
     // —— 添加 / 移除 ——
@@ -344,8 +368,50 @@ mod tests {
         // 真实 DHT 冷启动拉 peer 属手动验证项。
         let dir = std::env::temp_dir();
         let core = BtCore::new(&dir, "test-discovery").expect("session init");
-        core.apply_discovery(true, true, true).expect("全开应 Ok");
-        core.apply_discovery(false, false, false)
+        core.apply_discovery(true, true, true, true)
+            .expect("全开应 Ok");
+        core.apply_discovery(false, false, false, false)
             .expect("全关应 Ok");
+    }
+
+    #[test]
+    fn apply_transport_smoke_roundtrip() {
+        // 传输层冒烟：uTP 两态 × 加密三态全组合（参数封送 + 内核
+        // apply_settings 不抛异常；加密策略值映射见 lt.h 契约注释）。
+        let dir = std::env::temp_dir();
+        let core = BtCore::new(&dir, "test-transport").expect("session init");
+        for utp in [true, false] {
+            for pol in [
+                ffi::EncryptPolicy::Disable,
+                ffi::EncryptPolicy::Allow,
+                ffi::EncryptPolicy::Require,
+            ] {
+                core.apply_transport(utp, pol).expect("uTP/加密组合应 Ok");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_encrypt_policy_variants() {
+        // 字符串 → 策略解析：合法三态 + 非法拒绝（daemon 配置面同口径）
+        assert_eq!(
+            parse_encrypt_policy("disable"),
+            Some(ffi::EncryptPolicy::Disable)
+        );
+        assert_eq!(
+            parse_encrypt_policy("allow"),
+            Some(ffi::EncryptPolicy::Allow)
+        );
+        assert_eq!(
+            parse_encrypt_policy("require"),
+            Some(ffi::EncryptPolicy::Require)
+        );
+        assert_eq!(
+            parse_encrypt_policy(" require "),
+            Some(ffi::EncryptPolicy::Require)
+        );
+        assert_eq!(parse_encrypt_policy(""), None);
+        assert_eq!(parse_encrypt_policy("forced"), None);
+        assert_eq!(parse_encrypt_policy("ALLOWED"), None);
     }
 }

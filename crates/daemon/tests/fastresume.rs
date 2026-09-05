@@ -77,7 +77,19 @@ async fn fastresume_saved_on_remove_then_reloaded() {
     let magnet = seeder.magnet().to_string();
 
     // 第一次运行：下载完成
-    let engine = BtEngine::new(save.path(), None, 0, 0, false, false, false).unwrap();
+    let engine = BtEngine::new(
+        save.path(),
+        None,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        "allow",
+    )
+    .unwrap();
     let ih = engine.add(&bt_task("t1", &magnet)).await.unwrap();
     let (ip, port) = seeder.addr();
     engine.core().resume(&ih).unwrap();
@@ -93,7 +105,19 @@ async fn fastresume_saved_on_remove_then_reloaded() {
 
     // 模拟重启：新 session 同一 save_path → add 应命中 .fastresume 回灌（ih 一致 + 任务注册）
     drop(seeder); // 停掉种子源——回灌/注册不依赖网络
-    let engine2 = BtEngine::new(save.path(), None, 0, 0, false, false, false).unwrap();
+    let engine2 = BtEngine::new(
+        save.path(),
+        None,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        "allow",
+    )
+    .unwrap();
     let ih2 = engine2.add(&bt_task("t2", &magnet)).await.unwrap();
     assert_eq!(ih2, ih, "回灌 infohash 必须一致");
     // 任务已注册（status 可查）。注：libtorrent save_resume_data 的 resume 数据不含
@@ -107,7 +131,19 @@ async fn pause_saves_fastresume() {
     let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // pause 时也保存进度凭据（best-effort，含未完成场景）
     let save = seed::TempDir::new().expect("tempdir");
-    let engine = BtEngine::new(save.path(), None, 0, 0, false, false, false).unwrap();
+    let engine = BtEngine::new(
+        save.path(),
+        None,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        "allow",
+    )
+    .unwrap();
     let seeder = seed::TestSeeder::start();
     let ih = engine.add(&bt_task("t3", seeder.magnet())).await.unwrap();
     let (ip, port) = seeder.addr();
@@ -127,7 +163,19 @@ async fn delete_data_removes_fastresume() {
     let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // remove(delete_data=true) → 数据删除 → 续传凭据一并清理
     let save = seed::TempDir::new().expect("tempdir");
-    let engine = BtEngine::new(save.path(), None, 0, 0, false, false, false).unwrap();
+    let engine = BtEngine::new(
+        save.path(),
+        None,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        "allow",
+    )
+    .unwrap();
     let seeder = seed::TestSeeder::start();
     let ih = engine.add(&bt_task("t4", seeder.magnet())).await.unwrap();
     let (ip, port) = seeder.addr();
@@ -148,7 +196,9 @@ use smart_dl_daemon::state::DaemonState;
 use std::sync::Arc;
 
 fn bt_daemon(save: &std::path::Path, store: &std::path::Path) -> (Arc<DaemonState>, Arc<BtEngine>) {
-    let bt = Arc::new(BtEngine::new(save, None, 0, 0, false, false, false).unwrap());
+    let bt = Arc::new(
+        BtEngine::new(save, None, 0, 0, false, false, false, false, false, "allow").unwrap(),
+    );
     let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
     let state = Arc::new(
         DaemonState::new(Arc::new(http), vec![])
@@ -301,7 +351,19 @@ async fn torrent_name_surfaces_in_engine_status() {
     let seeder = seed::TestSeeder::start();
     let magnet = seeder.magnet().to_string();
 
-    let engine = BtEngine::new(save.path(), None, 0, 0, false, false, false).unwrap();
+    let engine = BtEngine::new(
+        save.path(),
+        None,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        "allow",
+    )
+    .unwrap();
     let ih = engine.add(&bt_task("t-name", &magnet)).await.unwrap();
     let (ip, port) = seeder.addr();
     engine.core().resume(&ih).unwrap();

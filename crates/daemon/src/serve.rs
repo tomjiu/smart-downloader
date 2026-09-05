@@ -168,6 +168,9 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
                     cfg.bt.enable_dht,
                     cfg.bt.enable_lsd,
                     cfg.bt.enable_upnp,
+                    cfg.bt.enable_pex,
+                    cfg.bt.enable_utp,
+                    &cfg.bt.encrypt,
                 )
                 .map_err(ServeError::Engine)?,
             );

@@ -95,8 +95,11 @@ impl BtEngine {
     /// 新建 BT 会话（save_path 为全局落盘目录，须已存在）。
     /// `proxy` = 代理 URL（`http://` / `socks5://` / `socks4://`，可带 `user:pass@`；None = 直连）；
     /// `down_kb_s`/`up_kb_s` = 全局下载/上传限速（KiB/s；0 = 不限）。
-    /// `enable_dht`/`enable_lsd`/`enable_upnp` = 发现层开关（默认语义全关，M0 确定性；
-    /// enable_upnp 同时控制 NAT-PMP——端口映射族）。启动时一次 apply，不参与热重载。
+    /// `enable_dht`/`enable_lsd`/`enable_upnp`/`enable_pex` = 发现层开关（默认语义全关，
+    /// M0 确定性；enable_upnp 同时控制 NAT-PMP——端口映射族）。启动时一次 apply，不参与热重载。
+    /// `enable_utp` = uTP 双向开关（incoming/outgoing 同进退）；`encrypt` = MSE 加密
+    /// 策略字符串（disable/allow/require，非法值报错）。启动时一次 apply。
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         save_path: &Path,
         proxy: Option<&str>,
@@ -105,6 +108,9 @@ impl BtEngine {
         enable_dht: bool,
         enable_lsd: bool,
         enable_upnp: bool,
+        enable_pex: bool,
+        enable_utp: bool,
+        encrypt: &str,
     ) -> Result<Self, String> {
         let core = BtCore::new(save_path, "smart-dl-daemon")
             .map_err(|e| format!("bt session init: {}", core_err(&e)))?;
@@ -120,9 +126,16 @@ impl BtEngine {
         };
         core.apply_network(proxy_cfg.as_ref(), down_kb_s, up_kb_s)
             .map_err(|e| format!("bt apply_network: {e:?}"))?;
-        // 发现层开关（DHT/LSD/UPnP）：无条件显式调用（默认 false 保持 M0 确定性）
-        core.apply_discovery(enable_dht, enable_lsd, enable_upnp)
+        // 发现层开关（DHT/LSD/UPnP/PEX）：无条件显式调用（默认 false 保持 M0 确定性）
+        core.apply_discovery(enable_dht, enable_lsd, enable_upnp, enable_pex)
             .map_err(|e| format!("bt apply_discovery: {e:?}"))?;
+        // 传输层开关（uTP + MSE 加密）：启动时一次 apply，不参与热重载
+        let enc_policy =
+            smart_dl_btcore::engine::parse_encrypt_policy(encrypt).ok_or_else(|| {
+                format!("bt.encrypt 解析失败 {encrypt:?}: 仅支持 disable/allow/require")
+            })?;
+        core.apply_transport(enable_utp, enc_policy)
+            .map_err(|e| format!("bt apply_transport: {e:?}"))?;
         Ok(BtEngine {
             core: Arc::new(core),
             save_path: save_path.to_path_buf(),

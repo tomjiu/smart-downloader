@@ -51,7 +51,9 @@ pub struct DownloadCfg {
     pub disk_precheck_strict: bool,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+/// BT 引擎配置。`encrypt` 缺省值是 `allow`（内核默认行为）而非空串，
+/// 故手动实现 Default + 字段级 serde 默认（derive Default 会给空串）。
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct BtCfg {
     /// 启用 BT 引擎（需编译时 --features bt）。
@@ -68,6 +70,38 @@ pub struct BtCfg {
     pub enable_lsd: bool,
     /// 启用 UPnP/NAT-PMP 端口映射（两者同进退）。默认关闭保持确定性。启动时生效。
     pub enable_upnp: bool,
+    /// 启用 PEX（peer 交换，BT peer 间互换已有 peer 列表）。默认关闭保持确定性
+    /// 且对私有 tracker 更友好。启动时生效。
+    pub enable_pex: bool,
+    /// 启用 uTP（BT 传输 uTP/UDP 双向开关，incoming/outgoing 同进退）。默认
+    /// 关闭保持确定性（v1 内核决策：uTP 首连超时会扰动 e2e 时序）。启动时生效。
+    pub enable_utp: bool,
+    /// MSE（Protocol Encryption）握手策略：`disable`（纯明文，拒 MSE）/
+    /// `allow`（明文+加密皆收，内核默认）/ `require`（强制加密，明文直接拒）。
+    /// 缺省 allow = 不改变现有行为；非法值拒绝启动。启动时生效。
+    /// 合法值口径与 btcore::engine::parse_encrypt_policy 一致。
+    #[serde(default = "default_bt_encrypt")]
+    pub encrypt: String,
+}
+
+fn default_bt_encrypt() -> String {
+    "allow".to_string()
+}
+
+impl Default for BtCfg {
+    fn default() -> Self {
+        BtCfg {
+            enabled: false,
+            save_path: None,
+            max_upload_kb_s: 0,
+            enable_dht: false,
+            enable_lsd: false,
+            enable_upnp: false,
+            enable_pex: false,
+            enable_utp: false,
+            encrypt: default_bt_encrypt(),
+        }
+    }
 }
 
 /// 迅雷 SDK 引擎配置（Windows-only）。
@@ -188,6 +222,9 @@ impl Default for Config {
                 enable_dht: false,
                 enable_lsd: false,
                 enable_upnp: false,
+                enable_pex: false,
+                enable_utp: false,
+                encrypt: "allow".to_string(),
             },
             xunlei: XunleiCfg::default(),
             provider: ProviderCfg {
@@ -216,7 +253,17 @@ impl Config {
             return Ok(Config::default());
         };
         let text = std::fs::read_to_string(p).map_err(|e| format!("读取配置 {p:?} 失败: {e}"))?;
-        toml::from_str(&text).map_err(|e| format!("配置解析失败 {p:?}: {e}"))
+        let cfg: Config = toml::from_str(&text).map_err(|e| format!("配置解析失败 {p:?}: {e}"))?;
+        // bt.encrypt 三态校验（fail-fast：未知值启动即报错，不等到引擎装配）。
+        // 合法值口径须与 btcore::engine::parse_encrypt_policy 一致（btcore 是
+        // feature 门控依赖，config 不能引用其类型，此处本地同步白名单）。
+        if !matches!(cfg.bt.encrypt.trim(), "disable" | "allow" | "require") {
+            return Err(format!(
+                "配置 bt.encrypt = {:?} 无效：仅支持 disable / allow / require",
+                cfg.bt.encrypt
+            ));
+        }
+        Ok(cfg)
     }
 
     /// 判定 addr 是否仅绑定回环地址（127.x/::1/localhost）。
@@ -264,6 +311,9 @@ impl Config {
             "bt_enable_dht": self.bt.enable_dht,
             "bt_enable_lsd": self.bt.enable_lsd,
             "bt_enable_upnp": self.bt.enable_upnp,
+            "bt_enable_pex": self.bt.enable_pex,
+            "bt_enable_utp": self.bt.enable_utp,
+            "bt_encrypt": self.bt.encrypt,
             "xunlei_enabled": self.xunlei.enabled,
             "listen_addr": self.server.addr,
             // 安全修复（V1）：仅暴露是否启用认证（布尔），token 本身绝不出快照
@@ -340,6 +390,10 @@ mod tests {
         assert!(!c.bt.enable_dht);
         assert!(!c.bt.enable_lsd);
         assert!(!c.bt.enable_upnp);
+        // 传输层默认：PEX/uTP 关，加密 allow（= 内核默认行为不变）
+        assert!(!c.bt.enable_pex);
+        assert!(!c.bt.enable_utp);
+        assert_eq!(c.bt.encrypt, "allow");
     }
 
     #[test]
@@ -350,6 +404,9 @@ mod tests {
         assert_eq!(snap["bt_enable_dht"], false);
         assert_eq!(snap["bt_enable_lsd"], false);
         assert_eq!(snap["bt_enable_upnp"], false);
+        assert_eq!(snap["bt_enable_pex"], false);
+        assert_eq!(snap["bt_enable_utp"], false);
+        assert_eq!(snap["bt_encrypt"], "allow");
     }
 
     #[test]
@@ -383,6 +440,57 @@ enable_upnp = true
         assert!(c2.bt.enable_dht);
         assert!(!c2.bt.enable_lsd);
         assert!(!c2.bt.enable_upnp);
+    }
+
+    #[test]
+    fn bt_transport_toml_overrides() {
+        // 传输层三键 TOML 解析 + 快照反映；encrypt 缺省回填 allow（serde 字段默认）
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(
+            &p,
+            r#"
+[bt]
+enable_pex = true
+enable_utp = true
+encrypt = "require"
+"#,
+        )
+        .unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert!(c.bt.enable_pex);
+        assert!(c.bt.enable_utp);
+        assert_eq!(c.bt.encrypt, "require");
+        let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap["bt_enable_pex"], true);
+        assert_eq!(snap["bt_enable_utp"], true);
+        assert_eq!(snap["bt_encrypt"], "require");
+
+        // [bt] 段存在但 encrypt 缺省 → serde 字段默认回填 allow（非空串）
+        let p2 = dir.path().join("config2.toml");
+        std::fs::write(&p2, "[bt]\nenabled = true\n").unwrap();
+        let c2 = Config::load(Some(&p2)).unwrap();
+        assert_eq!(c2.bt.encrypt, "allow");
+    }
+
+    #[test]
+    fn bt_encrypt_invalid_rejected() {
+        // 非法 encrypt 值 → load 报错（fail-fast，含合法值提示）
+        let dir = tempfile::tempdir().unwrap();
+        for bad in ["forced", "ALLOW", "", "on"] {
+            let p = dir.path().join(format!("{bad}.toml"));
+            std::fs::write(&p, format!("[bt]\nencrypt = \"{bad}\"\n")).unwrap();
+            let err = Config::load(Some(&p)).unwrap_err();
+            assert!(
+                err.contains("disable / allow / require"),
+                "报错应含合法值提示: {err}"
+            );
+        }
+        // 前后空白容忍（与 btcore parse_encrypt_policy 口径一致）
+        let p = dir.path().join("ok.toml");
+        std::fs::write(&p, "[bt]\nencrypt = \" require \"\n").unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert_eq!(c.bt.encrypt, " require ");
     }
 
     #[test]

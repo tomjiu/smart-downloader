@@ -20,7 +20,10 @@ use base64::Engine as _;
 async fn serve_bt() -> (std::net::SocketAddr, Arc<DaemonState>, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let save = dir.path().to_path_buf();
-    let bt = smart_dl_daemon::bt::BtEngine::new(&save, None, 0, 0, false, false, false).unwrap();
+    let bt = smart_dl_daemon::bt::BtEngine::new(
+        &save, None, 0, 0, false, false, false, false, false, "allow",
+    )
+    .unwrap();
     let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
     // 安全修复（V2）适配：save 同时注入为白名单根（with_dest_root 双重语义）。
     let state = Arc::new(
@@ -344,16 +347,38 @@ async fn readd_same_magnet_after_restart_ok() {
 
     // 第一次"运行"
     let r1 = {
-        let bt = smart_dl_daemon::bt::BtEngine::new(dir.path(), None, 0, 0, false, false, false)
-            .unwrap();
+        let bt = smart_dl_daemon::bt::BtEngine::new(
+            dir.path(),
+            None,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            "allow",
+        )
+        .unwrap();
         let state = DaemonState::new(Arc::new(http.clone()), vec![]).with_bt(Arc::new(bt));
         state.add_link_task(MAGNET.to_string(), None).await
     };
     assert!(r1.is_ok(), "首次 add 应成功: {:?}", r1.err());
 
     // "重启"：新 session（同 save_path）重新 add
-    let bt2 =
-        smart_dl_daemon::bt::BtEngine::new(dir.path(), None, 0, 0, false, false, false).unwrap();
+    let bt2 = smart_dl_daemon::bt::BtEngine::new(
+        dir.path(),
+        None,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        "allow",
+    )
+    .unwrap();
     let state2 = DaemonState::new(Arc::new(http), vec![]).with_bt(Arc::new(bt2));
     let r2 = state2.add_link_task(MAGNET.to_string(), None).await;
     assert!(
@@ -600,7 +625,10 @@ async fn serve_bt_in(
     store: Option<std::path::PathBuf>,
 ) -> (std::net::SocketAddr, Arc<DaemonState>, std::path::PathBuf) {
     let save = dir.to_path_buf();
-    let bt = smart_dl_daemon::bt::BtEngine::new(&save, None, 0, 0, false, false, false).unwrap();
+    let bt = smart_dl_daemon::bt::BtEngine::new(
+        &save, None, 0, 0, false, false, false, false, false, "allow",
+    )
+    .unwrap();
     let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
     let mut state = smart_dl_daemon::state::DaemonState::new(Arc::new(http), vec![])
         .with_dest_root(save.clone())
@@ -700,8 +728,19 @@ async fn file_priority_persisted_and_replayed_after_restart() {
     }
 
     // —— "重启"：新 session（同 save 目录）+ restore_from → 立即重放
-    let bt2 =
-        smart_dl_daemon::bt::BtEngine::new(dir.path(), None, 0, 0, false, false, false).unwrap();
+    let bt2 = smart_dl_daemon::bt::BtEngine::new(
+        dir.path(),
+        None,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        "allow",
+    )
+    .unwrap();
     let http2 = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
     let state2 = Arc::new(
         smart_dl_daemon::state::DaemonState::new(Arc::new(http2), vec![])
