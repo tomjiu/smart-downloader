@@ -37,7 +37,8 @@
 Piece 合并=libtorrent 原生；多连接 Range=httpdl。DHT/PEX/uTP/MSE 加密=配置开关
 （2026-09-05 落地 `[bt]` 四键配置面：enable_dht/lsd/upnp/pex + enable_utp + encrypt 三态；
 PEX 经 per-torrent disable_pex 实现——内核 2.0.x 无会话级开关；M0 默认全关决策，
-G1 手动验证脚本已备）。
+G1 手动验证脚本已备）。云盘 Provider 面：迅雷（登录/转存/直链）+ 夸克（骨架，待真机校准）
++ 百度分享解析（2026-09-05 B3-a：免登录 verify→list 真实 e2e；dlink 待 BDUSS 真机校准）。
 
 ---
 

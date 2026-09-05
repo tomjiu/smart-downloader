@@ -104,6 +104,21 @@ fn main() {
         return;
     }
 
+    // —— baidu-resolve：本地执行（无需 daemon 进程），分发前拦截 ——
+    if let smart_dl_daemon::cli::CliCommand::BaiduResolve { url, pwd, dir } = &cli.command {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime 创建失败");
+        if let Err(e) = rt.block_on(smart_dl_daemon::baidu_resolve::run(
+            url.clone(),
+            pwd.clone(),
+            dir.clone(),
+            cli.json,
+        )) {
+            eprintln!("baidu-resolve 失败: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime 创建失败");
     let client = smart_dl_daemon::client::CliClient::new(&server, token.as_deref());
     match rt.block_on(client.run(&cli.command, cli.json)) {

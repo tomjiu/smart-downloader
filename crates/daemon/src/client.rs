@@ -135,6 +135,10 @@ impl CliClient {
                 "xunlei-login 为本地命令，不经过 daemon：请直接运行 smart-dl-daemon xunlei-login"
                     .to_string(),
             )),
+            CliCommand::BaiduResolve { .. } => Err(CliError::Unknown(
+                "baidu-resolve 为本地命令，不经过 daemon：请直接运行 smart-dl-daemon baidu-resolve"
+                    .to_string(),
+            )),
         }
     }
 
