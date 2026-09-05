@@ -245,7 +245,7 @@ impl Session {
 
     /// 传输层开关：uTP（incoming/outgoing 同进退）+ MSE 加密三态。
     /// 会话默认 uTP 关 + 加密允许（M0 确定性语义）；本方法显式覆盖。
-    pub fn apply_transport(&self, enable_utp: bool, enc_policy: ffi::EncryptPolicy) -> Result<()> {
+    pub fn apply_transport(&self, enable_utp: bool, enc_policy: EncryptPolicy) -> Result<()> {
         let code =
             unsafe { lt_apply_transport(self.raw, enable_utp as c_int, enc_policy.as_c_int()) };
         call(code, || Ok(()))

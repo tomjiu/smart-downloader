@@ -279,6 +279,15 @@ impl DaemonState {
                 limits_touched = true;
                 self.apply_global_limits(b.max_download_kb_s, b.max_upload_kb_s)
                     .await?;
+                // 权威配置同步（persist 回写带宽域的唯一来源）
+                if let Some(cfg) = self.live_config.lock().as_mut() {
+                    if let Some(v) = b.max_download_kb_s {
+                        cfg.download.max_download_kb_s = v;
+                    }
+                    if let Some(v) = b.max_upload_kb_s {
+                        cfg.bt.max_upload_kb_s = v;
+                    }
+                }
                 applied.push("bandwidth.max_download_kb_s".into());
                 applied.push("bandwidth.max_upload_kb_s".into());
             }
@@ -297,6 +306,9 @@ impl DaemonState {
             .any(|x| x.is_some());
             if alt_changed {
                 *self.alt_cfg.lock() = alt.clone();
+                if let Some(cfg) = self.live_config.lock().as_mut() {
+                    cfg.limits = alt.clone();
+                }
                 limits_touched = true;
                 for k in [
                     "alt_enabled",
