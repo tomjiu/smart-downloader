@@ -388,6 +388,7 @@ mod ct_eq_tests;
 mod ftp_tests;
 mod global_limits_tests;
 mod list_batch_tests;
+mod metrics_tests;
 mod name_backfill_tests;
 mod persist_tests;
 mod post_download_tests;
