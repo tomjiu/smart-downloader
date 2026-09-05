@@ -11,7 +11,7 @@
 
 use crate::ledger::{self, Ledger};
 use crate::rate::RateLimiter;
-use crate::segment_manager::SegmentManager;
+use crate::segment_manager::{SegmentManager, MIN_RETRY_GRANULARITY};
 use crate::static_split::segment_count;
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -251,9 +251,6 @@ pub(crate) fn update_score(scores: &Mutex<HashMap<String, i64>>, url: &str, delt
     let s = m.entry(url.to_string()).or_insert(0);
     *s = (*s + delta).clamp(SCORE_MIN, SCORE_MAX);
 }
-
-/// 失败缩小粒度重试的最小粒度（P1）：低于该粒度不再拆分（对齐设计 §3.1 的 1MB 防碎片）。
-const MIN_RETRY_GRANULARITY: u64 = 1024 * 1024;
 
 /// 段下载 + 失败缩小粒度重试（P1）：整段全 mirror 失败时，若可拆（len/2 >= MIN_RETRY_GRANULARITY）
 /// 则拆半重试；左右子段都成功才视为成功。子段写入各自区间（与整段写入等价）；

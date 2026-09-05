@@ -5,7 +5,9 @@
 use crate::ledger;
 use crate::rate::{RateLimiter, RateSample};
 use crate::retry::Backoff;
-use crate::segment_manager::{Segment as DynSegment, SegmentManager, DEFAULT_MIN_SPLIT};
+use crate::segment_manager::{
+    Segment as DynSegment, SegmentManager, DEFAULT_MIN_SPLIT, MIN_RETRY_GRANULARITY,
+};
 use crate::static_split::segment_count;
 use parking_lot::Mutex;
 use smart_dl_core::session::output::OutputManager;
@@ -500,9 +502,93 @@ async fn download_segment(
         f.write_all(&chunk[..n]).map_err(|e| e.to_string())?;
         got += n;
     }
-    let _ = read_response(&mut s.reader).await; // 226
+    // 关键：读满子段配额后立即断开数据连接。RETR 无结束偏移语义，服务器从
+    // REST 偏移一直发到 EOF——非末段场景客户端停止读取后，服务器 write_all
+    // 会因流控阻塞（过量发送远超内核缓冲 ~1MB），226 永远不到达，双边死锁。
+    // 主动断开 → 服务器 EPIPE 收尾（真实服务器回 426/226 或直接关闭，均
+    // 无关紧要：数据完整性由 got==need 校验与账本语义保证）。
+    drop(data);
+    let _ = read_response(&mut s.reader).await; // 226（或 426/关闭，忽略）
     s.quit().await;
     Ok(())
+}
+
+/// 段下载 + 失败缩小粒度重试（P1，与 HTTP download.rs 同构）：失败段可拆
+/// （len/2 >= MIN_RETRY_GRANULARITY，两侧共用同一常量口径）则二分重试栈继续，
+/// 否则上抛；终态错误（5xx，协议级永久失败）不拆直接上抛。子段区间恒落在
+/// 原段内 → 部分写入由后续成功尝试全量重写；账本仍按原段边界记账
+/// （拆分仅是重试内部细节，不影响进度真源）。迭代式拆分栈（避免 async 递归装箱）。
+// 参数即协议会话要素（主机/凭据/路径/段/目标/限速/退避），拆 struct 反而模糊调用点语义。
+#[allow(clippy::too_many_arguments)]
+async fn download_segment_with_retry(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+    path: &str,
+    seg: DynSegment,
+    part: &Path,
+    limiter: &RateLimiter,
+    backoff: &Backoff,
+) -> Result<(), String> {
+    let mut stack: Vec<DynSegment> = vec![seg];
+    while let Some(cur) = stack.pop() {
+        match download_segment_attempts(host, port, user, pass, path, cur, part, limiter, backoff)
+            .await
+        {
+            Ok(()) => {}
+            Err(e) if is_terminal(&e) => {
+                return Err(format!("segment [{}, {}]: {e}", cur.start, cur.end))
+            }
+            Err(_) if cur.len() / 2 >= MIN_RETRY_GRANULARITY => {
+                let mid = cur.start + cur.len() / 2;
+                // 先压 right 再压 left → 先处理 left，与 HTTP 侧拆分顺序一致
+                stack.push(DynSegment {
+                    start: mid,
+                    end: cur.end,
+                });
+                stack.push(DynSegment {
+                    start: cur.start,
+                    end: mid - 1,
+                });
+            }
+            Err(e) => return Err(format!("segment [{}, {}]: {e}", cur.start, cur.end)),
+        }
+    }
+    Ok(())
+}
+
+/// 单个子段的连接层退避重试（421/IO；5xx 终态直接失败）——原 worker 内联
+/// 逻辑提为函数，供二分重试栈逐子段调用（每次栈内尝试都保有完整退避预算，
+/// 最坏尝试次数 = 拆分深度 × CONNECT_ATTEMPTS，有界）。
+// 参数即协议会话要素（主机/凭据/路径/段/目标/限速/退避），拆 struct 反而模糊调用点语义。
+#[allow(clippy::too_many_arguments)]
+async fn download_segment_attempts(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+    path: &str,
+    seg: DynSegment,
+    part: &Path,
+    limiter: &RateLimiter,
+    backoff: &Backoff,
+) -> Result<(), String> {
+    let mut last = String::new();
+    for attempt in 1..=CONNECT_ATTEMPTS {
+        match download_segment(host, port, user, pass, path, seg, part, limiter).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if attempt < CONNECT_ATTEMPTS && !is_terminal(&e) {
+                    tokio::time::sleep(backoff.next_delay(attempt)).await;
+                    continue;
+                }
+                last = e;
+                break;
+            }
+        }
+    }
+    Err(last)
 }
 
 /// 单文件下载核心（单文件/目录任务共用）：动态分段 + worker 池并行 + 账本续传。
@@ -590,33 +676,12 @@ async fn download_file(
                         None => return Ok::<(), String>(()),
                     }
                 };
-                // 连接层退避重试（421/IO）；550 等终态 → 直接失败
-                let mut ok = false;
-                let mut last_err = String::new();
-                for attempt in 1..=CONNECT_ATTEMPTS {
-                    match download_segment(&host, port, &user, &pass, &path, seg, &part, &limiter)
-                        .await
-                    {
-                        Ok(()) => {
-                            ok = true;
-                            break;
-                        }
-                        Err(e) => {
-                            if attempt < CONNECT_ATTEMPTS && !is_terminal(&e) {
-                                tokio::time::sleep(backoff.next_delay(attempt)).await;
-                                continue;
-                            }
-                            last_err = e;
-                            break;
-                        }
-                    }
-                }
-                if !ok {
-                    return Err(format!(
-                        "segment [{}, {}] failed: {last_err}",
-                        seg.start, seg.end
-                    ));
-                }
+                // 失败缩小粒度重试（P1，与 HTTP download.rs 同构）+ 连接层退避：
+                // 二分重试栈收敛瞬时故障，5xx 终态直接上抛
+                download_segment_with_retry(
+                    &host, port, &user, &pass, &path, seg, &part, &limiter, &backoff,
+                )
+                .await?;
                 // 段完成：记账 + 账本原子落盘 + 进度回报（锁内一并，
                 // 保证账本视图与计数一致——与 HTTP download.rs 同模式）
                 {
