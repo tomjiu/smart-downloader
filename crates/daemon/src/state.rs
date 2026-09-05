@@ -632,5 +632,5 @@ pub use ops::{canonical_http_url, ensure_dest_root, precheck_space};
 pub use persistence::write_tasks_atomic;
 
 #[cfg(test)]
-#[path = "state_tests.rs"]
+#[path = "state_tests/mod.rs"]
 mod state_tests;
