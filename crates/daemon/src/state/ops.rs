@@ -1188,7 +1188,7 @@ impl DaemonState {
         dest_root: Option<String>,
         start_at_unix: Option<u64>,
     ) -> Result<TaskId, DaemonError> {
-        if !url.starts_with("ftp://") {
+        if !url.starts_with("ftp://") && !url.starts_with("ftps://") {
             return Err(DaemonError::InvalidSource(url));
         }
         // B10：目标目录预检；目录总大小需 LIST 才可知 → 空间预检跳过（同 HTTP 逻辑）

@@ -16,7 +16,7 @@ pub enum NormalizedSource {
     Http(String),
     /// BT 磁力链接（v1 无 BT 引擎 → 由调用方报 Unsupported）。
     Magnet(String),
-    /// FTP 链接（含可选 user:pass@，匿名 → anonymous）。
+    /// FTP 链接（含可选 user:pass@，匿名 → anonymous；ftps:// = 显式 AUTH TLS）。
     Ftp(String),
     /// eD2k（本项目不支持）。
     Ed2k(String),
@@ -31,7 +31,7 @@ fn is_http(u: &str) -> bool {
 }
 
 fn is_ftp(u: &str) -> bool {
-    u.starts_with("ftp://")
+    u.starts_with("ftp://") || u.starts_with("ftps://")
 }
 
 /// 归一化用户提交的任意链接 → 下载源分类。
@@ -179,6 +179,14 @@ mod tests {
         assert_eq!(
             normalize_user_link("ftp://user:pass@example.com/a.bin"),
             NormalizedSource::Ftp("ftp://user:pass@example.com/a.bin".into())
+        );
+    }
+
+    #[test]
+    fn ftps_classified_as_ftp() {
+        assert_eq!(
+            normalize_user_link("ftps://example.com/a.bin"),
+            NormalizedSource::Ftp("ftps://example.com/a.bin".into())
         );
     }
 

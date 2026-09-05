@@ -33,6 +33,14 @@ serde_json = "1"
 # Metalink4 XML 解析（B1，RFC 5854）：纯 Rust 零拷贝事件流，默认 features
 # 关闭 serialize（仅读）；无前缀/带前缀标签统一按 local name 匹配。
 quick-xml = "0.37"
+# FTPS（B2，RFC 4217）：显式 AUTH TLS 控制连接升级 + PROT P 数据连接。
+# tokio-rustls 与 reqwest rustls-tls 共享 rustls 0.23 栈（ring provider，
+# aarch64-android 交叉兼容——见下方 reqwest 注释）；webpki-roots 固定根集。
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+] }
+webpki-roots = "0.26"
 thiserror = "1"
 async-trait = "0.1"
 # TLS 后端（P1-3 安卓交叉，2026-08-31）：default-features=false 关掉 native-tls
