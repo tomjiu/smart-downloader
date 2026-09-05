@@ -2,9 +2,11 @@
 //! 被动模式（PASV）、REST 断点续传（.part）、421 退避重试、目录下载（LIST 单层）；
 //! 不支持 SFTP/FTPS 隐式/目录递归/FXP。
 
+use crate::ledger;
 use crate::rate::{RateLimiter, RateSample};
 use crate::retry::Backoff;
-use crate::static_split::plan_segments;
+use crate::segment_manager::{Segment as DynSegment, SegmentManager, DEFAULT_MIN_SPLIT};
+use crate::static_split::segment_count;
 use parking_lot::Mutex;
 use smart_dl_core::session::output::OutputManager;
 use smart_dl_core::task::DownloadTask;
@@ -18,9 +20,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::task::JoinSet;
 
 /// 421/连接失败重试次数（连接层退避）。
 const CONNECT_ATTEMPTS: u32 = 4;
+
+/// FTP 段下载流式写入块大小：固定 64KB 缓冲（与 HTTP 侧 resp.chunk() 同级），
+/// 避免整段驻留内存（8 worker × 16MB 段 = 峰值 128MB+）。部分写入无害：
+/// 失败段不入账本，重试/恢复路径 seek 回 seg.start 全量重写。
+const FTP_CHUNK: usize = 64 * 1024;
 
 /// FTP URL 目标：单文件或目录。
 #[derive(Debug, PartialEq, Eq)]
@@ -66,9 +74,12 @@ struct EngineInner {
     /// set_global_limits 运行中热调。FTP 无任务级限速（引擎能力边界），
     /// 所有 FTP 任务的合计带宽由本 limiter 统一约束。
     limiter: Arc<RateLimiter>,
+    /// 动态分段粒度（字节，0 = 默认 16MB；与 HTTP 直链同粒度同源）。
+    /// 测试注入小粒度以覆盖多段/账本路径。
+    min_split: u64,
 }
 
-/// FTP 引擎（串行段下载：PASV + REST + RETR）。
+/// FTP 引擎（动态分段并行下载：PASV + REST + RETR，分段策略与 HTTP 对齐）。
 #[derive(Clone)]
 pub struct FtpEngine {
     backoff: Backoff,
@@ -98,8 +109,18 @@ impl FtpEngine {
             inner: Arc::new(EngineInner {
                 tasks: Mutex::new(HashMap::new()),
                 limiter: Arc::new(RateLimiter::new(download_kb_s)),
+                min_split: 0,
             }),
         }
+    }
+
+    /// 注入动态分段粒度（字节，0 = 默认 16MB）。测试用小粒度覆盖
+    /// 多段/账本续传路径；生产路径恒走默认（与 HTTP 直链同一粒度语义）。
+    pub fn with_min_split(mut self, min_split: u64) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.min_split = min_split;
+        }
+        self
     }
 
     /// 目录分支：LIST 探测（421 → 退避重试）→ 解析文件列表 → 建任务 → spawn 目录循环。
@@ -438,7 +459,7 @@ async fn download_segment(
     user: &str,
     pass: &str,
     path: &str,
-    seg: crate::static_split::Segment,
+    seg: DynSegment,
     part: &Path,
     limiter: &RateLimiter,
 ) -> Result<(), String> {
@@ -454,44 +475,45 @@ async fn download_segment(
     let mut data = TcpStream::connect(data_addr)
         .await
         .map_err(|e| e.to_string())?;
-    let need = seg.len() as usize;
-    let mut buf = vec![0u8; need];
-    let mut got = 0usize;
-    while got < need {
-        let n = data
-            .read(&mut buf[got..])
-            .await
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Err(format!("data connection closed early: {got}/{need}"));
-        }
-        // E16 全局限速：逐块消费全局预算（限速器内部计数，速率 0 早退零开销）
-        limiter.wait(n as u64).await;
-        got += n;
-    }
-    let _ = read_response(&mut s.reader).await; // 226
-    s.quit().await;
-
-    // 写 .part 段位置（段不相交 → 无锁）
+    // 流式直写 .part 段位置（与 HTTP 侧流式语义对齐；段不相交 → 无锁）。
+    // 固定 64KB 块缓冲，段长不再驻内存；失败时部分写入由重试/恢复路径
+    // seek 回 seg.start 全量重写（段未入账本前不构成有效凭据）。
+    use std::io::{Seek, SeekFrom, Write};
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(part)
         .map_err(|e| e.to_string())?;
-    use std::io::{Seek, SeekFrom, Write};
     f.seek(SeekFrom::Start(seg.start))
         .map_err(|e| e.to_string())?;
-    f.write_all(&buf).map_err(|e| e.to_string())?;
+    let need = seg.len() as usize;
+    let mut chunk = vec![0u8; FTP_CHUNK];
+    let mut got = 0usize;
+    while got < need {
+        let n = data.read(&mut chunk).await.map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err(format!("data connection closed early: {got}/{need}"));
+        }
+        // E16 全局限速：逐块消费全局预算（限速器内部计数，速率 0 早退零开销）
+        limiter.wait(n as u64).await;
+        f.write_all(&chunk[..n]).map_err(|e| e.to_string())?;
+        got += n;
+    }
+    let _ = read_response(&mut s.reader).await; // 226
+    s.quit().await;
     Ok(())
 }
 
-/// 单文件下载核心（单文件/目录任务共用）：串行段下载 + 退避重试 + .part 落位。
-/// 续传：.part 存在（>0 且 < total）→ 单段 REST 从 part 大小续到文件尾；
-/// 无 .part（或已满）→ 正常分块下载。每段完成经 `on_progress(len)` 上报增量。
+/// 单文件下载核心（单文件/目录任务共用）：动态分段 + worker 池并行 + 账本续传。
+/// 分段策略与 HTTP 直链对齐（P0 方案A + P4 账本统一进度真源）：
+/// - 段粒度 `min_split`（0 = 默认 16MB）FIFO 队列（<16MB 单段）；
+/// - 并行 worker 数 = `segment_count(total)`（与 HTTP 同一公式，2-8）；
+/// - 续传：`<part>.progress` 段账本为唯一凭据（缺失/损坏/失配 → 作废重下），
+///   每段完成原子落盘，finalize 后清理；旧 .part 长度前缀续传语义废弃（G1/G2）。
 // 参数即协议会话要素（主机/凭据/路径/目标/退避/进度回调），拆 struct 反而模糊调用点语义。
 #[allow(clippy::too_many_arguments)]
-async fn download_file<F: Fn(u64)>(
+async fn download_file(
     host: &str,
     port: u16,
     user: &str,
@@ -501,21 +523,29 @@ async fn download_file<F: Fn(u64)>(
     total: u64,
     backoff: Backoff,
     limiter: &RateLimiter,
-    on_progress: F,
+    min_split: u64,
+    on_progress: Arc<dyn Fn(u64) + Send + Sync>,
 ) -> Result<(), String> {
     let part = part_path_of(dest);
-    let part_done = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-    let segments = if part_done > 0 && part_done < total {
-        // .part 续传：从偏移续到文件尾（单段）
-        vec![crate::static_split::Segment {
-            start: part_done,
-            end: total - 1,
-        }]
-    } else {
-        plan_segments(total)
-    };
+    let ledger_path = ledger::ledger_path(&part);
+    // 段账本加载（P4 唯一进度真源，与 HTTP engine.rs 同口径）：合法账本 →
+    // 恢复已完成段并沿用其粒度；缺失/损坏/total 失配 → 全新计划 + .part 作废。
+    // 旧「.part 长度前缀续传」语义废弃（G1/G2：预分配后长度恒为 total，不可信）。
+    let loaded = ledger::load(&ledger_path).filter(|l| l.total == total && l.validate_segments());
+    if loaded.is_none() {
+        let _ = std::fs::remove_file(&part);
+    }
+    // 生效粒度：账本恢复沿用其粒度，否则用调用方注入（0 = 默认 16MB）
+    let eff_min_split = loaded
+        .as_ref()
+        .map(|l| l.min_split)
+        .unwrap_or(if min_split == 0 {
+            DEFAULT_MIN_SPLIT
+        } else {
+            min_split
+        });
 
-    // 预分配 .part
+    // 预分配 .part（续传场景：旧 .part 保留只写缺失段，不截断）
     std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -525,25 +555,111 @@ async fn download_file<F: Fn(u64)>(
         .set_len(total)
         .map_err(|e| format!("part open: {e}"))?;
 
-    for seg in segments {
-        for attempt in 1..=CONNECT_ATTEMPTS {
-            match download_segment(host, port, user, pass, path, seg, &part, limiter).await {
-                Ok(()) => break,
-                Err(e) => {
-                    // 连接层失败（421/IO）→ 退避重试；550 等终态 → 直接失败
-                    if attempt < CONNECT_ATTEMPTS && !is_terminal(&e) {
-                        tokio::time::sleep(backoff.next_delay(attempt)).await;
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        // 进度：段完成
-        on_progress(seg.len());
+    // 段管理器：账本恢复（跳过已完成段，折算 done_bytes）或全新计划
+    let manager = Arc::new(Mutex::new(match &loaded {
+        Some(l) => SegmentManager::new_with_done(total, l.min_split, &l.done),
+        None => SegmentManager::new(total, 0, eff_min_split),
+    }));
+    // 恢复进度立即可见（账本折算字节，daemon 轮询无需等首段）
+    let done0 = manager.lock().done_bytes();
+    if done0 > 0 {
+        on_progress(done0);
     }
 
-    // 全部段完成 → 落位
+    // worker 数：与 HTTP 同一公式（静态 2-8）。<16MB 单段时多出的 worker
+    // 领不到段（Drained）即退，零开销。
+    let n_workers = segment_count(total);
+    let mut workers = JoinSet::new();
+    for _ in 0..n_workers {
+        let host = host.to_string();
+        let user = user.to_string();
+        let pass = pass.to_string();
+        let path = path.to_string();
+        let part = part.clone();
+        let limiter = limiter.clone();
+        let manager = manager.clone();
+        let ledger_path = ledger_path.clone();
+        let on_progress = on_progress.clone();
+        workers.spawn(async move {
+            loop {
+                // FIFO 领取：段天然无重叠 → .part 分区写无需文件锁
+                let seg: DynSegment = {
+                    let mut m = manager.lock();
+                    match m.take_segment() {
+                        Some(s) => s,
+                        None => return Ok::<(), String>(()),
+                    }
+                };
+                // 连接层退避重试（421/IO）；550 等终态 → 直接失败
+                let mut ok = false;
+                let mut last_err = String::new();
+                for attempt in 1..=CONNECT_ATTEMPTS {
+                    match download_segment(&host, port, &user, &pass, &path, seg, &part, &limiter)
+                        .await
+                    {
+                        Ok(()) => {
+                            ok = true;
+                            break;
+                        }
+                        Err(e) => {
+                            if attempt < CONNECT_ATTEMPTS && !is_terminal(&e) {
+                                tokio::time::sleep(backoff.next_delay(attempt)).await;
+                                continue;
+                            }
+                            last_err = e;
+                            break;
+                        }
+                    }
+                }
+                if !ok {
+                    return Err(format!(
+                        "segment [{}, {}] failed: {last_err}",
+                        seg.start, seg.end
+                    ));
+                }
+                // 段完成：记账 + 账本原子落盘 + 进度回报（锁内一并，
+                // 保证账本视图与计数一致——与 HTTP download.rs 同模式）
+                {
+                    let mut m = manager.lock();
+                    m.complete(seg);
+                    let snapshot = ledger::Ledger {
+                        version: ledger::LEDGER_VERSION,
+                        total,
+                        min_split: eff_min_split,
+                        etag: None,
+                        last_modified: None,
+                        done: m.done_ranges().to_vec(),
+                    };
+                    ledger::save(&ledger_path, &snapshot);
+                    on_progress(m.done_bytes());
+                }
+            }
+        });
+    }
+    // 任一 worker 失败 → 整体失败，取消其余；账本保留已成功段 → 下次续传
+    let mut first_err: Option<String> = None;
+    while let Some(res) = workers.join_next().await {
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                workers.abort_all();
+                first_err = Some(e);
+                break;
+            }
+            Err(e) => {
+                workers.abort_all();
+                first_err = Some(format!("worker panicked: {e}"));
+                break;
+            }
+        }
+    }
+    drop(workers);
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+
+    // 全部段完成 → 清续传凭据 + 落位
+    let _ = std::fs::remove_file(&ledger_path);
     finalize_part(&part, dest, total)
 }
 
@@ -565,22 +681,15 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
     let inner2 = inner.clone();
     let tid2 = tid.clone();
     let limiter = inner.limiter.clone();
+    let min_split = inner.min_split;
+    let progress: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |n| {
+        let mut tasks = inner2.tasks.lock();
+        if let Some(t) = tasks.get_mut(&tid2) {
+            t.done += n;
+        }
+    });
     let r = download_file(
-        &host,
-        port,
-        &user,
-        &pass,
-        &path,
-        &dest,
-        total,
-        backoff,
-        &limiter,
-        move |n| {
-            let mut tasks = inner2.tasks.lock();
-            if let Some(t) = tasks.get_mut(&tid2) {
-                t.done += n;
-            }
-        },
+        &host, port, &user, &pass, &path, &dest, total, backoff, &limiter, min_split, progress,
     )
     .await;
     match r {
@@ -624,25 +733,18 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
         let tid2 = tid.clone();
         let name2 = name.clone();
         let limiter = inner.limiter.clone();
-        let r = download_file(
-            &host,
-            port,
-            &user,
-            &pass,
-            &fpath,
-            &dest,
-            size,
-            backoff,
-            &limiter,
-            move |n| {
-                let mut tasks = inner2.tasks.lock();
-                if let Some(t) = tasks.get_mut(&tid2) {
-                    t.done += n;
-                    if let Some(f) = t.files.iter_mut().find(|f| f.name == name2) {
-                        f.done += n;
-                    }
+        let min_split = inner.min_split;
+        let progress: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |n| {
+            let mut tasks = inner2.tasks.lock();
+            if let Some(t) = tasks.get_mut(&tid2) {
+                t.done += n;
+                if let Some(f) = t.files.iter_mut().find(|f| f.name == name2) {
+                    f.done += n;
                 }
-            },
+            }
+        });
+        let r = download_file(
+            &host, port, &user, &pass, &fpath, &dest, size, backoff, &limiter, min_split, progress,
         )
         .await;
         match r {
