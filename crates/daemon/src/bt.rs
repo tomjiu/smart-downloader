@@ -568,7 +568,7 @@ impl DownloadEngine for BtEngine {
             .encrypt
             .clone()
             .map(|e| e.trim().to_string())
-            .unwrap_or(snap.encrypt);
+            .unwrap_or_else(|| snap.encrypt.clone());
         merged.listen_port = patch.listen_port.unwrap_or(snap.listen_port);
         merged.max_connections = patch.max_connections.unwrap_or(snap.max_connections);
 
