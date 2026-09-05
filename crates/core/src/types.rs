@@ -393,6 +393,41 @@ pub trait DownloadEngine: Send + Sync {
             "add_xunlei_resume not supported by this engine".into(),
         ))
     }
+
+    /// BT 会话级设置补丁（S1 设置面）：None = 不调整；非 BT 引擎 →
+    /// `Unsupported`。发现开关（DHT/LSD/UPnP/PEX）与传输开关（uTP/MSE 加密）
+    /// 热改；`listen_port` 走内核 re-listen，`max_connections` 走
+    /// `connections_limit`（均 0 = 不下发）。
+    async fn apply_bt_session(&self, _patch: BtSessionPatch) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// 引擎级全局代理热改（S1 设置面）：`Some(url)` = 引擎后续新建连接走该
+    /// 代理；`None` = 清除回直连。BT = settings_pack 全量重放（立即）；HTTP =
+    /// 运行时全局代理并入逐任务 client 构建（新任务生效，存量任务不受扰）。
+    /// 非法 URL → `Other`（调用方定性入参错误，引擎状态不变）。不支持引擎 →
+    /// `Unsupported`。
+    async fn set_global_proxy(&self, _proxy: Option<&str>) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+}
+
+/// BT 会话级设置补丁（S1）：`apply_bt_session` 入参。字段独立可选——
+/// daemon 层把 `PUT /settings` 的多域补丁合并成一次下发（内部仍按
+/// 发现/传输/连接三类分别构造 settings_pack 调用，尽力而为不整包回滚）。
+#[derive(Clone, Debug, Default)]
+pub struct BtSessionPatch {
+    pub enable_dht: Option<bool>,
+    pub enable_lsd: Option<bool>,
+    pub enable_upnp: Option<bool>,
+    pub enable_pex: Option<bool>,
+    pub enable_utp: Option<bool>,
+    /// MSE 握手策略：`disable` / `allow` / `require`（非法值 → `Other`）。
+    pub encrypt: Option<String>,
+    /// BT 监听端口；0 = 不下发。
+    pub listen_port: Option<u16>,
+    /// 会话全局连接数上限；0 = 不下发。
+    pub max_connections: Option<u32>,
 }
 
 #[cfg(test)]

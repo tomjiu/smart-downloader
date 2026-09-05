@@ -63,6 +63,12 @@ pub enum SchedulerEvent {
     TaskActivated {
         task_id: String,
     },
+    /// 设置面变更（S1）：`PUT /settings` 应用成功后发出（daemon 级，无
+    /// task_id）。`keys` = 本次应用/落盘的设置键全集（点分路径，含重启
+    /// 生效项）——UI 订阅后重拉 `/settings` 对齐。
+    SettingsChanged {
+        keys: Vec<String>,
+    },
 }
 
 impl SchedulerEvent {
@@ -89,9 +95,9 @@ impl SchedulerEvent {
             | SchedulerEvent::Failed { task_id, .. }
             | SchedulerEvent::DuplicateRejected { task_id, .. }
             | SchedulerEvent::TaskActivated { task_id } => Some(task_id),
-            SchedulerEvent::ProviderStatus { .. } | SchedulerEvent::GlobalLimitsChanged { .. } => {
-                None
-            }
+            SchedulerEvent::ProviderStatus { .. }
+            | SchedulerEvent::GlobalLimitsChanged { .. }
+            | SchedulerEvent::SettingsChanged { .. } => None,
         }
     }
 
@@ -112,6 +118,7 @@ impl SchedulerEvent {
             SchedulerEvent::ProviderStatus { .. } => "provider_status",
             SchedulerEvent::GlobalLimitsChanged { .. } => "global_limits_changed",
             SchedulerEvent::TaskActivated { .. } => "task_activated",
+            SchedulerEvent::SettingsChanged { .. } => "settings_changed",
         }
     }
 }
@@ -133,6 +140,7 @@ pub fn known_event_type_labels() -> Vec<String> {
         "provider_status",
         "global_limits_changed",
         "task_activated",
+        "settings_changed",
     ]
     .iter()
     .map(|s| s.to_string())

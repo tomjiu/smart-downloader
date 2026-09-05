@@ -34,6 +34,15 @@ impl DaemonState {
             post_hook: Mutex::new(None),
             cleanup: Mutex::new(crate::config::CleanupCfg::default()),
             start_jitter_secs: std::sync::atomic::AtomicU32::new(0),
+            base_limits: Mutex::new(GlobalLimits {
+                max_download_kb_s: 0,
+                max_upload_kb_s: 0,
+            }),
+            alt_cfg: Mutex::new(crate::config::LimitsCfg::default()),
+            alt_active: std::sync::atomic::AtomicBool::new(false),
+            queue_cfg: Mutex::new(crate::config::QueueCfg::default()),
+            config_path: Mutex::new(None),
+            live_config: Mutex::new(None),
         }
     }
 
@@ -85,8 +94,13 @@ impl DaemonState {
     /// 注入全局限速总阀门初始值（E16）：serve 从 config
     /// `[download] max_download_kb_s` + `[bt] max_upload_kb_s` 传入——
     /// 引擎构造时已携同值，此处仅同步内存口径（GET /config/限速查询一致）。
+    /// S1：基准限速同步注入（启动配置即基准值）。
     pub fn with_global_limits(mut self, max_download_kb_s: u32, max_upload_kb_s: u32) -> Self {
         self.global_limits = Mutex::new(GlobalLimits {
+            max_download_kb_s,
+            max_upload_kb_s,
+        });
+        self.base_limits = Mutex::new(GlobalLimits {
             max_download_kb_s,
             max_upload_kb_s,
         });
@@ -96,6 +110,35 @@ impl DaemonState {
     /// 读取全局限速总阀门当前值（E16）。
     pub fn global_limits(&self) -> GlobalLimits {
         *self.global_limits.lock()
+    }
+
+    /// 读取基准限速（S1）：备用窗口生效时 ≠ global_limits（引擎实际值）。
+    pub fn base_limits(&self) -> GlobalLimits {
+        *self.base_limits.lock()
+    }
+
+    /// 注入备用限速调度配置（S1）：serve 从 `[limits]` 传入；热重载跟随。
+    pub fn with_limits_cfg(self, cfg: crate::config::LimitsCfg) -> Self {
+        *self.alt_cfg.lock() = cfg;
+        self
+    }
+
+    /// 注入并发队列配额（S1）：serve 从 `[queue]` 传入；热重载跟随。
+    pub fn with_queue_cfg(self, cfg: crate::config::QueueCfg) -> Self {
+        *self.queue_cfg.lock() = cfg;
+        self
+    }
+
+    /// 注入配置文件路径（S1 持久化）：`--config` 存在时由 serve 传入。
+    pub fn with_config_path(self, path: Option<PathBuf>) -> Self {
+        *self.config_path.lock() = path;
+        self
+    }
+
+    /// 注入当前权威配置（S1）：serve 启动时传入；热重载 refresh_config 刷新。
+    pub fn with_live_config(self, cfg: crate::config::Config) -> Self {
+        *self.live_config.lock() = Some(cfg);
+        self
     }
 
     /// 注入任务完成 Webhook URL（E17）：None/空 = 禁用。
@@ -121,6 +164,9 @@ impl DaemonState {
     /// 可失败引擎先行保证近全有或全无），成功后同步内存值 + /config 快照覆盖
     /// + `global_limits_changed` 事件。
     ///
+    /// S1 语义补充：本方法=「用户手动设定」——同时更新基准限速（base_limits）；
+    /// 若备用限速窗口正生效，立即重评估（备用优先级 > 基准，见 tick_alt_limits）。
+    ///
     /// - `None` 方向 = 不调整；`Some(0)` = 不限；`Some(n)` = 合计上限 n KiB/s
     /// - 双 `None` = 纯查询（返回当前值，零副作用）
     /// - 合并后值与当前一致 → 无变化 no-op（引擎侧已是该值，不发事件）
@@ -138,10 +184,21 @@ impl DaemonState {
         if down_kb_s.is_none() && up_kb_s.is_none() {
             return Ok(old); // 纯查询
         }
-        let effective = GlobalLimits {
-            max_download_kb_s: down_kb_s.unwrap_or(old.max_download_kb_s),
-            max_upload_kb_s: up_kb_s.unwrap_or(old.max_upload_kb_s),
+        let base = {
+            let b = *self.base_limits.lock();
+            GlobalLimits {
+                max_download_kb_s: down_kb_s.unwrap_or(b.max_download_kb_s),
+                max_upload_kb_s: up_kb_s.unwrap_or(b.max_upload_kb_s),
+            }
         };
+        *self.base_limits.lock() = base;
+        // 备用窗口正命中时：基准变更不直接生效，重评估取备用/基准优胜者
+        //（首次调用链上 alt 未配置时 alt_active=false → 等价直接生效）。
+        if self.alt_active.load(std::sync::atomic::Ordering::Relaxed) {
+            self.tick_alt_limits().await?;
+            return Ok(*self.global_limits.lock());
+        }
+        let effective = base;
         if effective == old {
             return Ok(old); // 无变化 no-op
         }
@@ -292,8 +349,14 @@ impl DaemonState {
     }
 
     /// #6 TOML 热重载应用：配置重读后刷新可热更字段（default_dest_root + /config 快照）。
-    /// 变更项记日志；不变项静默。
+    /// 变更项记日志；不变项静默。S1：同步刷新权威配置 + 备用限速/队列配置。
     pub fn refresh_config(&self, cfg: &crate::config::Config, tasks_path: &std::path::Path) {
+        // S1：权威配置先落地（后续字段均从 cfg 读，最后统一快照）
+        *self.live_config.lock() = Some(cfg.clone());
+        // S1：备用限速/队列配置热重载跟随（运行时效果由 serve 的 ticker
+        // 下轮评估 + apply_global_limits 文件为准路径接力，此处仅存配置）
+        *self.alt_cfg.lock() = cfg.limits.clone();
+        *self.queue_cfg.lock() = cfg.queue.clone();
         {
             let mut def = self.default_dest_root.lock();
             let new_root = cfg.download.dest_root.clone();

@@ -596,6 +596,25 @@ pub struct DaemonState {
     /// 0..=N 秒内延迟启动。serve 从 `[scheduler] start_jitter_seconds`
     /// 注入，热重载跟随（只影响新任务；AtomicU32 无锁读取，add 热路径）。
     start_jitter_secs: std::sync::atomic::AtomicU32,
+    /// 基准限速（S1 设置面）：用户语义上的「全局限速」值——备用限速窗口
+    /// 生效时引擎实际值 = 备用值（global_limits），窗口外回到本值。
+    /// 由 apply_global_limits（手动/热重载）与 PUT /settings 维护。
+    base_limits: Mutex<GlobalLimits>,
+    /// 备用限速调度配置（S1）：serve 从 `[limits]` 注入；PUT /settings 运行时
+    /// 更新；热重载跟随。tick_alt_limits 每 30s 评估窗口切换。
+    alt_cfg: Mutex<crate::config::LimitsCfg>,
+    /// 备用限速窗口当前是否命中（S1）：`GET /settings` 展示 + 避免 ticker
+    /// 重复计算边界。窗口切换时置位/复位。
+    alt_active: std::sync::atomic::AtomicBool,
+    /// 引擎并发队列配额（S1）：`[queue]` 注入 + PUT /settings 更新。
+    /// v1 仅持久化/快照（门控接线见 BACKLOG S1-b）。
+    queue_cfg: Mutex<crate::config::QueueCfg>,
+    /// 配置文件路径（S1 持久化）：`PUT /settings?persist=true` 回写目标；
+    /// None（未指定 --config / 测试装配）时 persist 请求返回 not_persisted。
+    config_path: Mutex<Option<PathBuf>>,
+    /// 当前权威配置（S1）：serve 启动注入 + 热重载刷新；PUT /settings 在其上
+    /// 打补丁后（a）应用运行时效果（b）persist 时回写文件（c）刷新 /config 快照。
+    live_config: Mutex<Option<crate::config::Config>>,
 }
 
 /// 全局限速总阀门当前值（E16，KiB/s；0 = 不限）。
@@ -622,6 +641,7 @@ mod bt_alerts;
 mod lifecycle;
 mod ops;
 mod persistence;
+mod settings;
 
 // 路径稳定 re-export：外部引用（serve.rs/bt.rs/http.rs/events.rs）与
 // state_tests.rs 的 `use super::*` 名字解析保持拆分前语义不变。
@@ -634,6 +654,7 @@ pub use bt_alerts::{FileMeta, TorrentMeta};
 use lifecycle::ct_eq;
 pub use ops::{canonical_http_url, ensure_dest_root, precheck_space};
 pub use persistence::write_tasks_atomic;
+pub use settings::{SettingsApplyReport, SettingsReq};
 
 #[cfg(test)]
 #[path = "state_tests/mod.rs"]

@@ -229,6 +229,13 @@ unsafe extern "C" {
     ) -> lt_err;
 }
 unsafe extern "C" {
+    pub fn lt_apply_conn(
+        s: *mut lt_session,
+        port: ::std::os::raw::c_int,
+        max_connections: ::std::os::raw::c_int,
+    ) -> lt_err;
+}
+unsafe extern "C" {
     pub fn lt_add_magnet(
         s: *mut lt_session,
         magnet: *const ::std::os::raw::c_char,

@@ -11,7 +11,7 @@ use crate::range::{multi_source_ok, probe_range, Probe};
 use crate::rate::{RateLimiter, RateSample};
 use crate::segment_manager::DEFAULT_MIN_SPLIT;
 use crate::verify::{verify_file, verify_file_md5, verify_file_sha1};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use smart_dl_core::identity::ContentIdentity;
 use smart_dl_core::session::output::OutputManager;
 use smart_dl_core::task::DownloadTask;
@@ -106,6 +106,10 @@ pub struct HttpEngine {
     /// 跨段共享限速器（0 = 不限）。
     limiter: Arc<RateLimiter>,
     inner: Arc<EngineInner>,
+    /// 运行时全局代理（S1 设置面）：`set_global_proxy` 热改；逐任务 client
+    /// 构建时与任务级代理合并（任务级优先）。启动时全局代理已烘入共享
+    /// client，本字段仅存运行中变更（None = 沿用启动口径，不重烘）。
+    global_proxy: Arc<RwLock<Option<String>>>,
 }
 
 /// 从代理 URL 提取 `user:pass@`（E5：任务级代理 reqwest basic_auth 用；
@@ -163,6 +167,7 @@ impl HttpEngine {
                 mirror_scores: Arc::new(Mutex::new(HashMap::new())),
                 limiters: Mutex::new(HashMap::new()),
             }),
+            global_proxy: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -173,11 +178,19 @@ impl HttpEngine {
     fn spawn_download(&self, tid: EngineTaskId, gen: u64, epoch: u64) {
         // E5 任务级代理：Some(proxy) → 构建任务专用 client（仅装该代理，覆盖
         // 全局）；None → 引擎共享 client（可能含全局 [download] proxy）。
+        // S1 补充：任务无代理且运行时全局代理已设置 → 合并运行时全局代理
+        // （新任务生效语义；启动时代理已烘入共享 client，此处仅运行中变更）。
         // 构建失败（add 时已校验过，此处兜底）→ 任务标 Error 不 spawn。
         let (client, spawn_err) = {
+            let runtime_global = self.global_proxy.read().clone().filter(|s| !s.is_empty());
             let tasks = self.inner.tasks.lock();
-            match tasks.get(&tid).and_then(|t| t.proxy.as_deref()) {
-                Some(p) => match build_proxied_client(p) {
+            match tasks
+                .get(&tid)
+                .and_then(|t| t.proxy.as_deref())
+                .map(|s| s.to_string())
+                .or(runtime_global)
+            {
+                Some(p) => match build_proxied_client(&p) {
                     Ok(c) => (c, None),
                     Err(e) => (
                         self.client.clone(),
@@ -1150,6 +1163,22 @@ impl DownloadEngine for HttpEngine {
             };
             self.spawn_download(id.clone(), gen, epoch);
         }
+        Ok(())
+    }
+
+    /// 引擎级全局代理热改（S1 设置面）：`Some(url)` = 后续新建任务走该代理
+    /// （逐任务 client 构建时合并，任务级代理仍优先）；`None` = 清除回启动
+    /// 口径（启动时已烘入共享 client 的代理不受影响）。非法 URL 试水拒绝
+    /// 零副作用（与 set_task_proxy 同语义）。存量任务不受扰（新任务生效）。
+    async fn set_global_proxy(&self, proxy: Option<&str>) -> Result<(), EngineError> {
+        let normalized = proxy
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // 试水校验（合法 → 构建产物即弃；spawn 时按需重建，成本 µs 级）
+        if let Some(p) = &normalized {
+            let _ = build_proxied_client(p).map_err(EngineError::Other)?;
+        }
+        *self.global_proxy.write() = normalized;
         Ok(())
     }
 
