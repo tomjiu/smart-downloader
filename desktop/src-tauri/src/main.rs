@@ -7,8 +7,13 @@
 //! - sidecar：`binaries/smart-dl-daemon-<target-triple>`（tauri externalBin）
 //! - UI 资源：`resources/ui/`（tauri bundle resources，源自 `ui/out`）
 //!
-//! 端口默认 8788，环境变量 `SMART_DL_DESKTOP_PORT` 可覆盖（避免与本机
-//! 常驻 daemon 冲突）。
+//! 端口契约：壳与 sidecar 同源约定——daemon 以 `--addr 127.0.0.1:<port>` 启动，
+//! 壳轮询同一端口就绪后开窗指向它，零漂移。默认 8788，环境变量
+//! `SMART_DL_DESKTOP_PORT` 可覆盖（避免与本机常驻 daemon 冲突）。
+//!
+//! 运行时目录：sidecar 的 CWD 设为应用配置目录（app_config_dir），daemon 的
+//! 相对路径（daemon.toml / tasks.json / downloads/ / daemon.lock）全部收纳其中，
+//! 避免打包后落到只读/系统目录。
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -100,12 +105,28 @@ fn main() {
                 .ok()
                 .map(|p| p.join("ui"))
                 .ok_or("缺少内嵌 UI 资源（resources/ui）")?;
+            // 运行时目录：app_config_dir（Linux ~/.config/<id>；macOS ~/Library/
+            // Application Support/<id>；Windows %APPDATA%/<id>）。CWD 指过去后
+            // daemon 的默认相对路径全部收纳于此；目录创建失败则 fail-closed。
+            let data_dir = handle
+                .path()
+                .app_config_dir()
+                .map_err(|e| format!("应用数据目录解析失败: {e}"))?;
+            std::fs::create_dir_all(&data_dir)
+                .map_err(|e| format!("应用数据目录创建失败（{data_dir:?}）: {e}"))?;
             let child_state: State<DaemonChild> = handle.state();
             let (mut rx, child) = handle
                 .shell()
                 .sidecar("smart-dl-daemon")
                 .map_err(|e| format!("sidecar 解析失败: {e}"))?
-                .args(["serve", "--ui-dir", &ui_dir.to_string_lossy()])
+                .args([
+                    "serve",
+                    "--addr",
+                    &format!("127.0.0.1:{port}"),
+                    "--ui-dir",
+                    &ui_dir.to_string_lossy(),
+                ])
+                .current_dir(&data_dir)
                 .spawn()
                 .map_err(|e| format!("daemon sidecar 启动失败: {e}"))?;
             *child_state.0.lock().unwrap() = Some(child);
