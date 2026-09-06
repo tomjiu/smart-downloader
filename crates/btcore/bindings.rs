@@ -547,6 +547,13 @@ unsafe extern "C" {
     ) -> lt_err;
 }
 unsafe extern "C" {
+    pub fn lt_torrent_set_max_connections(
+        s: *mut lt_session,
+        ih: *const ::std::os::raw::c_char,
+        max_connections: ::std::os::raw::c_int,
+    ) -> lt_err;
+}
+unsafe extern "C" {
     pub fn lt_set_limits(
         s: *mut lt_session,
         ih: *const ::std::os::raw::c_char,

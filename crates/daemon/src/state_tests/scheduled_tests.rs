@@ -62,6 +62,7 @@ fn insert_scheduled(state: &DaemonState, id: &str, kind: EngineKind, start_at: u
                 next_retry_at_unix: 0,
             },
             limits: None,
+            max_connections: None,
         },
         engine_tid: None,
         engine_kind: kind,
@@ -120,10 +121,19 @@ async fn activate_due_tasks_activates_only_due() {
     let future = now_unix() + 3600;
     insert_scheduled(&state, "t1", EngineKind::Http, past, TaskState::Queued);
     insert_scheduled(&state, "t2", EngineKind::Http, future, TaskState::Queued);
-    insert_scheduled(&state, "t3", EngineKind::Http, 0, TaskState::Queued); // 无调度（0）
+    // S1-b 起 start_at=0 + 无重试的无句柄 Queued 任务 = queue_wait（add 配额
+    // 满落队），随时可激活（配额 0 = 不限 → 直接过闸）；定时语义（t2 未到期
+    // 不激活）不变。
+    insert_scheduled(&state, "t3", EngineKind::Http, 0, TaskState::Queued);
     let activated = state.activate_due_tasks().await;
-    assert_eq!(activated, vec!["t1".to_string()], "仅到期任务被激活");
-    assert_eq!(fake.added.lock().len(), 1);
+    let mut sorted = activated.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        vec!["t1".to_string(), "t3".to_string()],
+        "到期任务 + queue_wait 激活；未来定时不激活"
+    );
+    assert_eq!(fake.added.lock().len(), 2);
     {
         let tasks = state.tasks.lock();
         assert!(tasks.get("t1").unwrap().engine_tid.is_some());
@@ -135,10 +145,6 @@ async fn activate_due_tasks_activates_only_due() {
         assert!(
             tasks.get("t2").unwrap().engine_tid.is_none(),
             "未到期不激活"
-        );
-        assert!(
-            tasks.get("t3").unwrap().engine_tid.is_none(),
-            "无调度不激活"
         );
     }
     // 事件：t1 有 TaskActivated（通过任务事件链验证 scheduled_start）

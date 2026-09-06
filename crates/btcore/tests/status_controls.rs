@@ -148,6 +148,28 @@ fn control_ops_and_read_piece() {
 }
 
 #[test]
+fn task_max_connections_set_and_reset() {
+    let (c, _save) = core("maxconn");
+    let seeder = seed::TestSeeder::start();
+    let ih = c.add_magnet(seeder.magnet(), &[]).expect("add_magnet");
+
+    // 元数据未就绪也可设（handle 级参数，S1-c 契约）
+    c.set_max_connections(&ih, 64).expect("set 64");
+    // 0 = 复位会话级 connections_limit 默认
+    c.set_max_connections(&ih, 0).expect("reset");
+
+    // 未知 infohash → NotFound 定性
+    let err = c
+        .set_max_connections("0000000000000000000000000000000000000000", 10)
+        .expect_err("未知 ih 必须失败");
+    assert!(
+        matches!(err, smart_dl_btcore::Error::NotFound(_)),
+        "实际 {:?}",
+        err
+    );
+}
+
+#[test]
 fn pause_resume_flow() {
     // pause → torrent_paused alert；resume 后状态可查（ABI100：状态停在暂停前值，§10.1）
     let (c, _save) = core("pr");

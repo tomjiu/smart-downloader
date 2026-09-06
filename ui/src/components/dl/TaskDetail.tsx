@@ -21,6 +21,7 @@ export default function TaskDetail({
   const [up, setUp] = useState("");
   const [proxy, setProxy] = useState("");
   const [seq, setSeq] = useState(false);
+  const [conn, setConn] = useState("");
   const [msg, setMsg] = useState<string | null>(null);
 
   useEffect(() => {
@@ -137,6 +138,30 @@ export default function TaskDetail({
                   <span className={`qoder-icon qoder-icon--${seq ? "check" : "circle-slash"}`} />
                   {seq ? "开启中" : "已关闭"}
                 </button>
+
+                {task.engine === "bt" && (
+                  <>
+                    <label className="dl-field-label">连接数上限</label>
+                    <input
+                      className="qoder-input"
+                      aria-label="任务连接数上限"
+                      placeholder={task.max_connections != null ? String(task.max_connections) : "0 = 内核默认"}
+                      value={conn}
+                      onChange={(e) => setConn(e.target.value.replace(/[^0-9]/g, ""))}
+                    />
+                    <div />
+                    <button
+                      className="qoder-btn"
+                      onClick={() => {
+                        if (!conn) return;
+                        run(() => client.taskConnections(task.task_id, Number(conn) || 0), conn === "0" ? "已复位内核默认" : "连接数上限已应用");
+                        setConn("");
+                      }}
+                    >
+                      应用连接数
+                    </button>
+                  </>
+                )}
 
                 <label className="dl-field-label">任务代理</label>
                 <input

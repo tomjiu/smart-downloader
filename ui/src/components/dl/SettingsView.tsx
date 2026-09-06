@@ -311,7 +311,7 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           <input className="qoder-input" type="number" min={0} value={s.queue.max_active_http} onChange={(e) => patch("queue", "max_active_http", num(e.target.value) ?? 0)} />
           <label className="dl-field-label">FTP 同时传输上限</label>
           <input className="qoder-input" type="number" min={0} value={s.queue.max_active_ftp} onChange={(e) => patch("queue", "max_active_ftp", num(e.target.value) ?? 0)} />
-          <div className="dl-field-help">当前版本仅持久化（引擎门控接线见 BACKLOG S1-b）</div>
+          <div className="dl-field-help">0 = 不限（禁用排队）；超配额自动排队，槽位空闲按提交顺序递补；手动恢复 = 强制开始</div>
         </div>
       </section>
 

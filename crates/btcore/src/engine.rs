@@ -335,6 +335,11 @@ impl BtCore {
         self.sess.set_sequential(ih, on)
     }
 
+    /// 任务级连接数上限（S1-c）：>0 = 上限；0 = 复位会话级默认。
+    pub fn set_max_connections(&self, ih: &str, max_connections: u32) -> ffi::Result<()> {
+        self.sess.set_max_connections(ih, max_connections)
+    }
+
     pub fn set_limits(&self, ih: &str, down: i64, up: i64) -> ffi::Result<()> {
         self.sess.set_limits(ih, down, up)
     }

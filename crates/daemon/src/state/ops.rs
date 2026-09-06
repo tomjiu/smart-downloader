@@ -256,6 +256,95 @@ impl DaemonState {
         task_id
     }
 
+    // ==================== S1-b 并发队列门控 ====================
+    // [queue] max_active_{bt,http,ftp}（0 = 不限）：add 入口配额满 → 任务落
+    // Queued 排队（无句柄），由 activate_due_tasks（serve 1s tick）在槽位空闲
+    // 后按 FIFO（created_at 升序）递补激活。槽位释放 = 任务进入非传输态
+    // （Completed/Failed/Stopped/Paused/Seeding/移除）。手动 resume = 强制
+    // 开始（无视配额，对齐 qbit「强制继续」语义）；恢复路径重放不设闸
+    // （保持停机前在飞集合，仅新增激活受闸）。
+
+    /// 引擎槽位下标（[bt, http, ftp]；Provider/XunleiNas 无独立配额，归 ftp
+    /// 桶但实际不会走到——门控仅在四条 add 路径调用，kind 恒为 Bt/Http/Ftp）。
+    fn slot_index(kind: EngineKind) -> usize {
+        match kind {
+            EngineKind::Bt => 0,
+            EngineKind::Http => 1,
+            EngineKind::Ftp | EngineKind::Provider | EngineKind::XunleiNas => 2,
+        }
+    }
+
+    /// 引擎并发配额（S1-b）：None = 不限（配置 0 或引擎无独立配额）。
+    /// 读 live queue_cfg（设置热改跟随）。
+    pub(super) fn queue_limit_of(&self, kind: EngineKind) -> Option<u32> {
+        let q = self.queue_cfg.lock().clone();
+        let v = match kind {
+            EngineKind::Bt => q.max_active_bt,
+            EngineKind::Http => q.max_active_http,
+            _ => q.max_active_ftp,
+        };
+        (v > 0).then_some(v)
+    }
+
+    /// 当前占用引擎槽位的任务数（S1-b）：有句柄且不在释放态（Paused = 用户
+    /// 挂起 / Seeding = 做种不占下载槽 / 终态）。add 后记录态短暂停留 Queued
+    /// （首轮引擎状态同步前）——有句柄即占位，防同 tick 连发超卖。
+    pub(super) fn active_slot_counts(&self) -> [u32; 3] {
+        let tasks = self.tasks.lock();
+        let mut counts = [0u32; 3];
+        for rec in tasks.values() {
+            if rec.engine_tid.is_none() {
+                continue;
+            }
+            if matches!(
+                rec.task.state,
+                TaskState::Paused
+                    | TaskState::Seeding
+                    | TaskState::Completed
+                    | TaskState::Stopped
+                    | TaskState::Failed
+            ) {
+                continue;
+            }
+            counts[Self::slot_index(rec.engine_kind)] += 1;
+        }
+        counts
+    }
+
+    /// add 路径配额闸门（S1-b）：返回 true = 有槽位，调用方继续 engine.add；
+    /// false = 配额已满，任务已落排队记录（Queued + 无句柄 + queue_wait 事件
+    /// + TaskCreated 发布），调用方直接返回 task_id。
+    ///
+    /// 调用时机：定时判定之后（定时任务不受此闸——到点由调度循环按当时配额激活）。
+    pub(super) fn gate_or_enqueue(&self, task: DownloadTask, kind: EngineKind) -> bool {
+        let Some(limit) = self.queue_limit_of(kind) else {
+            return true;
+        };
+        if self.active_slot_counts()[Self::slot_index(kind)] < limit {
+            return true;
+        }
+        let task_id = task.id.clone();
+        let mut rec = TaskRecord {
+            task,
+            engine_tid: None,
+            engine_kind: kind,
+            engine_status: None,
+            events: vec![],
+        };
+        rec.push_event(
+            "add",
+            Some(format!(
+                "queue_wait: {kind:?} 并发配额已满（{limit}），槽位空闲后自动递补"
+            )),
+        );
+        self.tasks.lock().insert(task_id.clone(), rec);
+        self.autosave();
+        self.hub.publish(SchedulerEvent::TaskCreated {
+            task_id: task_id.clone(),
+        });
+        false
+    }
+
     /// 激活单个定时任务（E23）：调引擎 add 接入 + 记录句柄 + 事件。
     /// add 失败/引擎不可用 → E30 重试拦截（预算未用尽安排退避重试）否则置
     /// Failed（对齐 restore add 失败语义）。激活成功时消费重试安排
@@ -337,16 +426,22 @@ impl DaemonState {
         }
     }
 
-    /// 调度激活循环驱动点（E23+E30）：把到期任务（未接入引擎、Queued）逐个
-    /// 接入引擎。到期判定：任务带重试安排（next_retry_at > 0）→ 按 next_retry_at
-    /// 判定（重试安排优先，避免定时任务首次激活间隙被误读）；否则按 E23
-    /// start_at 判定。serve 以 1s 周期驱动；测试可直接调用。返回激活成功的
-    /// task_id 列表（保持迭代序）。
+    /// 调度激活循环驱动点（E23+E30+S1-b）：把等待中的任务（未接入引擎、
+    /// Queued）逐个接入引擎。候选与到期判定：
+    /// - 带重试安排（next_retry_at > 0）→ 按 next_retry_at 判定（重试安排
+    ///   优先，避免定时任务首次激活间隙被误读）
+    /// - 否则 start_at > 0 → 按 E23 start_at 判定
+    /// - 否则 → S1-b queue_wait（add 时配额满落队），视为随时到期
+    ///
+    /// 激活统一过 S1-b 配额闸门：槽位不足则本轮跳过（队首优先，FIFO =
+    /// created_at 升序，Instant 纳秒粒度同刻碰撞实际不可能）。serve 以 1s
+    /// 周期驱动（终态/暂停/移除释放槽位 → 下轮递补）；测试可直接调用。
+    /// 返回激活成功的 task_id 列表（激活序）。
     pub async fn activate_due_tasks(&self) -> Vec<String> {
         let now = now_unix();
         let due: Vec<(String, DownloadTask, EngineKind)> = {
             let tasks = self.tasks.lock();
-            tasks
+            let mut v: Vec<(String, DownloadTask, EngineKind, std::time::Instant)> = tasks
                 .iter()
                 .filter(|(_, rec)| {
                     if rec.engine_tid.is_some() || rec.task.state != TaskState::Queued {
@@ -356,17 +451,38 @@ impl DaemonState {
                     if m.next_retry_at_unix > 0 {
                         // E30：重试等待中——到期才激活
                         m.next_retry_at_unix <= now
-                    } else {
+                    } else if m.start_at_unix > 0 {
                         // E23：定时启动等待中——到期才激活
-                        m.start_at_unix > 0 && m.start_at_unix <= now
+                        m.start_at_unix <= now
+                    } else {
+                        // S1-b：queue_wait 等槽位——随时可激活（下方配额闸门把关）
+                        true
                     }
                 })
-                .map(|(id, rec)| (id.clone(), rec.task.clone(), rec.engine_kind))
-                .collect()
+                .map(|(id, rec)| {
+                    (
+                        id.clone(),
+                        rec.task.clone(),
+                        rec.engine_kind,
+                        rec.task.created_at,
+                    )
+                })
+                .collect();
+            // S1-b FIFO：按创建序递补
+            v.sort_by_key(|(_, _, _, created)| *created);
+            v.into_iter().map(|(id, t, k, _)| (id, t, k)).collect()
         };
+        let mut counts = self.active_slot_counts();
         let mut activated = Vec::new();
         for (id, task, kind) in due {
+            // S1-b 配额闸门：槽位不足本轮跳过（下一 tick 再试）
+            if let Some(limit) = self.queue_limit_of(kind) {
+                if counts[Self::slot_index(kind)] >= limit {
+                    continue;
+                }
+            }
             if self.activate_one(&id, task, kind).await {
+                counts[Self::slot_index(kind)] += 1;
                 activated.push(id);
             }
         }
@@ -546,12 +662,17 @@ impl DaemonState {
                 next_retry_at_unix: 0,
             },
             limits: None,
+            max_connections: None,
         };
 
         // E23 定时启动：start_at 未来 → 延迟入引擎（记录 Queued + 无句柄），
         // 到点由调度循环接入（engine.add 与查重/预检后置同链路）。
         if task.metadata.start_at_unix > now_unix() {
             return Ok(self.insert_scheduled_task(task, EngineKind::Bt));
+        }
+        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
+        if !self.gate_or_enqueue(task.clone(), EngineKind::Bt) {
+            return Ok(task_id);
         }
 
         let engine_tid = self
@@ -675,11 +796,16 @@ impl DaemonState {
                 next_retry_at_unix: 0,
             },
             limits: None,
+            max_connections: None,
         };
 
         // E23 定时启动：start_at 未来 → 延迟入引擎，到点由调度循环接入。
         if task.metadata.start_at_unix > now_unix() {
             return Ok(self.insert_scheduled_task(task, EngineKind::Bt));
+        }
+        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
+        if !self.gate_or_enqueue(task.clone(), EngineKind::Bt) {
+            return Ok(task_id);
         }
 
         let engine_tid = self
@@ -912,6 +1038,7 @@ impl DaemonState {
                 next_retry_at_unix: 0,
             },
             limits: None,
+            max_connections: None,
         };
         let mut rec = TaskRecord {
             task,
@@ -1088,6 +1215,7 @@ impl DaemonState {
                 next_retry_at_unix: 0,
             },
             limits: None,
+            max_connections: None,
         };
 
         // E21 skip：目标文件已在 → 不入引擎，任务直接落 Completed
@@ -1135,6 +1263,10 @@ impl DaemonState {
         // 调度无意义（两开关同时给出时 skip 优先）。
         if task.metadata.start_at_unix > now_unix() {
             return Ok(self.insert_scheduled_task(task, EngineKind::Http));
+        }
+        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
+        if !self.gate_or_enqueue(task.clone(), EngineKind::Http) {
+            return Ok(task_id);
         }
         let engine_tid = self
             .engine_for(EngineKind::Http)?
@@ -1261,11 +1393,16 @@ impl DaemonState {
                 next_retry_at_unix: 0,
             },
             limits: None,
+            max_connections: None,
         };
 
         // E23 定时启动：start_at 未来 → 延迟入引擎，到点由调度循环接入。
         if task.metadata.start_at_unix > now_unix() {
             return Ok(self.insert_scheduled_task(task, EngineKind::Ftp));
+        }
+        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
+        if !self.gate_or_enqueue(task.clone(), EngineKind::Ftp) {
+            return Ok(task_id);
         }
 
         let engine = self.engine_for(EngineKind::Ftp)?;
@@ -1482,6 +1619,7 @@ impl DaemonState {
             limits: rec.task.limits.clone(),
             file_priorities: rec.task.file_priorities.clone(),
             sequential: rec.task.sequential,
+            max_connections: rec.task.max_connections,
             name: rec.task.metadata.name.clone(),
             tags: rec.task.metadata.tags.clone(),
             start_at_unix: rec.task.metadata.start_at_unix,
@@ -2029,6 +2167,50 @@ impl DaemonState {
             if let Some(rec) = tasks.get_mut(id) {
                 rec.task.sequential = on;
                 rec.push_event("sequential_changed", Some(on.to_string()));
+            }
+        }
+        self.autosave();
+        Ok(())
+    }
+
+    /// 任务级连接数上限（S1-c，qbit 每任务连接数）：仅 BT 任务（daemon 侧
+    /// 预拒，其余 kind → `UnsupportedOp` 409，同 task_proxy 预拒惯例）。
+    /// `n > 0` = 上限；`n == 0` = 复位会话级连接数默认。写入记录字段
+    /// （持久化 + 恢复重放，metadata 未就绪也可设）+ 引擎即时下发。
+    pub async fn set_task_max_connections(&self, id: &str, n: u32) -> Result<(), DaemonError> {
+        let (engine, tid) = {
+            let rec = self
+                .tasks
+                .lock()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            if rec.engine_kind != EngineKind::Bt {
+                return Err(DaemonError::UnsupportedOp(format!(
+                    "任务 {id} 非 BT 任务（{:?}），不支持连接数上限",
+                    rec.engine_kind
+                )));
+            }
+            let tid = rec
+                .engine_tid
+                .clone()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            (self.engine_for(rec.engine_kind)?, tid)
+        };
+        engine
+            .set_max_connections(&tid, n)
+            .await
+            .map_err(|e| match e {
+                smart_dl_core::types::EngineError::Unsupported => {
+                    DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持连接数上限"))
+                }
+                other => DaemonError::Engine(other.to_string()),
+            })?;
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.task.max_connections = Some(n);
+                rec.push_event("max_connections_changed", Some(n.to_string()));
             }
         }
         self.autosave();
@@ -2762,6 +2944,7 @@ impl HttpSink for FallbackSink {
                 next_retry_at_unix: 0,
             },
             limits: None,
+            max_connections: None,
         };
         let tid = self
             .http

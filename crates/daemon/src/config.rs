@@ -121,25 +121,16 @@ pub struct LimitsCfg {
 /// 引擎并发队列配额（S1）：各引擎**同时传输中**的任务数上限；超出的新任务
 /// 在 daemon 层挂 Queued 等待，任一在传任务到达非传输态（完成/暂停/失败/
 /// 移除）后 FIFO 递补。0 = 不限（保留旧行为）。
-#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct QueueCfg {
-    /// BT 引擎同时在传任务上限（默认 3，对齐 core 层历史配额）。
+    /// BT 引擎同时在传任务上限（S1-b；**0 = 不限/禁用排队**，默认值——
+    /// 保持升级前行为零变化；>0 启用门控，超配额任务排队由调度循环递补）。
     pub max_active_bt: u32,
-    /// HTTP 引擎同时在传任务上限（默认 8）。
+    /// HTTP 引擎同时在传任务上限（S1-b；0 = 不限）。
     pub max_active_http: u32,
-    /// FTP 引擎同时在传任务上限（默认 8）。
+    /// FTP 引擎同时在传任务上限（S1-b；0 = 不限）。
     pub max_active_ftp: u32,
-}
-
-impl Default for QueueCfg {
-    fn default() -> Self {
-        QueueCfg {
-            max_active_bt: 3,
-            max_active_http: 8,
-            max_active_ftp: 8,
-        }
-    }
 }
 
 fn default_bt_encrypt() -> String {

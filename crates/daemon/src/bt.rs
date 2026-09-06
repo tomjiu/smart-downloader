@@ -671,6 +671,12 @@ impl DownloadEngine for BtEngine {
         self.core.set_sequential(id, on).map_err(bt_engine_err)
     }
 
+    /// 任务级连接数上限（S1-c）：>0 = 上限；0 = 复位会话级默认。
+    /// metadata 未就绪也可设（handle 级参数，随任务存续生效）。
+    async fn set_max_connections(&self, id: &EngineTaskId, n: u32) -> Result<(), EngineError> {
+        self.core.set_max_connections(id, n).map_err(bt_engine_err)
+    }
+
     async fn add_xunlei_resume(&self, data: Vec<u8>) -> Result<EngineTaskId, EngineError> {
         self.core
             .add_torrent_resume(&data, &[])

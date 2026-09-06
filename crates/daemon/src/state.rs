@@ -146,6 +146,10 @@ pub struct TaskSnapshot {
     /// false = 默认并行策略（不序列化，快照向后兼容）。
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub sequential: bool,
+    /// 任务级连接数上限（S1-c，仅 BT 消费；None = 未设置走会话默认，
+    /// 序列化省略）。set 语义见 `DaemonState::set_task_max_connections`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
     /// 定时启动时刻（E23，unix 秒；0 = 未调度，序列化省略）。与列表
     /// `TaskSummary::start_at_unix` 同口径。
     #[serde(skip_serializing_if = "is_zero_u64")]

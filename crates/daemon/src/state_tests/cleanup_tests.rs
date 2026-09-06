@@ -48,6 +48,7 @@ fn insert_completed(state: &DaemonState, id: &str, finished_at_unix: u64) {
                 next_retry_at_unix: 0,
             },
             limits: None,
+            max_connections: None,
         },
         engine_tid: Some(id.to_string()),
         engine_kind: EngineKind::Http,

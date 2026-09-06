@@ -287,6 +287,43 @@ pub struct SequentialReq {
     pub sequential: bool,
 }
 
+/// 任务级连接数上限（`POST /tasks/:id/connections`，S1-c，qbit 每任务连接数）：
+/// `n > 0` = 上限；`n == 0` = 复位会话级默认。仅 BT 任务（其余 409）；
+/// 即时生效（handle 级参数，metadata 未就绪也可设）；持久化 + 恢复重放。
+#[derive(Deserialize)]
+pub struct ConnectionsReq {
+    pub max_connections: u32,
+}
+
+async fn task_connections(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ConnectionsReq>,
+) -> impl IntoResponse {
+    match state
+        .set_task_max_connections(&id, req.max_connections)
+        .await
+    {
+        Ok(()) => match state.task_snapshot(&id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
 async fn task_sequential(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -1976,6 +2013,7 @@ macro_rules! router_base {
             .route("/tasks/:id/fallback", post(task_fallback))
             .route("/tasks/:id/limit", post(task_limit))
             .route("/tasks/:id/sequential", post(task_sequential))
+            .route("/tasks/:id/connections", post(task_connections))
             .route("/tasks/:id/proxy", post(task_set_proxy))
             .route("/tasks/:id/name", post(task_rename))
             .route("/tasks/:id/tags", post(task_set_tags))
