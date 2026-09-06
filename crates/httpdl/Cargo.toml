@@ -26,6 +26,9 @@ md-5 = "0.10"
 # cbc 0.1 与 aes 0.8/cipher 0.4 配套，0.2 尚为 rc）
 aes = "0.8"
 cbc = "0.1"
+# DASH（C-DASH，MPD 清单解析）：quick-xml 事件流（workspace 统一 0.37，
+# metalink 同款）
+quick-xml = { workspace = true }
 smart-dl-core = { path = "../core" }
 parking_lot = { workspace = true }
 tokio-rustls = { workspace = true, optional = true }
