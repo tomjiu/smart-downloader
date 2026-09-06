@@ -931,3 +931,72 @@ workflow（workflow_dispatch 于 PR 分支）三平台首跑实证。
 （desktop-v0.2.0 Release 预留）；Release 文案更新（全引擎 + 原生库随包）。
 `desktop/src-tauri/native/` 与 `.vcpkg-cache/` 入 gitignore（CI stage 产物
 不入库）。
+
+## 33. RSS 订阅自动下载 + BT 任务 add 后 resume 补链（2026-09-06，PR #91）
+
+### fix(bt)：首次 add 后 handle 永久 paused（磁链实测暴露）
+
+- 内核统一语义（Bug A 修复）：`lt_add_magnet` / `lt_add_torrent_file` /
+  `lt_add_torrent_resume` 三入口均 `paused + 非 auto_managed` 落库。恢复重放
+  路径（`restore_from`）已有对称 resume（"非 paused 且 BT → engine.resume"），
+  但**首次 add 路径缺失**——任务层 add 只调引擎 add 不 resume，magnet 元数据
+  抓取与 .torrent 下载从不启动。
+- 暴露方式：本地 x.pe 磁链闭环（seed_main 做种 2MB 确定性文件 → daemon
+  `magnet:?xt=urn:btih:<ih>&dn=...&x.pe=127.0.0.1:<port>`）——修复前 seeder
+  `peers=0` 60s 零连接；补 `BtEngine::add` 末尾 resume 后：元数据（BEP-9）
+  → 下载完成 → 终态 Seeding → `cmp` 逐字节一致。
+- 新建任务无用户暂停意图，resume 与 P4 G5（重启保持暂停）不冲突；后续用户
+  pause 走 pause API（intent 标志位在 alert 循环持续压制复活）。
+- 环境注记：沙盒 UDP 出站被封（DHT ping `router.bittorrent.com:6881` 超时
+  实测）——公网磁链的 DHT/tracker 发现层依赖真实网络（G1 既有口径）；x.pe
+  直连绕过发现层，其余全链真实。
+
+### feat(rss)：RSS 订阅自动下载（qBittorrent RSS 对标，v1）
+
+**解析**（`crates/daemon/src/rss.rs`，quick-xml 0.37，对齐 metalink.rs 哲学）：
+- RSS 2.0（`<item>`）与 Atom（`<entry>`）同一解析循环，按 local name 匹配
+  （命名空间无关）。
+- 条目 URL 三级兜底：RSS 2.0 `<link>` 文本 → Atom `<link href>`（rel=alternate
+  优先，无 rel 次之，enclosure 等兜底）→ http(s) 形态 guid。均缺 → 跳过该条
+  （逐条容错）；整体无有效条目 → Err（上层 400）。
+- Atom 条目标识 `<id>` 与 RSS 2.0 `<guid>` 同映射 guid 字段；缺省 = url；
+  同 feed 内 guid 重复保留首见。
+- channel/feed 级 `<title>` → 订阅标题（首次拉取后锁定，站点改标题不改写）。
+
+**规则引擎**（无 regex 依赖）：
+- `must_contain` 全部关键词（大小写不敏感子串）命中标题才匹配；
+  `must_not_contain` 任一命中即排除。
+- `feed_id`：Some = 规则只作用于该订阅。
+- 命中 → `add_link_task_opts(url, rule.dest, name=条目标题)`（V3 显式名语义）
+  + `set_task_tags`（tags 非空时）→ 既有 HTTP 全链（探测/分段/限速/校验/
+  事件/Webhook）。
+- `item.task_id` 落位 = 去重标记：重复 refresh 不重建；新建规则可回溯未处理
+  历史条目。
+
+**API（八端点）**：
+- `POST /rss/feeds`（添加即拉取；拉取/解析失败 400 fail-closed 不入库；
+  同 URL 409）→ 201 `{id, title, item_count}`
+- `GET /rss/feeds`（含 item_count / pending_count）/ `DELETE /rss/feeds/:id`
+- `GET /rss/items?feed_id=`（条目 + task_id 透出）
+- `POST /rss/rules`（规则名校验 / 关键词至少一组 / feed_id 存在性校验）
+  / `GET /rss/rules` / `DELETE /rss/rules/:id`
+- `POST /rss/refresh`：全量刷新 → 条目合并（guid 去重）→ 规则匹配 → 自动
+  建任务；单 feed 拉取失败降级 `errors` 列表不拖垮整体。
+
+**配置与持久化**：
+- `[rss]`：`auto_refresh`（默认 true）/ `refresh_interval_secs`（默认 900，
+  ticker 下限 60s 防误配风暴）/ `max_processed_items_per_feed`（默认 200；
+  仅截已处理条目——未处理截掉会失去重标记导致重复建任务）。
+- rss.json（tasks.json 同目录，`with_storage` 派生）：feeds/items/rules 全量
+  持久化，重启恢复。
+- serve 刷新 ticker：`auto_refresh=true` 且间隔 >0 时 `rss_refresh_all` 周期
+  执行。
+
+**测试**：解析单测 6（RSS2.0 基础/Atom 基础/guid permalink 兜底去重/坏 XML
+三态/Atom 自闭合 link 三变体/规则匹配大小写）+ e2e 2（订阅 → 规则 → 自动
+建任务 → 真实下载 Completed → 落盘 cmp 逐字节一致 → tag 透传 → 去重 →
+rss.json 落盘；Atom 添加 + 规则校验 400 系列 + 坏 feed fail-closed）。
+
+**门禁**：fmt · clippy ×7（daemon 5 变体 + workspace + httpdl ftp，
+`-D warnings`）全 0 · daemon bt,ftp,sftp / default / core / httpdl(ftp)
+测试全 0 失败。
