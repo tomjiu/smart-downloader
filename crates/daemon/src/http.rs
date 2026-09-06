@@ -2351,16 +2351,56 @@ async fn auth_mw(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     if state.verify_http_token(authorization) {
-        next.run(req).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(
-                serde_json::json!({ "error": "unauthorized: 需要 Authorization: Bearer <token>" }),
-            ),
-        )
-            .into_response()
+        return next.run(req).await;
     }
+    // 审计修复（40-e P1-6）：SSE 鉴权回退——EventSource（浏览器规范限制）
+    // 无法自定义请求头，配置 token 后 UI 事件流 401 死循环（2s 重试永不
+    // 恢复，速率事件/完成 toast/日志视图全部失效）。仅对 /events/stream
+    // 精确路径接受 ?token=（UI 侧 encodeURIComponent；服务端原值/解码双
+    // 比较，常量时间与 Bearer 同口径）。其余端点仍严格 Bearer-only。
+    if req.uri().path() == "/events/stream" {
+        let from_query = req
+            .uri()
+            .query()
+            .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token=")));
+        if let Some(t) = from_query {
+            if state.verify_http_token_query(t) || state.verify_http_token_query(&pct_decode(t)) {
+                return next.run(req).await;
+            }
+        }
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({ "error": "unauthorized: 需要 Authorization: Bearer <token>" })),
+    )
+        .into_response()
+}
+
+/// 最小 percent-decode（SSE query token 回退专用：UI 侧 encodeURIComponent）。
+/// 非法序列原样保留；`+` 按查询串惯例解码为空格。
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
+            {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        if b[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(feature = "nas")]

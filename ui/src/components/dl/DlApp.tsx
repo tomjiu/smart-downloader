@@ -46,30 +46,28 @@ export default function DlApp() {
   }, []);
 
   const refresh = useCallback(async () => {
-    try {
-      const [t, s] = await Promise.all([
-        client.listTasks().catch(() => [] as TaskListItem[]),
-        client.stats().catch(() => null),
-      ]);
-      // 内容不变不重渲染（轮询防抖：避免每秒替换子树，也提升自动化稳定性）
-      setTasks((cur) => {
-        const next = t;
-        return JSON.stringify(cur) === JSON.stringify(next) ? cur : next;
-      });
-      if (s) {
-        setStats((cur) => (JSON.stringify(cur) === JSON.stringify(s) ? cur : s));
-        const h = historyRef.current;
-        const last = h[h.length - 1];
-        if (!last || last.down !== s.down_bytes_s || last.up !== s.up_bytes_s) {
-          h.push({ down: s.down_bytes_s, up: s.up_bytes_s });
-          if (h.length > 180) h.splice(0, h.length - 180);
-          setHistoryTick((x) => x + 1);
-        }
-      }
-      setConnected(true);
-    } catch {
-      setConnected(false);
+    // 审计修复（40-e P1-4）：失败保留旧数据——旧实现 listTasks().catch(() => [])
+    // 把失败吞成空数组，一次网络抖动/502 即整表清空显示「暂无任务」；且内层已
+    // 消化错误，setConnected(true) 每秒无条件执行。现失败置 null 保留旧态，
+    // 双请求都失败才判断连（与 SSE onState 不再互相打架）。
+    const [t, s] = await Promise.all([
+      client.listTasks().catch(() => null),
+      client.stats().catch(() => null),
+    ]);
+    if (t !== null) {
+      setTasks((cur) => (JSON.stringify(cur) === JSON.stringify(t) ? cur : t));
     }
+    if (s) {
+      setStats((cur) => (JSON.stringify(cur) === JSON.stringify(s) ? cur : s));
+      const h = historyRef.current;
+      const last = h[h.length - 1];
+      if (!last || last.down !== s.down_bytes_s || last.up !== s.up_bytes_s) {
+        h.push({ down: s.down_bytes_s, up: s.up_bytes_s });
+        if (h.length > 180) h.splice(0, h.length - 180);
+        setHistoryTick((x) => x + 1);
+      }
+    }
+    setConnected(t !== null || s !== null);
   }, []);
 
   useEffect(() => {
@@ -97,6 +95,19 @@ export default function DlApp() {
         }
         if (type === "completed") toast({ kind: "success", text: `任务完成（#${env.seq}）` });
         if (type === "failed") toast({ kind: "error", text: `任务失败（#${env.seq}）` });
+        // 审计修复（40-e P2-22）：终态事件清理速率表条目——旧实现按 task_id
+        // 只增不删，长会话中已删任务条目常驻（轻微内存增长）。
+        if (type === "completed" || type === "failed" || type === "removed") {
+          const tid = String(env.event.task_id ?? "");
+          if (tid) {
+            setRates((cur) => {
+              if (!(tid in cur)) return cur;
+              const next = { ...cur };
+              delete next[tid];
+              return next;
+            });
+          }
+        }
       },
       setConnected,
     );
@@ -148,7 +159,13 @@ export default function DlApp() {
         <main className="dl-main">
           <div key={view} className="dl-enter">
             {view === "tasks" && (
-              <TasksView tasks={tasks} rates={rates} onChanged={refresh} onOpen={setDetail} />
+              <TasksView
+                tasks={tasks}
+                rates={rates}
+                onChanged={refresh}
+                onOpen={setDetail}
+                onToast={toast}
+              />
             )}
             {view === "stats" && <StatsView stats={stats} history={historyRef.current} tasks={tasks} />}
             {view === "logs" && <LogsView events={events} />}
