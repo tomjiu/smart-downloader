@@ -365,9 +365,7 @@ mod tests {
             data.extend_from_slice(b"d1:k");
         }
         data.extend_from_slice(b"i1e");
-        for _ in 0..60 {
-            data.push(b'e');
-        }
+        data.extend(std::iter::repeat_n(b'e', 60));
         assert!(decode(&data).is_ok());
     }
 

@@ -386,6 +386,7 @@ mod tests {
     ///   - XLServerInfo：pack(1) + u32 + 3 宽字符串 + 保留（铁证）
     ///   - XLInitParam：pack(1) + 4 窄字符串 + flags（推断，待真机验证）
     ///   - XLTaskInfo：pack(1) 消除尾随 padding（字段布局仍推测，待 dump 还原）
+    ///
     /// 若未来结构体布局漂移，此测试立即回归报警。
     #[test]
     fn abi_size_assert_aligned() {
