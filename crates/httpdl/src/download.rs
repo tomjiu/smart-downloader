@@ -312,9 +312,15 @@ async fn download_segment_streaming(
         .send()
         .await
         .map_err(|e| e.to_string())?;
-    if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        return Err(format!("segment status {}", resp.status()));
-    }
+    // RFC 7233 §2.1：服务器可忽略 Range 返回 200 全量体。容错路径：
+    // 200 → 丢弃前 seg.start 字节后顺序写 seg.len 字节（正确但浪费带宽，
+    // 仅非 206 服务器触发的兜底路径；206 主路径零浪费）。写满即弃流
+    // （drop resp 断开连接），语义与账本/进度完全兼容。
+    let skip_start = match resp.status() {
+        reqwest::StatusCode::PARTIAL_CONTENT => 0u64,
+        reqwest::StatusCode::OK => seg.start,
+        other => return Err(format!("segment status {}", other)),
+    };
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .open(part)
@@ -322,12 +328,29 @@ async fn download_segment_streaming(
     f.seek(SeekFrom::Start(seg.start))
         .map_err(|e| e.to_string())?;
     let mut written: u64 = 0;
+    let mut skipped: u64 = 0;
     loop {
         let chunk = resp.chunk().await.map_err(|e| e.to_string())?;
         let Some(chunk) = chunk else { break };
-        limiter.wait(chunk.len() as u64).await;
-        f.write_all(&chunk).map_err(|e| e.to_string())?;
-        written += chunk.len() as u64;
+        if skipped < skip_start {
+            let take = ((skip_start - skipped) as usize).min(chunk.len());
+            skipped += take as u64;
+            if take < chunk.len() {
+                let rest = &chunk[take..];
+                let n = rest.len().min((seg.len() - written) as usize);
+                limiter.wait(n as u64).await;
+                f.write_all(&rest[..n]).map_err(|e| e.to_string())?;
+                written += n as u64;
+            }
+        } else {
+            let n = chunk.len().min((seg.len() - written) as usize);
+            limiter.wait(n as u64).await;
+            f.write_all(&chunk[..n]).map_err(|e| e.to_string())?;
+            written += n as u64;
+        }
+        if written >= seg.len() {
+            break; // 写满即停：200 全量体的剩余部分（若有）主动弃流
+        }
     }
     if written != seg.len() {
         return Err(format!(

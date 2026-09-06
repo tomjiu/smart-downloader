@@ -2044,16 +2044,47 @@ macro_rules! router_nas {
 
 #[cfg(feature = "xunlei-import")]
 pub fn router(state: Arc<DaemonState>) -> Router {
-    router_nas!(router_base!(Router::new()))
-        .route("/tasks/xunlei-import", post(add_xunlei_import))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
-        .with_state(state)
+    router_with_ui(state, None)
 }
 
 #[cfg(not(feature = "xunlei-import"))]
 pub fn router(state: Arc<DaemonState>) -> Router {
-    router_nas!(router_base!(Router::new()))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
+    router_with_ui(state, None)
+}
+
+/// 带 UI 静态服务的路由（S2 内嵌）：`ui_dir` Some 时挂 ServeDir 作 fallback
+/// （SPA：目录自动 index.html）；API 优先级不变（路由表命中优先于 fallback）。
+pub fn router_with_ui(state: Arc<DaemonState>, ui_dir: Option<std::path::PathBuf>) -> Router {
+    inner_router(state, ui_dir)
+}
+
+#[cfg(feature = "xunlei-import")]
+fn inner_router(state: Arc<DaemonState>, ui_dir: Option<std::path::PathBuf>) -> Router {
+    let app = router_nas!(router_base!(Router::new()))
+        .route("/tasks/xunlei-import", post(add_xunlei_import));
+    finish_router(app, state, ui_dir)
+}
+
+#[cfg(not(feature = "xunlei-import"))]
+fn inner_router(state: Arc<DaemonState>, ui_dir: Option<std::path::PathBuf>) -> Router {
+    finish_router(router_nas!(router_base!(Router::new())), state, ui_dir)
+}
+
+fn finish_router(
+    app: axum::Router<Arc<DaemonState>>,
+    state: Arc<DaemonState>,
+    ui_dir: Option<std::path::PathBuf>,
+) -> Router {
+    let app = match ui_dir {
+        Some(dir) => {
+            tracing::info!("内嵌 UI 已启用: {:?}", dir);
+            app.fallback_service(
+                tower_http::services::ServeDir::new(&dir).append_index_html_on_directories(true),
+            )
+        }
+        None => app,
+    };
+    app.layer(middleware::from_fn_with_state(state.clone(), auth_mw))
         .with_state(state)
 }
 

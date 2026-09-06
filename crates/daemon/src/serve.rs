@@ -23,7 +23,7 @@ pub enum ServeError {
 
 /// 运行 daemon（阻塞至 Ctrl+C / 服务错误）。`cfg_path` 为配置文件源路径（Some 时启用
 /// #6 TOML 热重载：5s 轮询变更 → 刷新可热更字段）。
-pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeError> {
+pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     // 1. 单实例锁（重复启动立即退出）
     let _lock = InstanceLock::acquire(&cfg.lock.path)?;
     tracing::info!("单实例锁已持有: {:?}", cfg.lock.path);
@@ -146,7 +146,7 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         .with_start_jitter(cfg.scheduler.start_jitter_seconds)
         .with_limits_cfg(cfg.limits.clone())
         .with_queue_cfg(cfg.queue.clone())
-        .with_config_path(cfg_path.clone())
+        .with_config_path(args.config.clone())
         .with_live_config(cfg.clone());
     #[cfg(not(feature = "bt"))]
     let mut state = DaemonState::new(http_engine, providers)
@@ -164,7 +164,7 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         .with_start_jitter(cfg.scheduler.start_jitter_seconds)
         .with_limits_cfg(cfg.limits.clone())
         .with_queue_cfg(cfg.queue.clone())
-        .with_config_path(cfg_path.clone())
+        .with_config_path(args.config.clone())
         .with_live_config(cfg.clone());
 
     // 4. BT 引擎（先取 core 句柄，供 alert 事件流）
@@ -374,7 +374,7 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
 
     // 4d. #6 TOML 热重载：5s 轮询配置文件内容变更 → 解析 → refresh_config
     // （默认落盘目录 + /config 快照刷新；解析失败保留旧配置并告警）。
-    if let Some(path) = cfg_path {
+    if let Some(path) = args.config.clone() {
         let st = state_arc.clone();
         let tasks = tasks_path.clone();
         let mut last = std::fs::read_to_string(&path).ok();
@@ -434,7 +434,7 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     // S2：清扫上次运行遗留的 magnet 抓取 scratch（kill -9/断电残骸，best-effort；
     // PID+mtime 双重保护，活跃抓取与并发实例不受影响）。
     http::cleanup_stale_magnet_scratch();
-    let app = http::router(state_arc.clone());
+    let app = http::router_with_ui(state_arc.clone(), args.ui_dir.clone());
     let listener = tokio::net::TcpListener::bind(&cfg.server.addr)
         .await
         .map_err(|e| ServeError::Bind(cfg.server.addr.clone(), e))?;
@@ -484,9 +484,17 @@ fn resolve_http_token(env_val: Option<String>, cfg_val: Option<String>) -> (Opti
     }
 }
 
-/// 进程参数：`serve [--config <path>]`。
-pub fn parse_args(args: &[String]) -> Result<Option<std::path::PathBuf>, String> {
-    let mut cfg_path = None;
+/// 进程参数：`serve [--config <path>] [--ui-dir <dir>]`。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServeArgs {
+    pub config: Option<std::path::PathBuf>,
+    /// 内嵌 UI 静态资源目录（S2）：Some 时 daemon 直接服务前端（SPA fallback
+    /// 到 index.html）；桌面壳/内嵌部署传 `ui/out`；None = 纯 API。
+    pub ui_dir: Option<std::path::PathBuf>,
+}
+
+pub fn parse_args(args: &[String]) -> Result<ServeArgs, String> {
+    let mut out = ServeArgs::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -494,14 +502,21 @@ pub fn parse_args(args: &[String]) -> Result<Option<std::path::PathBuf>, String>
                 let v = args
                     .get(i + 1)
                     .ok_or_else(|| "--config 缺少路径".to_string())?;
-                cfg_path = Some(std::path::PathBuf::from(v));
+                out.config = Some(std::path::PathBuf::from(v));
+                i += 2;
+            }
+            "--ui-dir" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--ui-dir 缺少路径".to_string())?;
+                out.ui_dir = Some(std::path::PathBuf::from(v));
                 i += 2;
             }
             a if a.starts_with('-') => return Err(format!("未知参数: {a}")),
             _ => i += 1,
         }
     }
-    Ok(cfg_path)
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -538,18 +553,26 @@ mod tests {
     #[test]
     fn parse_config_flag() {
         let p = parse_args(&["serve".into(), "--config".into(), "x.toml".into()]).unwrap();
-        assert_eq!(p, Some(std::path::PathBuf::from("x.toml")));
+        assert_eq!(p.config, Some(std::path::PathBuf::from("x.toml")));
+        assert_eq!(p.ui_dir, None);
+    }
+
+    #[test]
+    fn parse_ui_dir_flag() {
+        let p = parse_args(&["serve".into(), "--ui-dir".into(), "ui/out".into()]).unwrap();
+        assert_eq!(p.ui_dir, Some(std::path::PathBuf::from("ui/out")));
+        assert_eq!(p.config, None);
     }
 
     #[test]
     fn parse_short_flag() {
         let p = parse_args(&["-c".into(), "y.toml".into()]).unwrap();
-        assert_eq!(p, Some(std::path::PathBuf::from("y.toml")));
+        assert_eq!(p.config, Some(std::path::PathBuf::from("y.toml")));
     }
 
     #[test]
     fn parse_default_no_flag() {
-        assert_eq!(parse_args(&["serve".into()]).unwrap(), None);
+        assert_eq!(parse_args(&["serve".into()]).unwrap().config, None);
     }
 
     #[test]

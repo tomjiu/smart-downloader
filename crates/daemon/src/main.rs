@@ -17,15 +17,15 @@ fn main() {
 
     // —— serve 子命令 ——
     if args.get(1).map(|s| s.as_str()) == Some("serve") {
-        let cfg_path = match serve::parse_args(&args[2..]) {
+        let serve_args = match serve::parse_args(&args[2..]) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("参数错误: {e}");
-                eprintln!("用法: smart-dl-daemon serve [--config <path>]");
+                eprintln!("用法: smart-dl-daemon serve [--config <path>] [--ui-dir <dir>]");
                 std::process::exit(2);
             }
         };
-        let cfg = match smart_dl_daemon::config::Config::load(cfg_path.as_deref()) {
+        let cfg = match smart_dl_daemon::config::Config::load(serve_args.config.as_deref()) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("配置错误: {e}");
@@ -33,7 +33,7 @@ fn main() {
             }
         };
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime 创建失败");
-        if let Err(e) = rt.block_on(serve::run(cfg, cfg_path)) {
+        if let Err(e) = rt.block_on(serve::run(cfg, serve_args)) {
             eprintln!("daemon 退出: {e}");
             std::process::exit(1);
         }
