@@ -4,7 +4,7 @@
 
 [package]
 name = "smart-dl-desktop"
-version = "0.1.0"
+version = "0.2.0"
 description = "Smart Downloader 桌面端"
 authors = ["mmqz"]
 edition = "2021"

@@ -953,8 +953,27 @@ lt_err lt_metadata(lt_session* s, const char* ih, uint8_t* buf, size_t cap, size
         if (!ti) { set_err(s, "metadata not received"); return LT_ERR_NOT_FOUND; }
         // create_torrent(ti) → generate → bencode：由 torrent_info 重建标准 .torrent
         // 字节（info dict 原样 + announce 族回填；v1 torrent 为无损往返）。
+#if LIBTORRENT_VERSION_NUM >= 20100
+        // 2.1：create_torrent(torrent_info const&) ctor 在 ABI>=4 构建态被移除
+        //（vcpkg x64-windows 实证 C2665；brew 2.1.1 ABI<4 仅 deprecated 警告）。
+        // 官方替代 write_torrent_file(atp)（write_resume_data.hpp，TORRENT_EXPORT
+        // 无 ABI 守卫，dylib 必导出）：info dict 经 atp.ti 原样保留。
+        // 注意 ti 的 trackers()/web_seeds() 访问器在 ABI>=4 同样被移除（C2039
+        // 二次实证），announce 族改走 torrent_handle 未废弃面（h.trackers()/
+        // h.url_seeds()）；dht nodes 磁力派生 ti 本就为空，按空省略。
+        lt::add_torrent_params atp;
+        atp.ti = std::const_pointer_cast<lt::torrent_info>(ti);
+        for (const lt::announce_entry& ae : h.trackers()) {
+            atp.trackers.push_back(ae.url);
+        }
+        for (const std::string& u : h.url_seeds()) {
+            atp.url_seeds.push_back(u);
+        }
+        const lt::entry e = lt::write_torrent_file(atp);
+#else
         lt::create_torrent ct(*ti);
         const lt::entry e = ct.generate();
+#endif
         std::vector<char> data;
         lt::bencode(std::back_inserter(data), e);
         const size_t sz = data.size();
