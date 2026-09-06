@@ -346,6 +346,15 @@ impl Session {
         )
     }
 
+    /// 超级种子开关（seed_mode flag；下载中设置无效果，做种态生效）。
+    pub fn set_seed_mode(&self, ih: &str, on: bool) -> Result<()> {
+        let i = self.ih(ih)?;
+        call(
+            unsafe { lt_set_seed_mode(self.raw, i.as_ptr(), on as c_int) },
+            || Ok(()),
+        )
+    }
+
     pub fn resume(&self, ih: &str) -> Result<()> {
         let i = self.ih(ih)?;
         call(unsafe { lt_resume(self.raw, i.as_ptr()) }, || Ok(()))

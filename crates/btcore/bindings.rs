@@ -526,6 +526,13 @@ unsafe extern "C" {
     ) -> lt_err;
 }
 unsafe extern "C" {
+    pub fn lt_set_seed_mode(
+        s: *mut lt_session,
+        ih: *const ::std::os::raw::c_char,
+        on: i32,
+    ) -> lt_err;
+}
+unsafe extern "C" {
     pub fn lt_add_url_seed(
         s: *mut lt_session,
         ih: *const ::std::os::raw::c_char,

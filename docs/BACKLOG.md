@@ -103,3 +103,11 @@
 - Kaspersky 锁 daemon lib 单测 exe → 只能用集成测试（`--test X`）
 - bt_api 并行偶发 flaky（libtorrent 多 session 并行）→ 重跑即绿
 - http_api 曾偶发 1 用例失败：重负载窗口（连续重建 + 杀软扫描新 exe）把轮询测试的 10s 等待击穿。**已修复**：三处等待护栏 10s→60s（快照/list/事件；语义不变，仅抗进程级停顿；已实测 6 轮强制 rebuild 首跑 + 50+ 次运行全绿）
+
+> 更新：2026-09-06（五）。**qBittorrent 对标补齐批次落地（Task 38）**：磁链端到端
+> 实测（本地 seeder + x.pe 直连 → 2MB 下载 cmp 一致）暴露 API 面缺口后四项补齐——
+> ① `POST /tasks/:id/peers`（qbit 添加 peer，部分成功逐条回执）② `bt.extra_trackers`
+> （新任务自动追加 tracker）③ `bt.max_share_ratio`（Seeding 达标自动暂停 + 事件）
+> ④ `POST /tasks/:id/super-seeding`（超级种子，内核 lt_set_seed_mode）。做种时长
+> 上限需 `completed_at` 时间戳（记录无此字段，待需求出现再加）；peer 封禁受限于
+> libtorrent 2.x 公开 API 无 per-endpoint ban（内核文档化存根，维持）。

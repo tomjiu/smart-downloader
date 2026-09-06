@@ -106,6 +106,10 @@ struct BtSessionCfg {
     encrypt: String,
     listen_port: u16,
     max_connections: u32,
+    /// 新建任务自动追加 tracker（qbit 对标）；add() 时读取。
+    extra_trackers: Vec<String>,
+    /// 做种分享率上限（qbit Share Ratio Limit 对标）；0.0 = 不启用。
+    max_share_ratio: f64,
 }
 
 impl BtEngine {
@@ -116,6 +120,8 @@ impl BtEngine {
     /// M0 确定性；enable_upnp 同时控制 NAT-PMP——端口映射族）。启动时一次 apply，不参与热重载。
     /// `enable_utp` = uTP 双向开关（incoming/outgoing 同进退）；`encrypt` = MSE 加密
     /// 策略字符串（disable/allow/require，非法值报错）。启动时一次 apply。
+    /// `extra_trackers` = 新建任务自动追加 tracker（qbit 对标，可空）；
+    /// `max_share_ratio` = 做种分享率上限（0 = 不启用）。运行中均可热改。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         save_path: &Path,
@@ -128,6 +134,8 @@ impl BtEngine {
         enable_pex: bool,
         enable_utp: bool,
         encrypt: &str,
+        extra_trackers: &[String],
+        max_share_ratio: f64,
     ) -> Result<Self, String> {
         let core = BtCore::new(save_path, "smart-dl-daemon")
             .map_err(|e| format!("bt session init: {}", core_err(&e)))?;
@@ -171,6 +179,8 @@ impl BtEngine {
                 encrypt: encrypt.to_string(),
                 listen_port: 0,
                 max_connections: 0,
+                extra_trackers: extra_trackers.to_vec(),
+                max_share_ratio,
             }),
         })
     }
@@ -393,6 +403,14 @@ impl DownloadEngine for BtEngine {
         self.core
             .resume(&ih)
             .map_err(|e| EngineError::Other(core_err(&e)))?;
+        // extra_trackers（qbit「自动添加 tracker 到新任务」对标）：add 成功后
+        // 逐条注入（best-effort——单条 URL 失败不阻断建任务，任务可经
+        // /tasks/:id/trackers 手动补）；恢复重放路径不重复注入（fastresume
+        // 已带 tracker 集合）。
+        let extra = self.session.lock().extra_trackers.clone();
+        for url in extra {
+            let _ = self.core.add_tracker(&ih, &url);
+        }
         Ok(ih)
     }
 
@@ -582,6 +600,16 @@ impl DownloadEngine for BtEngine {
             .unwrap_or_else(|| snap.encrypt.clone());
         merged.listen_port = patch.listen_port.unwrap_or(snap.listen_port);
         merged.max_connections = patch.max_connections.unwrap_or(snap.max_connections);
+        // extra_trackers：None = 不调整；Some = 整表替换（trim 后空串过滤）。
+        // 仅影响后续新建任务（存量任务的 tracker 走 /tasks/:id/trackers 管理）。
+        if let Some(v) = &patch.extra_trackers {
+            merged.extra_trackers = v
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        merged.max_share_ratio = patch.max_share_ratio.unwrap_or(snap.max_share_ratio);
 
         // 1) 发现层（DHT/LSD/UPnP/PEX）
         let discovery_changed = merged.enable_dht != snap.enable_dht
@@ -686,6 +714,15 @@ impl DownloadEngine for BtEngine {
     /// metadata 未就绪也可设（handle 级参数，随任务存续生效）。
     async fn set_max_connections(&self, id: &EngineTaskId, n: u32) -> Result<(), EngineError> {
         self.core.set_max_connections(id, n).map_err(bt_engine_err)
+    }
+
+    async fn set_super_seeding(&self, id: &EngineTaskId, on: bool) -> Result<(), EngineError> {
+        self.core.set_super_seeding(id, on).map_err(bt_engine_err)
+    }
+
+    fn seeding_ratio_limit(&self) -> Option<f64> {
+        let r = self.session.lock().max_share_ratio;
+        (r > 0.0).then_some(r)
     }
 
     async fn add_xunlei_resume(&self, data: Vec<u8>) -> Result<EngineTaskId, EngineError> {
