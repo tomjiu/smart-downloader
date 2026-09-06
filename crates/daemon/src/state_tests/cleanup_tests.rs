@@ -7,6 +7,7 @@ use super::*;
 /// 白盒插入 Completed 任务，可编程完成时刻与引擎槽位。
 fn insert_completed(state: &DaemonState, id: &str, finished_at_unix: u64) {
     let rec = TaskRecord {
+        seeding_since: None,
         task: DownloadTask {
             id: id.into(),
             canonical_id: CanonicalId {

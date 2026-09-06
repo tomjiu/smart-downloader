@@ -77,6 +77,7 @@ impl DaemonState {
                     TaskState::Queued
                 };
                 let mut rec = TaskRecord {
+                    seeding_since: None,
                     task: t,
                     engine_tid: None,
                     engine_kind: pt.engine_kind,
@@ -164,6 +165,7 @@ impl DaemonState {
                         }
                     }
                     let mut rec = TaskRecord {
+                        seeding_since: None,
                         task: t,
                         engine_tid: Some(tid),
                         engine_kind: pt.engine_kind,
@@ -185,6 +187,7 @@ impl DaemonState {
                     tracing::warn!("恢复任务 {} 引擎 add 失败（标 Failed）: {e}", t.id);
                     t.state = TaskState::Failed;
                     let mut rec = TaskRecord {
+                        seeding_since: None,
                         task: t,
                         engine_tid: None,
                         engine_kind: pt.engine_kind,

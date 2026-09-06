@@ -36,6 +36,11 @@ pub struct TaskRecord {
     /// 运行态字段不落盘（持久化排除），写缓存不触发 autosave。
     /// 非活跃（暂停/终态）时轮询不再光顾，速率由 pause/终态迁移清零防陈旧。
     pub engine_status: Option<EngineStatus>,
+    /// 做种起始时刻（Task 39，仅内存）：BT 任务 State/Finished 迁移至 Seeding
+    /// 时登记，供 `bt.max_seeding_time_min` 执法（口径 = 本次运行内做种时长；
+    /// 离开 Seeding（暂停/失败/达标暂停）即清空，重启后经重新 checking 再
+    /// Finished 时重新登记）。
+    pub seeding_since: Option<std::time::Instant>,
     /// 运行态操作日志（add/pause/resume/remove/restored；引擎状态变更不记——见快照）。
     events: Vec<TaskEvent>,
 }

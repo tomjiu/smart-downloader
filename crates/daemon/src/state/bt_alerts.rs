@@ -326,6 +326,12 @@ impl DaemonState {
                     raw_to.clone()
                 };
                 rec.task.state = to.clone();
+                // Task 39：做种计时登记/清空（进入 Seeding 登记，离开清空）
+                if to == TaskState::Seeding {
+                    rec.seeding_since = Some(std::time::Instant::now());
+                } else {
+                    rec.seeding_since = None;
+                }
                 if let Some(es) = rec.engine_status.as_mut() {
                     // 错误信息按引擎原始去向记录（重试排队也保留最近失败原因可观测）
                     if raw_to == TaskState::Failed {

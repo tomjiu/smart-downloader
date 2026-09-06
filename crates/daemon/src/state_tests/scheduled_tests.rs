@@ -21,6 +21,7 @@ fn wait_file(path: &std::path::Path, timeout_ms: u64) {
 /// 白盒插入调度等待任务（engine_tid 空 + start_at 指定时刻；不联网）。
 fn insert_scheduled(state: &DaemonState, id: &str, kind: EngineKind, start_at: u64, st: TaskState) {
     let rec = TaskRecord {
+        seeding_since: None,
         task: DownloadTask {
             id: id.into(),
             canonical_id: CanonicalId {

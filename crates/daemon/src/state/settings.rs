@@ -75,6 +75,8 @@ pub struct BtSessionReq {
     pub extra_trackers: Option<Vec<String>>,
     /// 做种分享率上限（qbit Share Ratio Limit 对标）；0 = 不启用。
     pub max_share_ratio: Option<f64>,
+    /// 做种时长上限（分钟，qbit「做种时间限制」对标）；0 = 不启用。
+    pub max_seeding_time_min: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -177,6 +179,7 @@ impl DaemonState {
                 "encrypt": cfg.bt.encrypt,
                 "extra_trackers": cfg.bt.extra_trackers,
                 "max_share_ratio": cfg.bt.max_share_ratio,
+                "max_seeding_time_min": cfg.bt.max_seeding_time_min,
                 "bt_available": self.engines.contains_key(&EngineKind::Bt),
             },
             "download": {
@@ -270,6 +273,14 @@ impl DaemonState {
                 if !r.is_finite() || !(0.0..=9999.0).contains(&r) {
                     return Err(DaemonError::InvalidSource(format!(
                         "bittorrent.max_share_ratio = {r} 无效：须在 0.0..=9999.0（0 = 不启用）"
+                    )));
+                }
+            }
+            // max_seeding_time_min：上限 999999 分钟（0 = 关闭）
+            if let Some(m) = bt.max_seeding_time_min {
+                if m > 999_999 {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "bittorrent.max_seeding_time_min = {m} 无效：须在 0..=999999（0 = 不启用）"
                     )));
                 }
             }
@@ -395,7 +406,8 @@ impl DaemonState {
                 || bt.enable_utp.is_some()
                 || bt.encrypt.is_some()
                 || bt.extra_trackers.is_some()
-                || bt.max_share_ratio.is_some();
+                || bt.max_share_ratio.is_some()
+                || bt.max_seeding_time_min.is_some();
             if any {
                 let patch = BtSessionPatch {
                     enable_dht: bt.enable_dht,
@@ -408,6 +420,7 @@ impl DaemonState {
                     max_connections: None,
                     extra_trackers: bt.extra_trackers.clone(),
                     max_share_ratio: bt.max_share_ratio,
+                    max_seeding_time_min: bt.max_seeding_time_min,
                 };
                 self.dispatch_bt_patch(&patch).await;
                 if let Some(cfg) = self.live_config.lock().as_mut() {
@@ -439,6 +452,9 @@ impl DaemonState {
                     if let Some(v) = bt.max_share_ratio {
                         cfg.bt.max_share_ratio = v;
                     }
+                    if let Some(v) = bt.max_seeding_time_min {
+                        cfg.bt.max_seeding_time_min = v;
+                    }
                 }
                 for k in [
                     "enable_dht",
@@ -449,6 +465,7 @@ impl DaemonState {
                     "encrypt",
                     "extra_trackers",
                     "max_share_ratio",
+                    "max_seeding_time_min",
                 ] {
                     applied.push(format!("bittorrent.{k}"));
                 }
