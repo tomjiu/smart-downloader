@@ -1000,3 +1000,50 @@ rss.json 落盘；Atom 添加 + 规则校验 400 系列 + 坏 feed fail-closed�
 **门禁**：fmt · clippy ×7（daemon 5 变体 + workspace + httpdl ftp，
 `-D warnings`）全 0 · daemon bt,ftp,sftp / default / core / httpdl(ftp)
 测试全 0 失败。
+
+## 34. qBittorrent 对标补齐批次：添加 peer / 全局 tracker 追加 / 分享率上限 / 超级种子（2026-09-06，Task 38）
+
+> 用户指令：「磁链下载测试 + 设置功能确认 + 对标比特彗星/qBittorrent 的通用下载能力不全就补」。
+> 磁链端到端实测先行（暴露缺口），随后按差距清单四项落地。
+
+### 磁链端到端实测（先行，含环境重建）
+- 沙盒重置后全量重建：rustup stable 1.98 + `scripts/ci/bt-linux-setup.sh --no-root`
+  重建本地 libtorrent 2.0.11 native 资产（bt-native；env.sh 快照）。
+- btcore 层：`m0_magnet_e2e`（真实磁链 60s 内 progress>0，1.22s 通过）+
+  `magnet_metadata`（magnet → .torrent 抓取全链 + API 往返）3/3 绿。
+- daemon API 层：本地 seed_main seeder + `x.pe` 直连磁链 → `POST /tasks` →
+  metadata 到达 → 2MB 下载 → **Seeding 态（BT 完成语义）** → `cmp` 逐字节一致。
+  实测脚本沉淀 `scripts/magnet-e2e.sh`（seeder ECANCELED 教训：seed-data 目录
+  必须先建 + 同端口立即复用会失败——脚本已带随机端口 + 重试）。
+
+### 新能力四项（qbit 对标差距清单落地）
+1. **`POST /tasks/:id/peers`（qbit「添加 peer」对标）**：`{addrs:["ip:port"]}`
+   逐条 `connect_peer` 注入 BT 任务；部分成功语义（逐条回执 `{addr,ok,error?}`）；
+   非法 addr 400 整体拒绝（与 /bt/metadata peers 同口径）、非 BT 任务 409、
+   404。引擎链路 ffi `lt_add_peer` → session → BtCore 原本齐全，本次补 API 面。
+2. **`bt.extra_trackers`（qbit「自动添加 tracker 到新任务」对标）**：配置 +
+   `PUT /settings`（bittorrent 域，整表替换，≤50 条/单条 ≤512）；`add()` 成功后
+   逐条 `add_tracker`（best-effort）；快照暴露 `bt_extra_trackers`。
+3. **`bt.max_share_ratio`（qbit Share Ratio Limit 对标）**：Seeding 态任务
+   `share_ratio ≥ 阈值` → 引擎自动暂停 + `seeding_limit_reached` 事件（执法点 =
+   `poll_engine_states` BT 分支；执法逻辑独立 async fn——锁与 await 跨点隔离在
+   内部生成器，修 tokio Send 门禁）；0 = 不启用（默认），0..=9999 校验（启动 +
+   设置双口径）。快照暴露 `bt_max_share_ratio`。
+4. **`POST /tasks/:id/super-seeding`（BitComet 首创/qbit 任务右键对标）**：
+   内核新增 `lt_set_seed_mode`（`torrent_flags::seed_mode` set/unset 可逆）→
+   bindings → session `set_seed_mode` → BtCore `set_super_seeding` → daemon
+   端点（`{enabled:bool}`；做种态生效、下载中设置无效果——与 qbit 语义一致）。
+
+### 基建与测试
+- `BtSessionPatch` 增 `extra_trackers`/`max_share_ratio`（核心 trait 补丁面）；
+  `BtEngine::new` 增两参（13 处调用点全适配）；`DownloadEngine` trait 增
+  `set_super_seeding`（默认 Unsupported）+ `seeding_ratio_limit`（默认 None）。
+- 测试 +4：bt_api 3（peers 往返/HTTP 任务双 409/超级种子往返）+ settings_api 1
+  （extra_trackers + ratio 应用/快照回读/负值·超限·空条目 400/0 关闭合法）。
+- 运行时实测 `scripts/qbit-features-e2e.sh`：settings 快照新键 → extra_trackers
+  注入任务 tracker 表 → peers 回执 → super-seeding on/off → settings 热改 →
+  磁链下载回归 cmp 一致，全 PASS。
+
+**门禁**：fmt · clippy（workspace excl btcore + btcore + httpdl ftp，
+`--all-targets -D warnings`）全 0 · core+btcore+httpdl(ftp) 524 / daemon
+default 313 / daemon(bt,nas) --all-targets 384 —— 共 1221 测试 0 失败。

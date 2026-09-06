@@ -359,3 +359,82 @@ async fn proxy_and_dest_root_apply() {
         .unwrap();
     assert_eq!(snap["dest_root"], new_root, "/config 快照跟随");
 }
+
+#[tokio::test]
+async fn bittorrent_extra_trackers_and_ratio_apply() {
+    // Task 38 qbit 对标：extra_trackers（新任务自动追加 tracker）+
+    // max_share_ratio（做种分享率上限）——PUT 应用 + 快照回读 + 校验拒绝。
+    let (_dir, base, _p) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({
+            "bittorrent": {
+                "extra_trackers": [
+                    "udp://tracker.example:6969/announce",
+                    "http://t2.example/announce"
+                ],
+                "max_share_ratio": 2.5
+            },
+            "persist": false,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{:?}", resp.text().await.unwrap());
+    let report: serde_json::Value = resp.json().await.unwrap();
+    let applied = report["applied"].as_array().unwrap();
+    assert!(applied.contains(&serde_json::json!("bittorrent.extra_trackers")));
+    assert!(applied.contains(&serde_json::json!("bittorrent.max_share_ratio")));
+
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        s["bittorrent"]["extra_trackers"].as_array().unwrap().len(),
+        2
+    );
+    assert_eq!(s["bittorrent"]["max_share_ratio"], 2.5);
+
+    // 负值 ratio → 400 零副作用
+    let resp = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({ "bittorrent": { "max_share_ratio": -1.0 } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // 超上限 ratio → 400
+    let resp = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({ "bittorrent": { "max_share_ratio": 10000.0 } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // 空条目 tracker → 400
+    let resp = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({ "bittorrent": { "extra_trackers": ["  "] } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // 0.0 = 关闭上限，合法
+    let resp = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({ "bittorrent": { "max_share_ratio": 0.0 } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+}

@@ -284,7 +284,18 @@ mod bt_enabled {
         // 有效；forget 交给测试进程生命周期（进程退出随 tmp 清理）。
         std::mem::forget(dir);
         let bt = smart_dl_daemon::bt::BtEngine::new(
-            &dest_root, None, 0, 0, false, false, false, false, false, "allow",
+            &dest_root,
+            None,
+            0,
+            0,
+            false,
+            false,
+            false,
+            false,
+            false,
+            "allow",
+            &[],
+            0.0,
         )
         .unwrap();
         let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());

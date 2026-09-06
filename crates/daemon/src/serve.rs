@@ -188,6 +188,8 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
                     cfg.bt.enable_pex,
                     cfg.bt.enable_utp,
                     &cfg.bt.encrypt,
+                    &cfg.bt.extra_trackers,
+                    cfg.bt.max_share_ratio,
                 )
                 .map_err(ServeError::Engine)?,
             );
