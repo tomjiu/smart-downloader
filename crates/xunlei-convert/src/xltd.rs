@@ -80,6 +80,11 @@ pub struct XltdAnalysis {
     pub page_aligned: bool,
     /// 已下载 piece 数（通过 SHA1 验证）。
     pub completed_pieces: usize,
+    /// 已完成 piece 的局部索引集（审计修复 P0-2 新增：原实现只累计计数，
+    /// 位置信息丢失，多文件/非顺序进度被误当全局前缀置位 → 迁移静默数据
+    /// 损坏）。`#[serde(default)]` 保证旧 JSON 报告可反序列化。
+    #[serde(default)]
+    pub completed_indices: Vec<usize>,
     /// 在途 piece 数（部分非零但哈希不匹配）。
     pub partial_pieces: usize,
     /// 未下载 piece 数（全零）。
@@ -131,6 +136,7 @@ impl XltdAnalysis {
         let mut f = std::fs::File::open(path).map_err(|_| XltdError::IoError)?;
         let piece_length = piece_length as usize;
         let mut completed = 0usize;
+        let mut completed_indices = Vec::new();
         let mut partial = 0usize;
         let mut missing = 0usize;
 
@@ -169,6 +175,7 @@ impl XltdAnalysis {
 
             if actual_array == expected_hash {
                 completed += 1;
+                completed_indices.push(idx);
             } else if buf.iter().any(|&b| b != 0) {
                 partial += 1;
                 let nonzero = buf.iter().filter(|&&b| b != 0).count();
@@ -180,6 +187,7 @@ impl XltdAnalysis {
         }
 
         self.completed_pieces = completed;
+        self.completed_indices = completed_indices;
         self.partial_pieces = partial;
         self.missing_pieces = missing;
         Ok(())
