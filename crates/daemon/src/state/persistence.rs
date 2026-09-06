@@ -137,6 +137,16 @@ impl DaemonState {
                             replay_details.push(format!("顺序下载重放失败: {e}"));
                         }
                     }
+                    // ③b 连接数上限重放（S1-c，仅 BT）：Some 原样下发
+                    // （>0 = 上限；0 = 复位会话级默认；handle 级参数，
+                    // metadata 未就绪也可设，无 pending 场景）。
+                    if pt.engine_kind == EngineKind::Bt {
+                        if let Some(n) = t.max_connections {
+                            if let Err(e) = engine.set_max_connections(&tid, n).await {
+                                replay_details.push(format!("连接数上限重放失败: {e}"));
+                            }
+                        }
+                    }
                     // ④ 暂停意图重放 + 运行态恢复（P4 G5）：
                     // - was_paused → engine.pause：BT（内核暂停 + 意图登记持续压制
                     //   + fastresume）；HTTP（暂停标志置位，循环段边界退出）。

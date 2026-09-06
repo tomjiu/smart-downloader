@@ -100,6 +100,12 @@ export class DaemonClient {
       body: JSON.stringify({ sequential: on }),
     });
   }
+  taskConnections(id: string, maxConnections: number) {
+    return req(`/tasks/${id}/connections`, {
+      method: "POST",
+      body: JSON.stringify({ max_connections: maxConnections }),
+    });
+  }
   taskProxy(id: string, proxy: string | null) {
     return req(`/tasks/${id}/proxy`, {
       method: "POST",

@@ -62,6 +62,7 @@ pub fn make_http_task_to(
             next_retry_at_unix: 0,
         },
         limits: None,
+        max_connections: None,
     }
 }
 
@@ -196,6 +197,7 @@ pub fn make_ftp_task(id: &str, url: &str, dest_root: PathBuf, name: &str) -> Dow
             next_retry_at_unix: 0,
         },
         limits: None,
+        max_connections: None,
     }
 }
 

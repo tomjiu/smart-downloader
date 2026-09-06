@@ -173,6 +173,9 @@ lt_err lt_add_url_seed(lt_session* s, const char* ih, const char* url);
 lt_err lt_add_tracker(lt_session* s, const char* ih, const char* url);
 lt_err lt_set_sequential(lt_session* s, const char* ih, int on);
 lt_err lt_set_limits(lt_session* s, const char* ih, int64_t down_limit, int64_t up_limit); /* 字节/秒；0=不限 */
+/* 任务级连接数上限（S1-c）：>0 = torrent_handle::set_max_connections；
+   0 = 复位为会话级 connections_limit 当前值（qbit「无限制」回到全局口径）。 */
+lt_err lt_torrent_set_max_connections(lt_session* s, const char* ih, int max_connections);
 
 /* —— 块读取（v2；async read_piece → 轮询取数）—— */
 lt_err lt_read_piece(lt_session* s, const char* ih, int idx, uint8_t* buf, size_t buflen, size_t* out_len);
