@@ -1,5 +1,6 @@
 # 未实现清单（整体）— 迅雷 + 通用 + 未来愿景
 
+> 更新：2026-09-06。**S1 设置面 + S2 前端入仓 + 桌面端**三项落地（本提交批）：`GET/PUT /settings` 十域运行时生效 + 落盘持久化、备用限速调度（[limits] 跨零点窗口 + 星期过滤 + 30s ticker）、BT 会话热改链路（`BtSessionPatch` trait + 内核 `lt_apply_conn`：监听端口/全局连接数上限）、HTTP 全局代理热改（逐任务 client 构建合并）、`ui/` Next.js 静态导出 + qoder-ui `data-theme` 8 主题 + qbit 式设置视图、daemon `--ui-dir` 内嵌 UI、Tauri v2 桌面壳（sidecar + 托盘 + 三平台 CI）。**httpdl RFC 7233 容错**（200 全量响应 skip+截断写入）随 e2e 实测落地。遗留：S1-b 队列门控接线（下表 S1-b）、桌面版 BT 引擎装配、BT per-torrent 连接数上限。
 > 更新：2026-08-27。已完成主线（thunder 解码 / HTTP 断点续传 / BT / fastresume / 热重载 / 状态推进）+ C 类通用缺口中的**代理 + 引擎层限速**（3fac8e3）+ **M6 云兜底调度接线**（c19313a）+ 2026-08-25 四卡落地：**FTP 目录下载**（httpdl 引擎 + daemon 路由）、**BT DHT/LSD/UPnP 配置开关**（FFI `lt_apply_discovery` 全链路）、**.torrent 多文件空间预检**、**TaskSnapshot.files 透出** + 2026-08-27：**httpdl 动态分段（P0，方案A）**（109692c）。
 > 更新：2026-09-05（二）。**BT 传输/发现配置面补全**（PEX/uTP/MSE 加密三态，`lt_apply_transport` + `lt_apply_discovery` 扩参全链路，PEX 经 per-torrent disable_pex 落地——2.0.x 无会话级开关；daemon 默认 PEX 由内核默认开转为配置默认关，对齐 M0 全关语义）。
 > 更新：2026-09-04。**常规能力增强线 E1–E33 全部合并**（PR #22–#57，22 项愿望清单收官：任务管理面/事件三通道/速率全链路/重试/定时错峰/完成 Webhook 与钩子/冲突策略/多源并行/校验扩展/双指纹续传/BT tracker 运行时/Prometheus/探测预览/分享率统计），逐批档案见 [`IMPLEMENTED.md`](IMPLEMENTED.md) #21。
@@ -33,7 +34,10 @@
 
 | 缺口 | 说明 |
 |---|---|
-| ~代理支持~ | ~~无（HTTP/BT 均无代理配置项）~~ **已完成**：HTTP（reqwest Proxy）+ BT（lt_apply_network）双引擎接线，启动时生效（见 3fac8e3）|
+| S1-b 队列门控接线 | `[queue] max_active_{bt,http,ftp}` 配置/快照/持久化已就绪（S1），**daemon 运行时门控未接线**：core 层 `TaskQueue`/`EngineRegistry` 配额（BT≤3/HTTP·FTP≤8）历史上仅存在于 core 测试，daemon 生产路径无并发闸门。接线点：state/ops.rs 五个 `add_*_task_opts` 入口收敛到统一派发助手（acquire→engine.add / 排队挂 Queued），终态（Completed/Failed/Stopped/Paused/移除）release + FIFO 递补。风险点：恢复路径与定时激活路径的递补时机 |
+| S1-c BT per-task 连接数上限 | qbit 每任务连接数；内核需 per-torrent handle `set_max_connections`（`lt_apply_conn` 已覆盖会话级，per-torrent 待增 FFI） |
+| S1-d 桌面版 BT 引擎装配 | desktop CI 三平台原生 libtorrent 打包矩阵（Windows vcpkg / Linux apt / macOS brew）；当前桌面构建为 no-BT profile |
+| ~代理支持~ | ~~无（HTTP/BT 均无代理配置项）~~ **已完成**：HTTP（reqwest Proxy）+ BT（lt_apply_network）双引擎接线，启动时生效（见 3fac8e3）；**S1 追加：运行时热改**（BT settings_pack 重放立即生效 / HTTP 逐任务 client 构建合并新任务生效，`PUT /settings`）|
 | ~引擎层限速~ | ~~无（BT 的 libtorrent 速率上限未接线；HTTP 无限速）~~ **已完成**：全局下载/上传限速（KiB/s；0=不限），HTTP 跨段共享 RateLimiter（见 3fac8e3）|
 | ~云兜底调度接线~ | ~~FallbackCoordinator（M2 设计）仅在 provider crate 测试里使用，daemon 无调度入口~~ **已完成（M6）**：`POST /tasks/:id/fallback` 手动兜底——BT 任务暂停且进度 <50% → 选 provider → 直链 → HttpEngine 传输 → 任务 Completed；`[provider]` 配置段（mock 占位，真实 provider 待迅雷线落地）|
 | ~Provider 探活失败自动降级~ | ~~Provider 探活失败会阻塞主链路 / 手动兜底失败后无自动切换~~ **已完成（2026-08-27）**：`XunleiProvider` 内部失败冷却（Auth 5 分钟 / Quota 1 小时 / 其他 1 分钟）；`FallbackCoordinator::begin_fallback` 支持多 provider 依次尝试；`RemoteProvider::probe()` 轻量探活（默认 `Ok(())`）|

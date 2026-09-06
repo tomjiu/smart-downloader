@@ -251,6 +251,13 @@ impl Session {
         call(code, || Ok(()))
     }
 
+    /// 会话连接参数（S1）：监听端口 + 全局连接数上限。
+    /// port = 0 / max_connections = 0 → 该项不下发（内核默认/上次设置）。
+    pub fn apply_conn(&self, port: u16, max_connections: u32) -> Result<()> {
+        let code = unsafe { lt_apply_conn(self.raw, port as c_int, max_connections as c_int) };
+        call(code, || Ok(()))
+    }
+
     /// 最近一次错误（内核侧维护的人类可读文本）
     pub fn err_str(&self) -> Result<String> {
         let mut buf = vec![0u8; 1024];

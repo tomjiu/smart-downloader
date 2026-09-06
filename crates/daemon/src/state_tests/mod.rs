@@ -173,12 +173,16 @@ impl FakeEngine {
     }
 
     /// 读取已下发的子文件优先级调用记录（优先级重放测试断言用）。
+    // 跨 feature 门测试共享的 mock 观测器：调用点均在 #[cfg(feature = "bt")] 内，
+    // 默认 feature 组合下无调用点（同 set_status_files 豁免）。
+    #[allow(dead_code)]
     #[allow(clippy::type_complexity)]
     pub fn prio_calls(&self) -> Vec<(String, Vec<(usize, u32)>)> {
         self.prio_calls.lock().clone()
     }
 
     /// 编程 file_priorities() 行为（就绪/未就绪模拟用）。
+    #[allow(dead_code)]
     pub fn set_prio_readback(
         &self,
         v: Option<Result<Vec<Option<u32>>, smart_dl_core::types::EngineError>>,

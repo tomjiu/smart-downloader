@@ -194,6 +194,13 @@ impl BtCore {
         self.sess.apply_transport(enable_utp, enc_policy)
     }
 
+    /// 会话连接参数（S1 设置面）：监听端口（0 = 不下发，内核默认 6881 系）+
+    /// 全局连接数上限（0 = 不下发，内核默认 200）。apply_settings 后内核对
+    /// 端口变更自动 re-listen，运行中调用安全。
+    pub fn apply_conn(&self, port: u16, max_connections: u32) -> ffi::Result<()> {
+        self.sess.apply_conn(port, max_connections)
+    }
+
     // —— 添加 / 移除 ——
 
     pub fn add_magnet(&self, magnet: &str, web_seeds: &[String]) -> ffi::Result<String> {

@@ -1,15 +1,21 @@
 /// serve 配置（TOML）：HTTP 监听地址 / 默认下载目录 / BT 引擎开关 / 单实例锁路径 /
 /// 云兜底 Provider / 任务持久化。
 /// 文件缺失时使用默认值（Config::default）；`--config <path>` 覆盖。
-use serde::Deserialize;
+/// 全量 `Serialize`（S1 设置面）：支撑 `PUT /settings?persist=true` 的原子回写
+/// （`Config::save_to`）——注释不保留（TOML round-trip 丢失注释为已知边界）。
+use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub server: ServerCfg,
     pub download: DownloadCfg,
     pub bt: BtCfg,
+    /// 备用限速调度（S1）：指定时段/星期内自动切换到备用上下行限速。
+    pub limits: LimitsCfg,
+    /// 引擎并发队列配额（S1）：各引擎同时传输任务上限。
+    pub queue: QueueCfg,
     pub xunlei: XunleiCfg,
     pub provider: ProviderCfg,
     pub provider_xunlei: ProviderXunleiCfg,
@@ -21,7 +27,7 @@ pub struct Config {
     pub storage: StorageCfg,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ServerCfg {
     /// HTTP/WS 监听地址，如 `127.0.0.1:8787`。
@@ -33,7 +39,7 @@ pub struct ServerCfg {
     pub http_token: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DownloadCfg {
     /// 默认下载落盘根目录（三 add 入口的 dest 缺省值）。
@@ -53,7 +59,7 @@ pub struct DownloadCfg {
 
 /// BT 引擎配置。`encrypt` 缺省值是 `allow`（内核默认行为）而非空串，
 /// 故手动实现 Default + 字段级 serde 默认（derive Default 会给空串）。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct BtCfg {
     /// 启用 BT 引擎（需编译时 --features bt）。
@@ -82,6 +88,58 @@ pub struct BtCfg {
     /// 合法值口径与 btcore::engine::parse_encrypt_policy 一致。
     #[serde(default = "default_bt_encrypt")]
     pub encrypt: String,
+    /// BT 监听端口（S1，qbit「连接」页对齐项）：内核 `listen_interfaces`
+    /// = `0.0.0.0:<port>,[::]:<port>`。0 = 不下发（用内核默认 6881 系）。
+    /// 启动时生效；运行中可经 `PUT /settings` 热改（内核 re-listen）。
+    pub listen_port: u16,
+    /// BT 会话全局连接数上限（S1）：内核 `connections_limit`。
+    /// 0 = 不下发（内核默认 200）。运行中可热改。
+    pub max_connections: u32,
+}
+
+/// 备用限速调度（S1，qbit「速度」页 alternate rate limits 对齐项）：
+/// `alt_enabled=true` 且当前时间落在 [`alt_from`, `alt_to`) 窗口（支持跨零点，
+/// `alt_from > alt_to` 时自动回卷）且星期命中 `alt_days` 时，全局上下行
+/// 限速切到备用值；窗口外回到基准值。空 `alt_days` = 每天适用。
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct LimitsCfg {
+    /// 备用限速调度总开关；false = 永远使用基准限速。
+    pub alt_enabled: bool,
+    /// 备用下行限速（KiB/s）；0 = 不限。
+    pub alt_max_download_kb_s: u32,
+    /// 备用上行限速（KiB/s）；0 = 不限。
+    pub alt_max_upload_kb_s: u32,
+    /// 窗口起点 `HH:MM`（本地时区）；非法格式视为永不在窗口。
+    pub alt_from: String,
+    /// 窗口终点 `HH:MM`（本地时区）。
+    pub alt_to: String,
+    /// 适用星期（0=周日 .. 6=周六）；空 = 每天适用。
+    pub alt_days: Vec<u8>,
+}
+
+/// 引擎并发队列配额（S1）：各引擎**同时传输中**的任务数上限；超出的新任务
+/// 在 daemon 层挂 Queued 等待，任一在传任务到达非传输态（完成/暂停/失败/
+/// 移除）后 FIFO 递补。0 = 不限（保留旧行为）。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct QueueCfg {
+    /// BT 引擎同时在传任务上限（默认 3，对齐 core 层历史配额）。
+    pub max_active_bt: u32,
+    /// HTTP 引擎同时在传任务上限（默认 8）。
+    pub max_active_http: u32,
+    /// FTP 引擎同时在传任务上限（默认 8）。
+    pub max_active_ftp: u32,
+}
+
+impl Default for QueueCfg {
+    fn default() -> Self {
+        QueueCfg {
+            max_active_bt: 3,
+            max_active_http: 8,
+            max_active_ftp: 8,
+        }
+    }
 }
 
 fn default_bt_encrypt() -> String {
@@ -100,12 +158,14 @@ impl Default for BtCfg {
             enable_pex: false,
             enable_utp: false,
             encrypt: default_bt_encrypt(),
+            listen_port: 0,
+            max_connections: 0,
         }
     }
 }
 
 /// 迅雷 SDK 引擎配置（Windows-only）。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct XunleiCfg {
     /// 启用迅雷 SDK 引擎（需编译时 --features xunlei）。
@@ -116,7 +176,7 @@ pub struct XunleiCfg {
     pub save_path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProviderCfg {
     /// 云兜底总开关（`POST /tasks/:id/fallback` 需要 ≥1 个可用 provider）。
@@ -129,7 +189,7 @@ pub struct ProviderCfg {
 
 /// 迅雷云盘 Provider（XunleiProvider）装配配置。
 /// 默认关：需显式 `enabled=true` 才把 XunleiProvider 注入 provider 列表。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ProviderXunleiCfg {
     pub enabled: bool,
@@ -143,7 +203,7 @@ pub struct ProviderXunleiCfg {
 
 /// 任务完成 Webhook 配置（E17）：任务到达完成态时 daemon 向 `url` POST 一条
 /// JSON 通知（fire-and-forget，单次尝试 5s 超时，失败仅记日志）。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct WebhookCfg {
     /// 完成通知 Webhook URL；空 = 禁用（默认）。参与热重载。
@@ -151,7 +211,7 @@ pub struct WebhookCfg {
 }
 
 /// 已完成任务自动清理配置（E20）：按完成龄期清扫 Completed 任务。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CleanupCfg {
     /// Completed 任务保留天数（从完成时刻起算）；0 = 禁用（默认）。
@@ -162,7 +222,7 @@ pub struct CleanupCfg {
 }
 
 /// 下载完成自动处理配置（E27，清单 #15）：完成后移动 + 外部钩子。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct PostDownloadCfg {
     /// 完成后把落盘文件移动到该目录（目录自动创建；同盘 rename，跨盘
@@ -179,7 +239,7 @@ pub struct PostDownloadCfg {
 }
 
 /// 调度配置（E23 定时/错峰下载）：任务定时启动与批量入队错峰。
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SchedulerCfg {
     /// 错峰随机延迟上限（秒）：任务添加时未显式指定 start_at 且本值 > 0，
@@ -188,14 +248,14 @@ pub struct SchedulerCfg {
     pub start_jitter_seconds: u32,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LockCfg {
     /// 单实例锁文件路径（重复启动 → 拒绝）。
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct StorageCfg {
     /// 任务持久化文件（add/remove/状态变更自动落盘；启动时恢复）。
@@ -225,7 +285,11 @@ impl Default for Config {
                 enable_pex: false,
                 enable_utp: false,
                 encrypt: "allow".to_string(),
+                listen_port: 0,
+                max_connections: 0,
             },
+            limits: LimitsCfg::default(),
+            queue: QueueCfg::default(),
             xunlei: XunleiCfg::default(),
             provider: ProviderCfg {
                 enabled: false,
@@ -274,6 +338,24 @@ impl Config {
         host == "localhost" || host.starts_with("127.") || host == "::1" || host == "[::1]"
     }
 
+    /// 序列化为 TOML 文本（S1 设置面持久化）。无默认值裁剪——全量字段
+    /// 写出，用户手改注释/字段顺序会丢（文档化边界）。
+    pub fn to_toml_string(&self) -> Result<String, String> {
+        toml::to_string_pretty(self).map_err(|e| format!("配置序列化失败: {e}"))
+    }
+
+    /// 原子落盘（tmp + rename，S1）：`PUT /settings?persist=true` 用。
+    /// 目标目录不存在 → Err。
+    pub fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
+        let text = self.to_toml_string()?;
+        let tmp = path.with_extension("toml.tmp");
+        std::fs::write(&tmp, &text).map_err(|e| format!("写入临时文件 {tmp:?} 失败: {e}"))?;
+        std::fs::rename(&tmp, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("替换配置 {path:?} 失败: {e}")
+        })
+    }
+
     /// BT 实际落盘目录（save_path 或默认 dest_root）。
     pub fn bt_save_path(&self) -> PathBuf {
         self.bt
@@ -314,6 +396,8 @@ impl Config {
             "bt_enable_pex": self.bt.enable_pex,
             "bt_enable_utp": self.bt.enable_utp,
             "bt_encrypt": self.bt.encrypt,
+            "bt_listen_port": self.bt.listen_port,
+            "bt_max_connections": self.bt.max_connections,
             "xunlei_enabled": self.xunlei.enabled,
             "listen_addr": self.server.addr,
             // 安全修复（V1）：仅暴露是否启用认证（布尔），token 本身绝不出快照
@@ -338,6 +422,16 @@ impl Config {
             "post_move_to": self.post_download.move_to,
             "post_hook": self.post_download.hook,
             "start_jitter_seconds": self.scheduler.start_jitter_seconds,
+            // S1：备用限速调度 + 并发队列配额（设置面可见口径）
+            "alt_enabled": self.limits.alt_enabled,
+            "alt_max_download_kb_s": self.limits.alt_max_download_kb_s,
+            "alt_max_upload_kb_s": self.limits.alt_max_upload_kb_s,
+            "alt_from": self.limits.alt_from,
+            "alt_to": self.limits.alt_to,
+            "alt_days": self.limits.alt_days,
+            "queue_max_active_bt": self.queue.max_active_bt,
+            "queue_max_active_http": self.queue.max_active_http,
+            "queue_max_active_ftp": self.queue.max_active_ftp,
             // 仅暴露「登录态文件是否存在」布尔，不泄露路径字符串本身。
             "provider_xunlei_token_exists": self
                 .provider_xunlei

@@ -295,6 +295,27 @@ lt_err lt_apply_transport(lt_session* s, int enable_utp, int enc_policy) {
     }
 }
 
+lt_err lt_apply_conn(lt_session* s, int port, int max_connections) {
+    if (!s) return LT_ERR_ARG;
+    try {
+        lt::settings_pack sp;
+        if (port > 0) {
+            // IPv4+IPv6 双栈监听（apply_settings 后内核自动 re-listen，运行中安全）
+            const std::string ifs = "0.0.0.0:" + std::to_string(port) +
+                                    ",[::]:" + std::to_string(port);
+            sp.set_str(lt::settings_pack::listen_interfaces, ifs);
+        }
+        if (max_connections > 0) {
+            sp.set_int(lt::settings_pack::connections_limit,
+                       static_cast<int>(max_connections));
+        }
+        s->ses.apply_settings(sp);
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
 // PEX 会话策略落地（内核 2.0.x 无 settings_pack 会话开关）：pex_disabled=true
 // 时对新增任务注入 per-torrent disable_pex；默认（false）不动 flags = 内核行为。
 void apply_pex_policy(lt_session* s, lt::add_torrent_params& p) {

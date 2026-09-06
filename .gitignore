@@ -64,3 +64,8 @@ docs/nas/evidence/
 
 # 本地调试运行产物（bugb 复现环境：日志/配置/二进制/任务快照，含本机路径）
 /out/
+daemon.log
+ui/node_modules/
+ui/.next/
+ui/out/
+node_modules/
