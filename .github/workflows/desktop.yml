@@ -54,10 +54,12 @@ jobs:
 
       - name: Place sidecar binary
         shell: bash
+        # externalBin 相对 src-tauri/（tauri.conf.json 所在目录）解析：
+        # 期望 desktop/src-tauri/binaries/smart-dl-daemon-<triple>。
         run: |
-          mkdir -p desktop/binaries
+          mkdir -p desktop/src-tauri/binaries
           cp "target/release/smart-dl-daemon$( [ '${{ runner.os }}' = 'Windows' ] && echo '.exe' )" \
-             "desktop/binaries/smart-dl-daemon-${{ matrix.triple-suffix }}"
+             "desktop/src-tauri/binaries/smart-dl-daemon-${{ matrix.triple-suffix }}"
 
       - uses: tauri-apps/tauri-action@v0
         env:
