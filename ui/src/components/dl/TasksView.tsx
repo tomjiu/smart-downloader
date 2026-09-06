@@ -121,7 +121,7 @@ export default function TasksView({
             <input
               className="qoder-input"
               style={{ flex: 1, minWidth: 240 }}
-              placeholder="http(s):// · ftp(s):// · magnet:?xt=… · .m3u8 · .meta4"
+              placeholder="http(s):// · ftp(s):// · sftp:// · magnet:?xt=… · .m3u8 · .meta4"
               aria-label="下载链接"
               value={url}
               autoFocus

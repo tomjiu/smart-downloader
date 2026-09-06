@@ -1141,6 +1141,7 @@ async fn version_endpoint() -> impl IntoResponse {
         "features": {
             "bt": cfg!(feature = "bt"),
             "ftp": cfg!(feature = "ftp"),
+            "sftp": cfg!(feature = "sftp"),
             "nas": cfg!(feature = "nas"),
             "xunlei": cfg!(feature = "xunlei"),
         },

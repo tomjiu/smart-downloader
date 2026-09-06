@@ -18,6 +18,8 @@ webseed = ["bt"]
 nas = []
 # FTP 引擎（D12：并入 httpdl，feature-gated）。
 ftp = ["smart-dl-httpdl/ftp"]
+# SFTP 引擎（C-S1：russh + russh-sftp，纯 Rust 栈；与 ftp 平行门控）。
+sftp = ["smart-dl-httpdl/sftp"]
 
 [dependencies]
 tokio = { workspace = true }

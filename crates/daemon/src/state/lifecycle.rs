@@ -214,7 +214,7 @@ impl DaemonState {
             )
             .await?;
         }
-        for kind in [EngineKind::Ftp, EngineKind::Http] {
+        for kind in [EngineKind::Ftp, EngineKind::Http, EngineKind::Sftp] {
             if let Some(eng) = self.engines.get(&kind).cloned() {
                 Self::dispatch_global_limits(
                     eng.as_ref(),
@@ -324,6 +324,14 @@ impl DaemonState {
     #[cfg(feature = "ftp")]
     pub fn with_ftp(mut self, ftp: Arc<dyn DownloadEngine>) -> Self {
         self.engines.insert(EngineKind::Ftp, ftp);
+        self
+    }
+
+    /// 追加 SFTP 引擎（feature `sftp`，C-S1；sftp:// 链接路由到该引擎）。
+    /// 独立占用 `EngineKind::Sftp` 槽位；队列门控与 FTP 共用 ftp 桶（slot_index）。
+    #[cfg(feature = "sftp")]
+    pub fn with_sftp(mut self, sftp: Arc<dyn DownloadEngine>) -> Self {
+        self.engines.insert(EngineKind::Sftp, sftp);
         self
     }
 

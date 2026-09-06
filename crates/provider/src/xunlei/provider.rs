@@ -228,6 +228,7 @@ impl crate::RemoteProvider for XunleiProvider {
                 | DownloadSource::Thunder(_)
                 | DownloadSource::XunleiShare(_)
                 | DownloadSource::Ftp { .. }
+                | DownloadSource::Sftp { .. }
                 | DownloadSource::Ed2k(_) => {
                     return Err(ProviderError::Other(
                         "v1 离线提交仅支持磁力/HTTP 链接（torrent 字节上传留后续）".into(),
