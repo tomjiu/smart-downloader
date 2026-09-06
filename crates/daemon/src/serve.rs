@@ -440,6 +440,30 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
         });
     }
 
+    // RSS 订阅自动刷新 ticker（qbit RSS 对标）：`[rss] auto_refresh=true` 且
+    // refresh_interval_secs>0 时按周期 rss_refresh_all（拉取+规则匹配+自动建
+    // 任务）。间隔下限 60s 防误配风暴；单 feed 失败已在 refresh 内部降级为
+    // errors 列表，ticker 层仅告警。
+    if cfg.rss.auto_refresh && cfg.rss.refresh_interval_secs > 0 {
+        let st = state_arc.clone();
+        let period = Duration::from_secs(cfg.rss.refresh_interval_secs.max(60));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick.tick().await; // 首拍立即返回——启动时不抢跑，等第一个整周期
+            loop {
+                tick.tick().await;
+                let (_, matched, _, errors) = st.rss_refresh_all().await;
+                if matched > 0 {
+                    tracing::info!("RSS 自动刷新命中 {matched} 条并建任务");
+                }
+                for e in &errors {
+                    tracing::warn!("RSS 自动刷新错误: {e}");
+                }
+            }
+        });
+    }
+
     // 5. 路由 + 监听
     // S2：清扫上次运行遗留的 magnet 抓取 scratch（kill -9/断电残骸，best-effort；
     // PID+mtime 双重保护，活跃抓取与并发实例不受影响）。

@@ -16,6 +16,8 @@ pub struct Config {
     pub limits: LimitsCfg,
     /// 引擎并发队列配额（S1）：各引擎同时传输任务上限。
     pub queue: QueueCfg,
+    /// RSS 订阅自动下载（qbit RSS 对标）：feed 周期拉取 + 规则匹配自动建任务。
+    pub rss: RssCfg,
     pub xunlei: XunleiCfg,
     pub provider: ProviderCfg,
     pub provider_xunlei: ProviderXunleiCfg,
@@ -135,6 +137,29 @@ pub struct QueueCfg {
 
 fn default_bt_encrypt() -> String {
     "allow".to_string()
+}
+
+/// RSS 订阅自动下载（qbit RSS 对标）。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RssCfg {
+    /// 自动刷新开关（false = 仅手动 `POST /rss/refresh`）。
+    pub auto_refresh: bool,
+    /// 刷新间隔（秒；ticker 下限 60 防误配风暴）。
+    pub refresh_interval_secs: u64,
+    /// 单订阅已处理条目保留上限（防 rss.json 无限膨胀；未处理条目不淘汰
+    /// ——截掉会丢失去重标记，源刷新时重复建任务）。
+    pub max_processed_items_per_feed: u32,
+}
+
+impl Default for RssCfg {
+    fn default() -> Self {
+        Self {
+            auto_refresh: true,
+            refresh_interval_secs: 900,
+            max_processed_items_per_feed: 200,
+        }
+    }
 }
 
 impl Default for BtCfg {
@@ -281,6 +306,7 @@ impl Default for Config {
             },
             limits: LimitsCfg::default(),
             queue: QueueCfg::default(),
+            rss: RssCfg::default(),
             xunlei: XunleiCfg::default(),
             provider: ProviderCfg {
                 enabled: false,
