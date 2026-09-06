@@ -375,7 +375,7 @@ mod tests {
         v.extend_from_slice(&[0x00, 0x00]);
         let (report, entries) = analyze_cid_store(&v);
         assert!(report.xdlctx_family);
-        assert!(entries.len() >= 1, "notes={:?}", report.notes);
+        assert!(!entries.is_empty(), "notes={:?}", report.notes);
         assert_eq!(entries[0].path, "D:/dl/video.mkv");
         assert_eq!(entries[0].hash_len, 16);
         assert_eq!(entries[0].hash_hex, hex::encode(hash));
