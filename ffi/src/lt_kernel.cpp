@@ -37,6 +37,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -53,6 +54,12 @@ struct lt_session {
     uint32_t dropped = 0;
     uint32_t mask = 0;
     std::string last_err;
+    // 审计修复（P1-4）：last_err 专锁——daemon 单 session 被 bt_events 轮询
+    // 循环与 API handler（pause/remove/peers 等）并发调用，set_err 写与
+    // lt_err_str 读此前无任何同步（std::string 重分配期被读 = UB）。
+    // 独立叶子锁：set_err 可在持有 mtx 的路径（如 lt_take_resume_data）
+    // 内安全调用，无锁序倒置面。
+    mutable std::mutex err_mtx;
     // resume 异步流（D16）：request_save_resume → save_resume_data_alert →
     //   drain 时 bencode 存此 map → lt_take_resume_data 拷贝出（cap 不足则 LT_ERR_BUFFER_TOO_SMALL）
     std::map<std::string, std::vector<char>> resume_map;
@@ -61,7 +68,8 @@ struct lt_session {
     // PEX 会话策略：内核 2.0.x 无 settings_pack 会话级开关（PEX 默认开），
     // 由 lt_apply_discovery 记录意图，新增任务时注入 per-torrent disable_pex
     // flag（不回溯既有任务；daemon 在任务装配前 apply 故覆盖全部任务）。
-    bool pex_disabled = false;
+    // 审计修复（P1-4）：与 last_err 同族——apply 与 add 跨线程无同步，改 atomic。
+    std::atomic<bool> pex_disabled{false};
 
     explicit lt_session(const char* path)
         : ses(lt::session_params())
@@ -183,6 +191,13 @@ void drain_session(lt_session* s) {
             m = "torrent finished";
         } else if (a->type() == lt::torrent_paused_alert::alert_type) {
             m = "torrent paused";
+        } else if (a->type() == lt::torrent_error_alert::alert_type) {
+            // 审计修复（P1-5）：error 与 finished/paused 同构规范化。原透传原始
+            // message()——libtorrent 2.x 格式为 "<torrent名>: <errc.message()>"，
+            // 多数错误文案不含字面 "error"（如 "No such file or directory"），
+            // Rust 侧 state_subkind() 依 contains("error") 判定 → Failed 迁移
+            // 对多数引擎错误静默失效，任务卡在 Downloading。
+            m = "torrent error: " + m;
         } else if (a->type() == lt::save_resume_data_alert::alert_type) {
             m = "resume ready";
         } else if (a->type() == lt::save_resume_data_failed_alert::alert_type) {
@@ -459,7 +474,9 @@ lt_err lt_alerts_dropped(lt_session* s, uint32_t* out) {
 // —— M1 全量（§8.3）——
 
 static void set_err(lt_session* s, std::string m) {
-    if (s && s->last_err != m) s->last_err = std::move(m);
+    if (!s) return;
+    std::lock_guard<std::mutex> lk(s->err_mtx);
+    if (s->last_err != m) s->last_err = std::move(m);
 }
 
 static lt_err fill_ih(lt_session* s, const lt::add_torrent_params& p, const char** web_seeds, char* ih_out) {
@@ -485,7 +502,11 @@ static lt_err fill_ih(lt_session* s, const lt::add_torrent_params& p, const char
 
 lt_err lt_err_str(lt_session* s, char* buf, size_t cap, size_t* out_len) {
     if (!s || !buf || !out_len) return LT_ERR_ARG;
-    const std::string m = s->last_err.empty() ? "ok" : s->last_err;
+    std::string m;
+    {
+        std::lock_guard<std::mutex> lk(s->err_mtx);
+        m = s->last_err.empty() ? "ok" : s->last_err;
+    }
     if (cap < m.size() + 1) { *out_len = m.size() + 1; return LT_ERR_BUFFER_TOO_SMALL; }
     std::memcpy(buf, m.c_str(), m.size() + 1);
     *out_len = m.size(); // 不含 NUL
@@ -828,6 +849,11 @@ lt_err lt_take_resume_data(lt_session* s, const char* ih, uint8_t* buf, size_t c
     if (!buf || cap < sz) { *out_len = sz; return LT_ERR_BUFFER_TOO_SMALL; }
     std::memcpy(buf, it->second.data(), sz);
     *out_len = sz;
+    // 审计修复（P1-3）："take" = 一次性消费（对齐 read_map 与 lt.h D16 契约
+    // “数据 C++ 侧持有至 take 拷贝出”）。原实现从不 erase——长驻 daemon 每
+    // torrent 常驻一份 resume bencode，且重复 take 返回旧数据而非 NotFound。
+    // BUFFER_TOO_SMALL 重试路径不 erase（数据仍在，扩容后可重取）。
+    s->resume_map.erase(it);
     return LT_OK;
 }
 
