@@ -94,6 +94,9 @@ export interface Settings {
     enable_pex: boolean;
     enable_utp: boolean;
     encrypt: string;
+    extra_trackers: string[];
+    max_share_ratio: number;
+    max_seeding_time_min: number;
     bt_available: boolean;
   };
   download: { dest_root: string; disk_precheck_strict: boolean };

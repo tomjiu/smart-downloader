@@ -190,6 +190,7 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
                     &cfg.bt.encrypt,
                     &cfg.bt.extra_trackers,
                     cfg.bt.max_share_ratio,
+                    cfg.bt.max_seeding_time_min,
                 )
                 .map_err(ServeError::Engine)?,
             );

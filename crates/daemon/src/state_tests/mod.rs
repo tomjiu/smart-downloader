@@ -54,6 +54,10 @@ pub struct FakeEngine {
     global_limits_err: parking_lot::Mutex<Option<smart_dl_core::types::EngineError>>,
     /// 已下发的连接数上限调用（(engine_tid, n)，S1-c 断言用）。
     max_conn: parking_lot::Mutex<Vec<(String, u32)>>,
+    /// seeding_ratio_limit() 回显（Task 39 做种限制执法测试用；None = 未启用）。
+    seeding_ratio_limit: parking_lot::Mutex<Option<f64>>,
+    /// seeding_time_limit() 回显（分钟；None = 未启用）。
+    seeding_time_limit: parking_lot::Mutex<Option<u32>>,
 }
 
 #[cfg(test)]
@@ -81,6 +85,8 @@ impl FakeEngine {
             global_sets: parking_lot::Mutex::new(Vec::new()),
             global_limits_err: parking_lot::Mutex::new(None),
             max_conn: parking_lot::Mutex::new(Vec::new()),
+            seeding_ratio_limit: parking_lot::Mutex::new(None),
+            seeding_time_limit: parking_lot::Mutex::new(None),
         }
     }
 
@@ -293,6 +299,14 @@ impl DownloadEngine for FakeEngine {
         self.max_conn.lock().push((id.to_string(), n));
         Ok(())
     }
+
+    fn seeding_ratio_limit(&self) -> Option<f64> {
+        *self.seeding_ratio_limit.lock()
+    }
+
+    fn seeding_time_limit(&self) -> Option<u32> {
+        *self.seeding_time_limit.lock()
+    }
     async fn peers(
         &self,
         _id: &EngineTaskId,
@@ -421,6 +435,7 @@ mod post_download_tests;
 mod queue_gate_tests;
 mod rate_cache_tests;
 mod scheduled_tests;
+mod seeding_limit_tests;
 mod sftp_tests;
 mod tags_tests;
 mod task_proxy_set_tests;

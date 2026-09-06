@@ -110,6 +110,8 @@ struct BtSessionCfg {
     extra_trackers: Vec<String>,
     /// 做种分享率上限（qbit Share Ratio Limit 对标）；0.0 = 不启用。
     max_share_ratio: f64,
+    /// 做种时长上限（分钟，qbit「做种时间限制」对标）；0 = 不启用。
+    max_seeding_time_min: u32,
 }
 
 impl BtEngine {
@@ -121,7 +123,8 @@ impl BtEngine {
     /// `enable_utp` = uTP 双向开关（incoming/outgoing 同进退）；`encrypt` = MSE 加密
     /// 策略字符串（disable/allow/require，非法值报错）。启动时一次 apply。
     /// `extra_trackers` = 新建任务自动追加 tracker（qbit 对标，可空）；
-    /// `max_share_ratio` = 做种分享率上限（0 = 不启用）。运行中均可热改。
+    /// `max_share_ratio` = 做种分享率上限（0 = 不启用）；
+    /// `max_seeding_time_min` = 做种时长上限分钟（0 = 不启用）。运行中均可热改。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         save_path: &Path,
@@ -136,6 +139,7 @@ impl BtEngine {
         encrypt: &str,
         extra_trackers: &[String],
         max_share_ratio: f64,
+        max_seeding_time_min: u32,
     ) -> Result<Self, String> {
         let core = BtCore::new(save_path, "smart-dl-daemon")
             .map_err(|e| format!("bt session init: {}", core_err(&e)))?;
@@ -181,6 +185,7 @@ impl BtEngine {
                 max_connections: 0,
                 extra_trackers: extra_trackers.to_vec(),
                 max_share_ratio,
+                max_seeding_time_min,
             }),
         })
     }
@@ -610,6 +615,9 @@ impl DownloadEngine for BtEngine {
                 .collect();
         }
         merged.max_share_ratio = patch.max_share_ratio.unwrap_or(snap.max_share_ratio);
+        merged.max_seeding_time_min = patch
+            .max_seeding_time_min
+            .unwrap_or(snap.max_seeding_time_min);
 
         // 1) 发现层（DHT/LSD/UPnP/PEX）
         let discovery_changed = merged.enable_dht != snap.enable_dht
@@ -723,6 +731,11 @@ impl DownloadEngine for BtEngine {
     fn seeding_ratio_limit(&self) -> Option<f64> {
         let r = self.session.lock().max_share_ratio;
         (r > 0.0).then_some(r)
+    }
+
+    fn seeding_time_limit(&self) -> Option<u32> {
+        let m = self.session.lock().max_seeding_time_min;
+        (m > 0).then_some(m)
     }
 
     async fn add_xunlei_resume(&self, data: Vec<u8>) -> Result<EngineTaskId, EngineError> {

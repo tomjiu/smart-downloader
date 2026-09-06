@@ -296,6 +296,7 @@ mod bt_enabled {
             "allow",
             &[],
             0.0,
+            0,
         )
         .unwrap();
         let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());

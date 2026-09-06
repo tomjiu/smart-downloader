@@ -7,6 +7,7 @@ use super::*;
 /// 白盒插入指定状态/引擎种类的任务记录（不联网）。
 fn insert_rec(state: &DaemonState, id: &str, kind: EngineKind, st: TaskState) {
     let rec = TaskRecord {
+        seeding_since: None,
         task: DownloadTask {
             id: id.into(),
             canonical_id: CanonicalId {

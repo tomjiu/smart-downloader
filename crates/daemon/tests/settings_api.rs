@@ -375,7 +375,8 @@ async fn bittorrent_extra_trackers_and_ratio_apply() {
                     "udp://tracker.example:6969/announce",
                     "http://t2.example/announce"
                 ],
-                "max_share_ratio": 2.5
+                "max_share_ratio": 2.5,
+                "max_seeding_time_min": 120
             },
             "persist": false,
         }))
@@ -387,6 +388,7 @@ async fn bittorrent_extra_trackers_and_ratio_apply() {
     let applied = report["applied"].as_array().unwrap();
     assert!(applied.contains(&serde_json::json!("bittorrent.extra_trackers")));
     assert!(applied.contains(&serde_json::json!("bittorrent.max_share_ratio")));
+    assert!(applied.contains(&serde_json::json!("bittorrent.max_seeding_time_min")));
 
     let s: serde_json::Value = client
         .get(format!("{base}/settings"))
@@ -401,6 +403,7 @@ async fn bittorrent_extra_trackers_and_ratio_apply() {
         2
     );
     assert_eq!(s["bittorrent"]["max_share_ratio"], 2.5);
+    assert_eq!(s["bittorrent"]["max_seeding_time_min"], 120);
 
     // 负值 ratio → 400 零副作用
     let resp = client
@@ -415,6 +418,15 @@ async fn bittorrent_extra_trackers_and_ratio_apply() {
     let resp = client
         .put(format!("{base}/settings"))
         .json(&serde_json::json!({ "bittorrent": { "max_share_ratio": 10000.0 } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+
+    // 超上限 seeding time → 400
+    let resp = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({ "bittorrent": { "max_seeding_time_min": 1000000 } }))
         .send()
         .await
         .unwrap();

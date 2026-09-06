@@ -7,6 +7,7 @@ use super::*;
 /// 插入 Downloading(Bt) 状态的无名 magnet 任务记录（不联网）。
 fn insert_bt_downloading(state: &DaemonState, id: &str, ih: &str) {
     let rec = TaskRecord {
+        seeding_since: None,
         task: DownloadTask {
             id: id.into(),
             canonical_id: CanonicalId {

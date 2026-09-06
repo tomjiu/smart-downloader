@@ -8,6 +8,7 @@ use super::*;
 
 fn rec_with_retry(max: u32, st: TaskState) -> TaskRecord {
     let mut rec = TaskRecord {
+        seeding_since: None,
         task: DownloadTask {
             id: "tX".into(),
             canonical_id: CanonicalId {
@@ -222,6 +223,7 @@ async fn add_failure_schedules_retry_and_succeeds_after_recovery() {
     state.tasks.lock().insert(
         tid.clone(),
         TaskRecord {
+            seeding_since: None,
             task: DownloadTask {
                 id: tid.clone(),
                 canonical_id: CanonicalId {
@@ -358,6 +360,7 @@ async fn resume_failed_without_handle_retries_manually() {
     state.tasks.lock().insert(
         tid.clone(),
         TaskRecord {
+            seeding_since: None,
             task: DownloadTask {
                 id: tid.clone(),
                 canonical_id: CanonicalId {

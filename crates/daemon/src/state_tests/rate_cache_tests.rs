@@ -8,6 +8,7 @@ use super::*;
 /// 插入指定状态的 BT 任务记录（不联网，engine_tid = infohash）。
 fn insert_bt_rec_with(state: &DaemonState, id: &str, ih: &str, st: TaskState) {
     let rec = TaskRecord {
+        seeding_since: None,
         task: DownloadTask {
             id: id.into(),
             canonical_id: CanonicalId {
