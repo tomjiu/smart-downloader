@@ -23,6 +23,7 @@ use smart_dl_core::types::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -113,6 +114,8 @@ struct SftpTask {
     limit_kb_s: Option<u32>,
     /// 顺序下载（边下边播）：与 FTP 同语义（在飞段窗口收紧）。
     sequential: bool,
+    /// 审计修复（P1-4）：真暂停闸门（与 FTP/HTTP 同构）。
+    pause: Arc<AtomicBool>,
 }
 
 struct EngineInner {
@@ -178,6 +181,12 @@ impl Default for SftpEngine {
 
 /// 建立 SSH 连接 + 密码认证 + 打开 SFTP 子系统会话。
 /// v1 仅密码认证（公钥/agent/交互认证后续按需）；主机密策略见 AcceptHostKey。
+/// 审计修复（P1-6）：SSH 连接建立超时——russh 默认无超时，半开/黑洞地址
+/// 时 worker 永久阻塞。
+const SFTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// 审计修复（P1-6）：SFTP 段数据读取超时（对齐 HTTP/FTP 口径）。
+const SFTP_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 async fn connect_sftp(
     host: &str,
     port: u16,
@@ -185,9 +194,13 @@ async fn connect_sftp(
     pass: &str,
 ) -> Result<russh_sftp::client::SftpSession, String> {
     let config = Arc::new(russh::client::Config::default());
-    let mut handle = russh::client::connect(config, (host, port), AcceptHostKey)
-        .await
-        .map_err(|e| format!("ssh 连接失败: {e}"))?;
+    let mut handle = tokio::time::timeout(
+        SFTP_CONNECT_TIMEOUT,
+        russh::client::connect(config, (host, port), AcceptHostKey),
+    )
+    .await
+    .map_err(|_| "ssh connect timeout".to_string())?
+    .map_err(|e| format!("ssh 连接失败: {e}"))?;
     let auth = handle
         .authenticate_password(user, pass)
         .await
@@ -268,9 +281,10 @@ async fn download_segment(
     let mut got = 0usize;
     while got < need {
         let want = (need - got).min(SFTP_CHUNK);
-        let n = f
-            .read(&mut chunk[..want])
+        // 审计修复（P1-6）：段读取超时——服务器停发时不再永久阻塞
+        let n = tokio::time::timeout(SFTP_IO_TIMEOUT, f.read(&mut chunk[..want]))
             .await
+            .map_err(|_| "sftp read timeout".to_string())?
             .map_err(|e| e.to_string())?;
         if n == 0 {
             return Err(format!("sftp read closed early: {got}/{need}"));
@@ -367,6 +381,12 @@ async fn download_segment_attempts(
 /// - 续传：`<part>.progress` 段账本为唯一凭据（缺失/损坏/失配 → 作废重下），
 ///   每段完成原子落盘，finalize 后清理。
 // 参数即协议会话要素（主机/凭据/路径/目标/退避/进度回调），拆 struct 反而模糊调用点语义。
+/// download_file 结局（审计修复 P1-4）：Completed / Paused（语义与 FTP 同）。
+enum SftpOutcome {
+    Completed,
+    Paused,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn download_file(
     host: &str,
@@ -381,7 +401,8 @@ async fn download_file(
     min_split: u64,
     sequential: bool,
     on_progress: Arc<dyn Fn(u64) + Send + Sync>,
-) -> Result<(), String> {
+    pause: Option<Arc<AtomicBool>>,
+) -> Result<SftpOutcome, String> {
     let part = part_path_of(dest);
     let ledger_path = ledger::ledger_path(&part);
     // 段账本加载（P4 唯一进度真源，与 FTP/HTTP 同口径）：合法账本 →
@@ -444,8 +465,13 @@ async fn download_file(
         let seq_gate = seq_gate.clone();
         let ledger_path = ledger_path.clone();
         let on_progress = on_progress.clone();
+        let pause = pause.clone();
         workers.spawn(async move {
             loop {
+                // 审计修复（P1-4）：段边界检查暂停旗标（与 FTP 同构）
+                if pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst)) {
+                    return Ok::<(), String>(());
+                }
                 // 顺序模式：先拿 permit 再领取段，保证「在飞段数 ≤ 窗口」
                 let _permit = match &seq_gate {
                     Some(g) => Some(
@@ -504,13 +530,19 @@ async fn download_file(
         }
     }
     drop(workers);
+    // 暂停优先于错误（审计修复 P1-4，与 FTP 同构）：置位后任何 worker
+    // 错误/panic 都视为暂停退出；不清账本、不落位。
+    if pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst)) {
+        return Ok(SftpOutcome::Paused);
+    }
     if let Some(e) = first_err {
         return Err(e);
     }
 
     // 全部段完成 → 清续传凭据 + 落位
     let _ = std::fs::remove_file(&ledger_path);
-    finalize_part(&part, dest, total)
+    finalize_part(&part, dest, total)?;
+    Ok(SftpOutcome::Completed)
 }
 
 /// 单文件任务的下载循环：download_file 包装 + 任务状态落定。
@@ -543,19 +575,27 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
         tasks.get(&tid).map(|t| t.sequential).unwrap_or(false)
     };
     let min_split = inner.min_split;
+    let pause_flag = {
+        let tasks = inner.tasks.lock();
+        tasks.get(&tid).map(|t| t.pause.clone())
+    };
+    // 审计修复（P1-3）：进度改绝对赋值（max 语义，与 FTP/HTTP 同口径）——
+    // 旧实现按增量 += 累加账本折算的绝对值 → 进度虚报。
     let progress: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |n| {
         let mut tasks = inner2.tasks.lock();
         if let Some(t) = tasks.get_mut(&tid2) {
-            t.done += n;
+            t.done = t.done.max(n.min(t.total));
         }
     });
     let r = download_file(
         &host, port, &user, &pass, &path, &dest, total, backoff, &limiter, min_split, sequential,
-        progress,
+        progress, pause_flag,
     )
     .await;
     match r {
-        Ok(()) => finish(&inner, &tid, EngineState::Completed, None),
+        Ok(SftpOutcome::Completed) => finish(&inner, &tid, EngineState::Completed, None),
+        // 审计修复（P1-4）：暂停退出不落定状态（pause() 已置 Paused）
+        Ok(SftpOutcome::Paused) => {}
         Err(e) => finish(&inner, &tid, EngineState::Error, Some(e)),
     }
 }
@@ -767,6 +807,7 @@ impl DownloadEngine for SftpEngine {
                     error: None,
                     limit_kb_s: None,
                     sequential: task.sequential,
+                    pause: Arc::new(AtomicBool::new(false)),
                 },
             );
         }
@@ -777,17 +818,35 @@ impl DownloadEngine for SftpEngine {
         Ok(tid)
     }
 
+    /// 审计修复（P1-4）：真暂停（与 FTP 同构）——置位闸门 + 状态 Paused；
+    /// worker 在段边界退出，download_loop 识别 Paused 结局不 finish。
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError> {
         let mut tasks = self.inner.tasks.lock();
         let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
+        t.pause.store(true, Ordering::SeqCst);
         t.state = EngineState::Paused;
         Ok(())
     }
 
+    /// 审计修复（P1-4）：恢复 = 清闸门 + 重新 spawn 下载循环（账本续传，
+    /// 进度 max 语义不重复累计）。
     async fn resume(&self, id: &EngineTaskId) -> Result<(), EngineError> {
-        let mut tasks = self.inner.tasks.lock();
-        let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
-        t.state = EngineState::Downloading;
+        let was_paused = {
+            let mut tasks = self.inner.tasks.lock();
+            let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
+            let was = t.state == EngineState::Paused;
+            t.pause.store(false, Ordering::SeqCst);
+            t.state = EngineState::Downloading;
+            was
+        };
+        // 非暂停态的 resume 维持既有无操作语义，不重复 spawn
+        if !was_paused {
+            return Ok(());
+        }
+        let inner = self.inner.clone();
+        let backoff = self.backoff;
+        let spawn_tid = id.clone();
+        spawn_sftp_loop(download_loop, inner, spawn_tid, backoff);
         Ok(())
     }
 
@@ -815,6 +874,14 @@ impl DownloadEngine for SftpEngine {
     }
 
     async fn remove(&self, id: &EngineTaskId, _delete_data: bool) -> Result<(), EngineError> {
+        // 审计修复（P1-4）：置位暂停闸门再移除——运行中循环在段边界退出，
+        // 不再继续占用带宽/写 .part/把文件 rename 落位。
+        {
+            let tasks = self.inner.tasks.lock();
+            if let Some(t) = tasks.get(id) {
+                t.pause.store(true, Ordering::SeqCst);
+            }
+        }
         let mut tasks = self.inner.tasks.lock();
         tasks.remove(id).ok_or(EngineError::NotFound)?;
         // 任务级限速登记一并回收（防表无限增长；与 FTP/HTTP 同口径）
