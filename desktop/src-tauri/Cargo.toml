@@ -1,3 +1,7 @@
+# 独立 workspace：本 crate 在仓库根 workspace 目录树内但不属于其 members，
+# 若无此空声明，tauri/cargo 独立构建会因「believes it's in a workspace」报错。
+[workspace]
+
 [package]
 name = "smart-dl-desktop"
 version = "0.1.0"
