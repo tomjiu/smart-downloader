@@ -382,7 +382,18 @@ impl DownloadEngine for BtEngine {
             },
             _ => return Err(EngineError::Other("source is not bt".to_string())),
         };
-        ih.map_err(|e| EngineError::Other(core_err(&e)))
+        let ih = ih.map_err(|e| EngineError::Other(core_err(&e)))?;
+        // 内核统一语义（Bug A 修复）：三个 add 入口（magnet / .torrent /
+        // fastresume 回灌）均 paused + 非 auto_managed 落库。任务层「添加即
+        // 下载」：首次 add 成功即 resume——否则 handle 永久暂停，magnet 元数
+        // 据抓取与 .torrent 下载都不启动（恢复重放路径 restore_from 已有对
+        // 称 resume；本路径此前缺失，实测 x.pe 本地闭环暴露）。新建任务无
+        // 用户暂停意图，resume 与 P4 G5 不冲突；后续用户 pause 走 pause API
+        // （intent 标志位在 alert 循环持续压制复活）。
+        self.core
+            .resume(&ih)
+            .map_err(|e| EngineError::Other(core_err(&e)))?;
+        Ok(ih)
     }
 
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError> {
