@@ -307,7 +307,27 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     if tasks_path.exists() {
         match state.restore_from(&tasks_path).await {
             Ok(n) => tracing::info!("已从 {tasks_path:?} 恢复 {n} 个任务"),
-            Err(e) => tracing::warn!("任务恢复失败（继续空启动）: {e}"),
+            Err(e) => {
+                // 审计修复（P1-1 放大链收尾）：解析/读取失败时把坏文件改名留档。
+                // 原实现只 warn 继续空启动——下一次任务变更 autosave 会用空/新
+                // 状态**原位覆盖**坏文件，历史任务记录永久丢失（含 source 凭据，
+                // 用户无法手工修复重放）。留档后本次启动零任务，用户可事后恢复。
+                let bad = tasks_path.with_extension(format!(
+                    "json.bad-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                ));
+                match std::fs::rename(&tasks_path, &bad) {
+                    Ok(()) => tracing::error!(
+                        "任务恢复失败，坏文件已留档 {bad:?}（继续空启动，可手工修复后重放）: {e}"
+                    ),
+                    Err(re) => {
+                        tracing::error!("任务恢复失败且留档失败（{re}）——下次落盘将覆盖坏文件: {e}")
+                    }
+                }
+            }
         }
     }
 
