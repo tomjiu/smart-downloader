@@ -52,6 +52,7 @@ fn rec_with_retry(max: u32, st: TaskState) -> TaskRecord {
                 next_retry_at_unix: 0,
             },
             limits: None,
+            max_connections: None,
         },
         engine_tid: Some("fk1".into()),
         engine_kind: EngineKind::Http,
@@ -265,6 +266,7 @@ async fn add_failure_schedules_retry_and_succeeds_after_recovery() {
                     next_retry_at_unix: 1, // 已到期
                 },
                 limits: None,
+                max_connections: None,
             },
             engine_tid: None,
             engine_kind: EngineKind::Http,
@@ -400,6 +402,7 @@ async fn resume_failed_without_handle_retries_manually() {
                     next_retry_at_unix: 0,
                 },
                 limits: None,
+                max_connections: None,
             },
             engine_tid: None,
             engine_kind: EngineKind::Http,

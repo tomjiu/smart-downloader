@@ -884,6 +884,26 @@ lt_err lt_set_sequential(lt_session* s, const char* ih, int on) {
     }
 }
 
+/* 任务级连接数上限（S1-c）：>0 = set_max_connections；0 = 复位为会话级
+   connections_limit 当前值（add 时 libtorrent 以会话值初始化 per-torrent
+   上限，复位即回到该口径）。句柄不存在 → LT_ERR_NOT_FOUND。 */
+lt_err lt_torrent_set_max_connections(lt_session* s, const char* ih, int max_connections) {
+    if (!s || !ih) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        if (max_connections > 0) {
+            h.set_max_connections(max_connections);
+        } else {
+            h.set_max_connections(
+                s->ses.get_settings().get_int(lt::settings_pack::connections_limit));
+        }
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
 lt_err lt_set_limits(lt_session* s, const char* ih, int64_t down_limit, int64_t up_limit) {
     if (!s || !ih) return LT_ERR_ARG;
     try {

@@ -46,6 +46,7 @@ fn insert_bt_rec(state: &DaemonState, id: &str, ih: &str) {
                 next_retry_at_unix: 0,
             },
             limits: None,
+            max_connections: None,
         },
         engine_tid: Some(ih.to_string()),
         engine_kind: EngineKind::Bt,

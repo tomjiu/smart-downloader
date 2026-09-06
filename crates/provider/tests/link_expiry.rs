@@ -50,6 +50,7 @@ fn mock_task() -> smart_dl_core::task::DownloadTask {
             next_retry_at_unix: 0,
         },
         limits: None,
+        max_connections: None,
     }
 }
 

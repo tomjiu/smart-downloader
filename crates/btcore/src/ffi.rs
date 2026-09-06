@@ -613,6 +613,17 @@ impl Session {
         )
     }
 
+    /// 任务级连接数上限（S1-c）：>0 = 上限；0 = 复位会话级默认。
+    pub fn set_max_connections(&self, ih: &str, max_connections: u32) -> Result<()> {
+        let i = self.ih(ih)?;
+        call(
+            unsafe {
+                lt_torrent_set_max_connections(self.raw, i.as_ptr(), max_connections as c_int)
+            },
+            || Ok(()),
+        )
+    }
+
     pub fn set_limits(&self, ih: &str, down: i64, up: i64) -> Result<()> {
         let i = self.ih(ih)?;
         call(

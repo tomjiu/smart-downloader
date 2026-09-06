@@ -52,6 +52,8 @@ pub struct FakeEngine {
     global_sets: parking_lot::Mutex<Vec<(Option<u32>, Option<u32>)>>,
     /// set_global_limits 的可编程行为：Some(e) = 恒返回该错误（下发失败模拟）。
     global_limits_err: parking_lot::Mutex<Option<smart_dl_core::types::EngineError>>,
+    /// 已下发的连接数上限调用（(engine_tid, n)，S1-c 断言用）。
+    max_conn: parking_lot::Mutex<Vec<(String, u32)>>,
 }
 
 #[cfg(test)]
@@ -78,6 +80,7 @@ impl FakeEngine {
             status_state: parking_lot::Mutex::new(None),
             global_sets: parking_lot::Mutex::new(Vec::new()),
             global_limits_err: parking_lot::Mutex::new(None),
+            max_conn: parking_lot::Mutex::new(Vec::new()),
         }
     }
 
@@ -189,6 +192,14 @@ impl FakeEngine {
     ) {
         *self.prio_readback.lock() = v;
     }
+
+    /// 读取已下发的连接数上限调用记录（S1-c 断言用）。
+    // 跨 feature 门测试共享的 mock 观测器：主调用点在 bt 门内（Bt fake），
+    // 默认 feature 组合下无调用点（同 set_status_files 豁免惯例）。
+    #[allow(dead_code)]
+    pub fn max_conn_calls(&self) -> Vec<(String, u32)> {
+        self.max_conn.lock().clone()
+    }
 }
 
 #[cfg(test)]
@@ -270,6 +281,16 @@ impl DownloadEngine for FakeEngine {
         proxy: Option<String>,
     ) -> Result<(), smart_dl_core::types::EngineError> {
         self.proxy_sets.lock().push((id.to_string(), proxy));
+        Ok(())
+    }
+
+    /// 连接数上限（S1-c）：记录 (engine_tid, n) 供断言；恒成功。
+    async fn set_max_connections(
+        &self,
+        id: &EngineTaskId,
+        n: u32,
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        self.max_conn.lock().push((id.to_string(), n));
         Ok(())
     }
     async fn peers(
@@ -388,6 +409,7 @@ mod bt_alert_tests;
 mod bt_name_backfill_tests;
 mod cleanup_tests;
 mod conflict_tests;
+mod conn_limit_tests;
 mod ct_eq_tests;
 mod ftp_tests;
 mod global_limits_tests;
@@ -396,6 +418,7 @@ mod metrics_tests;
 mod name_backfill_tests;
 mod persist_tests;
 mod post_download_tests;
+mod queue_gate_tests;
 mod rate_cache_tests;
 mod scheduled_tests;
 mod tags_tests;

@@ -46,6 +46,12 @@ pub struct DownloadTask {
     /// 持久化 + 恢复重放：restore_from 对 sequential=true 的任务原样重放。
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub sequential: bool,
+    /// 任务级连接数上限（S1-c，qbit 每任务连接数；仅 BT 引擎消费）。
+    /// None = 未设置（会话默认）；Some(0) = 复位为会话级默认；Some(n>0) =
+    /// 上限 n。持久化 + 恢复重放：restore_from 对 Some 值原样下发引擎
+    /// （metadata 未就绪也可设，handle 级参数）。旧 tasks.json 无此字段自动补 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
 }
 
 /// 任务级限速（KiB/s）。语义：`None` = 不调整（保持现状/走全局）；

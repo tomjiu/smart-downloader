@@ -79,7 +79,10 @@ async fn get_settings_returns_all_domains() {
         s["bittorrent"]["bt_available"], false,
         "非 bt 构建无 BT 引擎"
     );
-    assert_eq!(s["queue"]["max_active_bt"], 3);
+    assert_eq!(
+        s["queue"]["max_active_bt"], 0,
+        "S1-b 默认 0 = 不限（禁用排队）"
+    );
     assert!(s["meta"]["persist_path"].is_string(), "持久化路径可见");
 }
 
@@ -288,7 +291,10 @@ async fn bittorrent_and_queue_and_misc_domains_apply() {
     // persist=false → 文件保持原样
     let text = std::fs::read_to_string(&cfg_path).unwrap();
     let reloaded = smart_dl_daemon::config::Config::load(Some(&cfg_path)).unwrap();
-    assert_eq!(reloaded.queue.max_active_bt, 3, "未落盘：文件值不变");
+    assert_eq!(
+        reloaded.queue.max_active_bt, 0,
+        "未落盘：文件值不变（默认 0 = 不限）"
+    );
     let _ = text;
 }
 
