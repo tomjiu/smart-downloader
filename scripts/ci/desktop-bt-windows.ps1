@@ -71,14 +71,17 @@ function Invoke-Setup {
     # 同样需要一致），否则链接期 undefined symbols
     $sslDef = ""
     if (Test-Path (Join-Path $Installed "lib\libssl.lib")) { $sslDef = "/DTORRENT_USE_OPENSSL=1 " }
+    # ⚠ 批处理行必须单行拼死：@() 元素里 "+ 换行" 续接不生效，片段会各自成行
+    # （二轮实证：cl 行腰斩 → D8003 缺源文件 + '/c' 被当命令执行）
+    $inc = Join-Path $Installed 'include'
+    $src = "$ffi\src\lt_kernel.cpp"
+    $out = Join-Path $buildDir 'lt_kernel.lib'
     @(
         "call `"$vcvars`" >NUL",
         "cd /d `"$buildDir`"",
-        "cl /nologo /std:c++17 /O2 /MD /EHsc /DNDEBUG $sslDef" +
-            "/I`"$ffi`" /I`"$(Join-Path $Installed 'include')`" " +
-            "/c `"$ffi\src\lt_kernel.cpp`"",
+        "cl /nologo /std:c++17 /O2 /MD /EHsc /DNDEBUG $sslDef/I`"$inc`" /I`"$ffi`" /c `"$src`"",
         "if errorlevel 1 exit /b 1",
-        "lib /nologo /OUT:`"$(Join-Path $buildDir 'lt_kernel.lib')`" lt_kernel.obj",
+        "lib /nologo /OUT:`"$out`" lt_kernel.obj",
         "if errorlevel 1 exit /b 1"
     ) | Set-Content -Path $bat
     # PowerShell 直调 .cmd（内部即 cmd /c，无引号折叠问题；cmd /c "`"$bat`"" 形式
