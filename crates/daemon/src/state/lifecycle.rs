@@ -43,6 +43,8 @@ impl DaemonState {
             queue_cfg: Mutex::new(crate::config::QueueCfg::default()),
             config_path: Mutex::new(None),
             live_config: Mutex::new(None),
+            rss: Mutex::new(crate::rss::RssState::default()),
+            rss_persist_path: None,
         }
     }
 
@@ -307,9 +309,24 @@ impl DaemonState {
     }
 
     /// 启用任务持久化（每次变更自动写 JSON 到 `path`）。
+    /// 同时派生 RSS 状态持久化路径（tasks.json 同目录 rss.json，qbit RSS 对标）。
     pub fn with_storage(mut self, path: PathBuf) -> Self {
+        self.rss_persist_path = path.parent().map(|d| d.join("rss.json"));
         self.persist_path = Some(path);
         self
+    }
+
+    /// RSS bootstrap client 克隆（与 metalink bootstrap 同源 client；None = 测试装配）。
+    pub(crate) fn bootstrap_client_opt(&self) -> Option<reqwest::Client> {
+        self.bootstrap_client.clone()
+    }
+
+    /// `[rss] max_processed_items_per_feed`（live_config 注入优先；None = 上层兑底）。
+    pub(crate) fn rss_max_processed_items_opt(&self) -> Option<usize> {
+        self.live_config
+            .lock()
+            .as_ref()
+            .map(|c| c.rss.max_processed_items_per_feed as usize)
     }
 
     /// 追加 BT 引擎（feature `bt`；无该引擎时 magnet 路由 → InvalidSource）。
