@@ -14,6 +14,7 @@ impl DaemonState {
             providers,
             next_id: AtomicU64::new(1),
             persist_path: None,
+            persist_lock: Mutex::new(()),
             default_dest_root: Mutex::new(PathBuf::from(".")),
             allowed_roots: Mutex::new(Vec::new()),
             http_token: None,

@@ -565,6 +565,13 @@ pub struct DaemonState {
     next_id: AtomicU64,
     /// 任务持久化文件（Some 时 add/remove/状态变更后自动落盘）。
     persist_path: Option<PathBuf>,
+    /// 审计修复（P1-1）：autosave 串行化闸门。autosave 在 tasks 锁外调用
+    /// （Bug B 修复的正确取舍），但因此 HTTP handler / 轮询回填 / alert 循环
+    /// 可并发执行 write_tasks_atomic——固定 tmp 名下并发写同一文件 + rename
+    /// 交错 → tasks.json 损坏 → 重启恢复失败继续空启动 → 下次 autosave 用空
+    /// 状态覆盖原文件（历史任务记录永久丢失）。该锁只保护落盘本身，
+    /// 不与 tasks 锁嵌套（先取快照再落盘的顺序不变）。
+    persist_lock: Mutex<()>,
     /// HTTP 任务默认落盘目录（dest 未指定时用；serve 从配置 `[download] dest_root` 注入；
     /// Mutex 支持 #6 TOML 热重载动态更新）。
     default_dest_root: Mutex<PathBuf>,

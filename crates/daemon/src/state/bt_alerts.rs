@@ -373,12 +373,20 @@ impl DaemonState {
 }
 
 /// 从 magnet 提取 btih（40 hex，v1 规范 xt=urn:btih:）。无 → None（canonical 回落全文）。
+/// 审计修复（P1）：原实现直接 `split('&')`，而标准磁链首段为 `magnet:?xt=...`，
+/// `strip_prefix("xt=urn:btih:")` 对首段永不匹配 → xt 在首位（最常见形态）恒 None
+/// → fastresume 回灌整链静默失效 + canonical 查重退化为全文比对。
 #[cfg(feature = "bt")]
 pub(crate) fn btih_of(magnet: &str) -> Option<String> {
-    magnet.split('&').find_map(|p| {
-        let v = p.strip_prefix("xt=urn:btih:")?;
-        (v.len() == 40 && v.bytes().all(|b| b.is_ascii_hexdigit())).then(|| v.to_ascii_lowercase())
-    })
+    magnet
+        .strip_prefix("magnet:?")
+        .unwrap_or(magnet)
+        .split('&')
+        .find_map(|p| {
+            let v = p.strip_prefix("xt=urn:btih:")?;
+            (v.len() == 40 && v.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| v.to_ascii_lowercase())
+        })
 }
 
 /// 从 .torrent 字节提取 BT infohash（40 hex 小写）= SHA1(info dict 原始字节)。
@@ -526,5 +534,49 @@ fn value_skip(b: &[u8], i: usize, depth: usize) -> Option<usize> {
             Some(e + 1)
         }
         _ => be_str(b, i).map(|(_, after)| after),
+    }
+}
+
+#[cfg(all(test, feature = "bt"))]
+mod btih_tests {
+    use super::btih_of;
+
+    const IH: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    /// 审计回归（P1）：xt 在首位的标准磁链必须能提取 btih——原实现对首段
+    /// strip_prefix("xt=urn:btih:") 永不匹配（前缀差 "magnet:?"），导致
+    /// fastresume 回灌整链静默失效 + canonical 查重退化为全文比对。
+    #[test]
+    fn btih_xt_first_param() {
+        assert_eq!(
+            btih_of(&format!("magnet:?xt=urn:btih:{IH}&dn=name")),
+            Some(IH.to_string())
+        );
+    }
+
+    #[test]
+    fn btih_xt_later_param() {
+        assert_eq!(
+            btih_of(&format!(
+                "magnet:?dn=name&tr=udp%3A%2F%2Fx&xt=urn:btih:{IH}"
+            )),
+            Some(IH.to_string())
+        );
+    }
+
+    #[test]
+    fn btih_normalizes_case() {
+        assert_eq!(
+            btih_of(&format!("magnet:?xt=urn:btih:{}", IH.to_uppercase())),
+            Some(IH.to_string())
+        );
+    }
+
+    #[test]
+    fn btih_rejects_base32_and_short() {
+        // 32 位 base32（v1 第二表示）非 40-hex，维持既有契约：拒绝（回落全文）
+        assert_eq!(btih_of("magnet:?xt=urn:btih:ORSXG5A="), None);
+        assert_eq!(btih_of(&format!("magnet:?xt=urn:btih:{IH}Z")), None);
+        assert_eq!(btih_of("magnet:?dn=only-name"), None);
     }
 }
