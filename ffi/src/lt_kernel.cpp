@@ -884,6 +884,26 @@ lt_err lt_set_sequential(lt_session* s, const char* ih, int on) {
     }
 }
 
+/* 超级种子（BitComet 首创，qBittorrent 任务右键同名能力）：seed_mode flag
+   仅在任务处于做种态（metadata 齐全且全部 piece 就绪）时有意义——下载中设置
+   libtorrent 静默接受但无效果（与 qbit 行为一致，无需上层拦截）。
+   on/off 均可逆：set_flags / unset_flags。句柄不存在 → LT_ERR_NOT_FOUND。 */
+lt_err lt_set_seed_mode(lt_session* s, const char* ih, int on) {
+    if (!s || !ih) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        if (on) {
+            h.set_flags(lt::torrent_flags::seed_mode);
+        } else {
+            h.unset_flags(lt::torrent_flags::seed_mode);
+        }
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
 /* 任务级连接数上限（S1-c）：>0 = set_max_connections；0 = 复位为会话级
    connections_limit 当前值（add 时 libtorrent 以会话值初始化 per-torrent
    上限，复位即回到该口径）。句柄不存在 → LT_ERR_NOT_FOUND。 */

@@ -212,6 +212,11 @@ impl BtCore {
         self.sess.add_peer(ih, ip, port)
     }
 
+    /// 超级种子开关（qBittorrent 同名能力；做种态生效，下载中无效果）
+    pub fn set_super_seeding(&self, ih: &str, on: bool) -> ffi::Result<()> {
+        self.sess.set_seed_mode(ih, on)
+    }
+
     pub fn add_torrent_file(&self, meta: &[u8], web_seeds: &[String]) -> ffi::Result<String> {
         self.sess.add_torrent_file(meta, web_seeds)
     }
