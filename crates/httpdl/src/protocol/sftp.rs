@@ -302,10 +302,8 @@ async fn download_segment_with_retry(
 ) -> Result<(), String> {
     let mut stack: Vec<DynSegment> = vec![seg];
     while let Some(cur) = stack.pop() {
-        match download_segment_attempts(
-            host, port, user, pass, path, cur, part, limiter, backoff,
-        )
-        .await
+        match download_segment_attempts(host, port, user, pass, path, cur, part, limiter, backoff)
+            .await
         {
             Ok(()) => {}
             Err(e) if is_terminal(&e) => {
