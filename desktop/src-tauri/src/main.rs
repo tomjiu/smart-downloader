@@ -18,7 +18,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{Manager, State};
 use tauri_plugin_shell::process::CommandChild;
@@ -32,24 +33,54 @@ struct DaemonChild(Mutex<Option<CommandChild>>);
 
 struct DaemonPort(u16);
 
+/// 审计修复（P2-8）：端口环境变量严格校验——原 `.parse().ok().unwrap_or(DEFAULT)`
+/// 对非法值静默回退 8788（恰与「避开常驻 daemon」的初衷相反），且 `0` 可
+/// 通过 parse → 壳轮询 `127.0.0.1:0` 必败 → 白屏。现非法值/0 直接报错退出。
 fn port() -> u16 {
-    std::env::var("SMART_DL_DESKTOP_PORT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_PORT)
+    match std::env::var("SMART_DL_DESKTOP_PORT") {
+        Ok(v) => match v.trim().parse::<u16>() {
+            Ok(p) if p != 0 => p,
+            _ => {
+                eprintln!(
+                    "SMART_DL_DESKTOP_PORT 非法（{v:?}）：需 1-65535 且非 0"
+                );
+                std::process::exit(2);
+            }
+        },
+        Err(_) => DEFAULT_PORT,
+    }
 }
 
-/// 轮询 daemon 监听端口直到可连（serve 在路由装配完成后才 bind——
-/// TCP 可连 = 全部引擎/存储初始化完成）。
-async fn wait_daemon(port: u16) -> bool {
+/// 审计修复（P1-3）：就绪探测改 HTTP GET /health（原 TCP 可连即就绪——
+/// 端口被外来常驻进程占用时假阳性开窗指向非 daemon；HTTP 响应行同时确认
+/// 对端身份）。接收任意 HTTP 状态行：200/401（配了 token）均证明 daemon
+/// 已就绪（serve 在路由装配完成后才 bind）。返回 false = 超时或 daemon
+/// 进程已死（Terminated 提前短路，不再干等 30s）。
+async fn wait_daemon(port: u16, dead: &AtomicBool) -> bool {
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-    let deadline = Instant::now() + Duration::from_secs(15);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let probe =
+        format!("GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     while Instant::now() < deadline {
-        if tokio::time::timeout(Duration::from_millis(400), tokio::net::TcpStream::connect(addr))
-            .await
-            .is_ok()
+        if dead.load(Ordering::SeqCst) {
+            return false;
+        }
+        if let Ok(Ok(mut stream)) = tokio::time::timeout(
+            Duration::from_millis(800),
+            tokio::net::TcpStream::connect(addr),
+        )
+        .await
         {
-            return true;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            if stream.write_all(probe.as_bytes()).await.is_ok() {
+                let mut buf = [0u8; 32];
+                let read = tokio::time::timeout(Duration::from_millis(800), stream.read(&mut buf));
+                if let Ok(Ok(n)) = read.await {
+                    if n >= 7 && buf.starts_with(b"HTTP/1.") {
+                        return true;
+                    }
+                }
+            }
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
@@ -92,7 +123,16 @@ fn main() {
                                 let _ = w.set_focus();
                             }
                         }
-                        "quit" => app.exit(0),
+                        "quit" => {
+                            // 审计修复（P1-1）：托盘退出必须先杀 daemon——
+                            // AppHandle::exit 不触发窗口 CloseRequested（daemon
+                            // 回收只挂在窗口关闭路径上）→ 旧实现产出僵尸 daemon
+                            // （占住 8788，下次启动 sidecar bind 失败 + 壳连到旧
+                            // 实例假正常）。ExitRequested 兜底（见 run 回调）另
+                            // 覆盖 macOS Cmd+Q / 系统注销路径。
+                            kill_daemon(&app.state::<DaemonChild>());
+                            app.exit(0);
+                        }
                         _ => {}
                     })
                     .build(handle)?;
@@ -130,6 +170,12 @@ fn main() {
                 .spawn()
                 .map_err(|e| format!("daemon sidecar 启动失败: {e}"))?;
             *child_state.0.lock().unwrap() = Some(child);
+            // 审计修复（P1-2）：daemon 崩溃/被杀感知——Terminated 落入 `_ => {}`
+            // 被吞，壳无感知不重启不提示；至少短路就绪等待 + 日志留痕，并清空
+            // 句柄避免退出时对已死进程 kill。
+            let daemon_dead = Arc::new(AtomicBool::new(false));
+            let ev_handle = handle.app_handle().clone();
+            let dead_flag = daemon_dead.clone();
             tauri::async_runtime::spawn(async move {
                 while let Some(ev) = rx.recv().await {
                     match ev {
@@ -139,6 +185,11 @@ fn main() {
                         tauri_plugin_shell::process::CommandEvent::Stdout(line) => {
                             println!("[daemon] {}", String::from_utf8_lossy(&line));
                         }
+                        tauri_plugin_shell::process::CommandEvent::Terminated => {
+                            eprintln!("[daemon] sidecar 进程已退出（崩溃/被杀）——不再等待就绪");
+                            dead_flag.store(true, Ordering::SeqCst);
+                            kill_daemon(&ev_handle.state::<DaemonChild>());
+                        }
                         _ => {}
                     }
                 }
@@ -146,10 +197,13 @@ fn main() {
 
             // —— 等就绪 → 开窗 ——
             let app_handle = handle.app_handle().clone();
+            let dead_flag_wait = daemon_dead.clone();
             tauri::async_runtime::spawn(async move {
-                let ready = wait_daemon(port).await;
+                let ready = wait_daemon(port, &dead_flag_wait).await;
                 if !ready {
-                    eprintln!("daemon 监听等待超时（15s）——仍尝试打开窗口");
+                    eprintln!(
+                        "daemon 就绪等待失败（超时 30s 或进程退出）——仍打开窗口（UI 会显示连接断开态）"
+                    );
                 }
                 let url: tauri::Url = format!("http://127.0.0.1:{port}/")
                     .parse()
@@ -180,6 +234,14 @@ fn main() {
                 window.app_handle().exit(0);
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            // 审计修复（P1-1 兕底）：全部退出路径（托盘退出/macOS Cmd+Q/
+            // 系统注销/ExitRequested）统一回收 daemon——旧实现只挂窗口
+            // CloseRequested，托盘退出产出僵尸 daemon。
+            if let tauri::RunEvent::ExitRequested { .. } = event {
+                kill_daemon(&app.state::<DaemonChild>());
+            }
+        });
 }
