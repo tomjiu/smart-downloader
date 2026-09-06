@@ -4,6 +4,7 @@
 //! 任一存活即换源成功（不再首源死即拒）。P4 续传：段账本（`<part>.progress`）为唯一进度真源；
 //! pause 真停（段边界退出）；epoch 单写者模型（resume 无条件新 epoch 循环，旧循环在检查点自杀且永不 finalize）。
 
+use crate::dash;
 use crate::download::{download_dynamic, update_score, DynamicLedger, DynamicOutcome, SCORE_MIN};
 use crate::hls;
 use crate::ledger;
@@ -84,9 +85,18 @@ struct HttpTask {
     /// 名 = CD → URL 末段 → 兑底链，已 sanitize_rel 终审）。status() 透出供
     /// daemon 回填 metadata.name——引擎内部派生的名字不再对 daemon 隐身。
     resolved_name: Option<String>,
-    /// C-HLS：任务为 HLS VOD 下载（.m3u8 URL 分流）——resume/update_sources
-    /// 按此分流到 HLS 循环/拒绝；status/pause/remove/limits 与普通任务同链。
-    hls: bool,
+    /// C-HLS/C-DASH：流式清单任务类型（.m3u8/.mpd URL 分流）——resume/
+    /// update_sources 按此分流到对应流式循环/拒绝；status/pause/remove/
+    /// limits 与普通任务同链。
+    stream: StreamKind,
+}
+
+/// 流式清单任务类型（C-HLS/C-DASH）：Plain = 普通分段链任务。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Plain,
+    Hls,
+    Dash,
 }
 
 struct EngineInner {
@@ -244,11 +254,12 @@ impl HttpEngine {
         });
     }
 
-    /// HLS 下载循环 spawn（C-HLS）：client/limiter/收尸监控与 spawn_download
-    /// 同口径；abort = 任务 pause flag（pause()/remove() 置位 → 段间退出，
-    /// `hls-aborted` 约定错误静默返回——状态由 pause()/remove() 管理）；
-    /// resume() epoch+1 → 旧循环在下一 abort 检查点自杀，新循环凭段账本续传。
-    fn spawn_hls_loop(&self, tid: EngineTaskId, epoch: u64) {
+    /// 流式清单下载循环 spawn（C-HLS/C-DASH）：client/limiter/收尸监控与
+    /// spawn_download 同口径；abort = 任务 pause flag（pause()/remove() 置位
+    /// → 段间退出，`hls-aborted`/`dash-aborted` 约定错误静默返回——状态由
+    /// pause()/remove() 管理）；resume() epoch+1 → 旧循环在下一 abort 检查点
+    /// 自杀，新循环凭段账本续传。
+    fn spawn_stream_loop(&self, tid: EngineTaskId, epoch: u64) {
         let (client, spawn_err) = {
             let tasks = self.inner.tasks.lock();
             match tasks.get(&tid).and_then(|t| t.proxy.as_deref()) {
@@ -270,7 +281,7 @@ impl HttpEngine {
             }
             return;
         }
-        let (url, headers, dest, pause_flag) = {
+        let (url, headers, dest, pause_flag, stream_kind) = {
             let tasks = self.inner.tasks.lock();
             match tasks.get(&tid) {
                 Some(t) => (
@@ -278,6 +289,7 @@ impl HttpEngine {
                     t.headers.clone(),
                     t.dest.clone(),
                     t.pause.clone(),
+                    t.stream,
                 ),
                 None => return,
             }
@@ -303,12 +315,38 @@ impl HttpEngine {
                     }
                 })
             };
-            let result =
-                hls::download_hls(client, url, headers, dest, limiter, on_progress, pause_flag)
-                    .await;
+            let result = match stream_kind {
+                StreamKind::Dash => {
+                    dash::download_dash(
+                        client.clone(),
+                        url.clone(),
+                        headers.clone(),
+                        dest.clone(),
+                        limiter.clone(),
+                        on_progress.clone(),
+                        pause_flag.clone(),
+                    )
+                    .await
+                }
+                _ => {
+                    hls::download_hls(
+                        client.clone(),
+                        url.clone(),
+                        headers.clone(),
+                        dest.clone(),
+                        limiter.clone(),
+                        on_progress.clone(),
+                        pause_flag.clone(),
+                    )
+                    .await
+                }
+            };
             // 状态落定：仅当前 epoch 的循环有权（过期循环静默退出）；
             // abort 中断（pause/remove 已管状态）不落 Error。
-            let aborted = matches!(&result, Err(e) if e.to_string().contains(hls::HLS_ABORTED_MSG));
+            let aborted = matches!(&result, Err(e) if {
+                let msg = e.to_string();
+                msg.contains(hls::HLS_ABORTED_MSG) || msg.contains(dash::DASH_ABORTED_MSG)
+            });
             let mut tasks = inner.tasks.lock();
             if let Some(t) = tasks.get_mut(&tid) {
                 if t.epoch != epoch {
@@ -331,7 +369,7 @@ impl HttpEngine {
         tokio::spawn(async move {
             if let Err(join_err) = handle.await {
                 if join_err.is_panic() {
-                    let msg = format!("HLS 循环 panic: {join_err}");
+                    let msg = format!("流式下载循环 panic: {join_err}");
                     tracing::error!("tid={tid_mon}: {msg}");
                     let mut tasks = inner_mon.tasks.lock();
                     if let Some(t) = tasks.get_mut(&tid_mon) {
@@ -791,11 +829,64 @@ impl DownloadEngine for HttpEngine {
                         sequential: task.sequential,
                         proxy,
                         resolved_name: Some(resolved_name),
-                        hls: true,
+                        stream: StreamKind::Hls,
                     },
                 );
             }
-            self.spawn_hls_loop(tid.clone(), 1);
+            self.spawn_stream_loop(tid.clone(), 1);
+            return Ok(tid);
+        }
+        // C-DASH 分流：.mpd URL → DASH static VOD 下载（与 HLS 同哲学：清单
+        // 是文本，total/Range 语义无意义；MPD 解析失败/明确拒绝面在下载循环
+        // 内落 Error）。备用源对 DASH 无意义（清单自带段 URL），静默忽略。
+        // 落盘名：显式名 → 派生 `<清单名>.mp4`（sanitize_rel 终审）→ 兕底
+        // download.mp4。
+        if dash::is_dash_url(&url) {
+            let rel_pb: String = match &task.metadata.name {
+                Some(rel) => smart_dl_core::session::output::sanitize_rel(rel)
+                    .map_err(|e| EngineError::Other(e.to_string()))?
+                    .to_string_lossy()
+                    .into_owned(),
+                None => dash::derive_mp4_name(&url).unwrap_or_else(|| "download.mp4".to_string()),
+            };
+            let dest = task.dest_root.join(&rel_pb);
+            let resolved_name = rel_pb;
+            let tid = task.id.clone();
+            {
+                let mut tasks = self.inner.tasks.lock();
+                tasks.insert(
+                    tid.clone(),
+                    HttpTask {
+                        headers: headers.clone(),
+                        mirrors: vec![url.clone()],
+                        etag: None,
+                        last_modified: None,
+                        dest,
+                        state: EngineState::Downloading,
+                        done: 0,
+                        total: 0,
+                        rate: RateSample::default(),
+                        error: None,
+                        sha256: None,
+                        sha1: None,
+                        md5: None,
+                        verify_attempts: 0,
+                        backup_url: None,
+                        backup_md5: None,
+                        backup_used: false,
+                        rotate_pool: Vec::new(),
+                        gen: 0,
+                        epoch: 1,
+                        pause: Arc::new(AtomicBool::new(false)),
+                        limit_kb_s: None,
+                        sequential: task.sequential,
+                        proxy,
+                        resolved_name: Some(resolved_name),
+                        stream: StreamKind::Dash,
+                    },
+                );
+            }
+            self.spawn_stream_loop(tid.clone(), 1);
             return Ok(tid);
         }
         // 探测韧性（与 update_sources 并发探测同批）：主源探测失败且配置了备用源
@@ -971,7 +1062,7 @@ impl DownloadEngine for HttpEngine {
                     sequential: task.sequential,
                     proxy,
                     resolved_name: Some(resolved_name),
-                    hls: false,
+                    stream: StreamKind::Plain,
                 },
             );
         }
@@ -994,17 +1085,18 @@ impl DownloadEngine for HttpEngine {
     /// 恢复已完成段）。旧循环（若仍在收尾）在下一 gen/epoch 检查点自杀，
     /// 且永不 finalize——并发下载仅重复写同内容字节，幂等无害。
     async fn resume(&self, id: &EngineTaskId) -> Result<(), EngineError> {
-        let (gen, epoch, is_hls) = {
+        let (gen, epoch, stream_kind) = {
             let mut tasks = self.inner.tasks.lock();
             let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
             t.pause.store(false, Ordering::SeqCst);
             t.state = EngineState::Downloading;
             t.epoch += 1;
-            (t.gen, t.epoch, t.hls)
+            (t.gen, t.epoch, t.stream)
         };
-        // C-HLS：HLS 任务 resume 走 HLS 循环（清单重拉 + 段账本续传），其余照旧
-        if is_hls {
-            self.spawn_hls_loop(id.clone(), epoch);
+        // C-HLS/C-DASH：流式任务 resume 走流式循环（清单重拉 + 段账本续传），
+        // 其余照旧
+        if stream_kind != StreamKind::Plain {
+            self.spawn_stream_loop(id.clone(), epoch);
         } else {
             self.spawn_download(id.clone(), gen, epoch);
         }
@@ -1256,7 +1348,7 @@ impl DownloadEngine for HttpEngine {
 
         let mut tasks = self.inner.tasks.lock();
         let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
-        if t.hls {
+        if t.stream != StreamKind::Plain {
             return Err(EngineError::Unsupported);
         }
         let etag_changed = probe.etag.is_some() && t.etag.is_some() && probe.etag != t.etag;
