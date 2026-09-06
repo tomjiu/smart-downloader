@@ -59,6 +59,13 @@ lt_err lt_apply_discovery(lt_session* s, int enable_dht, int enable_lsd, int ena
    会话默认 uTP 关 + 加密允许（M0 确定性语义）；本函数后置覆盖。 */
 lt_err lt_apply_transport(lt_session* s, int enable_utp, int enc_policy);
 
+/* —— 会话连接参数（监听端口 / 全局连接数上限）——
+   port: 0 = 不修改（沿用内核默认/上次设置）；>0 时 listen_interfaces =
+   "0.0.0.0:<port>,[::]:<port>"（IPv4+IPv6 双栈；apply_settings 后内核自动
+   re-listen，运行中调用安全）。
+   max_connections: 0 = 不修改（内核默认 200）；>0 时 connections_limit。 */
+lt_err lt_apply_conn(lt_session* s, int port, int max_connections);
+
 /* —— 添加/移除（5）—— */
 lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, char* ih_out /*41 字节*/);
 lt_err lt_add_torrent_file(lt_session* s, const uint8_t* meta, size_t len, const char** web_seeds, char* ih_out);

@@ -174,6 +174,10 @@ fn type_labels_cover_all_variants_and_match_serde_tag() {
         SchedulerEvent::TaskActivated {
             task_id: "t".into(),
         },
+        // S1：设置面变更（daemon 级，无 task_id）
+        SchedulerEvent::SettingsChanged {
+            keys: vec!["bandwidth.max_download_kb_s".into()],
+        },
     ];
     for ev in &extra {
         let label = ev.type_label();
@@ -183,6 +187,7 @@ fn type_labels_cover_all_variants_and_match_serde_tag() {
         );
         assert!(seen.insert(label), "known 内标签重复: {label}");
     }
-    // 全集长度 = 8 常规 + 4 特殊构造（E16 GlobalLimitsChanged + E23 TaskActivated）
-    assert_eq!(known.len(), 12);
+    // 全集长度 = 8 常规 + 5 特殊构造（E16 GlobalLimitsChanged + E23 TaskActivated
+    // + S1 SettingsChanged）
+    assert_eq!(known.len(), 13);
 }

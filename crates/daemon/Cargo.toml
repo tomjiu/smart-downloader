@@ -45,6 +45,8 @@ anyhow = "1"
 parking_lot = { workspace = true }
 uuid = { workspace = true }
 qrcode = "0.14" # 终端二维码（xunlei-login --qr）
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] } # S1 备用限速本地时段
+tower-http = { version = "0.6", features = ["fs"] } # S2 内嵌 UI 静态服务（--ui-dir）
 
 [dev-dependencies]
 tempfile = "3"
