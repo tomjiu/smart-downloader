@@ -50,9 +50,9 @@ jobs:
         # （与 bt integration job 同源 bt-linux-setup.sh，链接行为逐字一致）
         run: bash scripts/ci/desktop-bt-linux.sh setup
 
-      - name: Cache vcpkg binaries (Windows)
+      - name: Restore vcpkg binaries (Windows)
         if: runner.os == 'Windows'
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: .vcpkg-cache
           key: vcpkg-libtorrent-x64-windows-v1
@@ -61,6 +61,14 @@ jobs:
         if: runner.os == 'Windows'
         # vcpkg 装 libtorrent（动态 triplet）+ cl 编内核静态库 → GITHUB_ENV
         run: ./scripts/ci/desktop-bt-windows.ps1 -Cmd setup
+
+      # 失败也落袋：vcpkg 首建源码编译 ~30min，内容寻址缓存部分命中可续跑
+      - name: Save vcpkg binaries (Windows)
+        if: always() && runner.os == 'Windows'
+        uses: actions/cache/save@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-libtorrent-x64-windows-v1
 
       - name: Setup BT native env (macOS)
         if: runner.os == 'macOS'

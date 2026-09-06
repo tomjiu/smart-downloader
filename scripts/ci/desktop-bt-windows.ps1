@@ -81,7 +81,9 @@ function Invoke-Setup {
         "lib /nologo /OUT:`"$(Join-Path $buildDir 'lt_kernel.lib')`" lt_kernel.obj",
         "if errorlevel 1 exit /b 1"
     ) | Set-Content -Path $bat
-    cmd /c "`"$bat`""
+    # PowerShell 直调 .cmd（内部即 cmd /c，无引号折叠问题；cmd /c "`"$bat`"" 形式
+    # 会把 /c 折进参数串导致 "'/c' is not recognized"——首跑实证）
+    & $bat
     if ($LASTEXITCODE -ne 0) { throw "lt_kernel.lib 编译失败（$bat）" }
     if (-not (Test-Path (Join-Path $buildDir "lt_kernel.lib"))) { throw "lt_kernel.lib 未生成" }
     Write-Host "    lt_kernel.lib 就绪：$buildDir"
