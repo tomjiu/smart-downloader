@@ -654,6 +654,19 @@ async fn download_loop(
                 if now_mirrors.as_deref() != Some(mirrors_raw.as_slice()) {
                     continue; // 换源已生效 → 用新列表重试
                 }
+                // 审计修复（P1-5）：Err 分支补 gen/epoch 守卫——500ms 窗口内
+                // resume()/set_task_proxy()（epoch+1 但 mirrors 不变）时，旧
+                // 循环不得把正在跑的新循环任务标 Error（auto-retry/事件链会
+                // 误响应）。Ok 分支 finalize 前已有同款 still_current 检查。
+                let still_current = inner
+                    .tasks
+                    .lock()
+                    .get(&tid)
+                    .map(|t| t.gen == gen && t.epoch == epoch)
+                    .unwrap_or(false);
+                if !still_current {
+                    return;
+                }
                 finish(&inner, &tid, EngineState::Error, Some(e));
                 return;
             }

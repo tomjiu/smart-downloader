@@ -37,11 +37,15 @@ export default function TasksView({
   rates,
   onChanged,
   onOpen,
+  onToast,
 }: {
   tasks: TaskListItem[];
   rates: Record<string, TaskRate>;
   onChanged: () => void;
   onOpen: (id: string) => void;
+  /** 审计修复（40-e P1-5）：操作失败全局 toast——旧实现 setErr 结果只在
+   * 新建面板内部渲染，面板关闭后暂停/恢复/删除失败完全静默。 */
+  onToast?: (t: { kind: string; text: string }) => void;
 }) {
   const [filter, setFilter] = useState<string>("all");
   const [q, setQ] = useState("");
@@ -64,7 +68,10 @@ export default function TasksView({
       await fn();
       onChanged();
     } catch (e) {
-      setErr(String(e));
+      const msg = String(e);
+      setErr(msg);
+      // 审计修复（40-e P1-5）：失败上浮全局 toast（不再依赖新建面板是否打开）
+      onToast?.({ kind: "error", text: `操作失败：${msg}` });
     } finally {
       setBusy(false);
     }

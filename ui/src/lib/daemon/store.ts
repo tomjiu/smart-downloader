@@ -153,7 +153,11 @@ export class DaemonClient {
     });
   }
 
-  // 事件流（SSE，带断线重连）
+  // 事件流（SSE，带断线重连）。审计修复（40-e P1-6/P1-13）：
+  // - token 以 ?token= 查询参数传递（EventSource 规范无法设置请求头，
+  //   旧实现配置 token 后 401 死循环；daemon 侧对 /events/stream 回退）
+  // - 重连带 after 游标（最后收到 seq）——旧实现重连从 0 全量重放，
+  //   重复 seq 导致日志重复/重复 toast
   subscribeEvents(
     onEvent: (env: SchedulerEventEnvelope) => void,
     onState: (connected: boolean) => void,
@@ -161,14 +165,24 @@ export class DaemonClient {
     let closed = false;
     let es: EventSource | null = null;
     let retry: ReturnType<typeof setTimeout> | null = null;
+    let lastSeq = 0;
     const connect = () => {
       if (closed) return;
       try {
-        es = new EventSource(url("/events/stream"));
+        const t = getToken();
+        const q = [
+          t ? `token=${encodeURIComponent(t)}` : "",
+          lastSeq > 0 ? `after=${lastSeq}` : "",
+        ]
+          .filter(Boolean)
+          .join("&");
+        es = new EventSource(url(`/events/stream${q ? `?${q}` : ""}`));
         es.onopen = () => onState(true);
         es.onmessage = (m) => {
           try {
-            onEvent(JSON.parse(m.data));
+            const env = JSON.parse(m.data) as SchedulerEventEnvelope;
+            if (typeof env.seq === "number" && env.seq > lastSeq) lastSeq = env.seq;
+            onEvent(env);
           } catch {
             /* 跳过坏帧 */
           }
