@@ -249,6 +249,7 @@ pub fn known_state_labels() -> Vec<String> {
         TaskState::Downloading(EngineKind::Http),
         TaskState::Downloading(EngineKind::Bt),
         TaskState::Downloading(EngineKind::Ftp),
+        TaskState::Downloading(EngineKind::Sftp),
         TaskState::Downloading(EngineKind::Provider),
         TaskState::Downloading(EngineKind::XunleiNas),
         TaskState::Paused,
@@ -270,6 +271,7 @@ pub fn known_engine_labels() -> Vec<String> {
         EngineKind::Bt,
         EngineKind::Http,
         EngineKind::Ftp,
+        EngineKind::Sftp,
         EngineKind::Provider,
         EngineKind::XunleiNas,
     ]
@@ -331,6 +333,7 @@ fn kind_label(k: &EngineKind) -> &'static str {
         EngineKind::Bt => "bt",
         EngineKind::Http => "http",
         EngineKind::Ftp => "ftp",
+        EngineKind::Sftp => "sftp",
         EngineKind::Provider => "provider",
         EngineKind::XunleiNas => "xunlei-nas",
     }
