@@ -2002,6 +2002,201 @@ async fn providers(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     Json(rows)
 }
 
+// ===== RSS 订阅自动下载（qbit RSS 对标，v1）=====
+
+#[derive(serde::Deserialize)]
+struct AddRssFeedReq {
+    url: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AddRssRuleReq {
+    name: String,
+    #[serde(default = "default_rule_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    must_contain: Vec<String>,
+    #[serde(default)]
+    must_not_contain: Vec<String>,
+    #[serde(default)]
+    feed_id: Option<u64>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    dest: Option<String>,
+}
+
+fn default_rule_enabled() -> bool {
+    true
+}
+
+#[derive(serde::Deserialize)]
+struct RssItemsQuery {
+    #[serde(default)]
+    feed_id: Option<u64>,
+}
+
+async fn rss_feed_add(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<AddRssFeedReq>,
+) -> impl IntoResponse {
+    let url = req.url.trim().to_string();
+    if url.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "url 不可为空" })),
+        )
+            .into_response();
+    }
+    match state.rss_add_feed(url).await {
+        Ok((id, title, count)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": id, "title": title, "item_count": count })),
+        )
+            .into_response(),
+        Err(e) => {
+            let status = match e {
+                DaemonError::Duplicate(_) => StatusCode::CONFLICT,
+                DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+        }
+    }
+}
+
+async fn rss_feeds_list(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let st = state.rss_state().lock();
+    let feeds: Vec<serde_json::Value> = st
+        .feeds
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "id": f.id,
+                "url": f.url,
+                "title": f.title,
+                "added_at_unix": f.added_at_unix,
+                "last_refresh_unix": f.last_refresh_unix,
+                "item_count": f.items.len(),
+                "pending_count": f.items.iter().filter(|i| i.task_id.is_none()).count(),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "feeds": feeds })).into_response()
+}
+
+async fn rss_feed_remove(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    if state.rss_remove_feed(id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("feed {id} 不存在") })),
+        )
+            .into_response()
+    }
+}
+
+async fn rss_items_list(
+    State(state): State<Arc<DaemonState>>,
+    Query(q): Query<RssItemsQuery>,
+) -> impl IntoResponse {
+    let st = state.rss_state().lock();
+    let items: Vec<serde_json::Value> = st
+        .feeds
+        .iter()
+        .filter(|f| q.feed_id.map(|id| f.id == id).unwrap_or(true))
+        .flat_map(|f| {
+            f.items.iter().map(move |i| {
+                serde_json::json!({
+                    "feed_id": f.id,
+                    "feed_title": f.title,
+                    "guid": i.guid,
+                    "title": i.title,
+                    "url": i.url,
+                    "pub_date": i.pub_date,
+                    "task_id": i.task_id,
+                })
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "items": items })).into_response()
+}
+
+async fn rss_rule_add(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<AddRssRuleReq>,
+) -> impl IntoResponse {
+    match state.rss_add_rule(
+        req.name,
+        req.enabled,
+        req.must_contain,
+        req.must_not_contain,
+        req.feed_id,
+        req.tags,
+        req.dest,
+    ) {
+        Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
+        Err(e) => {
+            let status = match e {
+                DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+        }
+    }
+}
+
+async fn rss_rules_list(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let st = state.rss_state().lock();
+    let rules: Vec<serde_json::Value> = st
+        .rules
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "name": r.name,
+                "enabled": r.enabled,
+                "must_contain": r.must_contain,
+                "must_not_contain": r.must_not_contain,
+                "feed_id": r.feed_id,
+                "tags": r.tags,
+                "dest": r.dest,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "rules": rules })).into_response()
+}
+
+async fn rss_rule_remove(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    if state.rss_remove_rule(id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("rule {id} 不存在") })),
+        )
+            .into_response()
+    }
+}
+
+async fn rss_refresh(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let (new_items, matched, task_ids, errors) = state.rss_refresh_all().await;
+    Json(serde_json::json!({
+        "new_items": new_items,
+        "matched": matched,
+        "task_ids": task_ids,
+        "errors": errors,
+    }))
+    .into_response()
+}
+
 macro_rules! router_base {
     ($app:expr) => {
         $app.route("/tasks", get(list_tasks).post(add_task))
@@ -2027,6 +2222,12 @@ macro_rules! router_base {
             .route("/config", get(config_endpoint))
             .route("/config/limit", post(config_set_limit))
             .route("/settings", get(settings_endpoint).put(settings_put))
+            .route("/rss/feeds", get(rss_feeds_list).post(rss_feed_add))
+            .route("/rss/feeds/:id", delete(rss_feed_remove))
+            .route("/rss/items", get(rss_items_list))
+            .route("/rss/rules", get(rss_rules_list).post(rss_rule_add))
+            .route("/rss/rules/:id", delete(rss_rule_remove))
+            .route("/rss/refresh", post(rss_refresh))
             .route("/stats", get(stats_endpoint))
             .route("/metrics", get(metrics_endpoint))
             .route("/version", get(version_endpoint))

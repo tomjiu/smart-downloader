@@ -1,0 +1,757 @@
+//! RSS 订阅自动下载（qBittorrent RSS 对标，v1）。
+//!
+//! 定位：订阅 feed（RSS 2.0 / Atom）→ 周期拉取 → 关键词规则匹配 → 命中条目
+//! 自动建 HTTP 任务（复用既有 add_link_task_opts 全链：探测/分段/限速/校验/
+//! 事件/Webhook）。独立状态（feeds+items+rules）持久化 rss.json（与
+//! tasks.json 同目录），任务创建复用 DaemonState 既有链路——不新增引擎。
+//!
+//! 解析口径（v1，对齐 metalink.rs 哲学）：
+//! - 按 **local name** 匹配标签（命名空间无关；RSS 2.0 `<rss>` 与 Atom
+//!   `<feed>` 同一循环处理，按条目元素 item/entry 自适应分流）。
+//! - 条目 URL：RSS 2.0 取 `<link>` 文本；Atom 取 `<link href>`（rel=alternate
+//!   优先，无 rel 次之）；link 空 + guid 为 http(s) 文本时用 guid 兜底。
+//!   均缺 → **跳过该条目**（逐条容错，feed 现实质量参差，不因单条脏数据
+//!   整体 400）。
+//! - 条目 guid 缺省 = url（去重键 = guid；同一 feed 内 guid 重复保留首见）。
+//! - channel/feed 级 `<title>` → 订阅标题（首次拉取后锁定，后续刷新不改写
+//!   ——站点改标题不应悄悄变更用户可见的订阅名）。
+//! - CDATA/注释/PI 忽略（quick-xml Text 事件已含 CDATA 解包）；根元素不校验。
+//! - 无任何有效条目 → Err（上层转 400；空 feed 对订阅场景无意义且多半是
+//!   解析失败或页面误投）。
+//!
+//! 规则口径（v1，qbit 基础语义，无 regex 依赖）：
+//! - `must_contain`：全部关键词（大小写不敏感子串）命中 title 才算匹配；
+//! - `must_not_contain`：任一关键词命中 title 即排除；
+//! - `feed_id`：Some = 规则只作用于该订阅；None = 全部订阅；
+//! - 命中 → `add_link_task_opts(url, rule.dest, name=title)` + `set_task_tags`
+//!   （tags 非空时）；item.task_id 落位 = 去重标记（refresh 重复执行不重建）。
+
+use quick_xml::events::Event;
+use quick_xml::Reader;
+use serde::{Deserialize, Serialize};
+
+use crate::state::{DaemonError, DaemonState};
+
+/// 订阅条目。
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RssItem {
+    /// 去重键（条目 guid；缺省 = url）。
+    pub guid: String,
+    pub title: String,
+    /// 下载目标（http(s)/ftp 等 add 链可接受的链接）。
+    pub url: String,
+    /// 原文 pubDate（RSS 2.0）/ updated（Atom），仅透传展示。
+    pub pub_date: Option<String>,
+    /// 命中规则后建的任务 id（None = 未处理/未匹配）。
+    #[serde(default)]
+    pub task_id: Option<String>,
+}
+
+/// 订阅源。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RssFeed {
+    pub id: u64,
+    pub url: String,
+    /// 首次拉取成功后锁定的 feed 标题。
+    pub title: String,
+    pub added_at_unix: u64,
+    #[serde(default)]
+    pub last_refresh_unix: Option<u64>,
+    #[serde(default)]
+    pub items: Vec<RssItem>,
+}
+
+/// 自动下载规则。
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RssRule {
+    pub id: u64,
+    pub name: String,
+    #[serde(default = "crate::rss::default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub must_contain: Vec<String>,
+    #[serde(default)]
+    pub must_not_contain: Vec<String>,
+    /// Some = 只作用于该订阅。
+    #[serde(default)]
+    pub feed_id: Option<u64>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    /// 命中任务的落盘目录（None = default dest_root）。
+    #[serde(default)]
+    pub dest: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// RSS 持久化状态（rss.json）。
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct RssState {
+    #[serde(default)]
+    pub next_feed_id: u64,
+    #[serde(default)]
+    pub next_rule_id: u64,
+    #[serde(default)]
+    pub feeds: Vec<RssFeed>,
+    #[serde(default)]
+    pub rules: Vec<RssRule>,
+}
+
+impl RssState {
+    pub fn load(path: &std::path::Path) -> Option<RssState> {
+        let text = std::fs::read_to_string(path).ok()?;
+        match serde_json::from_str(&text) {
+            Ok(s) => Some(s),
+            Err(e) => {
+                tracing::warn!("rss.json 解析失败（按空状态启动）: {e}");
+                None
+            }
+        }
+    }
+
+    pub fn save(&self, path: &std::path::Path) {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension("json.tmp");
+        match serde_json::to_string_pretty(self) {
+            Ok(text) if std::fs::write(&tmp, &text).is_ok() => {
+                let _ = std::fs::rename(&tmp, path);
+            }
+            _ => tracing::warn!("rss.json 写盘失败（保留旧文件）"),
+        }
+    }
+}
+
+/// 单条 feed 解析产物（标题 + 有效条目）。
+pub struct ParsedFeed {
+    pub title: String,
+    pub items: Vec<RssItem>,
+}
+
+/// 当前正在收集文本的叶子元素（条目内）。
+#[derive(Debug)]
+enum TextTarget {
+    /// channel/feed 级标题。
+    FeedTitle,
+    /// 条目标题。
+    ItemTitle,
+    /// 条目 link 文本（RSS 2.0）。
+    ItemLink,
+    /// 条目 guid 文本。
+    ItemGuid,
+    /// 条目时间（pubDate / updated）。
+    ItemDate,
+}
+
+/// 解析 RSS 2.0 / Atom feed XML → 标题 + 条目列表。
+///
+/// 逐条容错：缺 URL 条目静默跳过；guid 重复保留首见；整体无有效条目 → Err。
+pub fn parse_feed(xml: &str) -> Result<ParsedFeed, String> {
+    let mut reader = Reader::from_str(xml);
+    reader.config_mut().trim_text(true);
+
+    let mut feed_title: Option<String> = None;
+    let mut items: Vec<RssItem> = Vec::new();
+    // 条目内状态（None = 不在条目内）。
+    let mut in_item = false;
+    let mut cur_title: Option<String> = None;
+    // Atom `<link href>` 候选（rel=alternate 优先；单项记录两级：首选与兜底）。
+    let mut link_href_preferred: Option<String> = None;
+    let mut link_href_fallback: Option<String> = None;
+    let mut cur_link_text: Option<String> = None;
+    let mut cur_guid: Option<String> = None;
+    let mut cur_date: Option<String> = None;
+    let mut target: Option<TextTarget> = None;
+
+    /// 条目收口：URL 三级兜底（link 文本 → link href → http 形态 guid）+
+    /// guid 缺省 = url + guid 去重保留首见。独立函数避免闭包可变捕获与
+    /// 解析循环赋值冲突。
+    #[allow(clippy::too_many_arguments)]
+    fn finish_item(
+        title: &mut Option<String>,
+        link_text: &mut Option<String>,
+        guid: &mut Option<String>,
+        date: &mut Option<String>,
+        link_href_preferred: &mut Option<String>,
+        link_href_fallback: &mut Option<String>,
+        items: &mut Vec<RssItem>,
+    ) {
+        let href = link_href_preferred
+            .clone()
+            .or_else(|| link_href_fallback.clone());
+        let url = link_text
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .or(href)
+            .or_else(|| {
+                guid.clone().filter(|g| {
+                    let g = g.trim();
+                    g.starts_with("http://") || g.starts_with("https://")
+                })
+            });
+        if let (Some(title), Some(url)) = (
+            title.take().filter(|s| !s.trim().is_empty()),
+            url.map(|u| u.trim().to_string()).filter(|s| !s.is_empty()),
+        ) {
+            let guid_key = guid
+                .take()
+                .map(|g| g.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| url.clone());
+            if !items.iter().any(|i| i.guid == guid_key) {
+                items.push(RssItem {
+                    guid: guid_key,
+                    title: title.trim().to_string(),
+                    url,
+                    pub_date: date.take(),
+                    task_id: None,
+                });
+            }
+        }
+        // 清场（未被消费的残留状态）
+        *title = None;
+        *link_text = None;
+        *guid = None;
+        *date = None;
+        *link_href_preferred = None;
+        *link_href_fallback = None;
+    }
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => match e.name().local_name().as_ref() {
+                b"item" | b"entry" => {
+                    in_item = true;
+                    cur_title = None;
+                    cur_link_text = None;
+                    cur_guid = None;
+                    cur_date = None;
+                    link_href_preferred = None;
+                    link_href_fallback = None;
+                }
+                b"title" => {
+                    target = Some(if in_item {
+                        TextTarget::ItemTitle
+                    } else {
+                        TextTarget::FeedTitle
+                    })
+                }
+                b"link" if in_item => {
+                    let mut href: Option<String> = None;
+                    let mut rel: Option<String> = None;
+                    for a in e.attributes() {
+                        let a = a.map_err(|er| format!("rss <link> 属性解析失败: {er}"))?;
+                        match a.key.local_name().as_ref() {
+                            b"href" => href = Some(decode(a, &reader)?),
+                            b"rel" => rel = Some(decode(a, &reader)?),
+                            _ => {}
+                        }
+                    }
+                    if let Some(href) = href {
+                        // rel=alternate（或无 rel）为正主；其余（self/enclosure…）兜底
+                        match rel.as_deref() {
+                            None | Some("alternate") => {
+                                link_href_preferred = Some(href);
+                            }
+                            _ => {
+                                if link_href_fallback.is_none() {
+                                    link_href_fallback = Some(href);
+                                }
+                            }
+                        }
+                    }
+                    target = Some(TextTarget::ItemLink);
+                }
+                b"guid" if in_item => target = Some(TextTarget::ItemGuid),
+                // Atom 条目标识 = <id>（RSS 2.0 为 <guid>；feed 级 <id> 被
+                // in_item 守卫排除）
+                b"id" if in_item => target = Some(TextTarget::ItemGuid),
+                b"pubDate" if in_item => target = Some(TextTarget::ItemDate),
+                b"updated" if in_item => target = Some(TextTarget::ItemDate),
+                _ => {}
+            },
+            Ok(Event::Empty(e)) if e.name().local_name().as_ref() == b"link" && in_item => {
+                // Atom 自闭合 `<link href="..." rel="..."/>`（Empty 事件不进
+                // Start 分支，href 属性在此抓取）
+                let mut href: Option<String> = None;
+                let mut rel: Option<String> = None;
+                for a in e.attributes() {
+                    let a = a.map_err(|er| format!("rss <link> 属性解析失败: {er}"))?;
+                    match a.key.local_name().as_ref() {
+                        b"href" => href = Some(decode(a, &reader)?),
+                        b"rel" => rel = Some(decode(a, &reader)?),
+                        _ => {}
+                    }
+                }
+                if let Some(href) = href {
+                    match rel.as_deref() {
+                        None | Some("alternate") => link_href_preferred = Some(href),
+                        _ => {
+                            if link_href_fallback.is_none() {
+                                link_href_fallback = Some(href);
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Event::Text(t)) => {
+                let Some(tgt) = &target else { continue };
+                let text = t
+                    .unescape()
+                    .map(|c| c.into_owned())
+                    .map_err(|e| format!("rss 文本转义非法: {e}"))?;
+                match tgt {
+                    TextTarget::FeedTitle => {
+                        if feed_title.is_none() && !text.trim().is_empty() {
+                            feed_title = Some(text.trim().to_string());
+                        }
+                    }
+                    TextTarget::ItemTitle => cur_title = Some(text),
+                    TextTarget::ItemLink => cur_link_text = Some(text),
+                    TextTarget::ItemGuid => cur_guid = Some(text),
+                    TextTarget::ItemDate => {
+                        if cur_date.is_none() && !text.trim().is_empty() {
+                            cur_date = Some(text.trim().to_string());
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(e)) => match e.name().local_name().as_ref() {
+                b"item" | b"entry" => {
+                    in_item = false;
+                    finish_item(
+                        &mut cur_title,
+                        &mut cur_link_text,
+                        &mut cur_guid,
+                        &mut cur_date,
+                        &mut link_href_preferred,
+                        &mut link_href_fallback,
+                        &mut items,
+                    );
+                }
+                b"title" | b"link" | b"guid" | b"pubDate" | b"updated" => target = None,
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(format!("rss XML 解析失败: {e}")),
+            _ => {}
+        }
+    }
+
+    if items.is_empty() {
+        return Err("rss feed 无有效条目（非 XML / 无 item/entry / 条目均缺链接）".into());
+    }
+    Ok(ParsedFeed {
+        title: feed_title.unwrap_or_default(),
+        items,
+    })
+}
+
+/// 属性值解码（统一错误文案）。
+fn decode(
+    a: quick_xml::events::attributes::Attribute,
+    reader: &Reader<&[u8]>,
+) -> Result<String, String> {
+    a.decode_and_unescape_value(reader.decoder())
+        .map(|c| c.into_owned())
+        .map_err(|e| format!("rss 属性解码失败: {e}"))
+}
+
+/// 规则匹配（大小写不敏感子串）：must 全命中 且 must_not 全不命中。
+pub fn item_matches(rule: &RssRule, title: &str) -> bool {
+    let lower = title.to_lowercase();
+    let hit = |k: &String| lower.contains(&k.trim().to_lowercase());
+    rule.must_contain.iter().all(hit) && !rule.must_not_contain.iter().any(hit)
+}
+
+/// RSS 自动下载匹配失败键（规则名/关键词为空告警用，v1 未消费保留语义注释）。
+pub const RSS_RULE_DOC: &str = "must_contain 全命中且 must_not_contain 全不命中";
+
+// ===== DaemonState 集成 =====
+
+impl DaemonState {
+    /// RSS 状态锁入口（字段在 DaemonState.rss，parking_lot Mutex）。
+    pub(crate) fn rss_state(&self) -> &parking_lot::Mutex<RssState> {
+        &self.rss
+    }
+
+    /// RSS 持久化路径（persist_path 同目录 rss.json；None = 不落盘）。
+    pub(crate) fn rss_persist_path(&self) -> Option<std::path::PathBuf> {
+        self.rss_persist_path.clone()
+    }
+
+    fn rss_save(&self, st: &RssState) {
+        if let Some(p) = self.rss_persist_path() {
+            st.save(&p);
+        }
+    }
+
+    /// 添加订阅（立即拉取一次，失败即 Err——坏 URL 不应静默入列）。
+    pub async fn rss_add_feed(&self, url: String) -> Result<(u64, String, usize), DaemonError> {
+        let client = self.rss_client();
+        let resp = client
+            .get(&url)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| DaemonError::InvalidSource(format!("rss feed 拉取失败: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(DaemonError::InvalidSource(format!(
+                "rss feed 拉取 HTTP {}",
+                resp.status()
+            )));
+        }
+        let xml = resp
+            .text()
+            .await
+            .map_err(|e| DaemonError::InvalidSource(format!("rss feed 读取失败: {e}")))?;
+        let parsed = parse_feed(&xml).map_err(DaemonError::InvalidSource)?;
+
+        let mut st = self.rss_state().lock();
+        // 同 URL 订阅去重（409 语义由 handler 转）
+        if st.feeds.iter().any(|f| f.url == url) {
+            return Err(DaemonError::Duplicate(url));
+        }
+        st.next_feed_id += 1;
+        let id = st.next_feed_id;
+        let title = if parsed.title.is_empty() {
+            url.clone()
+        } else {
+            parsed.title
+        };
+        let count = parsed.items.len();
+        st.feeds.push(RssFeed {
+            id,
+            url,
+            title,
+            added_at_unix: now_unix(),
+            last_refresh_unix: Some(now_unix()),
+            items: parsed.items,
+        });
+        self.rss_save(&st);
+        Ok((id, st.feeds.last().unwrap().title.clone(), count))
+    }
+
+    /// 移除订阅（未知 id → false）。
+    pub fn rss_remove_feed(&self, id: u64) -> bool {
+        let mut st = self.rss_state().lock();
+        let before = st.feeds.len();
+        st.feeds.retain(|f| f.id != id);
+        let removed = st.feeds.len() != before;
+        if removed {
+            self.rss_save(&st);
+        }
+        removed
+    }
+
+    /// 添加规则。
+    #[allow(clippy::too_many_arguments)]
+    pub fn rss_add_rule(
+        &self,
+        name: String,
+        enabled: bool,
+        must_contain: Vec<String>,
+        must_not_contain: Vec<String>,
+        feed_id: Option<u64>,
+        tags: Vec<String>,
+        dest: Option<String>,
+    ) -> Result<u64, DaemonError> {
+        if name.trim().is_empty() {
+            return Err(DaemonError::InvalidSource("规则名不可为空".into()));
+        }
+        if must_contain.is_empty() && must_not_contain.is_empty() {
+            return Err(DaemonError::InvalidSource(
+                "规则至少需要一个关键词（must_contain / must_not_contain 之一）".into(),
+            ));
+        }
+        let mut st = self.rss_state().lock();
+        if let Some(fid) = feed_id {
+            if !st.feeds.iter().any(|f| f.id == fid) {
+                return Err(DaemonError::InvalidSource(format!("feed_id {fid} 不存在")));
+            }
+        }
+        st.next_rule_id += 1;
+        let id = st.next_rule_id;
+        st.rules.push(RssRule {
+            id,
+            name: name.trim().to_string(),
+            enabled,
+            must_contain,
+            must_not_contain,
+            feed_id,
+            tags,
+            dest,
+        });
+        self.rss_save(&st);
+        Ok(id)
+    }
+
+    /// 移除规则（未知 id → false）。
+    pub fn rss_remove_rule(&self, id: u64) -> bool {
+        let mut st = self.rss_state().lock();
+        let before = st.rules.len();
+        st.rules.retain(|r| r.id != id);
+        let removed = st.rules.len() != before;
+        if removed {
+            self.rss_save(&st);
+        }
+        removed
+    }
+
+    /// 刷新全部订阅：拉取 → 条目合并（guid 去重）→ 规则匹配 → 自动建任务。
+    ///
+    /// 单 feed 拉取失败不整体失败（错误收集进返回 Vec）；返回
+    /// `(新增条目总数, 命中并建任务数, task_ids, 错误列表)`。
+    pub async fn rss_refresh_all(&self) -> (usize, usize, Vec<String>, Vec<String>) {
+        let client = self.rss_client();
+        let mut new_items_total = 0usize;
+        let mut matched = 0usize;
+        let mut task_ids: Vec<String> = Vec::new();
+        let mut errors: Vec<String> = Vec::new();
+
+        let feed_urls: Vec<(u64, String)> = {
+            let st = self.rss_state().lock();
+            st.feeds.iter().map(|f| (f.id, f.url.clone())).collect()
+        };
+
+        for (feed_id, url) in feed_urls {
+            let fetch = async {
+                let resp = client
+                    .get(&url)
+                    .timeout(std::time::Duration::from_secs(30))
+                    .send()
+                    .await
+                    .map_err(|e| format!("拉取失败: {e}"))?;
+                if !resp.status().is_success() {
+                    return Err(format!("HTTP {}", resp.status()));
+                }
+                let xml = resp.text().await.map_err(|e| format!("读取失败: {e}"))?;
+                parse_feed(&xml)
+            };
+            let parsed = match fetch.await {
+                Ok(p) => p,
+                Err(e) => {
+                    errors.push(format!("feed #{feed_id} ({url}): {e}"));
+                    continue;
+                }
+            };
+
+            // 合并条目 + 标题锁定（首次空标题回填）+ 已处理条目上限截断
+            let existing: Vec<RssItem> = {
+                let mut st = self.rss_state().lock();
+                let Some(feed) = st.feeds.iter_mut().find(|f| f.id == feed_id) else {
+                    continue;
+                };
+                let known: std::collections::HashSet<String> =
+                    feed.items.iter().map(|i| i.guid.clone()).collect();
+                let fresh: Vec<RssItem> = parsed
+                    .items
+                    .into_iter()
+                    .filter(|i| !known.contains(&i.guid))
+                    .collect();
+                new_items_total += fresh.len();
+                feed.items.extend(fresh.clone());
+                feed.last_refresh_unix = Some(now_unix());
+                if feed.title.is_empty() && !parsed.title.is_empty() {
+                    feed.title = parsed.title;
+                }
+                // 防膨胀：已处理条目保留最近 N 条（N=[rss]
+                // max_processed_items_per_feed）；未处理条目全保留——截掉会丢
+                // 去重标记，源刷新时重复建任务。
+                let cap = self.rss_max_processed_items();
+                let mut processed: Vec<RssItem> = feed
+                    .items
+                    .iter()
+                    .filter(|i| i.task_id.is_some())
+                    .cloned()
+                    .collect();
+                if processed.len() > cap {
+                    let keep = processed.split_off(processed.len() - cap);
+                    feed.items.retain(|i| i.task_id.is_none());
+                    feed.items.extend(keep);
+                }
+                feed.items.clone()
+            };
+
+            // 规则匹配（对全部未处理条目；含旧条目——新建规则能回溯未处理历史）
+            let rules: Vec<RssRule> = {
+                let st = self.rss_state().lock();
+                st.rules.iter().filter(|r| r.enabled).cloned().collect()
+            };
+            for rule in rules {
+                if rule.feed_id.map(|fid| fid != feed_id).unwrap_or(false) {
+                    continue;
+                }
+                for item in &existing {
+                    if item.task_id.is_some() {
+                        continue;
+                    }
+                    if !item_matches(&rule, &item.title) {
+                        continue;
+                    }
+                    let opts = crate::state::AddHttpOpts {
+                        name: Some(item.title.clone()),
+                        ..Default::default()
+                    };
+                    match self
+                        .add_link_task_opts(item.url.clone(), rule.dest.clone(), opts)
+                        .await
+                    {
+                        Ok(task_id) => {
+                            if !rule.tags.is_empty() {
+                                let _ = self.set_task_tags(&task_id, Some(rule.tags.clone()));
+                            }
+                            let mut st = self.rss_state().lock();
+                            if let Some(f) = st.feeds.iter_mut().find(|f| f.id == feed_id) {
+                                if let Some(it) = f.items.iter_mut().find(|i| i.guid == item.guid) {
+                                    it.task_id = Some(task_id.clone());
+                                }
+                            }
+                            self.rss_save(&st);
+                            drop(st);
+                            matched += 1;
+                            task_ids.push(task_id);
+                        }
+                        Err(e) => {
+                            errors.push(format!(
+                                "feed #{feed_id} 条目 {:?} 建任务失败: {e}",
+                                item.title
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        (new_items_total, matched, task_ids, errors)
+    }
+
+    /// RSS 拉取 client（bootstrap_client 同口径克隆；None 时裸建）。
+    fn rss_client(&self) -> reqwest::Client {
+        self.bootstrap_client_opt().unwrap_or_default()
+    }
+
+    /// 已处理条目保留上限（live_config 注入时取 [rss] 配置；否则默认 200）。
+    fn rss_max_processed_items(&self) -> usize {
+        self.rss_max_processed_items_opt().unwrap_or(200)
+    }
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RSS2: &str = r#"<?xml version="1.0"?>
+<rss version="2.0"><channel>
+<title>Ubuntu Releases</title>
+<item><title>Ubuntu 24.04.2 Desktop amd64 iso</title><link>https://releases.example.com/ubuntu-24.04.iso</link><guid isPermaLink="false">u24042</guid><pubDate>Tue, 01 Sep 2026 10:00:00 GMT</pubDate></item>
+<item><title>Ubuntu 23.10 old release</title><link>https://releases.example.com/ubuntu-23.10.iso</link></item>
+<item><title>no link item</title><guid>internal-123</guid></item>
+</channel></rss>"#;
+
+    const ATOM: &str = r#"<?xml version="1.0"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+<title>Debian News</title>
+<entry><title>Debian 13 released</title><link rel="self" href="https://example.com/self"/><link href="https://example.com/debian-13.iso"/><id>tag:debian,2026:13</id><updated>2026-09-01T00:00:00Z</updated></entry>
+</feed>"#;
+
+    #[test]
+    fn parse_rss2_basic() {
+        let f = parse_feed(RSS2).unwrap();
+        assert_eq!(f.title, "Ubuntu Releases");
+        // 缺 link 且 guid 非 URL 的第 3 条跳过
+        assert_eq!(f.items.len(), 2);
+        assert_eq!(f.items[0].guid, "u24042");
+        assert_eq!(
+            f.items[0].url,
+            "https://releases.example.com/ubuntu-24.04.iso"
+        );
+        assert_eq!(
+            f.items[0].pub_date.as_deref(),
+            Some("Tue, 01 Sep 2026 10:00:00 GMT")
+        );
+        // 缺 guid → url 兜底
+        assert_eq!(
+            f.items[1].guid,
+            "https://releases.example.com/ubuntu-23.10.iso"
+        );
+    }
+
+    #[test]
+    fn parse_atom_basic() {
+        let f = parse_feed(ATOM).unwrap();
+        assert_eq!(f.title, "Debian News");
+        assert_eq!(f.items.len(), 1);
+        // rel=self 排除，取无 rel 的 alternate href
+        assert_eq!(f.items[0].url, "https://example.com/debian-13.iso");
+        assert_eq!(f.items[0].guid, "tag:debian,2026:13");
+        assert_eq!(f.items[0].pub_date.as_deref(), Some("2026-09-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn parse_guid_permalink_fallback_and_dedup() {
+        let xml = r#"<rss><channel><title>t</title>
+<item><title>a</title><guid>https://a.example/x.iso</guid></item>
+<item><title>b</title><guid>https://a.example/x.iso</guid></item>
+</channel></rss>"#;
+        let f = parse_feed(xml).unwrap();
+        // guid(http 文本) 兜底 url；重复 guid 去重保留首见
+        assert_eq!(f.items.len(), 1);
+        assert_eq!(f.items[0].url, "https://a.example/x.iso");
+    }
+
+    #[test]
+    fn parse_empty_and_bad_xml() {
+        assert!(parse_feed("<html><body>not a feed</body></html>").is_err());
+        assert!(parse_feed("this is not xml <").is_err());
+        assert!(parse_feed("").is_err());
+    }
+
+    #[test]
+    fn atom_selfclosing_link_variants() {
+        let xml = r#"<feed>
+<entry><title>e1</title><link href="https://x/1.iso" rel="alternate"/><id>e1</id></entry>
+<entry><title>e2</title><link href="https://x/2.iso"/><id>e2</id></entry>
+<entry><title>e3</title><link rel="enclosure" href="https://x/3.iso" type="application/x-iso"/><link rel="self" href="https://x/3-self"/><id>e3</id></entry>
+</feed>"#;
+        let f = parse_feed(xml).unwrap();
+        assert_eq!(f.items.len(), 3);
+        assert_eq!(f.items[0].url, "https://x/1.iso");
+        assert_eq!(f.items[1].url, "https://x/2.iso");
+        // enclosure 兜底命中
+        assert_eq!(f.items[2].url, "https://x/3.iso");
+    }
+
+    #[test]
+    fn rule_matching_case_insensitive() {
+        let rule = RssRule {
+            id: 1,
+            name: "r".into(),
+            enabled: true,
+            must_contain: vec!["ubuntu".into(), "24.04".into()],
+            must_not_contain: vec!["beta".into()],
+            feed_id: None,
+            tags: vec![],
+            dest: None,
+        };
+        assert!(item_matches(&rule, "Ubuntu 24.04.2 Desktop"));
+        assert!(!item_matches(&rule, "Ubuntu 24.04 beta"));
+        assert!(!item_matches(&rule, "Debian 13"));
+        let exclude_only = RssRule {
+            must_contain: vec![],
+            must_not_contain: vec!["alpha".into()],
+            ..rule.clone()
+        };
+        assert!(item_matches(&exclude_only, "Anything stable"));
+        assert!(!item_matches(&exclude_only, "x ALPHA y"));
+    }
+}

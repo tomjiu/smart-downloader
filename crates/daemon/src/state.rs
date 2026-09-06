@@ -622,6 +622,12 @@ pub struct DaemonState {
     /// 当前权威配置（S1）：serve 启动注入 + 热重载刷新；PUT /settings 在其上
     /// 打补丁后（a）应用运行时效果（b）persist 时回写文件（c）刷新 /config 快照。
     live_config: Mutex<Option<crate::config::Config>>,
+    /// RSS 订阅自动下载（qbit RSS 对标）：订阅/条目/规则；`/rss/*` 端点与
+    /// refresh ticker 共用。逻辑与解析在 [`crate::rss`]（pub(crate)：rss 模块
+    /// 非 state 子模块，字段跨模块访问）。
+    pub(crate) rss: Mutex<crate::rss::RssState>,
+    /// rss.json 路径（with_storage 派生：tasks.json 同目录；None = 不落盘）。
+    pub(crate) rss_persist_path: Option<PathBuf>,
 }
 
 /// 全局限速总阀门当前值（E16，KiB/s；0 = 不限）。
