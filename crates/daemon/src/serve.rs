@@ -484,13 +484,17 @@ fn resolve_http_token(env_val: Option<String>, cfg_val: Option<String>) -> (Opti
     }
 }
 
-/// 进程参数：`serve [--config <path>] [--ui-dir <dir>]`。
+/// 进程参数：`serve [--config <path>] [--ui-dir <dir>] [--addr <addr>]`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServeArgs {
     pub config: Option<std::path::PathBuf>,
     /// 内嵌 UI 静态资源目录（S2）：Some 时 daemon 直接服务前端（SPA fallback
     /// 到 index.html）；桌面壳/内嵌部署传 `ui/out`；None = 纯 API。
     pub ui_dir: Option<std::path::PathBuf>,
+    /// 监听地址覆盖（S2 桌面端）：优先级 CLI `--addr` > 配置文件 > 默认值。
+    /// 桌面壳用它与 sidecar 约定同一端口（壳轮询就绪 + 开窗同址）。
+    /// 非回环地址仍走 serve::run 的 fail-closed 校验（无 token 拒绝启动）。
+    pub addr: Option<String>,
 }
 
 pub fn parse_args(args: &[String]) -> Result<ServeArgs, String> {
@@ -510,6 +514,13 @@ pub fn parse_args(args: &[String]) -> Result<ServeArgs, String> {
                     .get(i + 1)
                     .ok_or_else(|| "--ui-dir 缺少路径".to_string())?;
                 out.ui_dir = Some(std::path::PathBuf::from(v));
+                i += 2;
+            }
+            "--addr" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--addr 缺少监听地址".to_string())?;
+                out.addr = Some(v.to_string());
                 i += 2;
             }
             a if a.starts_with('-') => return Err(format!("未知参数: {a}")),
@@ -565,6 +576,26 @@ mod tests {
     }
 
     #[test]
+    fn parse_addr_flag() {
+        let p = parse_args(&["serve".into(), "--addr".into(), "127.0.0.1:8788".into()]).unwrap();
+        assert_eq!(p.addr.as_deref(), Some("127.0.0.1:8788"));
+        assert_eq!(p.config, None);
+        // 与其余旗标组合互不干扰
+        let p = parse_args(&[
+            "--addr".into(),
+            "127.0.0.1:9000".into(),
+            "--ui-dir".into(),
+            "ui/out".into(),
+            "-c".into(),
+            "z.toml".into(),
+        ])
+        .unwrap();
+        assert_eq!(p.addr.as_deref(), Some("127.0.0.1:9000"));
+        assert_eq!(p.ui_dir, Some(std::path::PathBuf::from("ui/out")));
+        assert_eq!(p.config, Some(std::path::PathBuf::from("z.toml")));
+    }
+
+    #[test]
     fn parse_short_flag() {
         let p = parse_args(&["-c".into(), "y.toml".into()]).unwrap();
         assert_eq!(p.config, Some(std::path::PathBuf::from("y.toml")));
@@ -583,5 +614,6 @@ mod tests {
     #[test]
     fn parse_missing_value_errors() {
         assert!(parse_args(&["--config".into()]).is_err());
+        assert!(parse_args(&["--addr".into()]).is_err());
     }
 }

@@ -1,5 +1,5 @@
 //! smart-dl-daemon 二进制入口：
-//! - `smart-dl-daemon serve [--config <path>]`：daemon 服务
+//! - `smart-dl-daemon serve [--config <path>] [--ui-dir <dir>] [--addr <addr>]`：daemon 服务
 //! - 其他命令（add/list/status/...）：客户端模式，连接 serve 的 HTTP API
 //!   （`--server <url>`，默认 http://127.0.0.1:8787）
 
@@ -21,7 +21,7 @@ fn main() {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("参数错误: {e}");
-                eprintln!("用法: smart-dl-daemon serve [--config <path>] [--ui-dir <dir>]");
+                eprintln!("用法: smart-dl-daemon serve [--config <path>] [--ui-dir <dir>] [--addr <addr>]");
                 std::process::exit(2);
             }
         };
@@ -31,6 +31,16 @@ fn main() {
                 eprintln!("配置错误: {e}");
                 std::process::exit(2);
             }
+        };
+        // CLI `--addr` 覆盖配置文件监听地址（桌面壳 sidecar 契约：壳与 daemon
+        // 同端口约定）。非回环 + 无 token 的 fail-closed 校验在 serve::run 内。
+        let cfg = match &serve_args.addr {
+            Some(addr) => {
+                let mut c = cfg;
+                c.server.addr = addr.clone();
+                c
+            }
+            None => cfg,
         };
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime 创建失败");
         if let Err(e) = rt.block_on(serve::run(cfg, serve_args)) {
