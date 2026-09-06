@@ -1,5 +1,6 @@
 # 未实现清单（整体）— 迅雷 + 通用 + 未来愿景
 
+> 更新：2026-09-06（二）。**DASH（MPD）下载支持落地（C-DASH）**：`.mpd` 分流 → MPD static VOD 解析（视频优先选流 + SegmentTemplate/SegmentList 定址 + BaseURL 链）→ init+媒体段顺序拼接 + 段账本续传 + pause/resume，全链路与 HLS 同构（`.dash-ledger`/`dash-aborted` 同语义）。遗留：桌面版 BT 引擎装配（下表 S1-d）。
 > 更新：2026-09-06。**S1 设置面 + S2 前端入仓 + 桌面端**三项落地（本提交批）：`GET/PUT /settings` 十域运行时生效 + 落盘持久化、备用限速调度（[limits] 跨零点窗口 + 星期过滤 + 30s ticker）、BT 会话热改链路（`BtSessionPatch` trait + 内核 `lt_apply_conn`：监听端口/全局连接数上限）、HTTP 全局代理热改（逐任务 client 构建合并）、`ui/` Next.js 静态导出 + qoder-ui `data-theme` 8 主题 + qbit 式设置视图、daemon `--ui-dir` 内嵌 UI、Tauri v2 桌面壳（sidecar + 托盘 + 三平台 CI）。**httpdl RFC 7233 容错**（200 全量响应 skip+截断写入）随 e2e 实测落地。遗留：S1-b 队列门控接线（下表 S1-b）、桌面版 BT 引擎装配、BT per-torrent 连接数上限。
 > 更新：2026-08-27。已完成主线（thunder 解码 / HTTP 断点续传 / BT / fastresume / 热重载 / 状态推进）+ C 类通用缺口中的**代理 + 引擎层限速**（3fac8e3）+ **M6 云兜底调度接线**（c19313a）+ 2026-08-25 四卡落地：**FTP 目录下载**（httpdl 引擎 + daemon 路由）、**BT DHT/LSD/UPnP 配置开关**（FFI `lt_apply_discovery` 全链路）、**.torrent 多文件空间预检**、**TaskSnapshot.files 透出** + 2026-08-27：**httpdl 动态分段（P0，方案A）**（109692c）。
 > 更新：2026-09-05（二）。**BT 传输/发现配置面补全**（PEX/uTP/MSE 加密三态，`lt_apply_transport` + `lt_apply_discovery` 扩参全链路，PEX 经 per-torrent disable_pex 落地——2.0.x 无会话级开关；daemon 默认 PEX 由内核默认开转为配置默认关，对齐 M0 全关语义）。
@@ -46,7 +47,7 @@
 | ~快照 files 字段透出~ | ~~多文件任务快照只见总量不见明细~~ **已完成（2026-08-25）**：`TaskSnapshot.files` 透出每个子文件的路径/大小/进度 |
 | ~xunlei-import 端到端测试~ | ~~`POST /tasks/xunlei-import` 代码存在但无 e2e 测试~~ **已完成（2026-08-27）**：新增 `crates/daemon/tests/xunlei_import_api.rs`，覆盖合法样本导入、bad base64、xltd 数量不匹配 |
 | ed2k 协议 | ~~明确不支持~~ **链接解析已完成（2026-08-30，`core/src/source_parse/ed2k.rs`：name/size/md4 结构化 + 明确错误分类）**；完整 eMule/eDonkey 客户端协议仍列远期（数周级），并入"跨协议"远期专项（见 F 段）|
-| HLS/DASH 流媒体 | **HLS 已完成（2026-09-05，C-HLS，PR #78）**：RFC 8216 VOD 子集——`.m3u8` 分流、master 最高带宽变体、AES-128-CBC 解密（key 缓存/IV 缺省推导）、顺序段下载 + 段账本续传、pause/resume；live 流/BYTERANGE/MAP 明确拒绝。DASH（MPD）未做 |
+| HLS/DASH 流媒体 | **HLS 已完成（2026-09-05，C-HLS，PR #78）**：RFC 8216 VOD 子集——`.m3u8` 分流、master 最高带宽变体、AES-128-CBC 解密（key 缓存/IV 缺省推导）、顺序段下载 + 段账本续传、pause/resume；live 流/BYTERANGE/MAP 明确拒绝。**DASH 已完成（2026-09-06，C-DASH）**：MPD static VOD 子集——`.mpd` 分流、视频优先/最高码率选流（纯音频回退）、SegmentTemplate（duration→$Number$ / SegmentTimeline→$Time$，含 `%0Nd`/`$$`）与 SegmentList、BaseURL 链逐级解析 + `..` 压平、init+媒体段顺序拼接 + `.dash-ledger` 续传、pause/resume；dynamic（live）/多 Period/DRM（ContentProtection）/SegmentBase/xlink/$SubNumber$/mediaRange 明确拒绝；音视频分轨 v1 仅取单轨（不混流） |
 | ~Metalink4 支持~ | **已完成（2026-09-05，B1，PR #76）**：RFC 5854 解析（quick-xml 事件流）→ 逐 `<file>` 展开为 HTTP 任务集（priority 主/备 URL + 内建哈希择强直通校验链 + failover 复用）；API 三选一 `metalink_b64` / `.meta4`-`.metalink` URL 引导拉取 / 常规 url；响应 task_ids/count。v1 边界：仅 http(s) URL、文件名取末段不做子目录展开 |
 
 已有（防重复列）：**cookie jar（2026-09-05 A5：reqwest cookies，探测/段请求/重定向自动会话，全局 client 同站共享 + 任务级代理 client 独立 jar）**、**BT PEX/uTP/MSE 加密配置面（2026-09-05，`[bt]` 三键 + FFI `lt_apply_transport`；PEX 经 per-torrent disable_pex 实现，内核 2.0.x 无会话级开关）**、并发队列（BT≤3/HTTP·FTP≤8）、HTTP 多连接并行/镜像/换源、**HTTP 动态分段（SegmentManager 动态领取 + 流式写盘，`109692c`）**、**任务级顺序下载（HTTP/FTP 在飞窗口 + BT sequential flag，2026-09-02 双引擎落地、2026-09-05 A3 扩 FTP 三引擎齐备，CAPABILITY_MAP N3）**
