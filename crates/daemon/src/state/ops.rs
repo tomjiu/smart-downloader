@@ -875,7 +875,7 @@ impl DaemonState {
         xltds: Vec<Vec<u8>>,
         dest_root: Option<String>,
     ) -> Result<TaskId, DaemonError> {
-        use xunlei_convert::{build_bitfield_lenient, FastresumeConverter, XlbtCfg};
+        use xunlei_convert::{build_bitfield_from_indices, FastresumeConverter, XlbtCfg};
 
         // 1. 解析 torrent
         let meta = TorrentMeta::parse(&torrent)?;
@@ -947,7 +947,12 @@ impl DaemonState {
 
         // 全局完成位图（初始全 0）
         let mut bitfield = vec![0u8; (meta.pieces_hash.len() + 7) / 8];
-        let mut completed_total = 0usize;
+        // 审计修复（P0-2）：按真实索引合并全局完成集。原实现把各文件完成数
+        // 累加后当全局前缀长度置位 0..N——多文件种子跨文件进度不均衡（迅雷
+        // 子文件选择下载）或非顺序完成时，前置未下载 piece 被误标完成 →
+        // libtorrent 信任 fastresume → 落盘文件混入全零块（静默损坏）。
+        let mut completed_global: std::collections::BTreeSet<usize> =
+            std::collections::BTreeSet::new();
         let mut partial_infos: Vec<xunlei_convert::PartialPieceInfo> = Vec::new();
 
         let mut converter = FastresumeConverter::new();
@@ -979,14 +984,20 @@ impl DaemonState {
                     total_bytes: total,
                 });
             }
-            // 累加局部完成数（completed_pieces 是局部索引的前缀计数，这里用位图直接设置更稳妥）
-            // completed_pieces 语义：前 N 个 piece 完成（局部），映射到全局连续区间。
-            completed_total += report.completed_pieces;
+            // 局部完成索引映射回全局索引（file.piece_offset 为该文件首 piece）
+            for &local_idx in &report.completed_piece_indices {
+                completed_global.insert(file.piece_offset + local_idx);
+            }
         }
 
-        // 用 lenient 策略构建全局 bitfield（合并所有文件的 partial）
-        bitfield =
-            build_bitfield_lenient(meta.pieces_hash.len(), completed_total, &partial_infos, 0.5);
+        // 用 lenient 策略构建全局 bitfield（按真实索引 + partial 阈值合并）
+        let completed_vec: Vec<usize> = completed_global.into_iter().collect();
+        bitfield = build_bitfield_from_indices(
+            meta.pieces_hash.len(),
+            &completed_vec,
+            &partial_infos,
+            0.5,
+        );
 
         // fastresume file_sizes：[[size, pad], ...]，pad = piece 边界填充
         let file_sizes: Vec<[u64; 2]> = files
@@ -2929,8 +2940,25 @@ impl DaemonState {
             .map_err(map_provider_err)?;
         // 4b. BT 引擎任务退役（直链已替代 BT 传输，keep data）：
         // 快照不再读引擎实时下载态 → 回落到记录态 Completed
-        if let (Some(tid), Ok(bt)) = (&rec.engine_tid, self.engine_for(EngineKind::Bt)) {
-            let _ = bt.remove(tid, false).await;
+        // 审计修复（P1-4）：engine_tid 必须一并清空——残留的 Some(tid) 让
+        // pause/resume/set_limits/set_sequential/set_max_connections/peers/
+        // trackers/webseeds 继续对已退役句柄操作（EngineError），与记录态
+        // Completed 彻底错位；恢复链路也会对不存在引擎任务 resume。
+        // （锁纪律：tasks 锁内不得 await——先取句柄快照，remove 在锁外执行。）
+        let retired_tid = {
+            let tasks = self.tasks.lock();
+            tasks.get(id).and_then(|r| r.engine_tid.clone())
+        };
+        if let Some(tid) = retired_tid {
+            if let Ok(bt) = self.engine_for(EngineKind::Bt) {
+                let _ = bt.remove(&tid, false).await;
+            }
+        }
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(r) = tasks.get_mut(id) {
+                r.engine_tid = None;
+            }
         }
         // 5. 成功：置 Completed + 事件 + 落盘
         {
