@@ -303,6 +303,17 @@ impl DaemonState {
         }
     }
 
+    /// 审计修复（40-e P1-6）：SSE EventSource 鉴权回退——浏览器规范限制
+    /// EventSource 无法自定义请求头，配置 token 后 UI 事件流永久 401。
+    /// 仅限 /events/stream 的 ?token= 查询参数（原值/percent-decode 双比较，
+    /// 常量时间与 Bearer 同口径）。
+    pub fn verify_http_token_query(&self, token: &str) -> bool {
+        match self.http_token.as_deref() {
+            None | Some("") => true,
+            Some(expect) => ct_eq(token, expect),
+        }
+    }
+
     /// 注入生效配置快照（`GET /config` 返回；serve 组装精简字段）。
     pub fn with_config(self, snapshot: serde_json::Value) -> Self {
         *self.config_snapshot.lock() = Some(snapshot);

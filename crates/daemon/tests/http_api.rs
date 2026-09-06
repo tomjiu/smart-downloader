@@ -923,6 +923,65 @@ async fn auth_required_when_token_configured() {
     assert_eq!(r.status(), reqwest::StatusCode::OK, "正确 token 应放行");
 }
 
+/// 审计回归（40-e P1-6）：SSE EventSource 无法携带 Authorization 头（浏览器
+/// 规范限制）——/events/stream 精确路径支持 ?token= 查询参数回退（常量时间
+/// 比较 + percent-decode），其余端点仍严格 Bearer-only。
+#[tokio::test]
+async fn sse_query_token_fallback() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
+    let addr = serve_with_token().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 正确 query token → 放行（send 在响应头到达即返回，SSE 流不阻塞断言）
+    let r = client
+        .get(format!("{base}/events/stream?token=test-token-123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        reqwest::StatusCode::OK,
+        "SSE query token 应放行"
+    );
+
+    // percent-encoded token（UI encodeURIComponent 形态）→ 同样放行
+    let r = client
+        .get(format!("{base}/events/stream?token=test%2Dtoken%2D123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::OK, "encoded token 应放行");
+
+    // 错误 query token → 401
+    let r = client
+        .get(format!("{base}/events/stream?token=wrong"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 无 token → 401
+    let r = client
+        .get(format!("{base}/events/stream"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // 回退不得扩散到其他端点：?token= 对 /tasks 无效
+    let r = client
+        .get(format!("{base}/tasks?token=test-token-123"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status(),
+        reqwest::StatusCode::UNAUTHORIZED,
+        "query token 不得扩散到其他端点"
+    );
+}
+
 #[tokio::test]
 async fn auth_open_when_token_not_configured() {
     let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
