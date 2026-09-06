@@ -498,10 +498,24 @@ impl FtpSession {
         }
     }
 
+    /// 登录（审计修复：USER/PASS/TYPE 响应码校验）。原实现丢弃全部响应码，
+    /// 密码错误要到 RETR 才以 550 暴露；多行 banner 下的失步另由
+    /// read_response 的多行支持处理（RFC 959）。USER 2xx = 免密已登录，
+    /// 跳过 PASS（部分服务器对多余 PASS 回 503）；3xx = 需要 PASS；其余 = 终态。
     async fn login(&mut self, user: &str, pass: &str) -> Result<(), String> {
-        self.cmd(&format!("USER {user}")).await?;
-        self.cmd(&format!("PASS {pass}")).await?;
-        self.cmd("TYPE I").await?;
+        let user_resp = self.cmd(&format!("USER {user}")).await?;
+        if user_resp.starts_with('3') {
+            let pass_resp = self.cmd(&format!("PASS {pass}")).await?;
+            if !pass_resp.starts_with('2') {
+                return Err(pass_resp);
+            }
+        } else if !user_resp.starts_with('2') {
+            return Err(user_resp);
+        }
+        let type_resp = self.cmd("TYPE I").await?;
+        if !type_resp.starts_with('2') {
+            return Err(type_resp);
+        }
         Ok(())
     }
 
@@ -535,6 +549,10 @@ impl FtpSession {
     }
 }
 
+/// 读 FTP 响应（审计修复：支持 RFC 959 多行响应）。原实现只读一行——
+/// 多行 banner/331/150（proftpd/pure-ftpd 常见）会把后续行错配给下一条
+/// 命令，轻则登录/FTPS 握手失步失败，重则响应对错位。
+/// 多行格式：首行 `xyz-text`，以 `xyz text`（同 xyz + 空格）为终止行。
 async fn read_response<T: AsyncRead + Unpin>(reader: &mut BufReader<T>) -> Result<String, String> {
     let mut line = String::new();
     let n = reader
@@ -544,7 +562,29 @@ async fn read_response<T: AsyncRead + Unpin>(reader: &mut BufReader<T>) -> Resul
     if n == 0 {
         return Err("connection closed by server".to_string());
     }
-    Ok(line.trim_end().to_string())
+    let first = line.trim_end().to_string();
+    let bytes = first.as_bytes();
+    let is_multiline =
+        bytes.len() >= 4 && bytes[3] == b'-' && bytes[..3].iter().all(|b| b.is_ascii_digit());
+    if !is_multiline {
+        return Ok(first);
+    }
+    let code = &first[..3]; // 纯 ASCII 数字（上方已校验），切片安全
+    loop {
+        let mut cont = String::new();
+        let n = reader
+            .read_line(&mut cont)
+            .await
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("connection closed in multiline response".to_string());
+        }
+        let cont = cont.trim_end().to_string();
+        let cb = cont.as_bytes();
+        if cb.len() >= 4 && cont.starts_with(code) && cb[3] == b' ' {
+            return Ok(cont); // 终止行作为权威响应
+        }
+    }
 }
 
 /// 发送命令行并读单行响应（AUTH TLS 升级前后共用——升级需在 session
@@ -596,7 +636,14 @@ async fn download_segment(
     let mut s = FtpSession::connect(host, port, use_tls).await?;
     s.login(user, pass).await?;
     let data_addr = s.pasv().await?;
-    s.cmd(&format!("REST {}", seg.start)).await?;
+    // 审计修复（P0）：REST 响应码必须校验。原实现丢弃响应——服务器拒绝 REST
+    // （5xx，不支持断点）时 RETR 仍从字节 0 全量传输，客户端却把读到的
+    // seg.len 字节写在 .part 的 seg.start 偏移处 → 段数据错位写盘（静默损坏）。
+    // REST 成功 = 350；4xx/5xx 一律失败（5xx 由 is_terminal 判终态不再二分重试）。
+    let rest = s.cmd(&format!("REST {}", seg.start)).await?;
+    if !rest.starts_with("350") {
+        return Err(format!("{rest} (REST {} rejected)", seg.start));
+    }
     // RETR 必须是 1xx 中间响应（150）；550 等错误直接终态失败
     let retr = s.cmd(&format!("RETR {path}")).await?;
     if !retr.starts_with('1') {

@@ -5,16 +5,41 @@ use super::*;
 /// 原子写任务文件（tmp + rename，防半写）。
 /// 安全修复（V12，CWE-312/732）：PersistedTask 含完整 source（可能带凭据的 URL/headers），
 /// 落盘必须 0600（rename 保留权限位）；存量宽松权限文件在下次写入时被收紧。
+/// 审计修复（P1-1）：tmp 名唯一化（pid+纳秒）——固定 tmp 名在多调用方并发
+/// 写入时交错破坏后 rename，产出损坏 JSON；唯一名保证 rename 原子性不被
+/// 并发写破坏（autosave 串行化由 DaemonState.persist_lock 承担，直接调用方
+/// 如 serve 退出路径亦受益）。
 pub fn write_tasks_atomic(path: &Path, tasks: &[PersistedTask]) -> std::io::Result<()> {
     let json = serde_json::to_vec_pretty(tasks).map_err(std::io::Error::other)?;
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, &json)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut tmp_name = path.file_name().map_or_else(
+        || format!("tasks-{unique}.json.tmp"),
+        |f| format!("{}-{unique}.tmp", f.to_string_lossy()),
+    );
+    if tmp_name == format!("-{unique}.tmp") {
+        tmp_name = format!("tasks-{unique}.json.tmp");
     }
-    std::fs::rename(&tmp, path)?;
+    let tmp = path.with_file_name(tmp_name);
+    let write_guard = TmpWriteGuard { path: tmp.clone() };
+    let res = (|| {
+        std::fs::write(&tmp, &json)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    // rename 成功后 tmp 已不存在，drop guard 无操作；失败时清掉半写 tmp
+    let renamed = res.is_ok();
+    drop(write_guard);
+    if !renamed {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -26,6 +51,17 @@ pub fn write_tasks_atomic(path: &Path, tasks: &[PersistedTask]) -> std::io::Resu
         }
     }
     Ok(())
+}
+
+/// 临时文件 RAII 清理（仅在写入失败且未被 rename 消费时删半写文件）。
+struct TmpWriteGuard {
+    path: PathBuf,
+}
+
+impl Drop for TmpWriteGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 impl DaemonState {
@@ -45,11 +81,15 @@ impl DaemonState {
 
     /// 自动落盘（启用 storage 时）。同步原子写：任务变更低频（add/remove/状态迁移），
     /// 必须保证顺序（异步并发写会竞态覆盖旧快照）；JSON 规模小，阻塞代价可忽略。
+    /// 审计修复（P1-1）：persist_lock 串行化——autosave 在 tasks 锁外被多调用方
+    /// （HTTP handler/轮询回填/alert 循环）并发触发，唯一 tmp 名解决交错损坏，
+    /// 该锁解决并发写导致的旧快照被新快照**重排覆盖**问题（后写者可能持旧快照）。
     pub(super) fn autosave(&self) {
         let Some(path) = self.persist_path.clone() else {
             return;
         };
         let data = self.persisted_tasks();
+        let _g = self.persist_lock.lock();
         if let Err(e) = write_tasks_atomic(&path, &data) {
             tracing::warn!("任务持久化失败 {path:?}: {e}");
         }
@@ -67,9 +107,31 @@ impl DaemonState {
         for pt in pts {
             let mut t = pt.task.clone();
             let was_paused = pt.paused; // 用户暂停意图（P4 G5，旧文件无此字段 = false）
-                                        // E23：定时任务未到期 → 不入引擎（engine_tid 空），到点由调度
-                                        // 循环激活。paused 意图保留（用户在调度等待期暂停过）——恢复后
-                                        // 仍 Paused，激活器只认 Queued 不会误触发；resume = 立即激活。
+                                        // 审计修复（P1-2）：终态任务（Completed/Stopped/Failed）不再重新入队——
+                                        // 原实现一律 state=Queued 并 engine.add：HTTP 完成任务 .part/账本已清
+                                        // （httpdl 只认 .part 续传）→ 重启后整文件重新下载并覆盖已落盘文件；
+                                        // Failed 任务被静默复活重试；与 E20 完成龄清扫冲突（清扫条件永不满足）。
+                                        // 终态任务仅重建记录（有记录无句柄），状态原样保留。
+            if matches!(
+                t.state,
+                TaskState::Completed | TaskState::Stopped | TaskState::Failed
+            ) {
+                let mut rec = TaskRecord {
+                    seeding_since: None,
+                    task: t,
+                    engine_tid: None,
+                    engine_kind: pt.engine_kind,
+                    engine_status: None,
+                    events: vec![],
+                };
+                rec.push_event("restored", Some("terminal_state_kept".into()));
+                self.tasks.lock().insert(rec.task.id.clone(), rec);
+                restored += 1;
+                continue;
+            }
+            // E23：定时任务未到期 → 不入引擎（engine_tid 空），到点由调度
+            // 循环激活。paused 意图保留（用户在调度等待期暂停过）——恢复后
+            // 仍 Paused，激活器只认 Queued 不会误触发；resume = 立即激活。
             if t.metadata.start_at_unix > now_unix() {
                 t.state = if was_paused {
                     TaskState::Paused
