@@ -389,6 +389,13 @@ pub trait DownloadEngine: Send + Sync {
         None
     }
 
+    /// 做种时长上限快照（分钟，Task 39 执法面）：`Some(>0)` = Seeding 态
+    /// 经过指定分钟即自动暂停；`None`/`Some(0)` = 未启用。仅 BT 引擎返回
+    /// 非 None。同步只读。
+    fn seeding_time_limit(&self) -> Option<u32> {
+        None
+    }
+
     /// 任务级代理热改（E8）：`Some(url)` = 切任务专用 client（覆盖全局，语义
     /// 与 add 时设定一致）；`None` = 清除回引擎共享 client。HTTP 引擎实现：
     /// 非法 URL → `Other`（调用方定性入参错误，不动现任务）；下载中任务
@@ -468,6 +475,9 @@ pub struct BtSessionPatch {
     /// 达标即自动暂停。`None` = 不调整；`Some(0.0)` 或负值非法（校验层拦截）；
     /// `Some(0.0)` = 关闭（>0 = 生效阈值）。
     pub max_share_ratio: Option<f64>,
+    /// 做种时长上限（分钟，qbit「做种时间限制」对标）：Seeding 态经过
+    /// 指定时长即自动暂停。`None` = 不调整；`Some(0)` = 关闭（>0 = 生效阈值）。
+    pub max_seeding_time_min: Option<u32>,
 }
 
 #[cfg(test)]

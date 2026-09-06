@@ -107,6 +107,12 @@ pub struct BtCfg {
     /// >0 = 生效阈值（上限 9999.0）。运行中可经 `PUT /settings` 热改。
     #[serde(default = "default_bt_max_share_ratio")]
     pub max_share_ratio: f64,
+    /// 做种时长上限（分钟，qbit「做种时间限制」对标）：Seeding 态经过指定
+    /// 分钟即自动暂停。0（默认）= 不启用；>0 = 生效阈值（上限 999999）。
+    /// 口径 = 本次运行内做种时长（重启后经重新 checking 重新计时）。
+    /// （u32 serde default = 0 = 不启用，无需具名缺省函数。）
+    #[serde(default)]
+    pub max_seeding_time_min: u32,
 }
 
 /// 备用限速调度（S1，qbit「速度」页 alternate rate limits 对齐项）：
@@ -192,6 +198,7 @@ impl Default for BtCfg {
             max_connections: 0,
             extra_trackers: Vec::new(),
             max_share_ratio: default_bt_max_share_ratio(),
+            max_seeding_time_min: 0,
         }
     }
 }
@@ -321,6 +328,7 @@ impl Default for Config {
                 max_connections: 0,
                 extra_trackers: Vec::new(),
                 max_share_ratio: default_bt_max_share_ratio(),
+                max_seeding_time_min: 0,
             },
             limits: LimitsCfg::default(),
             queue: QueueCfg::default(),
@@ -367,6 +375,13 @@ impl Config {
             return Err(format!(
                 "配置 bt.max_share_ratio = {} 无效：须在 0.0..=9999.0（0 = 不启用）",
                 cfg.bt.max_share_ratio
+            ));
+        }
+        // 做种时长上限（分钟）：超上限 → 拒绝启动
+        if cfg.bt.max_seeding_time_min > 999_999 {
+            return Err(format!(
+                "配置 bt.max_seeding_time_min = {} 无效：须在 0..=999999（0 = 不启用）",
+                cfg.bt.max_seeding_time_min
             ));
         }
         Ok(cfg)
@@ -442,6 +457,7 @@ impl Config {
             "bt_max_connections": self.bt.max_connections,
             "bt_extra_trackers": self.bt.extra_trackers,
             "bt_max_share_ratio": self.bt.max_share_ratio,
+            "bt_max_seeding_time_min": self.bt.max_seeding_time_min,
             "xunlei_enabled": self.xunlei.enabled,
             "listen_addr": self.server.addr,
             // 安全修复（V1）：仅暴露是否启用认证（布尔），token 本身绝不出快照

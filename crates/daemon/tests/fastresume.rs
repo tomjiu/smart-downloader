@@ -91,6 +91,7 @@ async fn fastresume_saved_on_remove_then_reloaded() {
         "allow",
         &[],
         0.0,
+        0,
     )
     .unwrap();
     let ih = engine.add(&bt_task("t1", &magnet)).await.unwrap();
@@ -121,6 +122,7 @@ async fn fastresume_saved_on_remove_then_reloaded() {
         "allow",
         &[],
         0.0,
+        0,
     )
     .unwrap();
     let ih2 = engine2.add(&bt_task("t2", &magnet)).await.unwrap();
@@ -149,6 +151,7 @@ async fn pause_saves_fastresume() {
         "allow",
         &[],
         0.0,
+        0,
     )
     .unwrap();
     let seeder = seed::TestSeeder::start();
@@ -183,6 +186,7 @@ async fn delete_data_removes_fastresume() {
         "allow",
         &[],
         0.0,
+        0,
     )
     .unwrap();
     let seeder = seed::TestSeeder::start();
@@ -219,6 +223,7 @@ fn bt_daemon(save: &std::path::Path, store: &std::path::Path) -> (Arc<DaemonStat
             "allow",
             &[],
             0.0,
+            0,
         )
         .unwrap(),
     );
@@ -387,6 +392,7 @@ async fn torrent_name_surfaces_in_engine_status() {
         "allow",
         &[],
         0.0,
+        0,
     )
     .unwrap();
     let ih = engine.add(&bt_task("t-name", &magnet)).await.unwrap();

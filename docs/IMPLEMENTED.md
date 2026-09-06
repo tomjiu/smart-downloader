@@ -1047,3 +1047,39 @@ rss.json 落盘；Atom 添加 + 规则校验 400 系列 + 坏 feed fail-closed�
 **门禁**：fmt · clippy（workspace excl btcore + btcore + httpdl ftp，
 `--all-targets -D warnings`）全 0 · core+btcore+httpdl(ftp) 524 / daemon
 default 313 / daemon(bt,nas) --all-targets 384 —— 共 1221 测试 0 失败。
+
+## 35. 做种时长上限（qbit「做种时间限制」对标）+ UI 设置面板同步（2026-09-06，Task 39）
+
+### feat(bt)：`bt.max_seeding_time_min`（做种时长上限）
+- **计时登记**：`TaskRecord.seeding_since: Option<Instant>`（仅内存）——BT 任务
+  State/Finished 迁移至 Seeding 时登记（apply_bt_alert）；离开 Seeding（手动暂停/
+  失败/达标暂停）即清空。重启口径 = 重新 checking 再 Finished 时重新登记（时长
+  计本次运行内）。
+- **执法升级**：`enforce_seeding_limit` 扩展为 share_ratio + seeding_time 双限制；
+  达标 → 复用完整 `pause()` 语义（引擎暂停 + 记录同步 Paused + autosave + 状态
+  广播——与手动暂停同口径，此前 F3 只停引擎不同步记录的缺口一并修复）+
+  `seeding_limit_reached` 事件（原因明细：ratio/time/双达）。`cache_bt_poll` 返回
+  `seeding_since` 供执法入参。
+- **设置面**：`[bt] max_seeding_time_min`（分钟，0=不启用，0..=999999 双口径校验）
+  + `PUT /settings` bittorrent 域 + 快照 `bt_max_seeding_time_min`；
+  `BtSessionPatch.max_seeding_time_min` 热改链路；trait 增
+  `seeding_time_limit()`（默认 None，BtEngine 读会话快照）。
+
+### feat(ui)：设置面板补三项（与 Task 38 后端对齐）
+- bittorrent 组新增：做种分享率上限 / 做种时长上限（分钟）数字输入 +
+  「新任务自动追加 tracker」多行 textarea（每行一条，trim 过滤空行）；
+  类型定义 `Settings.bittorrent` 同步扩展。
+
+### 测试
+- `state_tests/seeding_limit_tests.rs` 新 7 例（feature bt 门控）：ratio 达标暂停
+  （走完整 pause 语义断言：引擎暂停 + Paused + 计时清 + 双事件）/ ratio 未达 /
+  时长达标（ Instant 回拨 31min）/ 时长未达 / 双限未启 / 无计时跳过时长限
+  （重启恢复口径）/ 非 Seeding 态不执法。FakeEngine 增 `seeding_ratio_limit`/
+  `seeding_time_limit` 可编程面。
+- settings_api e2e 例扩展 `max_seeding_time_min`（应用 + 快照回读 + 超限 400）。
+- UI lint/build 绿；磁链 e2e 回归 PASS（脚本 peer 注入步骤改走真实
+  `/tasks/:id/peers` 端点）。
+
+**门禁**：fmt · clippy（workspace excl btcore + btcore，`--all-targets -D warnings`）
+全 0 · core+btcore+httpdl(ftp) 524 / daemon default 313 / daemon(bt,nas)
+--all-targets 391 —— 全 0 失败。
