@@ -761,3 +761,79 @@ mock 形状与实测协议一致）+ daemon baidu_resolve 1 + CLI parse；
 shareid/uk → 根目录 + `--dir` 子目录清单 + `--json`）。门禁：fmt · CI 双
 clippy 0 · httpdl(ftp) 203/0 · core 255/0 · btcore 37/0 · provider 162/0 ·
 daemon default 286/0（+1）· ftp,nas 297/0（+1）· bt --all-targets 348/0（+1）。
+
+## S1 设置面 + S2 前端入仓 + 桌面端（2026-09-06 批次）
+
+### 1. 运行时设置 API（`GET/PUT /settings`，feat 提交 934a700）
+
+**API**：
+- `GET /settings`：十域快照——`bandwidth`（基准限速 + 备用调度 + 引擎实际
+  生效值 `effective_*` + 窗口命中态 `alt_active_now`）/ `connection`
+  （proxy + bt_listen_port + bt_max_connections）/ `bittorrent`（发现五键 +
+  encrypt 三态 + bt_available）/ `download` / `cleanup` / `post_download` /
+  `webhook` / `scheduler` / `queue` / `meta.persist_path`。
+- `PUT /settings?persist=`（缺省 true）：域级部分更新；**验证前置零副作用**
+  （encrypt 白名单 / HH:MM 格式 / alt_days∈[0,6] / proxy scheme 白名单 +
+  主机段非空 / dest_root 非空，违规 400）；成功响应
+  `{applied[], restart_required[], persisted, limits}` + `settings_changed`
+  事件（daemon 级，keys 点分全集）；限速变更沿用 `global_limits_changed`。
+- 持久化：权威配置（live_config：启动注入 + 热重载跟随）打补丁 →
+  `Config::save_to` 原子回写（tmp+rename；注释不保留为文档化边界）；
+  `--config` 未指定时 persisted=false 仅运行时生效。与热重载天然协同
+  （回写后 5s 轮询按文本变更检测读取同值，幂等 no-op）。
+
+**生效语义**（每域文档化）：带宽 立即（E16 同链路，双轨：基准 base_limits /
+引擎实际 global_limits）；代理 BT 立即（settings_pack 全量重放）/ HTTP 新任务
+（逐任务 client 构建合并运行时全局，任务级代理仍优先，存量任务不受扰）；
+BT 发现/传输/连接 立即；dest_root 立即（目录创建 + 白名单追加）；cleanup/
+post_download/webhook/jitter 立即；disk_precheck_strict 重启；queue 持久化
+预留（S1-b 门控接线见 BACKLOG）。
+
+**备用限速调度**：`[limits] alt_enabled / alt_max_*_kb_s / alt_from / alt_to /
+alt_days`；窗口 `[from, to)` 半开 + 跨零点回卷（from>to）+ 星期过滤
+（空=每天；0=周日）；`alt_window_active` 纯函数单测直打；serve 30s ticker +
+设置变更即时重评估；`from==to`/格式非法 = 永不生效（安全侧）。手动
+`POST /config/limit` 语义升级为「设定基准」——窗口命中时经
+`tick_alt_limits` 重评估取备用/基准优胜者。
+
+**BT 会话热改链路**：trait `apply_bt_session(BtSessionPatch)`（默认
+Unsupported）→ `BtEngine` 会话快照（BtSessionCfg）合并后按组全量重放
+（discovery / transport / conn 任一组失败快照保持旧值，重试幂等）；内核新增
+`lt_apply_conn(port, max_connections)`——`listen_interfaces =
+"0.0.0.0:<p>,[::]:<p>"`（apply_settings 自动 re-listen）+ `connections_limit`
+（0=不下发）；lt.h 契约注释 / bindings.rs / ffi.rs `Session::apply_conn` /
+engine.rs `BtCore::apply_conn` 四层同步；启动期经 `BtEngine::apply_startup_conn`
+（serve 装配从 `[bt] listen_port / max_connections`）。
+
+**事件**：`SchedulerEvent::SettingsChanged { keys }`（type_label=
+`settings_changed`，known_event_type_labels 锁定 13 变体）。
+
+**验证**：`tests/settings_api.rs` 6 例（快照形状/持久化 round-trip+事件/
+备用窗口立即切换/非法 400 零副作用落盘未动/多域应用+restart_required/
+代理与 dest_root）+ 窗口判定单测 4 例；daemon 默认 297/0 · bt
+--all-targets 359/0 · btcore 37/0 · httpdl 175/0 · 双 clippy 0。
+
+### 2. 前端入仓 + 内嵌 UI + 桌面端（feat 提交 67daeff / 3cf0bae）
+
+- `ui/`：Next.js 15 `output: export` 静态导出；qoder-ui vendored
+  （`public/qoder-ui/`）；主题机制对齐官方——`<html data-theme>` 属性
+  （forest/bee/mint/parchment 各 light/dark），**修复旧版 class 切换导致的
+  主题预览偏差**；视图：任务（过滤/搜索/新建/暂停恢复删除/事件速率）/
+  统计（KPI 卡 + 引擎/状态分布 + Catmull-Rom 速率曲线 + SMIL 呼吸端点）/
+  日志（事件流 + 类型过滤）/ 设置（八组 + 生效徽标 + 保存 toast）/ 详情抽屉
+  （限速/顺序/代理/子文件）。
+- `daemon --ui-dir`：tower-http ServeDir fallback（API 优先级不变），
+  同一 daemon 二进制同源服务 API+UI；`router_with_ui` 兼容既有
+  `router(state)`（24 个测试文件零改动）。
+- `desktop/`：Tauri v2 壳——sidecar daemon（externalBin target-triple）+
+  TCP 就绪探测 + 主窗加载 daemon URL（同源零 CORS）+ 托盘（显示/退出回收
+  子进程）+ `SMART_DL_DESKTOP_PORT` 覆盖；三平台打包 CI
+  （`.github/workflows/desktop.yml`，tag `desktop-v*`）；沙盒无
+  webkit2gtk 无法本地编译，正确性由 desktop CI 首跑兜底（daemon/ui 侧
+  均已实测）。
+- e2e（agent-browser 实测）：添加任务 → Downloading → **Completed**，
+  产物 `cmp` 逐字节一致；设置改限速 2048/512 → 保存 toast「已应用 2 项，
+  已落盘」→ 配置文件回写校验通过；8 主题截图存证。
+- 引擎健壮性修复（e2e 发现）：httpdl 段下载接受 RFC 7233 §2.1 的 200
+  全量响应（skip seg.start + 截断写 seg.len，写满弃流）——非 Range 服务器
+  （python http.server 等）不再 "all mirrors failed"。
