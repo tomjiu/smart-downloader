@@ -837,3 +837,50 @@ engine.rs `BtCore::apply_conn` 四层同步；启动期经 `BtEngine::apply_star
 - 引擎健壮性修复（e2e 发现）：httpdl 段下载接受 RFC 7233 §2.1 的 200
   全量响应（skip seg.start + 截断写 seg.len，写满弃流）——非 Range 服务器
   （python http.server 等）不再 "all mirrors failed"。
+
+### 32. DASH（MPD）下载支持（C-DASH，2026-09-06）
+
+**背景**：与 HLS 同场景（流媒体点播 `.mpd` 清单无下载器自动化）——HLS 覆盖
+m3u8 生态后，DASH（ISO/IEC 23009-1）是另一主流分片清单格式，YouTube 类
+CDN 与大量 VOD 站点使用 MPD。
+
+**实现**（MPD static VOD 子集，与 HLS v1 同哲学）：
+- **识别与分流**：`HttpEngine::add` 对 URL 路径 `.mpd` 后缀（剥 query/frag
+  大小写无关）分流 DASH 路径——不走 Range 探测/分段链；任务级代理/
+  headers/限速全链同源；`HttpTask.hls: bool` 升级为 `StreamKind` 枚举
+  （Plain/Hls/Dash），spawn 循环泛化为 `spawn_stream_loop`（按 kind 分发
+  `download_hls`/`download_dash`，abort 约定串双白名单）。
+- **MPD 解析**（`dash.rs`，quick-xml 0.37 事件 → 轻量元素树后结构解析，
+  metalink 同款依赖）：`type="dynamic"`（live）/多 Period/xlink 外链 →
+  拒绝；**选流** = 视频优先（contentType/mimeType video/）→ 集合内最高
+  BANDWIDTH Representation，纯音频内容回退最高码率音频轨；DRM
+  （ContentProtection）→ 拒绝。
+- **分段定址**：SegmentTemplate `duration` 属性 → $Number$ 定址（段数 =
+  ceil(Period 时长 × timescale / duration)，时长取 Period@duration 或
+  MPD@mediaPresentationDuration，ISO 8601 解析含 Y/M/W 固定换算）；
+  `SegmentTimeline` → $Time$ 定址（`<S t d r>` 展开，t 缺省继承前段终点，
+  负 r 拒绝）；SegmentList（显式 SegmentURL）；无分段且 Representation
+  自带 BaseURL → 单文件整下。模板替换 `$RepresentationID$`/`$Bandwidth$`/
+  `$Number$`/`$Time$`（`%0Nd` 零宽、`$$` 转义）；`$SubNumber$`/未知标识符
+  → 拒绝。URL 按 BaseURL 链（MPD→Period→AS→Rep）逐级相对解析 +
+  `.`/`..` 段压平；SegmentList 对所属元素 base 解析（spec 5.3.9.4.2）。
+  SegmentBase（单文件索引 byte-range）/ mediaRange / index → 明确拒绝。
+- **顺序下载 + 段账本续传**：init 段（如有）+ 媒体段顺序 append `.part`
+  （fMP4 init+media 裸拼接 = 可播放流文件）；`.part.dash-ledger` JSON
+  记录清单指纹（sha256 MPD 文本+URL）/已完成段数/字节数（init 计第 0 项）；
+  恢复 = 重拉 MPD → 指纹对账（失配作废重下）→ 断点续传，已完成段零重复
+  请求（e2e 计数断言）。
+- **pause/resume**：abort flag 段间检查点（`dash-aborted` 约定错误静默
+  退出）；resume epoch+1 重 spawn 凭账本续传——HLS 同模式。
+- **落盘名**：显式名权威；派生 = 入口 URL 清单名去 `.mpd` + `.mp4`；
+  total = 0（未知长度语义），done 按字节累计。
+- 依赖：quick-xml（workspace 统一 0.37，metalink 同款，无 feature 门）。
+
+**验证**：解析单测 17（duration/Timeline/List 定址、BaseURL 链 + `..`
+压平、模板边角 `$$`/未闭合/非法宽度/SubNumber、audio 回退、单文件表示、
+ISO 8601、dynamic/多 Period/DRM/SegmentBase/xlink 拒绝、识别与落盘名）
++ e2e 4（duration 定址 init+4 段逐字节 + 名派生 manifest.mp4、timeline
+账本续传零重复拉取、dynamic 任务 Error、pause→resume roundtrip）。
+门禁：fmt · clippy ×6（workspace ftp/sftp + daemon ftp/nas/ftp,nas/sftp，
+-D warnings）全 0 · core 262/0 · httpdl(ftp) 224/0 · httpdl(sftp) 203/0 ·
+provider 162/0 · daemon default 304/0 · ftp,nas 316/0 · sftp 309/0。

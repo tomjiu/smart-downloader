@@ -6,6 +6,8 @@
 // 测试以 `httpdl::` 引用（包名为 smart-dl-httpdl）。
 extern crate self as httpdl;
 
+/// DASH（ISO/IEC 23009-1，MPD 清单）static VOD 下载支持（C-DASH）。
+pub mod dash;
 pub mod download;
 pub mod engine;
 /// HLS（RFC 8216）VOD 下载支持（C-HLS）。
