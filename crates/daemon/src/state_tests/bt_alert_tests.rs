@@ -16,6 +16,7 @@ fn make_state_with(rec: TaskRecord) -> DaemonState {
 
 fn bt_rec(state: TaskState, ih: &str) -> TaskRecord {
     TaskRecord {
+        seeding_since: None,
         task: DownloadTask {
             id: "t1".into(),
             canonical_id: CanonicalId {

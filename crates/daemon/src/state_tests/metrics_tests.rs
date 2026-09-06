@@ -8,6 +8,7 @@ use super::*;
 
 fn http_rec_with_rates(id: &str, down: u64, up: u64) -> TaskRecord {
     TaskRecord {
+        seeding_since: None,
         task: DownloadTask {
             id: id.into(),
             canonical_id: CanonicalId {

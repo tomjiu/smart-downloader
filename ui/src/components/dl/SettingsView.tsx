@@ -296,6 +296,41 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
             <option value="require">强制加密</option>
           </select>
           <div className="dl-field-help">开关热改即时生效（新发现任务对 PEX 全量生效）；私有 tracker 建议关闭 DHT/PEX/LSD</div>
+          <label className="dl-field-label">做种分享率上限<Effective kind="now" /></label>
+          <input
+            className="qoder-input"
+            type="number"
+            min={0}
+            step="0.1"
+            placeholder="0 = 不启用"
+            value={s.bittorrent.max_share_ratio}
+            onChange={(e) => patch("bittorrent", "max_share_ratio", num(e.target.value) ?? 0)}
+          />
+          <label className="dl-field-label">做种时长上限（分钟）<Effective kind="now" /></label>
+          <input
+            className="qoder-input"
+            type="number"
+            min={0}
+            placeholder="0 = 不启用"
+            value={s.bittorrent.max_seeding_time_min}
+            onChange={(e) => patch("bittorrent", "max_seeding_time_min", num(e.target.value) ?? 0)}
+          />
+          <div className="dl-field-help">qBittorrent 同名能力：做种达到分享率或时长任一上限即自动暂停（可手动恢复）</div>
+          <label className="dl-field-label">新任务自动追加 tracker<Effective kind="now" /></label>
+          <textarea
+            className="qoder-input"
+            rows={3}
+            placeholder={"udp://tracker.example:6969/announce\nhttp://t2.example/announce"}
+            value={(s.bittorrent.extra_trackers ?? []).join("\n")}
+            onChange={(e) =>
+              patch(
+                "bittorrent",
+                "extra_trackers",
+                e.target.value.split("\n").map((x) => x.trim()).filter((x) => x.length > 0),
+              )
+            }
+          />
+          <div className="dl-field-help">每行一条；保存后仅对后续新建 BT 任务生效（存量任务在任务详情里管理 tracker）</div>
         </div>
       </section>
 

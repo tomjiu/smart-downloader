@@ -33,6 +33,7 @@ async fn serve_bt() -> (std::net::SocketAddr, Arc<DaemonState>, std::path::PathB
         "allow",
         &[],
         0.0,
+        0,
     )
     .unwrap();
     let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
@@ -371,6 +372,7 @@ async fn readd_same_magnet_after_restart_ok() {
             "allow",
             &[],
             0.0,
+            0,
         )
         .unwrap();
         let state = DaemonState::new(Arc::new(http.clone()), vec![]).with_bt(Arc::new(bt));
@@ -392,6 +394,7 @@ async fn readd_same_magnet_after_restart_ok() {
         "allow",
         &[],
         0.0,
+        0,
     )
     .unwrap();
     let state2 = DaemonState::new(Arc::new(http), vec![]).with_bt(Arc::new(bt2));
@@ -653,6 +656,7 @@ async fn serve_bt_in(
         "allow",
         &[],
         0.0,
+        0,
     )
     .unwrap();
     let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
@@ -767,6 +771,7 @@ async fn file_priority_persisted_and_replayed_after_restart() {
         "allow",
         &[],
         0.0,
+        0,
     )
     .unwrap();
     let http2 = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());

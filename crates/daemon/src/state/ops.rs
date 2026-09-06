@@ -241,6 +241,7 @@ impl DaemonState {
         let task_id = task.id.clone();
         let start_at = task.metadata.start_at_unix;
         let mut rec = TaskRecord {
+            seeding_since: None,
             task,
             engine_tid: None,
             engine_kind: kind,
@@ -327,6 +328,7 @@ impl DaemonState {
         }
         let task_id = task.id.clone();
         let mut rec = TaskRecord {
+            seeding_since: None,
             task,
             engine_tid: None,
             engine_kind: kind,
@@ -706,6 +708,7 @@ impl DaemonState {
             }
         }
         let mut rec = TaskRecord {
+            seeding_since: None,
             task,
             engine_tid: Some(engine_tid),
             engine_kind: EngineKind::Bt,
@@ -838,6 +841,7 @@ impl DaemonState {
             }
         }
         let mut rec = TaskRecord {
+            seeding_since: None,
             task,
             engine_tid: Some(engine_tid),
             engine_kind: EngineKind::Bt,
@@ -1058,6 +1062,7 @@ impl DaemonState {
             max_connections: None,
         };
         let mut rec = TaskRecord {
+            seeding_since: None,
             task,
             engine_tid: Some(engine_tid.clone()),
             engine_kind: EngineKind::Bt,
@@ -1240,6 +1245,7 @@ impl DaemonState {
         // 一并写 finished_at）
         if skip_download {
             let mut rec = TaskRecord {
+                seeding_since: None,
                 task,
                 engine_tid: None,
                 engine_kind: EngineKind::Http,
@@ -1291,6 +1297,7 @@ impl DaemonState {
             .await
             .map_err(|e| DaemonError::Engine(e.to_string()))?;
         let mut rec = TaskRecord {
+            seeding_since: None,
             task,
             engine_tid: Some(engine_tid),
             engine_kind: EngineKind::Http,
@@ -1428,6 +1435,7 @@ impl DaemonState {
             .await
             .map_err(|e| DaemonError::Engine(e.to_string()))?;
         let mut rec = TaskRecord {
+            seeding_since: None,
             task,
             engine_tid: Some(engine_tid.clone()),
             engine_kind: EngineKind::Ftp,
@@ -1594,6 +1602,7 @@ impl DaemonState {
             .await
             .map_err(|e| DaemonError::Engine(e.to_string()))?;
         let mut rec = TaskRecord {
+            seeding_since: None,
             task,
             engine_tid: Some(engine_tid.clone()),
             engine_kind: EngineKind::Sftp,
@@ -2053,6 +2062,7 @@ impl DaemonState {
                 es.down_rate = 0;
                 es.up_rate = 0;
             }
+            rec.seeding_since = None; // Task 39：离开做种态清计时
         }
         // 暂停意图必须立刻持久化（P4 G5）：否则重启后暂停任务被当作运行任务恢复
         self.autosave();
@@ -3053,13 +3063,13 @@ impl DaemonState {
                 // E28：任务名回填在此放行——torrent metadata name 就绪 +
                 // metadata.name 空缺 → 幂等回填 + 事件（E9 同语义：一次成功
                 // 后 name 非 None 自然停）。快照缓存照旧整体入缓存。
-                self.cache_bt_poll(&id, &st);
-                // F3 执法：share_ratio = uploaded/downloaded（E33 all-time 口径，
-                // 与快照字段同源）。仅 Seeding 态触发（下载中 uploaded 含给
-                // 他人补块的量，语义噪声大）；达阈值 → pause（qbit 行为 =
-                // 任务停止，用户可手动 resume，resume 后再达标会再次暂停）。
+                let seeding_since = self.cache_bt_poll(&id, &st);
+                // F3/Task 39 执法：share_ratio（E33 all-time 口径，与快照字段
+                // 同源）+ 做种时长（seeding_since 起算）。仅 Seeding 态触发；
+                // 达阈值 → 完整 pause 语义（记录同步 Paused + autosave + 广播，
+                // 与手动暂停同口径，用户可 resume，resume 后再达标再次触发）。
                 // 独立 async fn：锁与 await 的跨点隔离在内部生成器（Send 门禁）。
-                self.enforce_seeding_limit(&id, &tid, engine.clone(), &st)
+                self.enforce_seeding_limit(&id, engine.clone(), &st, seeding_since)
                     .await;
                 continue;
             }
@@ -3131,7 +3141,12 @@ impl DaemonState {
 
     /// BT 轮询缓存 + E28 名回填（同步、锁内无 await）：快照整体入
     /// `engine_status` 缓存；metadata name 就绪且记录空缺 → 幂等回填 + 事件。
-    fn cache_bt_poll(&self, id: &str, st: &smart_dl_core::types::EngineStatus) {
+    /// 返回该记录的 `seeding_since`（做种时长执法入参）。
+    fn cache_bt_poll(
+        &self,
+        id: &str,
+        st: &smart_dl_core::types::EngineStatus,
+    ) -> Option<std::time::Instant> {
         let mut tasks = self.tasks.lock();
         if let Some(rec) = tasks.get_mut(id) {
             // 双检：轮询间隙状态可能已被 alert 推进至终态
@@ -3147,39 +3162,67 @@ impl DaemonState {
                     }
                 }
                 rec.engine_status = Some(st.clone());
+                return rec.seeding_since;
             }
         }
+        None
     }
 
-    /// F3 做种分享率执法（qbit Share Ratio Limit）：Seeding 态 + 上限启用 +
-    /// share_ratio ≥ 阈值 → 引擎暂停 + `seeding_limit_reached` 事件。
+    /// F3/Task 39 做种限制执法（qbit Share Ratio Limit + 做种时间限制）：
+    /// Seeding 态 + （share_ratio ≥ 阈值 或 做种时长 ≥ 上限）→ 完整 pause
+    /// 语义（复用 `pause`：引擎暂停 + 记录同步 Paused + autosave + 状态广播；
+    /// 与手动暂停同口径，用户可 resume，resume 后再达标会再次触发）+
+    /// `seeding_limit_reached` 事件（原因明细）。
     /// 独立 async fn —— 内部锁不跨自身 await（外层轮询生成器的 Send 门禁）。
     async fn enforce_seeding_limit(
         &self,
         id: &str,
-        tid: &EngineTaskId,
         engine: std::sync::Arc<dyn DownloadEngine>,
         st: &smart_dl_core::types::EngineStatus,
+        seeding_since: Option<std::time::Instant>,
     ) {
         if !matches!(st.state, smart_dl_core::types::EngineState::Seeding) {
             return;
         }
-        let Some(limit) = engine.seeding_ratio_limit() else {
-            return;
-        };
-        let Some(ratio) = crate::state::share_ratio(st.total_uploaded, st.total_downloaded) else {
-            return;
-        };
-        if ratio < limit {
+        let ratio_limit = engine.seeding_ratio_limit();
+        let time_limit_min = engine.seeding_time_limit();
+        if ratio_limit.is_none() && time_limit_min.is_none() {
             return;
         }
-        let paused = engine.pause(tid).await.is_ok();
-        let mut tasks = self.tasks.lock();
-        if let Some(rec) = tasks.get_mut(id) {
-            rec.push_event(
-                "seeding_limit_reached",
-                Some(format!("ratio={ratio:.2} limit={limit:.2} paused={paused}")),
-            );
+        let ratio = crate::state::share_ratio(st.total_uploaded, st.total_downloaded);
+        let elapsed_min = seeding_since
+            .map(|t| t.elapsed().as_secs() / 60)
+            .unwrap_or(0);
+        let ratio_hit = matches!((ratio_limit, ratio), (Some(l), Some(r)) if r >= l);
+        let time_hit = matches!((time_limit_min, elapsed_min), (Some(l), m) if m >= l as u64);
+        if !ratio_hit && !time_hit {
+            return;
+        }
+        let reason = match (ratio_hit, time_hit) {
+            (true, true) => format!(
+                "ratio={:.2}>=?{:?} time={elapsed_min}min>=?{:?}min（双达）",
+                ratio.unwrap_or(f64::INFINITY),
+                ratio_limit,
+                time_limit_min
+            ),
+            (true, false) => format!(
+                "ratio={:.2} >= limit={:?}",
+                ratio.unwrap_or(f64::INFINITY),
+                ratio_limit
+            ),
+            (false, true) => format!(
+                "seeding time={elapsed_min}min >= limit={:?}min",
+                time_limit_min
+            ),
+            (false, false) => unreachable!("已由 hit 判定"),
+        };
+        // 完整 pause 语义（记录同步/事件/持久化/广播都在里面）
+        if self.pause(id).await.is_ok() {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.seeding_since = None;
+                rec.push_event("seeding_limit_reached", Some(reason));
+            }
         }
     }
 }

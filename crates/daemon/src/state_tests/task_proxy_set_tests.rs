@@ -11,6 +11,7 @@ use smart_dl_core::identity::{CanonicalId, CanonicalKind, ContentIdentity};
 /// 预拒发生在 engine_for 之前，未注册引擎不影响断言路径）。
 fn insert_bt_rec(state: &DaemonState, id: &str, ih: &str) {
     let rec = TaskRecord {
+        seeding_since: None,
         task: DownloadTask {
             id: id.into(),
             canonical_id: CanonicalId {

@@ -111,3 +111,10 @@
 > ④ `POST /tasks/:id/super-seeding`（超级种子，内核 lt_set_seed_mode）。做种时长
 > 上限需 `completed_at` 时间戳（记录无此字段，待需求出现再加）；peer 封禁受限于
 > libtorrent 2.x 公开 API 无 per-endpoint ban（内核文档化存根，维持）。
+
+> 更新：2026-09-06（六）。**做种时长上限落地（Task 39）**：`bt.max_seeding_time_min`
+> （分钟，0=不启用）+ TaskRecord.seeding_since 计时（Finished→Seeding 登记/离开清空）
+> + 执法升级为 share_ratio ∪ seeding_time 双限制，达标走完整 pause 语义（修复 F3
+> 只停引擎不同步记录态的缺口）；UI 设置面板同步 extra_trackers / max_share_ratio /
+> max_seeding_time_min 三项。至此 qbit 做种限制对标补齐（时长口径=本次运行内，
+> 重启经重新 checking 重新计时——持久化口径待需求出现再议）。
