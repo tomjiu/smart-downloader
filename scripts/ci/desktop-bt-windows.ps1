@@ -66,10 +66,15 @@ function Invoke-Setup {
     # vcvars（供 Windows SDK 的 INCLUDE/LIB）+ cl 编译 + lib 打静态库：
     # 走临时 .cmd 批处理执行，规避 cmd /c 长串内嵌引号剥层问题
     $bat = Join-Path $buildDir "_build_kernel.cmd"
+    # 构建态宏一致性：vcpkg libtorrent 带 openssl 时（libssl.lib 存在），消费者编译
+    # 必须同定义 TORRENT_USE_OPENSSL（2.1.x RTC 强制校验；2.0.x 内联/模板实例化
+    # 同样需要一致），否则链接期 undefined symbols
+    $sslDef = ""
+    if (Test-Path (Join-Path $Installed "lib\libssl.lib")) { $sslDef = "/DTORRENT_USE_OPENSSL=1 " }
     @(
         "call `"$vcvars`" >NUL",
         "cd /d `"$buildDir`"",
-        "cl /nologo /std:c++17 /O2 /MD /EHsc /DNDEBUG " +
+        "cl /nologo /std:c++17 /O2 /MD /EHsc /DNDEBUG $sslDef" +
             "/I`"$ffi`" /I`"$(Join-Path $Installed 'include')`" " +
             "/c `"$ffi\src\lt_kernel.cpp`"",
         "if errorlevel 1 exit /b 1",

@@ -47,9 +47,17 @@ do_setup() {
     [[ -f "$LT_DYLIB" ]] || { echo "FATAL: 未找到 libtorrent dylib" >&2; exit 1; }
     echo "==> libtorrent: $LT_DYLIB"
 
-    # FFI 内核（clang++，libc++ ABI，与 brew libtorrent 同链）
+    # FFI 内核（clang++，libc++ ABI，与 brew libtorrent 同链）。
+    # cflags 走 pkg-config（版本无关的官方一致性通道）：brew 2.1.x 起 RTC 默认
+    # 开启，config.hpp 强制要求消费者定义 TORRENT_USE_OPENSSL 与构建态一致，
+    # 手写 -I 会漏掉这类定义（首跑实证 error: compiling with TORRENT_USE_RTC
+    # requires TORRENT_USE_OPENSSL or TORRENT_USE_GNUTLS）。
+    export PKG_CONFIG_PATH="$BREW_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+    LT_CFLAGS="$(pkg-config --cflags libtorrent-rasterbar 2>/dev/null || true)"
+    echo "    pkg-config cflags: ${LT_CFLAGS:-(空，回退 brew include)}"
     mkdir -p "$HOME/bt-native-macos/lib"
-    c++ -std=c++17 -O2 -fPIC -DNDEBUG -I"$REPO_ROOT/ffi" -I"$BREW_PREFIX/include" \
+    # shellcheck disable=SC2086
+    c++ -std=c++17 -O2 -fPIC -DNDEBUG $LT_CFLAGS -I"$REPO_ROOT/ffi" -I"$BREW_PREFIX/include" \
         -c "$REPO_ROOT/ffi/src/lt_kernel.cpp" -o "$HOME/bt-native-macos/lib/lt_kernel.o"
     ar rcs "$HOME/bt-native-macos/lib/liblt_kernel.a" "$HOME/bt-native-macos/lib/lt_kernel.o"
     rm -f "$HOME/bt-native-macos/lib/lt_kernel.o"
