@@ -1,5 +1,6 @@
 # 未实现清单（整体）— 迅雷 + 通用 + 未来愿景
 
+> 更新：2026-09-06（三）。**桌面版 BT 引擎装配落地（S1-d）**：desktop CI 三平台原生 libtorrent 打包矩阵（Windows vcpkg x64-windows / Linux apt / macOS brew），sidecar 升级 `--features bt,ftp,sftp` 全引擎；运行期原生库随包分发（Linux RUNPATH `$ORIGIN/../lib/Smart Downloader/native/linux`（deb/AppImage 同构）/ macOS install_name `@executable_path/../Resources/…` + ad-hoc 重签 / Windows vcpkg DLL+CRT 落安装根），布局依据 v0.1.0 产物解剖实证。desktop-v0.2.0。
 > 更新：2026-09-06（二）。**DASH（MPD）下载支持落地（C-DASH）**：`.mpd` 分流 → MPD static VOD 解析（视频优先选流 + SegmentTemplate/SegmentList 定址 + BaseURL 链）→ init+媒体段顺序拼接 + 段账本续传 + pause/resume，全链路与 HLS 同构（`.dash-ledger`/`dash-aborted` 同语义）。遗留：桌面版 BT 引擎装配（下表 S1-d）。
 > 更新：2026-09-06。**S1 设置面 + S2 前端入仓 + 桌面端**三项落地（本提交批）：`GET/PUT /settings` 十域运行时生效 + 落盘持久化、备用限速调度（[limits] 跨零点窗口 + 星期过滤 + 30s ticker）、BT 会话热改链路（`BtSessionPatch` trait + 内核 `lt_apply_conn`：监听端口/全局连接数上限）、HTTP 全局代理热改（逐任务 client 构建合并）、`ui/` Next.js 静态导出 + qoder-ui `data-theme` 8 主题 + qbit 式设置视图、daemon `--ui-dir` 内嵌 UI、Tauri v2 桌面壳（sidecar + 托盘 + 三平台 CI）。**httpdl RFC 7233 容错**（200 全量响应 skip+截断写入）随 e2e 实测落地。遗留：S1-b 队列门控接线（下表 S1-b）、桌面版 BT 引擎装配、BT per-torrent 连接数上限。
 > 更新：2026-08-27。已完成主线（thunder 解码 / HTTP 断点续传 / BT / fastresume / 热重载 / 状态推进）+ C 类通用缺口中的**代理 + 引擎层限速**（3fac8e3）+ **M6 云兜底调度接线**（c19313a）+ 2026-08-25 四卡落地：**FTP 目录下载**（httpdl 引擎 + daemon 路由）、**BT DHT/LSD/UPnP 配置开关**（FFI `lt_apply_discovery` 全链路）、**.torrent 多文件空间预检**、**TaskSnapshot.files 透出** + 2026-08-27：**httpdl 动态分段（P0，方案A）**（109692c）。
@@ -37,7 +38,7 @@
 |---|---|
 | ~S1-b 队列门控接线~ | **已完成（2026-09-06）**：`[queue] max_active_{bt,http,ftp}`（0 = 不限，默认禁用排队）daemon 运行时门控——add 四入口 `gate_or_enqueue` 配额满落 Queued（queue_wait 事件）；`activate_due_tasks` 统一激活泵扩容为 E23+E30+S1-b 三候选（queue_wait 随时到期），FIFO（created_at）+ 配额闸递补；槽位 = 有句柄且非 Paused/Seeding/终态（add 后轮询前窗口按句柄占位防超卖）；手动 resume = 强制开始；恢复重放不设闸。settings_api/queue_gate 6 测试 |
 | ~S1-c BT per-task 连接数上限~ | **已完成（2026-09-06）**：FFI `lt_torrent_set_max_connections`（>0 上限 / 0 复位会话级默认，metadata 未就绪可设）→ btcore ffi/engine → trait `set_max_connections`（default Unsupported）→ daemon BtEngine；`DownloadTask.max_connections`（serde default 向后兼容）+ `POST /tasks/:id/connections`（仅 BT，其余 409）+ 快照透出 + 恢复重放 ③b + TaskDetail BT 控件；内核级/status 真实 libtorrent 测试 |
-| S1-d 桌面版 BT 引擎装配 | desktop CI 三平台原生 libtorrent 打包矩阵（Windows vcpkg / Linux apt / macOS brew）；当前桌面构建为 no-BT profile |
+| ~S1-d 桌面版 BT 引擎装配~ | **已完成（2026-09-06，PR #90）**：desktop workflow 三平台 BT 矩阵（scripts/ci/desktop-bt-{linux,macos}.sh + desktop-bt-windows.ps1，setup/stage 两段式）；tauri.{linux,macos,windows}.conf.json 平台资源覆盖层；Linux stage 自检 = 安装布局模拟树 + 空 LD_LIBRARY_PATH ldd 全解析；本地 Linux 实证 env -i 实跑 serve/magnet 全通 |
 | ~代理支持~ | ~~无（HTTP/BT 均无代理配置项）~~ **已完成**：HTTP（reqwest Proxy）+ BT（lt_apply_network）双引擎接线，启动时生效（见 3fac8e3）；**S1 追加：运行时热改**（BT settings_pack 重放立即生效 / HTTP 逐任务 client 构建合并新任务生效，`PUT /settings`）|
 | ~引擎层限速~ | ~~无（BT 的 libtorrent 速率上限未接线；HTTP 无限速）~~ **已完成**：全局下载/上传限速（KiB/s；0=不限），HTTP 跨段共享 RateLimiter（见 3fac8e3）|
 | ~云兜底调度接线~ | ~~FallbackCoordinator（M2 设计）仅在 provider crate 测试里使用，daemon 无调度入口~~ **已完成（M6）**：`POST /tasks/:id/fallback` 手动兜底——BT 任务暂停且进度 <50% → 选 provider → 直链 → HttpEngine 传输 → 任务 Completed；`[provider]` 配置段（mock 占位，真实 provider 待迅雷线落地）|

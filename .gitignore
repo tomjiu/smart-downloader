@@ -69,3 +69,8 @@ ui/node_modules/
 ui/.next/
 ui/out/
 node_modules/
+
+# S1-d 桌面 BT 装配：native 运行库为 CI stage 产物（.so/.dylib/DLL 闭包），
+# vcpkg 二进制缓存同理——均不入库（tauri 资源映射在 CI 构建期读取）
+desktop/src-tauri/native/
+.vcpkg-cache/
