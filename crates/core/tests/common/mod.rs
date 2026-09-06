@@ -73,5 +73,6 @@ pub fn make_task(id: &str, name: &str) -> DownloadTask {
             next_retry_at_unix: 0,
         },
         limits: None,
+        max_connections: None,
     }
 }

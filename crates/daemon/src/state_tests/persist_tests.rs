@@ -144,6 +144,7 @@ fn bt_prio_task(id: &str, prios: Option<Vec<u32>>) -> DownloadTask {
         created_at: std::time::Instant::now(),
         file_priorities: prios,
         sequential: false,
+        max_connections: None,
         metadata: TaskMetadata {
             name: None,
             added_at_unix: 0,

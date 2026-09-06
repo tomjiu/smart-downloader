@@ -356,6 +356,13 @@ pub trait DownloadEngine: Send + Sync {
         Err(EngineError::Unsupported)
     }
 
+    /// 任务级连接数上限（S1-c，qbit 每任务连接数）：`n > 0` = 上限；
+    /// `n == 0` = 复位为会话级连接数默认。仅 BT 引擎实现（即时生效，
+    /// metadata 未就绪也可设）；其余引擎 → `Unsupported`。
+    async fn set_max_connections(&self, _id: &EngineTaskId, _n: u32) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
     /// 任务级代理热改（E8）：`Some(url)` = 切任务专用 client（覆盖全局，语义
     /// 与 add 时设定一致）；`None` = 清除回引擎共享 client。HTTP 引擎实现：
     /// 非法 URL → `Other`（调用方定性入参错误，不动现任务）；下载中任务

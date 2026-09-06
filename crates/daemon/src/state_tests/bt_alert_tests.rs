@@ -42,6 +42,7 @@ fn bt_rec(state: TaskState, ih: &str) -> TaskRecord {
             created_at: std::time::Instant::now(),
             file_priorities: None,
             sequential: false,
+            max_connections: None,
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,

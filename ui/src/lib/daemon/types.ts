@@ -29,6 +29,14 @@ export interface TaskSnapshot {
   error?: string | null;
   files?: TaskFile[];
   name: string;
+  /** 任务级连接数上限（S1-c，仅 BT；未设置 = undefined） */
+  max_connections?: number;
+  /** 顺序下载（BT/HTTP） */
+  sequential?: boolean;
+  /** 任务级限速 */
+  limits?: { down_kb_s?: number | null; up_kb_s?: number | null };
+  /** 定时启动（unix 秒；0 = 未调度） */
+  start_at_unix?: number;
 }
 
 /// 事件流派生的任务级速率（Speed 事件）。

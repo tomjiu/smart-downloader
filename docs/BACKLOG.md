@@ -34,8 +34,8 @@
 
 | 缺口 | 说明 |
 |---|---|
-| S1-b 队列门控接线 | `[queue] max_active_{bt,http,ftp}` 配置/快照/持久化已就绪（S1），**daemon 运行时门控未接线**：core 层 `TaskQueue`/`EngineRegistry` 配额（BT≤3/HTTP·FTP≤8）历史上仅存在于 core 测试，daemon 生产路径无并发闸门。接线点：state/ops.rs 五个 `add_*_task_opts` 入口收敛到统一派发助手（acquire→engine.add / 排队挂 Queued），终态（Completed/Failed/Stopped/Paused/移除）release + FIFO 递补。风险点：恢复路径与定时激活路径的递补时机 |
-| S1-c BT per-task 连接数上限 | qbit 每任务连接数；内核需 per-torrent handle `set_max_connections`（`lt_apply_conn` 已覆盖会话级，per-torrent 待增 FFI） |
+| ~S1-b 队列门控接线~ | **已完成（2026-09-06）**：`[queue] max_active_{bt,http,ftp}`（0 = 不限，默认禁用排队）daemon 运行时门控——add 四入口 `gate_or_enqueue` 配额满落 Queued（queue_wait 事件）；`activate_due_tasks` 统一激活泵扩容为 E23+E30+S1-b 三候选（queue_wait 随时到期），FIFO（created_at）+ 配额闸递补；槽位 = 有句柄且非 Paused/Seeding/终态（add 后轮询前窗口按句柄占位防超卖）；手动 resume = 强制开始；恢复重放不设闸。settings_api/queue_gate 6 测试 |
+| ~S1-c BT per-task 连接数上限~ | **已完成（2026-09-06）**：FFI `lt_torrent_set_max_connections`（>0 上限 / 0 复位会话级默认，metadata 未就绪可设）→ btcore ffi/engine → trait `set_max_connections`（default Unsupported）→ daemon BtEngine；`DownloadTask.max_connections`（serde default 向后兼容）+ `POST /tasks/:id/connections`（仅 BT，其余 409）+ 快照透出 + 恢复重放 ③b + TaskDetail BT 控件；内核级/status 真实 libtorrent 测试 |
 | S1-d 桌面版 BT 引擎装配 | desktop CI 三平台原生 libtorrent 打包矩阵（Windows vcpkg / Linux apt / macOS brew）；当前桌面构建为 no-BT profile |
 | ~代理支持~ | ~~无（HTTP/BT 均无代理配置项）~~ **已完成**：HTTP（reqwest Proxy）+ BT（lt_apply_network）双引擎接线，启动时生效（见 3fac8e3）；**S1 追加：运行时热改**（BT settings_pack 重放立即生效 / HTTP 逐任务 client 构建合并新任务生效，`PUT /settings`）|
 | ~引擎层限速~ | ~~无（BT 的 libtorrent 速率上限未接线；HTTP 无限速）~~ **已完成**：全局下载/上传限速（KiB/s；0=不限），HTTP 跨段共享 RateLimiter（见 3fac8e3）|
