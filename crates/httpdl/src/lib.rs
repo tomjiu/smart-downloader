@@ -18,10 +18,13 @@ pub mod segment_manager;
 pub mod static_split;
 pub mod verify;
 
-#[cfg(feature = "ftp")]
+#[cfg(any(feature = "ftp", feature = "sftp"))]
 pub mod protocol;
 
 pub use engine::{build_proxied_client, proxy_auth_of, url_basename, HttpEngine};
 
 #[cfg(feature = "ftp")]
 pub use protocol::ftp::FtpEngine;
+
+#[cfg(feature = "sftp")]
+pub use protocol::sftp::SftpEngine;

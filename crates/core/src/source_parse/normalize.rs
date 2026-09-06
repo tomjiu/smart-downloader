@@ -18,6 +18,8 @@ pub enum NormalizedSource {
     Magnet(String),
     /// FTP 链接（含可选 user:pass@，匿名 → anonymous；ftps:// = 显式 AUTH TLS）。
     Ftp(String),
+    /// SFTP 链接（C-S1，sftp://；user 必填——SSH 无匿名惯例）。
+    Sftp(String),
     /// eD2k（本项目不支持）。
     Ed2k(String),
     /// 迅雷网盘分享链接。
@@ -34,6 +36,10 @@ fn is_ftp(u: &str) -> bool {
     u.starts_with("ftp://") || u.starts_with("ftps://")
 }
 
+fn is_sftp(u: &str) -> bool {
+    u.starts_with("sftp://")
+}
+
 /// 归一化用户提交的任意链接 → 下载源分类。
 pub fn normalize_user_link(link: &str) -> NormalizedSource {
     if is_http(link) {
@@ -41,6 +47,9 @@ pub fn normalize_user_link(link: &str) -> NormalizedSource {
     }
     if is_ftp(link) {
         return NormalizedSource::Ftp(link.to_string());
+    }
+    if is_sftp(link) {
+        return NormalizedSource::Sftp(link.to_string());
     }
     if let Some(rest) = link.strip_prefix("thunder://") {
         return match decode_thunder(link) {
@@ -188,6 +197,23 @@ mod tests {
             normalize_user_link("ftps://example.com/a.bin"),
             NormalizedSource::Ftp("ftps://example.com/a.bin".into())
         );
+    }
+
+    #[test]
+    fn sftp_classified() {
+        assert_eq!(
+            normalize_user_link("sftp://user:pass@example.com:2222/a.bin"),
+            NormalizedSource::Sftp("sftp://user:pass@example.com:2222/a.bin".into())
+        );
+    }
+
+    #[test]
+    fn sftp_uppercase_scheme_is_unsupported() {
+        // 与 ftp:// 同口径：scheme 小写敏感（大写 → Unsupported）
+        assert!(matches!(
+            normalize_user_link("SFTP://example.com/a.bin"),
+            NormalizedSource::Unsupported(_)
+        ));
     }
 
     #[test]

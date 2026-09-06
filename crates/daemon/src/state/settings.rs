@@ -607,7 +607,7 @@ impl DaemonState {
             )
             .await?;
         }
-        for kind in [EngineKind::Ftp, EngineKind::Http] {
+        for kind in [EngineKind::Ftp, EngineKind::Http, EngineKind::Sftp] {
             if let Some(eng) = self.engines.get(&kind).cloned() {
                 Self::dispatch_global_limits(
                     eng.as_ref(),

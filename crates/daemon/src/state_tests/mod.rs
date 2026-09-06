@@ -421,6 +421,7 @@ mod post_download_tests;
 mod queue_gate_tests;
 mod rate_cache_tests;
 mod scheduled_tests;
+mod sftp_tests;
 mod tags_tests;
 mod task_proxy_set_tests;
 mod task_proxy_tests;

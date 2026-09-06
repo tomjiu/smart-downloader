@@ -27,6 +27,12 @@ pub enum DownloadSource {
         user: String,
         pass: String,
     },
+    /// SFTP（C-S1）：SSH 文件传输协议（sftp://，user 必填——SSH 无匿名惯例）。
+    Sftp {
+        url: String,
+        user: String,
+        pass: String,
+    },
     Thunder(String), // 解码为 Http（§7.1）
     /// 迅雷网盘分享链接（pan.xunlei.com/s/xxx?pwd=yyy）。
     XunleiShare(String),
@@ -140,7 +146,7 @@ impl DownloadSource {
     }
 
     /// 搜索语料（E14）：来源中可供关键字匹配的 URL 集合——Http 主源 + 备用源、
-    /// Ftp url、Magnet/Thunder/XunleiShare/Ed2k 链接；TorrentFile 纯二进制
+    /// Ftp/Sftp url、Magnet/Thunder/XunleiShare/Ed2k 链接；TorrentFile 纯二进制
     /// 无 URL → 空集。脱敏复用 `redact_url`（userinfo/敏感 query → [REDACTED]），
     /// 与快照展示口径一致——按凭据片段搜索命中不了，防止 search 侧信道泄漏。
     pub fn search_urls(&self) -> Vec<String> {
@@ -159,7 +165,9 @@ impl DownloadSource {
                 }
                 v
             }
-            DownloadSource::Ftp { url, .. } => vec![redact_url(url)],
+            DownloadSource::Ftp { url, .. } | DownloadSource::Sftp { url, .. } => {
+                vec![redact_url(url)]
+            }
         }
     }
 }
@@ -185,6 +193,8 @@ pub enum Capability {
     UrlRefresh,
     Ftp,
     FtpResume,
+    /// SFTP（C-S1）：SSH 文件传输协议引擎。
+    Sftp,
     OfflineCache,
 }
 
@@ -194,6 +204,8 @@ pub enum EngineKind {
     Bt,
     Http,
     Ftp,
+    /// SFTP 引擎（C-S1，feature `sftp`）：russh + russh-sftp 纯 Rust 栈。
+    Sftp,
     Provider,
     /// NAS 版迅雷引擎（xllite/pan-cli 远程托管，daemon feature `nas`，附录 E）。
     XunleiNas,

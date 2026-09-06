@@ -85,6 +85,9 @@ impl EngineRegistry {
             DownloadSource::Ftp { .. } => self
                 .first_with(Capability::Ftp)
                 .ok_or_else(|| RoutingError::FeatureDisabled("ftp".into())),
+            DownloadSource::Sftp { .. } => self
+                .first_with(Capability::Sftp)
+                .ok_or_else(|| RoutingError::FeatureDisabled("sftp".into())),
             DownloadSource::Ed2k(link) => match parse_ed2k(link) {
                 Ok(l) => Err(RoutingError::Ed2kNotSupported {
                     name: l.name,
