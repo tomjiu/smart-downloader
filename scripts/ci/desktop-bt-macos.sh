@@ -129,9 +129,11 @@ do_stage() {
     echo "==> 闭包 $(wc -l < "$closure_list" | tr -d ' ') 个 dylib:"
     ls "$NATIVE_DIR"
 
-    # 2) 改写引用：先各 dylib 内部互引，再 sidecar（ install_name_tool 逐条 -change ）
+    # 2) 改写引用：先各 dylib（自身 id 用 -id，互引用 -change），再 sidecar
+    #    （otool -L 首行 = 库自身 install name id，-change 改不动，须 -id——二轮实证）
     local dep orig base
     for dylib in "$NATIVE_DIR"/*.dylib; do
+        install_name_tool -id "$target_base/$(basename "$dylib")" "$dylib"
         while read -r dep _rest; do
             case "$dep" in
                 "$BREW_PREFIX"/*|/usr/local/*) ;;
