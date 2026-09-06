@@ -7,6 +7,9 @@ edition.workspace = true
 # FTP 引擎（D12：并入 httpdl，feature-gated）。FTPS（B2）随同门控：
 # TLS 栈（tokio-rustls/webpki-roots）为 optional 依赖，仅 ftp 构建引入。
 ftp = ["dep:tokio-rustls", "dep:webpki-roots"]
+# SFTP 引擎（C-S1）：russh（SSH2 传输）+ russh-sftp（SFTP v3 子系统），
+# 纯 Rust 栈；独立 feature 门控（与 ftp 平行，daemon 侧同名 feature 透传）。
+sftp = ["dep:russh", "dep:russh-sftp"]
 
 [dependencies]
 tokio = { workspace = true }
@@ -27,6 +30,9 @@ smart-dl-core = { path = "../core" }
 parking_lot = { workspace = true }
 tokio-rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
+# SFTP（C-S1）：见 workspace.dependencies 注释
+russh = { workspace = true, optional = true }
+russh-sftp = { workspace = true, optional = true }
 
 [dev-dependencies]
 axum = "0.7"
@@ -35,3 +41,6 @@ serde_json = { workspace = true }
 futures = { workspace = true }
 # FTPS e2e：自签证书生成（测试 server 侧 + 客户端信任链）
 rcgen = "0.13"
+# SFTP e2e（C-S1）：hermetic SSH 服务桩的 Ed25519 host key 随机生成
+#（ssh-key 0.7-rc PrivateKey::random 依赖 rand_core 0.10 → 配 rand 0.10）
+rand = "0.10"

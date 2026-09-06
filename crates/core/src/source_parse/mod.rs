@@ -4,5 +4,6 @@ pub mod fs2you;
 pub mod ftp;
 pub mod magnet;
 pub mod normalize;
+pub mod sftp;
 pub mod thunder;
 pub mod xunlei_share;

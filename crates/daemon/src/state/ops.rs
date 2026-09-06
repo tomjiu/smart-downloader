@@ -264,13 +264,15 @@ impl DaemonState {
     // 开始（无视配额，对齐 qbit「强制继续」语义）；恢复路径重放不设闸
     // （保持停机前在飞集合，仅新增激活受闸）。
 
-    /// 引擎槽位下标（[bt, http, ftp]；Provider/XunleiNas 无独立配额，归 ftp
-    /// 桶但实际不会走到——门控仅在四条 add 路径调用，kind 恒为 Bt/Http/Ftp）。
+    /// 引擎槽位下标（[bt, http, ftp]；Provider/XunleiNas/Sftp 无独立配额，
+    /// 归 ftp 桶但 Provider/XunleiNas 实际不会走到——门控仅在 add 路径调用，
+    /// kind 恒为 Bt/Http/Ftp/Sftp；Sftp 复用 ftp 桶（同为文件传输协议，
+    /// 独立配额键后续按需拆分））。
     fn slot_index(kind: EngineKind) -> usize {
         match kind {
             EngineKind::Bt => 0,
             EngineKind::Http => 1,
-            EngineKind::Ftp | EngineKind::Provider | EngineKind::XunleiNas => 2,
+            EngineKind::Ftp | EngineKind::Sftp | EngineKind::Provider | EngineKind::XunleiNas => 2,
         }
     }
 
@@ -583,6 +585,21 @@ impl DaemonState {
                     let _ = opts.start_at_unix;
                     Err(DaemonError::InvalidSource(format!(
                         "ftp 需 FTP 引擎（编译时启用 --features ftp）: {u}"
+                    )))
+                }
+            }
+            NormalizedSource::Sftp(u) => {
+                #[cfg(feature = "sftp")]
+                {
+                    return self
+                        .add_sftp_task_opts(u, dest_root, opts.start_at_unix)
+                        .await;
+                }
+                #[cfg(not(feature = "sftp"))]
+                {
+                    let _ = opts.start_at_unix;
+                    Err(DaemonError::InvalidSource(format!(
+                        "sftp 需 SFTP 引擎（编译时启用 --features sftp）: {u}"
                     )))
                 }
             }
@@ -1454,6 +1471,146 @@ impl DaemonState {
             task_id: task_id.clone(),
             from: TaskState::Queued,
             to: TaskState::Downloading(EngineKind::Ftp),
+        });
+        Ok(task_id)
+    }
+
+    /// 添加 SFTP 任务（feature `sftp`，C-S1）：校验 `sftp://` 前缀 + user 必填
+    /// （SSH 无匿名惯例）→ ensure_dest_root → `parse_sftp_auth` 提取 user/pass →
+    /// 归一化 URL 作 canonical 查重（CanonicalKind::Sftp，与 ftp:// 键不相撞）→
+    /// 路由 `EngineKind::Sftp` 引擎 → add → TaskCreated/StateChanged 事件与
+    /// 持久化（完全仿照 add_ftp_task；v1 仅单文件——目录任务路由层报错）。
+    #[cfg(feature = "sftp")]
+    pub async fn add_sftp_task(
+        &self,
+        url: String,
+        dest_root: Option<String>,
+    ) -> Result<TaskId, DaemonError> {
+        self.add_sftp_task_opts(url, dest_root, None).await
+    }
+
+    /// 定时变体（E23）：`start_at_unix` Some(未来) = 延迟入引擎，到点由
+    /// 调度循环激活。
+    #[cfg(feature = "sftp")]
+    pub async fn add_sftp_task_opts(
+        &self,
+        url: String,
+        dest_root: Option<String>,
+        start_at_unix: Option<u64>,
+    ) -> Result<TaskId, DaemonError> {
+        if !url.starts_with("sftp://") {
+            return Err(DaemonError::InvalidSource(url));
+        }
+        let (user, _pass) = smart_dl_core::source_parse::sftp::parse_sftp_auth(&url);
+        if user.is_empty() {
+            return Err(DaemonError::InvalidSource(format!(
+                "sftp 需显式 user（SSH 无匿名惯例）: {url}"
+            )));
+        }
+        // B10：目标目录预检（单文件 size 由引擎 add 时 stat，预检略过同 FTP 单文件）
+        let def = self.default_dest_root.lock().to_string_lossy().into_owned();
+        let dest_root = ensure_dest_root(dest_root.or(Some(def)), &self.dest_roots())?;
+        // canonical 归一化同 FTP 键构方式；CanonicalKind::Sftp 与 ftp:// 键不相撞
+        let canonical = CanonicalId {
+            kind: CanonicalKind::Sftp,
+            identity: canonical_http_url(&url),
+            validator: None,
+            token_sensitive: false,
+        };
+        let task_id = format!("t{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+
+        // 查重（canonical 一致 → DuplicateRejected）
+        {
+            let tasks = self.tasks.lock();
+            for (existing, rec) in tasks.iter() {
+                if rec.task.canonical_id == canonical {
+                    self.hub.publish(SchedulerEvent::DuplicateRejected {
+                        task_id: task_id.clone(),
+                        existing: existing.clone(),
+                    });
+                    return Err(DaemonError::Duplicate(existing.clone()));
+                }
+            }
+        }
+
+        // 单文件：落盘名取 URL 最后一段（引擎 `add` 用作 dest 相对文件名）
+        let name = url
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let task = DownloadTask {
+            id: task_id.clone(),
+            canonical_id: canonical,
+            source: DownloadSource::Sftp {
+                url: url.clone(),
+                user,
+                pass: _pass,
+            },
+            identity: ContentIdentity::SingleFile {
+                size: 0,
+                etag: None,
+                sha256: None,
+                sha1: None,
+                md5: None,
+                backup_md5: None,
+            },
+            dest_root: dest_root.clone(),
+            files: vec![],
+            acquisitions: vec![],
+            aggregate: Default::default(),
+            state: TaskState::Queued,
+            retry: Default::default(),
+            created_at: std::time::Instant::now(),
+            file_priorities: None,
+            sequential: false,
+            metadata: TaskMetadata {
+                name,
+                added_at_unix: 0,
+                tags: Vec::new(),
+                finished_at_unix: 0,
+                start_at_unix: self.resolve_start_at(start_at_unix),
+                next_retry_at_unix: 0,
+            },
+            limits: None,
+            max_connections: None,
+        };
+
+        // E23 定时启动：start_at 未来 → 延迟入引擎，到点由调度循环接入。
+        if task.metadata.start_at_unix > now_unix() {
+            return Ok(self.insert_scheduled_task(task, EngineKind::Sftp));
+        }
+        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
+        //（Sftp 与 Ftp 共用 ftp 桶配额，见 slot_index 注释）
+        if !self.gate_or_enqueue(task.clone(), EngineKind::Sftp) {
+            return Ok(task_id);
+        }
+
+        let engine = self.engine_for(EngineKind::Sftp)?;
+        let engine_tid = engine
+            .add(&task)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        let mut rec = TaskRecord {
+            task,
+            engine_tid: Some(engine_tid.clone()),
+            engine_kind: EngineKind::Sftp,
+            engine_status: None,
+            events: vec![],
+        };
+        rec.push_event("add", None);
+
+        self.tasks.lock().insert(task_id.clone(), rec);
+        self.autosave();
+        self.hub.publish(SchedulerEvent::TaskCreated {
+            task_id: task_id.clone(),
+        });
+        self.hub.publish(SchedulerEvent::StateChanged {
+            task_id: task_id.clone(),
+            from: TaskState::Queued,
+            to: TaskState::Downloading(EngineKind::Sftp),
         });
         Ok(task_id)
     }
@@ -2764,7 +2921,8 @@ impl DaemonState {
             tasks
                 .iter()
                 .filter(|(_, rec)| match rec.engine_kind {
-                    EngineKind::Http | EngineKind::Ftp => matches!(
+                    // SFTP 与 HTTP/FTP 同为轮询推进引擎（无 alert 回调）
+                    EngineKind::Http | EngineKind::Ftp | EngineKind::Sftp => matches!(
                         rec.task.state,
                         TaskState::Queued | TaskState::Downloading(_)
                     ),

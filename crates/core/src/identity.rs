@@ -13,6 +13,8 @@ pub enum CanonicalKind {
     Http,
     /// FTP: URL+size+mtime
     Ftp,
+    /// SFTP（C-S1）：归一化 URL（同 FTP 键构方式；scheme 区分 → 与 ftp:// 不相撞）
+    Sftp,
 }
 
 /// 去重验证器（带 token 的 URL 必须有一致 validator 才认重，D34）。

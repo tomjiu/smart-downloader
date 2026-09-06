@@ -261,6 +261,16 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
         tracing::info!("FTP 引擎已启用");
     }
 
+    // 4d-2. SFTP 引擎（feature `sftp`，C-S1；同用全局限速总阀门）
+    #[cfg(feature = "sftp")]
+    {
+        let sftp_engine: Arc<dyn smart_dl_core::types::DownloadEngine> = Arc::new(
+            smart_dl_httpdl::SftpEngine::new_limited(cfg.download.max_download_kb_s),
+        );
+        state = state.with_sftp(sftp_engine);
+        tracing::info!("SFTP 引擎已启用");
+    }
+
     // 4e. NAS 引擎身份桥（feature `nas`，B-3 统一身份层）：L1 登录态存在时
     // 自动同步为 xllite 引擎预置 token（免扫码启动；格式校准=假设区 #8）。
     #[cfg(feature = "nas")]

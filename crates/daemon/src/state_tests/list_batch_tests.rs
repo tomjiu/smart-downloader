@@ -198,7 +198,10 @@ fn known_labels_cover_all_variants() {
         );
     }
     let engines = known_engine_labels();
-    assert_eq!(engines, vec!["bt", "http", "ftp", "provider", "xunlei-nas"]);
+    assert_eq!(
+        engines,
+        vec!["bt", "http", "ftp", "sftp", "provider", "xunlei-nas"]
+    );
 }
 
 /// E14 搜索：名字 / URL 子串命中、大小写不敏感、无命中空集、
