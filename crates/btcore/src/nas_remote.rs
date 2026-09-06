@@ -100,12 +100,19 @@ pub fn classify_error(status: u16, body: &str) -> EngineError {
     EngineError::Other(format!("xunlei api {status}: {}", truncate(body, 160)))
 }
 
+/// 按字符边界截断（审计修复 P1-2：原 `&s[..n]` 按字节切片，n=160/120 落在
+/// 多字节 UTF-8（CJK）中间即 panic——NAS/迅雷错误体以中文为主，必然触发）。
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
+        return s.to_string();
     }
+    let cut = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= n)
+        .last()
+        .unwrap_or(0);
+    format!("{}…", &s[..cut])
 }
 
 /// `params.speed` 形如 `"1.23MB/s"` / `"456KB/s"` / `"789"`（B/s）→ B/s。

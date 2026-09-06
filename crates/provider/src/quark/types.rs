@@ -47,6 +47,9 @@ pub fn load_auth(path: &std::path::Path) -> Option<QuarkAuth> {
 
 /// 原子写登录态（临时文件 + rename；内容不变跳过写盘，
 /// 语义对齐 `xunlei::auth::save` 的 Bug B 修复，避免高频落盘）。
+/// 审计修复（P1-6，CWE-312/732 回归）：完整 Cookie（__pus/__puus 即账号
+/// 凭据）落盘必须 0600——对齐 xunlei::auth::save 的 V7 修复（rename 保留
+/// 权限位；存量宽松权限文件写入时顺带收紧），quark 侧此前漏同步。
 pub fn save_auth(path: &std::path::Path, auth: &QuarkAuth) -> std::io::Result<()> {
     let serialized = serde_json::to_string(auth)?;
     if let Ok(existing) = std::fs::read_to_string(path) {
@@ -56,7 +59,23 @@ pub fn save_auth(path: &std::path::Path, auth: &QuarkAuth) -> std::io::Result<()
     }
     let tmp = path.with_extension("tmp");
     std::fs::write(&tmp, &serialized)?;
-    std::fs::rename(&tmp, path)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+    }
+    std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(md) = std::fs::metadata(path) {
+            let mode = md.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// 夸克渠道错误分类（决策依据：对齐 `xunlei::provider` 的失败冷却模式）。
