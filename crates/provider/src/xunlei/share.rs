@@ -177,7 +177,11 @@ pub struct Sharer {
 impl Sharer {
     pub fn new() -> Self {
         Sharer {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
             captcha: Mutex::new(None),
             pass_token: Mutex::new(None),
         }

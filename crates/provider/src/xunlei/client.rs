@@ -258,9 +258,21 @@ impl Default for Client {
 }
 
 impl Client {
+    /// 审计修复（P1-1）：显式超时——reqwest::Client::new() 默认无超时，
+    /// 任一迅雷端点 TCP 半开/慢响应即无限挂起（refresh_auth 持 auth 锁
+    /// 阻塞 poll_ready/login_page 全链路）。对齐 quark（10s/30s，H-9）
+    /// 与 baidu（30s）的既有口径。
+    fn http_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default()
+    }
+
     pub fn new() -> Self {
         Client {
-            http: reqwest::Client::new(),
+            http: Self::http_client(),
             xluser_base: XLUSER_BASE.to_string(),
             pan_base: PAN_BASE.to_string(),
             tier: &TIER_WEB,
@@ -270,7 +282,7 @@ impl Client {
     /// 测试用：注入本地 mock 服务基地址（登录页 mock 测试需要）。
     pub fn with_bases(xluser_base: impl Into<String>, pan_base: impl Into<String>) -> Self {
         Client {
-            http: reqwest::Client::new(),
+            http: Self::http_client(),
             xluser_base: xluser_base.into(),
             pan_base: pan_base.into(),
             tier: &TIER_WEB,
