@@ -884,3 +884,50 @@ ISO 8601、dynamic/多 Period/DRM/SegmentBase/xlink 拒绝、识别与落盘名�
 门禁：fmt · clippy ×6（workspace ftp/sftp + daemon ftp/nas/ftp,nas/sftp，
 -D warnings）全 0 · core 262/0 · httpdl(ftp) 224/0 · httpdl(sftp) 203/0 ·
 provider 162/0 · daemon default 304/0 · ftp,nas 316/0 · sftp 309/0。
+
+## 桌面版 BT 引擎装配（S1-d，2026-09-06 批次，PR #90）
+
+### 三平台原生 libtorrent 打包矩阵（desktop workflow）
+
+sidecar（smart-dl-daemon）从 no-BT profile 升级 **`--features bt,ftp,sftp`
+全引擎**；libtorrent 以动态库链接，运行期闭包随包分发，用户机器零额外安装。
+
+**布局实证先行**：解剖 desktop-v0.1.0 三平台产物（dpkg-deb -x /
+--appimage-extract / .app tar.gz）取得 tauri v2 打包真相——sidecar 安装名
+剥 `-<triple>` 后缀（`/usr/bin/smart-dl-daemon`、`Contents/MacOS/…`）、资源根
+`/usr/lib/Smart Downloader/`（deb）与 `AppDir/usr/lib/Smart Downloader/`
+（AppImage，同相对层）、`Contents/Resources/`（macOS）、安装根 = exe 目录
+（Windows）。资源覆盖层 `tauri.{linux,macos,windows}.conf.json` 按此映射。
+
+| 平台 | libtorrent | FFI 内核 | 运行期分发 | 自检 |
+|---|---|---|---|---|
+| Linux | apt libtorrent-rasterbar-dev（jammy 2.0.8，`#if LIBTORRENT_VERSION_NUM >= 20100` 源内守卫兼容） | bt-linux-setup.sh 同源（g++ -std=c++17 -fPIC → liblt_kernel.a；fakevcpkg `.lib` 别名 + `lib*.so` 符号链接；g++ 驱动链接器 wrapper） | `ldd` 全闭包拷贝（排 glibc 基座，**含 libstdc++**）→ `patchelf` 注入 RUNPATH `$ORIGIN/../lib/Smart Downloader/native/linux`（deb/AppImage 同构；每个 .so 另注 `$ORIGIN`） | 临时安装布局模拟树 + **空 LD_LIBRARY_PATH** ldd 全解析 |
+| macOS (aarch64) | brew libtorrent-rasterbar | clang++ -std=c++17（libc++ ABI） | `otool -L` 递归闭包拷贝 → sidecar 与各 dylib `install_name_tool -change` → `@executable_path/../Resources/native/macos/lib/<basename>` → 全量 `codesign -f -s -` 重签 | otool 无残留 brew 绝对引用 |
+| Windows (msvc) | vcpkg libtorrent（x64-windows 动态 triplet，build.rs vcpkg 契约原生同构；二进制缓存 `.vcpkg-cache`） | MSVC cl /std:c++17 /MD（vcvars 供 SDK INCLUDE；临时 .cmd 批处理规避 cmd /c 引号剥层） | vcpkg `bin/*.dll` 全量 + CRT 三件套（msvcp140/vcruntime140/vcruntime140_1）→ 资源映射安装根（= exe 目录，DLL 搜索路径首位） | 产物存在性断言 |
+
+**新文件**：`scripts/ci/desktop-bt-linux.sh` / `desktop-bt-macos.sh` /
+`desktop-bt-windows.ps1`（setup = native 环境 + GITHUB_ENV；stage = 闭包
+分发 + 改写 + 自检）；`tauri.{linux,macos,windows}.conf.json`。
+
+**踩坑记录**：
+- `ldd` 行格式为「lib名 => 路径 (地址)」三字段，两字段 read 会把 `=>`
+  当路径（闭包 0 个）；
+- `cp -r src dst` 当 dst 不存在时 dst 本身成为 src 副本（.so 上移一层，
+  RUNPATH 差一级失配）——模拟树必须先 mkdir 再 `cp -r src dst/`；
+- `$ORIGIN` 与含空格路径（`Smart Downloader`）经 `LD_DEBUG=libs` 实证
+  glibc 展开正常；
+- macOS fakevcpkg 必须带 dylib 实名符号链接（ld64 不搜索 brew lib 默认
+  路径）+ `c++.lib` 别名（rustc cc 驱动不自动带 C++ 运行时）；
+- Linux 侧同理由 `stdc++.lib` 别名进链接行（`-nodefaultlibs` 语义）。
+
+**验证**：本地 Linux 全链——release 构建（5m28s）→ stage 闭包 6 .so
+（libtorrent-rasterbar/ssl/crypto/stdc++/z/zstd，trixie 2.0.11 无 boost
+实体库依赖）→ 安装布局模拟树 `env -i` 实跑：`serve` /health 200 + magnet
+任务 `engine=bt` 落位 + FTP/SFTP 引擎启用日志（RUNPATH 独立解析，无环境
+依赖，即 deb/AppImage 安装后运行形态）。macOS/Windows 路径由 desktop
+workflow（workflow_dispatch 于 PR 分支）三平台首跑实证。
+
+**版本**：tauri.conf.json / src-tauri Cargo.toml 0.1.0 → **0.2.0**
+（desktop-v0.2.0 Release 预留）；Release 文案更新（全引擎 + 原生库随包）。
+`desktop/src-tauri/native/` 与 `.vcpkg-cache/` 入 gitignore（CI stage 产物
+不入库）。
