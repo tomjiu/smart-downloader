@@ -18,6 +18,9 @@ tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# wait_daemon 端口轮询（timeout/sleep + TcpStream::connect）；tauri 自带
+# runtime，此处仅取 API 所需 feature
+tokio = { version = "1", features = ["time", "net"] }
 
 [profile.release]
 codegen-units = 1
