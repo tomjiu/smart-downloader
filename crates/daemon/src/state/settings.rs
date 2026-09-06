@@ -71,6 +71,10 @@ pub struct BtSessionReq {
     pub enable_pex: Option<bool>,
     pub enable_utp: Option<bool>,
     pub encrypt: Option<String>,
+    /// 新建 BT 任务自动追加 tracker（qbit 对标）；整表替换。
+    pub extra_trackers: Option<Vec<String>>,
+    /// 做种分享率上限（qbit Share Ratio Limit 对标）；0 = 不启用。
+    pub max_share_ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -171,6 +175,8 @@ impl DaemonState {
                 "enable_pex": cfg.bt.enable_pex,
                 "enable_utp": cfg.bt.enable_utp,
                 "encrypt": cfg.bt.encrypt,
+                "extra_trackers": cfg.bt.extra_trackers,
+                "max_share_ratio": cfg.bt.max_share_ratio,
                 "bt_available": self.engines.contains_key(&EngineKind::Bt),
             },
             "download": {
@@ -235,6 +241,35 @@ impl DaemonState {
                 if !matches!(e, "disable" | "allow" | "require") {
                     return Err(DaemonError::InvalidSource(format!(
                         "bittorrent.encrypt = {e:?} 无效：仅支持 disable / allow / require"
+                    )));
+                }
+            }
+            // extra_trackers：逐条 trim 非空 + 长度上限；条数上限 50
+            if let Some(v) = &bt.extra_trackers {
+                if v.len() > 50 {
+                    return Err(DaemonError::InvalidSource(
+                        "bittorrent.extra_trackers 最多 50 条".into(),
+                    ));
+                }
+                for t in v {
+                    let t = t.trim();
+                    if t.is_empty() {
+                        return Err(DaemonError::InvalidSource(
+                            "bittorrent.extra_trackers 含空条目".into(),
+                        ));
+                    }
+                    if t.len() > 512 {
+                        return Err(DaemonError::InvalidSource(format!(
+                            "bittorrent.extra_trackers 单条超长（>512）: {t:.32}…"
+                        )));
+                    }
+                }
+            }
+            // max_share_ratio：非负 + 有限 + 上限 9999（0 = 关闭）
+            if let Some(r) = bt.max_share_ratio {
+                if !r.is_finite() || !(0.0..=9999.0).contains(&r) {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "bittorrent.max_share_ratio = {r} 无效：须在 0.0..=9999.0（0 = 不启用）"
                     )));
                 }
             }
@@ -358,7 +393,9 @@ impl DaemonState {
                 || bt.enable_upnp.is_some()
                 || bt.enable_pex.is_some()
                 || bt.enable_utp.is_some()
-                || bt.encrypt.is_some();
+                || bt.encrypt.is_some()
+                || bt.extra_trackers.is_some()
+                || bt.max_share_ratio.is_some();
             if any {
                 let patch = BtSessionPatch {
                     enable_dht: bt.enable_dht,
@@ -369,6 +406,8 @@ impl DaemonState {
                     encrypt: bt.encrypt.clone(),
                     listen_port: None,
                     max_connections: None,
+                    extra_trackers: bt.extra_trackers.clone(),
+                    max_share_ratio: bt.max_share_ratio,
                 };
                 self.dispatch_bt_patch(&patch).await;
                 if let Some(cfg) = self.live_config.lock().as_mut() {
@@ -390,6 +429,16 @@ impl DaemonState {
                     if let Some(v) = bt.encrypt.as_deref() {
                         cfg.bt.encrypt = v.trim().to_string();
                     }
+                    if let Some(v) = &bt.extra_trackers {
+                        cfg.bt.extra_trackers = v
+                            .iter()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                    }
+                    if let Some(v) = bt.max_share_ratio {
+                        cfg.bt.max_share_ratio = v;
+                    }
                 }
                 for k in [
                     "enable_dht",
@@ -398,6 +447,8 @@ impl DaemonState {
                     "enable_pex",
                     "enable_utp",
                     "encrypt",
+                    "extra_trackers",
+                    "max_share_ratio",
                 ] {
                     applied.push(format!("bittorrent.{k}"));
                 }

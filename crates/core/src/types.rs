@@ -375,6 +375,20 @@ pub trait DownloadEngine: Send + Sync {
         Err(EngineError::Unsupported)
     }
 
+    /// 超级种子开关（BitComet 首创，qbit 任务右键同名能力）：仅 BT 引擎
+    /// 实现（seed_mode flag，做种态生效、下载中无效果）；其余引擎 →
+    /// `Unsupported`。
+    async fn set_super_seeding(&self, _id: &EngineTaskId, _on: bool) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// 做种分享率上限快照（F3 执法面）：`Some(>0.0)` = Seeding 态达标自动
+    /// 暂停；`None`/`Some(0.0)` = 未启用。仅 BT 引擎返回非 None。同步只读
+    /// （读引擎会话快照），供状态轮询每轮执法判断。
+    fn seeding_ratio_limit(&self) -> Option<f64> {
+        None
+    }
+
     /// 任务级代理热改（E8）：`Some(url)` = 切任务专用 client（覆盖全局，语义
     /// 与 add 时设定一致）；`None` = 清除回引擎共享 client。HTTP 引擎实现：
     /// 非法 URL → `Other`（调用方定性入参错误，不动现任务）；下载中任务
@@ -447,6 +461,13 @@ pub struct BtSessionPatch {
     pub listen_port: Option<u16>,
     /// 会话全局连接数上限；0 = 不下发。
     pub max_connections: Option<u32>,
+    /// 新建 BT 任务自动追加的 tracker 列表（qBittorrent「自动添加以下
+    /// tracker 到新任务」对标）；`None` = 不调整，`Some(v)` = 整表替换。
+    pub extra_trackers: Option<Vec<String>>,
+    /// 做种分享率上限（qBittorrent Share Ratio Limit 对标）：Seeding 态
+    /// 达标即自动暂停。`None` = 不调整；`Some(0.0)` 或负值非法（校验层拦截）；
+    /// `Some(0.0)` = 关闭（>0 = 生效阈值）。
+    pub max_share_ratio: Option<f64>,
 }
 
 #[cfg(test)]

@@ -21,7 +21,18 @@ async fn serve_bt() -> (std::net::SocketAddr, Arc<DaemonState>, std::path::PathB
     let dir = tempfile::tempdir().unwrap();
     let save = dir.path().to_path_buf();
     let bt = smart_dl_daemon::bt::BtEngine::new(
-        &save, None, 0, 0, false, false, false, false, false, "allow",
+        &save,
+        None,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        "allow",
+        &[],
+        0.0,
     )
     .unwrap();
     let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
@@ -358,6 +369,8 @@ async fn readd_same_magnet_after_restart_ok() {
             false,
             false,
             "allow",
+            &[],
+            0.0,
         )
         .unwrap();
         let state = DaemonState::new(Arc::new(http.clone()), vec![]).with_bt(Arc::new(bt));
@@ -377,6 +390,8 @@ async fn readd_same_magnet_after_restart_ok() {
         false,
         false,
         "allow",
+        &[],
+        0.0,
     )
     .unwrap();
     let state2 = DaemonState::new(Arc::new(http), vec![]).with_bt(Arc::new(bt2));
@@ -626,7 +641,18 @@ async fn serve_bt_in(
 ) -> (std::net::SocketAddr, Arc<DaemonState>, std::path::PathBuf) {
     let save = dir.to_path_buf();
     let bt = smart_dl_daemon::bt::BtEngine::new(
-        &save, None, 0, 0, false, false, false, false, false, "allow",
+        &save,
+        None,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        "allow",
+        &[],
+        0.0,
     )
     .unwrap();
     let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
@@ -739,6 +765,8 @@ async fn file_priority_persisted_and_replayed_after_restart() {
         false,
         false,
         "allow",
+        &[],
+        0.0,
     )
     .unwrap();
     let http2 = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
@@ -1058,5 +1086,169 @@ async fn trackers_on_http_task_is_409() {
         resp.status(),
         reqwest::StatusCode::CONFLICT,
         "HTTP 任务应 409"
+    );
+}
+
+// ==================== qbit 对标补齐：添加 peer / 超级种子（Task 38） ====================
+
+#[tokio::test]
+async fn add_peers_endpoint_roundtrip_on_magnet_task() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
+    // magnet 任务（假 btih，handle 级 connect_peer 不依赖 metadata）：
+    // 合法 addr 逐条回执 ok；非法 addr → 400 整体拒绝；空 addrs → 400。
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "url": MAGNET }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 合法注入（部分成功语义 → 全部 ok 也走 200）
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/peers"))
+        .json(&serde_json::json!({ "addrs": ["127.0.0.1:6881", "192.168.9.9:51413"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "合法 addrs 必须 200: {:?}",
+        resp.text().await.unwrap()
+    );
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let results = body["results"].as_array().unwrap();
+    assert_eq!(results.len(), 2);
+    assert!(
+        results[0]["ok"].as_bool().unwrap(),
+        "connect_peer 即时回执 ok: {results:?}"
+    );
+
+    // 非法 addr → 400（与 /bt/metadata peers 同口径）
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/peers"))
+        .json(&serde_json::json!({ "addrs": ["not-an-addr"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 空 addrs → 400
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/peers"))
+        .json(&serde_json::json!({ "addrs": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 不存在的任务 → 404
+    let resp = client
+        .post(format!("{base}/tasks/tx-missing/peers"))
+        .json(&serde_json::json!({ "addrs": ["127.0.0.1:6881"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn super_seeding_endpoint_roundtrip_on_torrent_task() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
+    // 真实 torrent → 超级种子 true/false 往返。端点 200 = FFI lt_set_seed_mode
+    // 真实生效（句柄级 flag，metadata 就绪即可设；做种态才实际生效——内核语义）。
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "torrent_b64": minimal_torrent_b64() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for on in [true, false] {
+        let resp = client
+            .post(format!("{base}/tasks/{tid}/super-seeding"))
+            .json(&serde_json::json!({ "enabled": on }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::OK,
+            "super-seeding={on} 必须 200: {:?}",
+            resp.text().await.unwrap()
+        );
+    }
+
+    // 不存在的任务 → 404
+    let resp = client
+        .post(format!("{base}/tasks/tx-missing/super-seeding"))
+        .json(&serde_json::json!({ "enabled": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn peers_and_super_seeding_on_http_task_are_409() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
+    // HTTP 任务不支持 peer 注入 / 超级种子 → UnsupportedOp 定性 409
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let srv = TestServer::start(common::patterned(8 * 1024)).await;
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "url": srv.url() }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/peers"))
+        .json(&serde_json::json!({ "addrs": ["127.0.0.1:6881"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "HTTP 任务 peers 应 409"
+    );
+
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/super-seeding"))
+        .json(&serde_json::json!({ "enabled": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "HTTP 任务 super-seeding 应 409"
     );
 }

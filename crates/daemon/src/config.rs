@@ -97,6 +97,16 @@ pub struct BtCfg {
     /// BT 会话全局连接数上限（S1）：内核 `connections_limit`。
     /// 0 = 不下发（内核默认 200）。运行中可热改。
     pub max_connections: u32,
+    /// 新建 BT 任务自动追加的 tracker 列表（qbit「自动添加以下 tracker 到
+    /// 新任务」对标）：add 成功后逐条 `add_tracker`（best-effort，单条失败
+    /// 不阻断建任务）。运行中可经 `PUT /settings` 热改（只影响后续新任务）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_trackers: Vec<String>,
+    /// 做种分享率上限（qbit Share Ratio Limit 对标）：Seeding 态任务
+    /// `uploaded/downloaded >= 阈值` 时自动暂停。0.0（默认）= 不启用；
+    /// >0 = 生效阈值（上限 9999.0）。运行中可经 `PUT /settings` 热改。
+    #[serde(default = "default_bt_max_share_ratio")]
+    pub max_share_ratio: f64,
 }
 
 /// 备用限速调度（S1，qbit「速度」页 alternate rate limits 对齐项）：
@@ -139,6 +149,10 @@ fn default_bt_encrypt() -> String {
     "allow".to_string()
 }
 
+fn default_bt_max_share_ratio() -> f64 {
+    0.0
+}
+
 /// RSS 订阅自动下载（qbit RSS 对标）。
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default)]
@@ -176,6 +190,8 @@ impl Default for BtCfg {
             encrypt: default_bt_encrypt(),
             listen_port: 0,
             max_connections: 0,
+            extra_trackers: Vec::new(),
+            max_share_ratio: default_bt_max_share_ratio(),
         }
     }
 }
@@ -303,6 +319,8 @@ impl Default for Config {
                 encrypt: "allow".to_string(),
                 listen_port: 0,
                 max_connections: 0,
+                extra_trackers: Vec::new(),
+                max_share_ratio: default_bt_max_share_ratio(),
             },
             limits: LimitsCfg::default(),
             queue: QueueCfg::default(),
@@ -342,6 +360,13 @@ impl Config {
             return Err(format!(
                 "配置 bt.encrypt = {:?} 无效：仅支持 disable / allow / require",
                 cfg.bt.encrypt
+            ));
+        }
+        // 做种分享率上限（qbit Share Ratio Limit）：负数/NaN/超上限 → 拒绝启动
+        if !(0.0..=9999.0).contains(&cfg.bt.max_share_ratio) {
+            return Err(format!(
+                "配置 bt.max_share_ratio = {} 无效：须在 0.0..=9999.0（0 = 不启用）",
+                cfg.bt.max_share_ratio
             ));
         }
         Ok(cfg)
@@ -415,6 +440,8 @@ impl Config {
             "bt_encrypt": self.bt.encrypt,
             "bt_listen_port": self.bt.listen_port,
             "bt_max_connections": self.bt.max_connections,
+            "bt_extra_trackers": self.bt.extra_trackers,
+            "bt_max_share_ratio": self.bt.max_share_ratio,
             "xunlei_enabled": self.xunlei.enabled,
             "listen_addr": self.server.addr,
             // 安全修复（V1）：仅暴露是否启用认证（布尔），token 本身绝不出快照

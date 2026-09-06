@@ -2330,6 +2330,105 @@ impl DaemonState {
         Ok(())
     }
 
+    /// 超级种子开关（qbit 任务右键同名能力）：仅 BT 任务（其余 kind →
+    /// `UnsupportedOp` 409，同 set_max_connections 预拒惯例）。仅下发引擎
+    /// flag（做种态生效、下载中无效果），不改记录状态、不落盘。
+    pub async fn set_task_super_seeding(&self, id: &str, on: bool) -> Result<(), DaemonError> {
+        let (engine, tid, kind) = {
+            let rec = self
+                .tasks
+                .lock()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            let tid = rec
+                .engine_tid
+                .clone()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            (self.engine_for(rec.engine_kind)?, tid, rec.engine_kind)
+        };
+        if kind != EngineKind::Bt {
+            return Err(DaemonError::UnsupportedOp(format!(
+                "任务 {id} 的引擎不支持超级种子（仅 BT 任务）"
+            )));
+        }
+        engine
+            .set_super_seeding(&tid, on)
+            .await
+            .map_err(|e| match e {
+                smart_dl_core::types::EngineError::Unsupported => {
+                    DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持超级种子"))
+                }
+                other => DaemonError::Engine(other.to_string()),
+            })?;
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.push_event("super_seeding_changed", Some(on.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// 手动添加 peer（qbit「添加 peer」对标）：addr 逐条注入 BT 任务；
+    /// 逐条返回结果（部分成功语义——单条失败不影响其余）。非 BT 引擎 /
+    /// 不支持注入 → 逐条 Err（HTTP 层 409）。事件一条汇总（成功率）。
+    pub async fn add_task_peers(
+        &self,
+        id: &str,
+        addrs: Vec<std::net::SocketAddr>,
+    ) -> Vec<(String, Result<(), String>)> {
+        let resolved: Result<
+            (
+                std::sync::Arc<dyn smart_dl_core::types::DownloadEngine>,
+                String,
+                EngineKind,
+            ),
+            DaemonError,
+        > = {
+            let rec = self.tasks.lock().get(id).cloned();
+            match rec {
+                None => Err(DaemonError::NotFound(id.to_string())),
+                Some(rec) => match rec.engine_tid.clone() {
+                    None => Err(DaemonError::NotFound(id.to_string())),
+                    Some(tid) => self
+                        .engine_for(rec.engine_kind)
+                        .map(|e| (e, tid, rec.engine_kind)),
+                },
+            }
+        };
+        let (engine, tid, kind) = match resolved {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.to_string();
+                return addrs
+                    .into_iter()
+                    .map(|a| (a.to_string(), Err(msg.clone())))
+                    .collect();
+            }
+        };
+        if kind != EngineKind::Bt {
+            return addrs
+                .into_iter()
+                .map(|a| (a.to_string(), Err("仅 BT 任务支持添加 peer".into())))
+                .collect();
+        }
+        let mut results = Vec::with_capacity(addrs.len());
+        for a in addrs {
+            let key = a.to_string();
+            let r = engine.add_peer(&tid, a).await;
+            results.push((key, r.map_err(|e| e.to_string())));
+        }
+        let ok = results.iter().filter(|(_, r)| r.is_ok()).count();
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.push_event("peers_added", Some(format!("{ok}/{}", results.len())));
+            }
+        }
+        results
+    }
+
     /// 任务级连接数上限（S1-c，qbit 每任务连接数）：仅 BT 任务（daemon 侧
     /// 预拒，其余 kind → `UnsupportedOp` 409，同 task_proxy 预拒惯例）。
     /// `n > 0` = 上限；`n == 0` = 复位会话级连接数默认。写入记录字段
@@ -2954,23 +3053,14 @@ impl DaemonState {
                 // E28：任务名回填在此放行——torrent metadata name 就绪 +
                 // metadata.name 空缺 → 幂等回填 + 事件（E9 同语义：一次成功
                 // 后 name 非 None 自然停）。快照缓存照旧整体入缓存。
-                let mut tasks = self.tasks.lock();
-                if let Some(rec) = tasks.get_mut(&id) {
-                    // 双检：轮询间隙状态可能已被 alert 推进至终态
-                    //（终态不缓存——与 apply_bt_alert 的终态清零同口径）
-                    if matches!(
-                        rec.task.state,
-                        TaskState::Downloading(_) | TaskState::Seeding
-                    ) {
-                        if rec.task.metadata.name.is_none() {
-                            if let Some(n) = &st.name {
-                                rec.task.metadata.name = Some(n.clone());
-                                rec.push_event("name_backfilled", Some(n.clone()));
-                            }
-                        }
-                        rec.engine_status = Some(st.clone());
-                    }
-                }
+                self.cache_bt_poll(&id, &st);
+                // F3 执法：share_ratio = uploaded/downloaded（E33 all-time 口径，
+                // 与快照字段同源）。仅 Seeding 态触发（下载中 uploaded 含给
+                // 他人补块的量，语义噪声大）；达阈值 → pause（qbit 行为 =
+                // 任务停止，用户可手动 resume，resume 后再达标会再次暂停）。
+                // 独立 async fn：锁与 await 的跨点隔离在内部生成器（Send 门禁）。
+                self.enforce_seeding_limit(&id, &tid, engine.clone(), &st)
+                    .await;
                 continue;
             }
             // Bug B 根因修复：autosave 移到锁外（persisted_tasks 重入同一把非重入锁
@@ -3037,6 +3127,60 @@ impl DaemonState {
             }
         }
         effects
+    }
+
+    /// BT 轮询缓存 + E28 名回填（同步、锁内无 await）：快照整体入
+    /// `engine_status` 缓存；metadata name 就绪且记录空缺 → 幂等回填 + 事件。
+    fn cache_bt_poll(&self, id: &str, st: &smart_dl_core::types::EngineStatus) {
+        let mut tasks = self.tasks.lock();
+        if let Some(rec) = tasks.get_mut(id) {
+            // 双检：轮询间隙状态可能已被 alert 推进至终态
+            //（终态不缓存——与 apply_bt_alert 的终态清零同口径）
+            if matches!(
+                rec.task.state,
+                TaskState::Downloading(_) | TaskState::Seeding
+            ) {
+                if rec.task.metadata.name.is_none() {
+                    if let Some(n) = &st.name {
+                        rec.task.metadata.name = Some(n.clone());
+                        rec.push_event("name_backfilled", Some(n.clone()));
+                    }
+                }
+                rec.engine_status = Some(st.clone());
+            }
+        }
+    }
+
+    /// F3 做种分享率执法（qbit Share Ratio Limit）：Seeding 态 + 上限启用 +
+    /// share_ratio ≥ 阈值 → 引擎暂停 + `seeding_limit_reached` 事件。
+    /// 独立 async fn —— 内部锁不跨自身 await（外层轮询生成器的 Send 门禁）。
+    async fn enforce_seeding_limit(
+        &self,
+        id: &str,
+        tid: &EngineTaskId,
+        engine: std::sync::Arc<dyn DownloadEngine>,
+        st: &smart_dl_core::types::EngineStatus,
+    ) {
+        if !matches!(st.state, smart_dl_core::types::EngineState::Seeding) {
+            return;
+        }
+        let Some(limit) = engine.seeding_ratio_limit() else {
+            return;
+        };
+        let Some(ratio) = crate::state::share_ratio(st.total_uploaded, st.total_downloaded) else {
+            return;
+        };
+        if ratio < limit {
+            return;
+        }
+        let paused = engine.pause(tid).await.is_ok();
+        let mut tasks = self.tasks.lock();
+        if let Some(rec) = tasks.get_mut(id) {
+            rec.push_event(
+                "seeding_limit_reached",
+                Some(format!("ratio={ratio:.2} limit={limit:.2} paused={paused}")),
+            );
+        }
     }
 }
 

@@ -295,6 +295,103 @@ pub struct ConnectionsReq {
     pub max_connections: u32,
 }
 
+/// 手动添加 peer（`POST /tasks/:id/peers`，qbit「添加 peer」对标）：
+/// `addrs` 逐条注入（`ip:port`，支持 IPv6 `[::1]:6881`）；部分成功语义——
+/// 逐条回执 `[{addr, ok, error?}]`；任务非 BT → 全部回执 err（409）。
+#[derive(Deserialize)]
+pub struct AddPeersReq {
+    pub addrs: Vec<String>,
+}
+
+async fn task_add_peers(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<AddPeersReq>,
+) -> impl IntoResponse {
+    // 入参解析（同步、快）：非法 addr → 400 整体拒绝（与 /bt/metadata peers 同口径）
+    let mut parsed = Vec::with_capacity(req.addrs.len());
+    for a in &req.addrs {
+        match a.parse::<std::net::SocketAddr>() {
+            Ok(sa) => parsed.push(sa),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("addrs 解析失败 {a:?}: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    if parsed.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "addrs 不能为空" })),
+        )
+            .into_response();
+    }
+    let results = state.add_task_peers(&id, parsed).await;
+    // 任务不存在 → 404；全部失败且为不支持语义 → 409；其余 200（部分成功也算成功）
+    if state.task_snapshot(&id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "not found" })),
+        )
+            .into_response();
+    }
+    let body: Vec<_> = results
+        .iter()
+        .map(|(addr, r)| match r {
+            Ok(()) => serde_json::json!({ "addr": addr, "ok": true }),
+            Err(e) => serde_json::json!({ "addr": addr, "ok": false, "error": e }),
+        })
+        .collect();
+    let any_ok = results.iter().any(|(_, r)| r.is_ok());
+    let any_unsupported = results.iter().any(|(_, r)| {
+        r.as_ref()
+            .is_err_and(|e| e.contains("仅 BT 任务支持添加 peer"))
+    });
+    let status = if any_ok || !any_unsupported {
+        StatusCode::OK
+    } else {
+        StatusCode::CONFLICT
+    };
+    (status, Json(serde_json::json!({ "results": body }))).into_response()
+}
+
+/// 超级种子开关（`POST /tasks/:id/super-seeding`，BitComet 首创 / qbit 任务
+/// 右键同名能力）：`{enabled: bool}`。仅 BT 任务（其余 409）；做种态生效、
+/// 下载中设置无效果（libtorrent seed_mode flag 语义，与 qbit 一致）。
+#[derive(Deserialize)]
+pub struct SuperSeedingReq {
+    pub enabled: bool,
+}
+
+async fn task_super_seeding(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SuperSeedingReq>,
+) -> impl IntoResponse {
+    match state.set_task_super_seeding(&id, req.enabled).await {
+        Ok(()) => match state.task_snapshot(&id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
 async fn task_connections(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -2215,6 +2312,8 @@ macro_rules! router_base {
             .route("/tasks/:id/tags", post(task_set_tags))
             .route("/tasks/:id/files/priority", post(task_file_priority))
             .route("/tasks/:id/webseeds", post(task_webseeds))
+            .route("/tasks/:id/peers", post(task_add_peers))
+            .route("/tasks/:id/super-seeding", post(task_super_seeding))
             .route("/tasks/:id/trackers", get(task_trackers_list))
             .route("/tasks/:id/trackers", post(task_trackers_add))
             .route("/tasks/:id/trackers", delete(task_trackers_remove))
