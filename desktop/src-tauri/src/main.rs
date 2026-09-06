@@ -174,8 +174,9 @@ fn main() {
         .on_window_event(|window, event| {
             // 主窗关闭 = 整体退出（回收 daemon sidecar）
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                api.prevent_exit();
-                kill_daemon(window.app_handle().state::<DaemonChild>());
+                // Tauri 2 API：阻止默认关闭后自行 exit（顺带回收 daemon sidecar）
+                api.prevent_close();
+                kill_daemon(&window.app_handle().state::<DaemonChild>());
                 window.app_handle().exit(0);
             }
         })
