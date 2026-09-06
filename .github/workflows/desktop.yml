@@ -66,6 +66,18 @@ jobs:
           projectPath: desktop
           tauriScript: cargo tauri
           args: --target ${{ matrix.target }}
+          # tag 触发时发布 Release 并附安装包（矩阵三平台同 Release 并发上传，
+          # tauri-action 幂等：已存在则仅追加资产）；__VERSION__ 取 tauri.conf.json
+          tagName: desktop-v__VERSION__
+          releaseName: Smart Downloader Desktop v__VERSION__
+          releaseBody: |
+            Smart Downloader 桌面端（内嵌 daemon + UI，no-BT profile）。
+            - Windows：.msi / .exe（WebView2）
+            - macOS（Apple Silicon）：.dmg / .app
+            - Linux：.deb / .AppImage
+            首次启动后数据目录：系统标准应用配置目录（任务/下载收纳于此）。
+          releaseDraft: false
+          prerelease: false
 
       - name: Upload bundles (workflow artifact)
         uses: actions/upload-artifact@v4
