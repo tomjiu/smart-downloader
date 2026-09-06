@@ -43,14 +43,39 @@ jobs:
       - name: Install tauri-cli
         run: cargo install tauri-cli --version '^2' --locked
 
+      # ---- S1-d：BT 引擎（原生 libtorrent）三平台装配 ----
+      - name: Setup BT native env (Linux)
+        if: runner.os == 'Linux'
+        # apt 装 libtorrent-rasterbar-dev + 内核静态库 + fakevcpkg 契约 + GITHUB_ENV
+        # （与 bt integration job 同源 bt-linux-setup.sh，链接行为逐字一致）
+        run: bash scripts/ci/desktop-bt-linux.sh setup
+
+      - name: Cache vcpkg binaries (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-libtorrent-x64-windows-v1
+
+      - name: Setup BT native env (Windows)
+        if: runner.os == 'Windows'
+        # vcpkg 装 libtorrent（动态 triplet）+ cl 编内核静态库 → GITHUB_ENV
+        run: ./scripts/ci/desktop-bt-windows.ps1 -Cmd setup
+
+      - name: Setup BT native env (macOS)
+        if: runner.os == 'macOS'
+        # brew 装 libtorrent-rasterbar + clang++ 编内核 + fakevcpkg 别名 → GITHUB_ENV
+        run: bash scripts/ci/desktop-bt-macos.sh setup
+
       - name: Build UI (static export)
         working-directory: ui
         run: |
           bun install --frozen-lockfile
           bun run build
 
-      - name: Build daemon (release, no-BT desktop profile)
-        run: cargo build --release -p smart-dl-daemon
+      # bt,ftp,sftp 全引擎 profile：BT 依赖上方三平台 native libtorrent 环境
+      - name: Build daemon (release, full-engine profile)
+        run: cargo build --release -p smart-dl-daemon --features bt,ftp,sftp
 
       - name: Place sidecar binary
         shell: bash
@@ -60,6 +85,23 @@ jobs:
           mkdir -p desktop/src-tauri/binaries
           cp "target/release/smart-dl-daemon$( [ '${{ runner.os }}' = 'Windows' ] && echo '.exe' )" \
              "desktop/src-tauri/binaries/smart-dl-daemon-${{ matrix.triple-suffix }}"
+
+      # ---- S1-d：运行期原生库随包分发 ----
+      - name: Stage native libs (Linux)
+        if: runner.os == 'Linux'
+        # .so 闭包 → src-tauri/native/linux/ + sidecar 注入 RUNPATH
+        # $ORIGIN/../lib/Smart Downloader/native/linux（deb 与 AppImage 同构）
+        run: bash scripts/ci/desktop-bt-linux.sh stage "desktop/src-tauri/binaries/smart-dl-daemon-${{ matrix.triple-suffix }}"
+
+      - name: Stage native libs (macOS)
+        if: runner.os == 'macOS'
+        # dylib 闭包 → src-tauri/native/macos/lib/ + install_name 改写 @executable_path + ad-hoc 重签
+        run: bash scripts/ci/desktop-bt-macos.sh stage "desktop/src-tauri/binaries/smart-dl-daemon-${{ matrix.triple-suffix }}"
+
+      - name: Stage native libs (Windows)
+        if: runner.os == 'Windows'
+        # vcpkg bin DLL 全量 + CRT 三件套 → src-tauri/native/win/（资源映射落安装根）
+        run: ./scripts/ci/desktop-bt-windows.ps1 -Cmd stage
 
       - uses: tauri-apps/tauri-action@v0
         env:
@@ -73,10 +115,11 @@ jobs:
           tagName: desktop-v__VERSION__
           releaseName: Smart Downloader Desktop v__VERSION__
           releaseBody: |
-            Smart Downloader 桌面端（内嵌 daemon + UI，no-BT profile）。
+            Smart Downloader 桌面端（内嵌 daemon + UI，全引擎：BT(libtorrent) / HTTP / FTP / SFTP）。
             - Windows：.msi / .exe（WebView2）
             - macOS（Apple Silicon）：.dmg / .app
             - Linux：.deb / .AppImage
+            原生库已随包分发，无需另行安装 libtorrent/VC 运行时。
             首次启动后数据目录：系统标准应用配置目录（任务/下载收纳于此）。
           releaseDraft: false
           prerelease: false
