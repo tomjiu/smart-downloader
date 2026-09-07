@@ -211,6 +211,13 @@ async fn handle_mock_ftp(mut stream: TcpStream, files: SArc<Vec<(String, Vec<u8>
                     .await;
                 data_listener = Some(dl);
             }
+            // batch3 修复配套：引擎（PR #96 起）发 REST 协商断点起点并校验
+            // 响应码——mock 补齐该命令（RETR 的 rest 消费逻辑本就存在），
+            // 修复 ftp_dir_completes 存量失败（上游 b67c5f0 亦挂）。
+            "REST" => {
+                rest = arg.parse().unwrap_or(0);
+                let _ = conn.write_all(b"350 reset ok, send RETR\r\n").await;
+            }
             "RETR" => {
                 let data: Option<Vec<u8>> =
                     files.iter().find(|(p, _)| p == arg).map(|(_, d)| d.clone());
