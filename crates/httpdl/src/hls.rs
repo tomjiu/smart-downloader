@@ -517,7 +517,10 @@ pub async fn download_hls(
         f.write_all(&payload)
             .map_err(|e| EngineError::Other(format!("part 写入: {e}")))?;
         bytes_done += payload.len() as u64;
-        on_progress(payload.len() as u64);
+        // batch3-P1：进度统一绝对累计语义（与 resume 回填 on_progress(bytes_done)
+        // 同口径）——旧实现逐段传增量、回填传绝对，引擎侧 += 累加在 resume 场景
+        // 把已完成字节重复计入，进度恒为实际 2 倍上下。
+        on_progress(bytes_done);
         // 段完成即落账本（顺序前缀语义 → 崩溃后从下一段续）
         save_ledger(
             &ledger_path,

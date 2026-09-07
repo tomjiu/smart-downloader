@@ -317,7 +317,29 @@ async fn download_segment_streaming(
     // 仅非 206 服务器触发的兜底路径；206 主路径零浪费）。写满即弃流
     // （drop resp 断开连接），语义与账本/进度完全兼容。
     let skip_start = match resp.status() {
-        reqwest::StatusCode::PARTIAL_CONTENT => 0u64,
+        reqwest::StatusCode::PARTIAL_CONTENT => {
+            // batch3-P1：206 必须校验 Content-Range 首字节 == 段起点。旧实现
+            // 无条件信任 206 与请求区间一致——服务器/中间缓存错位应答（含
+            // 「bytes 0-N/…」归一化劣化）会把数据写到错误偏移，账本/长度全部
+            // 自洽，仅哈希校验能事后兜底。不符按失败处理（走段重试/降粒度）。
+            let cr_start = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(parse_content_range_start);
+            match cr_start {
+                Some(st) if st == seg.start => 0u64,
+                // 缺失头宽容放行（保持旧行为：RFC 要求 206 必带，但部分轻量
+                // 服务器省略；只拒绝「有头但与请求区间不符」的明确错位）。
+                None => 0u64,
+                other => {
+                    return Err(format!(
+                        "segment Content-Range mismatch (request start {}, got {other:?})",
+                        seg.start
+                    ))
+                }
+            }
+        }
         reqwest::StatusCode::OK => seg.start,
         other => return Err(format!("segment status {}", other)),
     };
@@ -360,6 +382,15 @@ async fn download_segment_streaming(
         ));
     }
     Ok(())
+}
+
+/// batch3-P1：解析 `Content-Range: bytes START-END/TOTAL` 的 START。
+/// `bytes */TOTAL`（unsatisfied）返回 None。
+fn parse_content_range_start(v: &str) -> Option<u64> {
+    let rest = v.trim().strip_prefix("bytes")?.trim().strip_prefix('=')?;
+    let unit = rest.trim().split('/').next()?.trim();
+    let start = unit.split('-').next()?.trim();
+    start.parse().ok()
 }
 
 #[cfg(test)]
