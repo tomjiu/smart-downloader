@@ -69,9 +69,6 @@ fn map_status(st: &TorrentStatus) -> EngineStatus {
 /// `[bt] save_path`）。`DownloadTask.dest_root` 仅接受与全局目录一致或默认 `"."`——
 /// 显式指定其他目录会返回错误（避免"用户指定 A 目录、实际落 B 目录"的静默错位）。
 /// **断点续传（#5）**：remove/pause 显式保存 `.fastresume`；重启后 add 回灌。
-/// batch3-P2：Clone（全 Arc/Mutex 共享内部态）——pause/remove 的 fastresume
-/// 保存走 spawn_blocking 需 'static 持有。
-#[derive(Clone)]
 pub struct BtEngine {
     core: Arc<BtCore>,
     save_path: PathBuf,
@@ -90,10 +87,12 @@ pub struct BtEngine {
     /// save_fastresume 不再自行 pop_alerts（旧实现整环消费吞掉其他任务终态
     /// alert，且与 bt_events 循环互吞 RESUME → fastresume 超时/任务卡态），
     /// 改为注册等待 + 由 bt_events 唯一消费者经 dispatch 分发。
-    resume_waiters: parking_lot::Mutex<
-        std::collections::HashMap<
-            String,
-            Vec<tokio::sync::mpsc::UnboundedSender<smart_dl_btcore::Alert>>,
+    resume_waiters: Arc<
+        parking_lot::Mutex<
+            std::collections::HashMap<
+                String,
+                Vec<tokio::sync::mpsc::UnboundedSender<smart_dl_btcore::Alert>>,
+            >,
         >,
     >,
 }
@@ -182,7 +181,9 @@ impl BtEngine {
             core: Arc::new(core),
             save_path: save_path.to_path_buf(),
             pause_intents: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            resume_waiters: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            resume_waiters: Arc::new(parking_lot::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             network: parking_lot::Mutex::new(BtNetwork {
                 proxy_url: proxy.map(|s| s.to_string()).filter(|s| !s.is_empty()),
                 down_kb_s,
@@ -274,22 +275,7 @@ impl BtEngine {
     /// batch3-P1：把 RESUME alert 分发给注册的等待者（唯一消费者 pop 后回填）。
     /// 无等待者时丢弃（与旧行为一致）；等待者已离开（recv 端关闭）→ 清除。
     fn dispatch_resume_alerts(&self, alerts: &[smart_dl_btcore::Alert]) {
-        if alerts.is_empty() {
-            return;
-        }
-        let mut waiters = self.resume_waiters.lock();
-        if waiters.is_empty() {
-            return;
-        }
-        for a in alerts {
-            if a.kind != smart_dl_btcore::AlertKind::Resume || a.ih.is_empty() {
-                continue;
-            }
-            if let Some(list) = waiters.get_mut(&a.ih) {
-                list.retain(|tx| tx.send(a.clone()).is_ok());
-            }
-        }
-        waiters.retain(|_, l| !l.is_empty());
+        dispatch_resume_alerts(&self.resume_waiters, alerts);
     }
 
     /// .fastresume 文件路径（按 infohash 命名——避开文件名转义问题，且 magnet 无需
@@ -312,63 +298,8 @@ impl BtEngine {
     /// alert ring 单消费者化后本函数仅等待分发，其他 alert 全部流向 bt_events。
     /// resume 未就绪（暂无 metadata/超时）→ Ok(None) 不落盘。
     fn save_fastresume(&self, ih: &str) -> Result<Option<PathBuf>, EngineError> {
-        use std::sync::atomic::Ordering;
-        // 执行语境标记：bt_events 消费循环自身（tokio 上下文）不能阻塞等待
-        // 自己分发——它 pop 到 RESUME 时 dispatch 会直接喂给本等待者，若本函数
-        // 在 alert 循环线程内同步 recv 会死锁。以「是否 tokio 运行时」判定：
-        // 运行时内 = 由 bt.rs 的 async 调用方（pause/remove）持有，安全；
-        // 非运行时 = spawn_blocking 线程（周期保存/退出路径），同样安全。
-        // 两者均不在 pop_alerts 循环线程上。
-        let _ = Ordering::Relaxed;
-        self.core
-            .request_save_resume(ih)
-            .map_err(|e| EngineError::Other(core_err(&e)))?;
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        self.resume_waiters
-            .lock()
-            .entry(ih.to_string())
-            .or_default()
-            .push(tx);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let mut saved: Option<smart_dl_btcore::ResumeBytes> = None;
-        while std::time::Instant::now() < deadline {
-            match rx.try_recv() {
-                Ok(a) => {
-                    tracing::debug!("fastresume: RESUME alert ready={}", a.is_resume_ready());
-                    if a.is_resume_ready() {
-                        if let Ok(r) = self.core.take_resume_data(ih) {
-                            saved = Some(r);
-                        } else {
-                            tracing::warn!("fastresume: take_resume_data 失败（未就绪）");
-                        }
-                    }
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
-            }
-            if saved.is_some() {
-                break;
-            }
-        }
-        // 注销等待者（防止表无限增长）
-        if let Some(list) = self.resume_waiters.lock().get_mut(ih) {
-            list.retain(|w| !w.same_channel(&tx));
-        }
-        if saved.is_none() {
-            tracing::warn!("fastresume: TIMEOUT ih={ih}");
-            return Ok(None);
-        }
-        tracing::debug!("fastresume: ready ih={ih}");
-        let r = saved.expect("saved checked");
-        let p = self.fastresume_path(ih);
-        let tmp = p.with_extension("fastresume.tmp");
-        std::fs::write(&tmp, r.as_bytes())
-            .map_err(|e| EngineError::Other(format!("写 fastresume 失败: {e}")))?;
-        std::fs::rename(&tmp, &p)
-            .map_err(|e| EngineError::Other(format!("落位 fastresume 失败: {e}")))?;
-        Ok(Some(p))
+        save_fastresume_impl(&self.core, &self.resume_waiters, &self.save_path, ih)
+    }
     }
 
     /// 保存指定任务的 fastresume（公开入口：daemon 周期/退出时机保存，P4 G4）。
@@ -382,6 +313,97 @@ impl BtEngine {
     fn remove_fastresume(&self, ih: &str) {
         let _ = std::fs::remove_file(self.fastresume_path(ih));
     }
+}
+
+type ResumeWaiters = Arc<
+    parking_lot::Mutex<
+        std::collections::HashMap<
+            String,
+            Vec<tokio::sync::mpsc::UnboundedSender<smart_dl_btcore::Alert>>,
+        >,
+    >,
+>;
+
+/// batch3-P1：把 RESUME alert 分发给注册的等待者（唯一消费者 pop 后回填）。
+/// 无等待者时丢弃（与旧行为一致）；等待者已离开（recv 端关闭）→ 清除。
+fn dispatch_resume_alerts(waiters: &ResumeWaiters, alerts: &[smart_dl_btcore::Alert]) {
+    if alerts.is_empty() {
+        return;
+    }
+    let mut waiters = waiters.lock();
+    if waiters.is_empty() {
+        return;
+    }
+    for a in alerts {
+        if a.kind != smart_dl_btcore::AlertKind::Resume || a.ih.is_empty() {
+            continue;
+        }
+        if let Some(list) = waiters.get_mut(&a.ih) {
+            list.retain(|tx| tx.send(a.clone()).is_ok());
+        }
+    }
+    waiters.retain(|_, l| !l.is_empty());
+}
+
+/// batch3-P1：fastresume 保存核心（request → 注册等待 → 等待分发 → take →
+/// 原子写）。free fn 形态便于 spawn_blocking 捕获可克隆字段（Arc/PathBuf）。
+/// 执行语境：调用方（pause/remove 经 spawn_blocking、周期保存、退出路径）
+/// 均不在 bt_events pop_alerts 循环线程上——分发为 unbounded send 不阻塞，
+/// 无死锁。
+fn save_fastresume_impl(
+    core: &Arc<BtCore>,
+    waiters: &ResumeWaiters,
+    save_path: &Path,
+    ih: &str,
+) -> Result<Option<PathBuf>, EngineError> {
+    core.request_save_resume(ih)
+        .map_err(|e| EngineError::Other(core_err(&e)))?;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    waiters
+        .lock()
+        .entry(ih.to_string())
+        .or_default()
+        .push(tx.clone());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    let mut saved: Option<smart_dl_btcore::ResumeBytes> = None;
+    while std::time::Instant::now() < deadline {
+        match rx.try_recv() {
+            Ok(a) => {
+                tracing::debug!("fastresume: RESUME alert ready={}", a.is_resume_ready());
+                if a.is_resume_ready() {
+                    if let Ok(r) = core.take_resume_data(ih) {
+                        saved = Some(r);
+                    } else {
+                        tracing::warn!("fastresume: take_resume_data 失败（未就绪）");
+                    }
+                }
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+        }
+        if saved.is_some() {
+            break;
+        }
+    }
+    // 注销等待者（防止表无限增长）
+    if let Some(list) = waiters.lock().get_mut(ih) {
+        list.retain(|w| !w.same_channel(&tx));
+    }
+    if saved.is_none() {
+        tracing::warn!("fastresume: TIMEOUT ih={ih}");
+        return Ok(None);
+    }
+    tracing::debug!("fastresume: ready ih={ih}");
+    let r = saved.expect("saved checked");
+    let p = save_path.join(format!("{ih}.fastresume"));
+    let tmp = p.with_extension("fastresume.tmp");
+    std::fs::write(&tmp, r.as_bytes())
+        .map_err(|e| EngineError::Other(format!("写 fastresume 失败: {e}")))?;
+    std::fs::rename(&tmp, &p)
+        .map_err(|e| EngineError::Other(format!("落位 fastresume 失败: {e}")))?;
+    Ok(Some(p))
 }
 
 fn core_err(e: &smart_dl_btcore::Error) -> String {
@@ -481,9 +503,14 @@ impl DownloadEngine for BtEngine {
             .map_err(|e| EngineError::Other(core_err(&e)))?;
         // 暂停时保存进度（best-effort；无 metadata 等场景静默跳过）
         // batch3-P2：同步等待 RESUME（≤3s）→ spawn_blocking 不阻塞 tokio worker
-        let this = self.clone();
+        let core = self.core.clone();
+        let waiters = self.resume_waiters.clone();
+        let save_path = self.save_path.clone();
         let ih = id.clone();
-        let _ = tokio::task::spawn_blocking(move || this.save_fastresume(&ih)).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            save_fastresume_impl(&core, &waiters, &save_path, &ih)
+        })
+        .await;
         Ok(())
     }
 
@@ -506,9 +533,14 @@ impl DownloadEngine for BtEngine {
         // 移除前显式保存 fastresume（重启后重新 add 同一 magnet → 回灌续传）。
         // 失败不阻断移除（best-effort）。
         // batch3-P2：同步等待 RESUME（≤3s）→ spawn_blocking 不阻塞 tokio worker
-        let this = self.clone();
+        let core = self.core.clone();
+        let waiters = self.resume_waiters.clone();
+        let save_path = self.save_path.clone();
         let ih = id.clone();
-        let _ = tokio::task::spawn_blocking(move || this.save_fastresume(&ih)).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            save_fastresume_impl(&core, &waiters, &save_path, &ih)
+        })
+        .await;
         self.set_pause_intent(id, false);
         let r = self.core.remove(id, delete_data);
         let _ = r.map_err(|e| EngineError::Other(core_err(&e)))?;
