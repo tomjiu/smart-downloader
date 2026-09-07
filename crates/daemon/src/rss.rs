@@ -15,7 +15,10 @@
 //! - 条目 guid 缺省 = url（去重键 = guid；同一 feed 内 guid 重复保留首见）。
 //! - channel/feed 级 `<title>` → 订阅标题（首次拉取后锁定，后续刷新不改写
 //!   ——站点改标题不应悄悄变更用户可见的订阅名）。
-//! - CDATA/注释/PI 忽略（quick-xml Text 事件已含 CDATA 解包）；根元素不校验。
+//! - CDATA **独立事件接取**（quick-xml 将 `<![CDATA[...]]>` 投递为 `Event::CData`
+//!   而非 Text——WordPress 等主流 CMS 的 feed 用 CDATA 包裹 title/link，漏接 =
+//!   真实世界 feed 条目全丢；CDATA 内容为原始文本，不做实体反转义）；注释/PI 忽略。
+//!   根元素不校验。
 //! - 无任何有效条目 → Err（上层转 400；空 feed 对订阅场景无意义且多半是
 //!   解析失败或页面误投）。
 //!
@@ -117,11 +120,25 @@ pub struct RssState {
 
 impl RssState {
     pub fn load(path: &std::path::Path) -> Option<RssState> {
-        let text = std::fs::read_to_string(path).ok()?;
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            // 不存在 = 首次启动，静默空状态
+            Err(_) => return None,
+        };
         match serde_json::from_str(&text) {
             Ok(s) => Some(s),
             Err(e) => {
-                tracing::warn!("rss.json 解析失败（按空状态启动）: {e}");
+                // batch6-P1：坏文件留存改名（原内容是用户订阅+规则的唯一
+                // 证据），再按空启动——fail-open 不再静默覆盖销毁。
+                let corrupt = path.with_extension("json.corrupt");
+                if std::fs::rename(path, &corrupt).is_ok() {
+                    tracing::error!(
+                        "rss.json 解析失败（已留存为 {}，按空状态启动）: {e}",
+                        corrupt.display()
+                    );
+                } else {
+                    tracing::error!("rss.json 解析失败（留存改名也失败，按空状态启动）: {e}");
+                }
                 None
             }
         }
@@ -131,12 +148,36 @@ impl RssState {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        let tmp = path.with_extension("json.tmp");
-        match serde_json::to_string_pretty(self) {
-            Ok(text) if std::fs::write(&tmp, &text).is_ok() => {
-                let _ = std::fs::rename(&tmp, path);
+        // batch6-P1：与 write_tasks_atomic / write_bans_atomic 同配方——
+        // 唯一 tmp 名 + 0600 + rename（feed URL 常内嵌 apikey/token，权限
+        // 加固对齐 tasks.json V12 口径）；固定 tmp 名并发写会交错损坏。
+        let Ok(json) = serde_json::to_vec_pretty(self) else {
+            tracing::warn!("rss.json 序列化失败（保留旧文件）");
+            return;
+        };
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = path.with_file_name(format!(
+            "{}-{unique}.tmp",
+            path.file_name().map_or_else(
+                || "rss.json".to_string(),
+                |f| f.to_string_lossy().into_owned(),
+            )
+        ));
+        let res = (|| {
+            std::fs::write(&tmp, &json)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
             }
-            _ => tracing::warn!("rss.json 写盘失败（保留旧文件）"),
+            std::fs::rename(&tmp, path)
+        })();
+        if res.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            tracing::warn!("rss.json 写盘失败（保留旧文件）");
         }
     }
 }
@@ -319,21 +360,30 @@ pub fn parse_feed(xml: &str) -> Result<ParsedFeed, String> {
                     .unescape()
                     .map(|c| c.into_owned())
                     .map_err(|e| format!("rss 文本转义非法: {e}"))?;
-                match tgt {
-                    TextTarget::FeedTitle => {
-                        if feed_title.is_none() && !text.trim().is_empty() {
-                            feed_title = Some(text.trim().to_string());
-                        }
-                    }
-                    TextTarget::ItemTitle => cur_title = Some(text),
-                    TextTarget::ItemLink => cur_link_text = Some(text),
-                    TextTarget::ItemGuid => cur_guid = Some(text),
-                    TextTarget::ItemDate => {
-                        if cur_date.is_none() && !text.trim().is_empty() {
-                            cur_date = Some(text.trim().to_string());
-                        }
-                    }
-                }
+                store_text(
+                    tgt,
+                    text,
+                    &mut feed_title,
+                    &mut cur_title,
+                    &mut cur_link_text,
+                    &mut cur_guid,
+                    &mut cur_date,
+                );
+            }
+            Ok(Event::CData(t)) => {
+                // CDATA 内容为原始文本（XML 实体不转义），直接取用。
+                // 输入已是 UTF-8 String，lossy 即恒等。
+                let Some(tgt) = &target else { continue };
+                let text = String::from_utf8_lossy(&t).into_owned();
+                store_text(
+                    tgt,
+                    text,
+                    &mut feed_title,
+                    &mut cur_title,
+                    &mut cur_link_text,
+                    &mut cur_guid,
+                    &mut cur_date,
+                );
             }
             Ok(Event::End(e)) => match e.name().local_name().as_ref() {
                 b"item" | b"entry" => {
@@ -364,6 +414,44 @@ pub fn parse_feed(xml: &str) -> Result<ParsedFeed, String> {
         title: feed_title.unwrap_or_default(),
         items,
     })
+}
+
+/// 文本事件按目标槽位落位（Text 与 CData 两分支共用）。
+/// 条目槽位（title/link/guid）为累加语义：混合内容（如
+/// `plain<![CDATA[..]]>tail` 产生 Text+CData+Text 三事件）拼接完整值；
+/// feed 标题/日期保持首见非空优先。
+fn store_text(
+    tgt: &TextTarget,
+    text: String,
+    feed_title: &mut Option<String>,
+    cur_title: &mut Option<String>,
+    cur_link_text: &mut Option<String>,
+    cur_guid: &mut Option<String>,
+    cur_date: &mut Option<String>,
+) {
+    match tgt {
+        TextTarget::FeedTitle => {
+            if feed_title.is_none() && !text.trim().is_empty() {
+                *feed_title = Some(text.trim().to_string());
+            }
+        }
+        TextTarget::ItemTitle => append_slot(cur_title, text),
+        TextTarget::ItemLink => append_slot(cur_link_text, text),
+        TextTarget::ItemGuid => append_slot(cur_guid, text),
+        TextTarget::ItemDate => {
+            if cur_date.is_none() && !text.trim().is_empty() {
+                *cur_date = Some(text.trim().to_string());
+            }
+        }
+    }
+}
+
+/// 混合内容累加：已有值则拼接，否则首见。
+fn append_slot(slot: &mut Option<String>, text: String) {
+    match slot {
+        Some(existing) => existing.push_str(&text),
+        None => *slot = Some(text),
+    }
 }
 
 /// 属性值解码（统一错误文案）。
@@ -471,16 +559,19 @@ fn extract_episodes(title: &str) -> Vec<(u32, u32)> {
         regex::Regex::new(r"(?i)(?:^|[^a-z0-9])(\d{1,3})x(\d{1,3})(?:[^0-9]|$)").unwrap()
     });
     let mut out: Vec<(u32, u32)> = Vec::new();
-    if let Some(c) = re_s.captures(title) {
+    // captures_iter（batch6-P2）：标题含多集时全部提取（"S01E01 S01E02"）；
+    // captures 只取最左匹配会漏后续集，过滤串含第二集时被误拒。
+    for c in re_s.captures_iter(title) {
         if let (Some(s), Some(e)) = (c[1].parse().ok(), c[2].parse().ok()) {
             out.push((s, e));
         }
     }
-    if let Some(c) = re_x.captures(title) {
+    for c in re_x.captures_iter(title) {
         if let (Some(s), Some(e)) = (c[1].parse().ok(), c[2].parse().ok()) {
             out.push((s, e));
         }
     }
+    out.dedup();
     out
 }
 
@@ -629,6 +720,15 @@ impl DaemonState {
                 "规则至少需要一个关键词（must_contain / must_not_contain 之一）".into(),
             ));
         }
+        // batch6-P2：空白关键词拒绝——trim 后空串的 contains("") 恒 true，
+        // must_contain 空白 = 匹配一切，must_not_contain 空白 = 排除一切（语义翻转）。
+        for k in must_contain.iter().chain(must_not_contain.iter()) {
+            if k.trim().is_empty() {
+                return Err(DaemonError::InvalidSource(
+                    "关键词不可为空白（空串会恒命中/恒排除）".into(),
+                ));
+            }
+        }
         let mut st = self.rss_state().lock();
         if let Some(fid) = feed_id {
             if !st.feeds.iter().any(|f| f.id == fid) {
@@ -681,7 +781,11 @@ impl DaemonState {
     }
 
     /// 刷新实现（force=false 时按 feed 级间隔过滤）。
+    /// 持有 `rss_refresh_gate` 串行化整轮刷新（batch6-P1）：手动刷新与
+    /// ticker 并发（或 UI 双击）时，后到者排队而非基于同一未处理快照
+    /// 各自建任务（同一条目重复下载）。
     async fn rss_refresh_impl(&self, force: bool) -> (usize, usize, Vec<String>, Vec<String>) {
+        let _gate = self.rss_refresh_gate.lock().await;
         let client = self.rss_client();
         let mut new_items_total = 0usize;
         let mut matched = 0usize;
@@ -774,16 +878,19 @@ impl DaemonState {
                 feed.items.clone()
             };
 
-            // 规则匹配（对全部未处理条目；含旧条目——新建规则能回溯未处理历史）
+            // 规则匹配（对全部未处理条目；含旧条目——新建规则能回溯未处理历史）。
+            // 命中后同步标记本地快照（batch6-P1）：否则同一 feed 内多条规则
+            // 命中同一条目时会重复建任务（违背首见规则生效语义）。
             let rules: Vec<RssRule> = {
                 let st = self.rss_state().lock();
                 st.rules.iter().filter(|r| r.enabled).cloned().collect()
             };
+            let mut existing = existing;
             for rule in rules {
                 if rule.feed_id.map(|fid| fid != feed_id).unwrap_or(false) {
                     continue;
                 }
-                for item in &existing {
+                for item in existing.iter_mut() {
                     if item.task_id.is_some() {
                         continue;
                     }
@@ -810,6 +917,8 @@ impl DaemonState {
                             }
                             self.rss_save(&st);
                             drop(st);
+                            // 本地快照同步标记：后续规则跳过该条目
+                            item.task_id = Some(task_id.clone());
                             matched += 1;
                             task_ids.push(task_id);
                         }
@@ -832,8 +941,12 @@ impl DaemonState {
     }
 
     /// 已处理条目保留上限（live_config 注入时取 [rss] 配置；否则默认 200）。
+    /// 0 视为无效回落默认（batch6-P2）：cap=0 会在每次刷新清空全部已处理
+    /// 去重标记 → 源 feed 仍列出这些条目 → 规则命中无限重下。
     fn rss_max_processed_items(&self) -> usize {
-        self.rss_max_processed_items_opt().unwrap_or(200)
+        self.rss_max_processed_items_opt()
+            .filter(|&v| v > 0)
+            .unwrap_or(200)
     }
 }
 
@@ -893,6 +1006,30 @@ mod tests {
         assert_eq!(f.items[0].url, "https://example.com/debian-13.iso");
         assert_eq!(f.items[0].guid, "tag:debian,2026:13");
         assert_eq!(f.items[0].pub_date.as_deref(), Some("2026-09-01T00:00:00Z"));
+    }
+
+    const RSS2_CDATA: &str = r#"<?xml version="1.0"?>
+<rss version="2.0"><channel>
+<title><![CDATA[Arch Linux Releases]]></title>
+<item><title><![CDATA[Arch 2026.09 iso (x86_64)]]></title><link><![CDATA[https://geo.example.com/arch-2026.09.iso]]></link><guid isPermaLink="false"><![CDATA[arch-202609]]></guid><pubDate>Wed, 02 Sep 2026 10:00:00 GMT</pubDate></item>
+</channel></rss>"#;
+
+    #[test]
+    fn parse_rss2_cdata_title_link_guid() {
+        // WordPress 等主流 CMS 默认用 CDATA 包裹字段；quick-xml 将其投递为
+        // 独立 CData 事件——漏接 = 条目全丢（batch6 审计 P0 回归锚）。
+        let f = parse_feed(RSS2_CDATA).unwrap();
+        assert_eq!(f.title, "Arch Linux Releases");
+        assert_eq!(f.items.len(), 1);
+        assert_eq!(f.items[0].title, "Arch 2026.09 iso (x86_64)");
+        assert_eq!(f.items[0].url, "https://geo.example.com/arch-2026.09.iso");
+        assert_eq!(f.items[0].guid, "arch-202609");
+        // 同元素混合形态：Text + CData 相邻时首见优先（Text 先到先得）。
+        let mixed = r#"<rss><channel><title>T</title>
+<item><title>plain<![CDATA[ + cdata]]>tail</title><link>https://e.example/x.iso</link></item>
+</channel></rss>"#;
+        let f = parse_feed(mixed).unwrap();
+        assert_eq!(f.items[0].title, "plain + cdatatail");
     }
 
     #[test]

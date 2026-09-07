@@ -40,6 +40,16 @@ type BoxFtpIo = Box<dyn FtpIo>;
 ///（不引入直接依赖，与 reqwest 共享同一 rustls 0.23 编译单元）。
 fn ftps_connector() -> Result<tokio_rustls::TlsConnector, String> {
     use tokio_rustls::rustls::crypto::ring as ring_backend;
+    // batch6-P2：全局共享 connector——rustls 的 TLS 会话缓存属于单个
+    // ClientConfig 实例，每次现建则控制/数据连接之间无会话可复用；
+    // vsftpd 自 2.3.5 起 require_ssl_reuse=YES 是默认值，数据连接握手
+    // 未复用控制会话会被服务端直接掐断（主流 Linux FTP 服务器默认配置
+    // 下 FTPS 必挂）。共享实例后 TLS 会话跨连接复用；附带收益：
+    // webpki-roots 根集只解析一次。
+    static SHARED: std::sync::OnceLock<tokio_rustls::TlsConnector> = std::sync::OnceLock::new();
+    if let Some(c) = SHARED.get() {
+        return Ok(c.clone());
+    }
     let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(
         ring_backend::default_provider().into(),
     )
@@ -47,7 +57,8 @@ fn ftps_connector() -> Result<tokio_rustls::TlsConnector, String> {
     .map_err(|e| format!("FTPS 协议版本配置失败: {e}"))?
     .with_root_certificates(ftps_roots())
     .with_no_client_auth();
-    Ok(tokio_rustls::TlsConnector::from(Arc::new(config)))
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    Ok(SHARED.get_or_init(|| connector).clone())
 }
 
 fn ftps_roots() -> tokio_rustls::rustls::RootCertStore {

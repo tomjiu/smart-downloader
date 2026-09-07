@@ -29,6 +29,7 @@ impl DaemonState {
             completion_action: Mutex::new("none".to_string()),
             completion_fired: std::sync::atomic::AtomicBool::new(false),
             ban_ops: tokio::sync::Mutex::new(()),
+            rss_refresh_gate: tokio::sync::Mutex::new(()),
             session_traffic: Mutex::new((0, 0)),
             webhook_client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))

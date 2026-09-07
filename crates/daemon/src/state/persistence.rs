@@ -197,6 +197,12 @@ impl DaemonState {
                 restored += 1;
                 continue;
             }
+            // batch6-P1：重启前处于 Seeding 的 BT 任务，恢复后直接回登记
+            // 做种态（含计时重起）。旧实现强置 Queued：BT 轮询候选只认
+            // Downloading|Seeding → 任务退出轮询管道（无速率/无名回填/做种
+            // 限制执法失效）；若 lt 重发 finished alert 则 Queued→Seeding 会
+            // 重发完成事件（webhook 重发 + finished_at 覆盖 + 计时清零）。
+            let was_seeding = t.state == TaskState::Seeding;
             t.state = TaskState::Queued; // 重启后重新入队
             let engine = match self.engine_for(pt.engine_kind) {
                 Ok(e) => e,
@@ -298,6 +304,13 @@ impl DaemonState {
                     };
                     if was_paused {
                         rec.task.state = TaskState::Paused;
+                    }
+                    // batch6-P1：重启前 Seeding 的任务恢复后回登记做种态
+                    //（计时重起；处于轮询管道内，执法/统计立即生效；后续
+                    // 重发的 finished alert 因记录已是 Seeding 不再重发完成事件）
+                    if was_seeding && !was_paused {
+                        rec.task.state = TaskState::Seeding;
+                        rec.seeding_since = Some(std::time::Instant::now());
                     }
                     if replay_details.is_empty() {
                         rec.push_event("restored", None);
