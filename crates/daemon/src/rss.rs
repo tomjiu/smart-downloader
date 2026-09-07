@@ -528,7 +528,18 @@ impl DaemonState {
                 if !resp.status().is_success() {
                     return Err(format!("HTTP {}", resp.status()));
                 }
-                let xml = resp.text().await.map_err(|e| format!("读取失败: {e}"))?;
+                // batch3-P2：限长读取（16MB 封顶，防恶意 feed 打爆内存）
+                const FEED_MAX: usize = 16 * 1024 * 1024;
+                let mut xml: Vec<u8> = Vec::new();
+                let mut resp = resp;
+                while let Some(chunk) = resp.chunk().await.map_err(|e| format!("读取失败: {e}"))?
+                {
+                    if xml.len() + chunk.len() > FEED_MAX {
+                        return Err("feed 响应超过 16MB 上限".to_string());
+                    }
+                    xml.extend_from_slice(&chunk);
+                }
+                let xml = String::from_utf8_lossy(&xml).into_owned();
                 parse_feed(&xml)
             };
             let parsed = match fetch.await {

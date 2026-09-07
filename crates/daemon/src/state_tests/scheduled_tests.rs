@@ -138,10 +138,12 @@ async fn activate_due_tasks_activates_only_due() {
     {
         let tasks = state.tasks.lock();
         assert!(tasks.get("t1").unwrap().engine_tid.is_some());
+        // batch3-P1：激活即 Downloading（BT 任务无轮询纠偏，add/activate
+        // 统一同步记录态；HTTP 轮询器随后幂等确认，语义一致）
         assert_eq!(
             tasks.get("t1").unwrap().task.state,
-            TaskState::Queued,
-            "激活不改记录态（轮询器对齐）"
+            TaskState::Downloading(EngineKind::Http),
+            "激活同步记录态 Downloading"
         );
         assert!(
             tasks.get("t2").unwrap().engine_tid.is_none(),
