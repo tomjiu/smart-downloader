@@ -64,6 +64,7 @@ fn insert_scheduled(state: &DaemonState, id: &str, kind: EngineKind, start_at: u
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         },
         engine_tid: None,
         engine_kind: kind,

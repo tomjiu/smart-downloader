@@ -441,6 +441,20 @@ fn core_err(e: &smart_dl_btcore::Error) -> String {
     format!("{:?}", e)
 }
 
+/// RFC 3986 保守 percent-encode（magnet dn/tr 参数拼装用；unreserved 之外全转义）。
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
 /// ffi 错误分类：NotFound（torrent/metadata 缺失）→ EngineError::NotFound，
 /// 其余 → Other（供子文件优先级链路区分 404 与「metadata 未就绪」409）。
 fn bt_engine_err(e: smart_dl_btcore::Error) -> EngineError {
@@ -648,8 +662,13 @@ impl DownloadEngine for BtEngine {
             .map_err(|e| EngineError::Other(core_err(&e)))
     }
 
-    async fn ban_peer(&self, _id: &EngineTaskId, _peer: SocketAddr) -> Result<(), EngineError> {
-        Err(EngineError::Unsupported)
+    /// 任务上下文封禁 peer（Task 46 真实现）：session 级 ip_filter（libtorrent
+    /// 2.x 无 per-endpoint ban；作用域 = 全 session，与 qbit「永久封禁」一致）。
+    /// id 仅用于任务存在性验证（NotFound 语义）。
+    async fn ban_peer(&self, id: &EngineTaskId, peer: SocketAddr) -> Result<(), EngineError> {
+        self.core
+            .ban_ip(Some(id), &peer.ip().to_string())
+            .map_err(bt_engine_err)
     }
 
     async fn read_piece(&self, id: &EngineTaskId, idx: u32) -> Result<Vec<u8>, EngineError> {
@@ -852,6 +871,61 @@ impl DownloadEngine for BtEngine {
 
     async fn set_super_seeding(&self, id: &EngineTaskId, on: bool) -> Result<(), EngineError> {
         self.core.set_super_seeding(id, on).map_err(bt_engine_err)
+    }
+
+    /// 强制向全部 tracker 立即宣告（Task 46，qbit/BitComet 任务右键对标）。
+    async fn force_reannounce(&self, id: &EngineTaskId) -> Result<(), EngineError> {
+        self.core.force_reannounce(id).map_err(bt_engine_err)
+    }
+
+    /// 强制 DHT 宣告（DHT 未启用时内核 no-op 不报错）。
+    async fn force_dht_announce(&self, id: &EngineTaskId) -> Result<(), EngineError> {
+        self.core.force_dht_announce(id).map_err(bt_engine_err)
+    }
+
+    /// 强制重新校验（任务转入 checking；校验期下载/做种挂起）。
+    async fn force_recheck(&self, id: &EngineTaskId) -> Result<(), EngineError> {
+        self.core.force_recheck(id).map_err(bt_engine_err)
+    }
+
+    /// 导出 .torrent（Task 46）：metainfo bencode；magnet 任务 metadata
+    /// 未就绪 → Other（调用方 409）。
+    async fn export_torrent(&self, id: &EngineTaskId) -> Result<Vec<u8>, EngineError> {
+        match self.core.metadata(id).map_err(bt_engine_err)? {
+            Some(bytes) if !bytes.is_empty() => Ok(bytes),
+            _ => Err(EngineError::Other(
+                "元数据未就绪（magnet 任务需先收到 metadata）".into(),
+            )),
+        }
+    }
+
+    /// 生成 magnet URI（Task 46）：btih + dn（status.name）+ 全量 tracker。
+    async fn magnet_uri(&self, id: &EngineTaskId) -> Result<String, EngineError> {
+        let st = self.core.status(id).map_err(bt_engine_err)?;
+        let trackers = self.core.list_trackers(id).map_err(bt_engine_err)?;
+        let mut uri = format!("magnet:?xt=urn:btih:{}", id);
+        if let Some(name) = st.name.as_deref().filter(|n| !n.is_empty()) {
+            uri.push_str("&dn=");
+            uri.push_str(&percent_encode(name));
+        }
+        for t in &trackers {
+            if t.url.is_empty() {
+                continue;
+            }
+            uri.push_str("&tr=");
+            uri.push_str(&percent_encode(&t.url));
+        }
+        Ok(uri)
+    }
+
+    /// Session 级 IP 封禁（Task 46；幂等）。
+    async fn ban_ip(&self, ip: &str) -> Result<(), EngineError> {
+        self.core.ban_ip(None, ip).map_err(bt_engine_err)
+    }
+
+    /// 解除 Session 级 IP 封禁（Task 46；幂等）。
+    async fn unban_ip(&self, ip: &str) -> Result<(), EngineError> {
+        self.core.unban_ip(ip).map_err(bt_engine_err)
     }
 
     fn seeding_ratio_limit(&self) -> Option<f64> {

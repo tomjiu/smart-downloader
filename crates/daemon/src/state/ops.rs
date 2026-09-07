@@ -1,5 +1,6 @@
 //! 任务操作面：添加（HTTP/FTP/BT/迅雷/链接）、查询与列表、批量、控制（pause/resume/限速/优先级/顺序/代理/改名/标签）、tracker/webseed、移除、provider 兜底、完成回调与清理、HTTP/FTP 状态轮询。
 
+use super::lifecycle::execute_completion_action;
 use super::*;
 
 impl DaemonState {
@@ -21,6 +22,47 @@ impl DaemonState {
         });
         self.fire_completion_webhook(task_id);
         self.run_post_download_actions(task_id);
+        // Task 46：全部任务终态后的全局动作（qbit「下载完成后关机」对标）
+        self.maybe_run_completion_action();
+    }
+
+    /// 完成动作判定（Task 46）：action != none 且未触发过 → 全任务终态检查。
+    /// 空任务表不触发（无意义）；非终态任务存在（含 Paused/Queued/Seeding）
+    /// 阻塞触发——qbit 同语义（暂停/做种中均算未完成）。触发后置位 fired。
+    fn maybe_run_completion_action(&self) {
+        let action = self.completion_action.lock().clone();
+        if action == "none" || action.is_empty() {
+            return;
+        }
+        if self
+            .completion_fired
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return; // 本会话已触发过
+        }
+        let all_terminal = {
+            let tasks = self.tasks.lock();
+            !tasks.is_empty()
+                && tasks.values().all(|r| {
+                    matches!(
+                        r.task.state,
+                        TaskState::Completed | TaskState::Failed | TaskState::Stopped
+                    )
+                })
+        };
+        if !all_terminal {
+            // 尚有活跃/暂停/排队任务 → 复位旗标，下次完成事件再判
+            self.completion_fired
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        execute_completion_action(&action);
     }
 
     /// 完成自动处理（E27，清单 #15）：`[post_download] move_to` 移动 +
@@ -440,15 +482,16 @@ impl DaemonState {
     /// - 否则 start_at > 0 → 按 E23 start_at 判定
     /// - 否则 → S1-b queue_wait（add 时配额满落队），视为随时到期
     ///
-    /// 激活统一过 S1-b 配额闸门：槽位不足则本轮跳过（队首优先，FIFO =
-    /// created_at 升序，Instant 纳秒粒度同刻碰撞实际不可能）。serve 以 1s
-    /// 周期驱动（终态/暂停/移除释放槽位 → 下轮递补）；测试可直接调用。
-    /// 返回激活成功的 task_id 列表（激活序）。
+    /// 激活统一过 S1-b 配额闸门：槽位不足则本轮跳过（队首优先）。递补排序 =
+    /// (queue_priority 升序, created_at 升序)——Task 46 qbit 队列位置对标：
+    /// 值小者先补位，同值保持 FIFO（create 序，Instant 纳秒粒度同刻碰撞实际
+    /// 不可能）。serve 以 1s 周期驱动（终态/暂停/移除释放槽位 → 下轮递补）；
+    /// 测试可直接调用。返回激活成功的 task_id 列表（激活序）。
     pub async fn activate_due_tasks(&self) -> Vec<String> {
         let now = now_unix();
         let due: Vec<(String, DownloadTask, EngineKind)> = {
             let tasks = self.tasks.lock();
-            let mut v: Vec<(String, DownloadTask, EngineKind, std::time::Instant)> = tasks
+            let mut v: Vec<(String, DownloadTask, EngineKind, i32, std::time::Instant)> = tasks
                 .iter()
                 .filter(|(_, rec)| {
                     if rec.engine_tid.is_some() || rec.task.state != TaskState::Queued {
@@ -471,13 +514,14 @@ impl DaemonState {
                         id.clone(),
                         rec.task.clone(),
                         rec.engine_kind,
+                        rec.task.queue_priority,
                         rec.task.created_at,
                     )
                 })
                 .collect();
-            // S1-b FIFO：按创建序递补
-            v.sort_by_key(|(_, _, _, created)| *created);
-            v.into_iter().map(|(id, t, k, _)| (id, t, k)).collect()
+            // S1-b 递补序：优先级小者先，同值 FIFO（创建序）
+            v.sort_by_key(|(_, _, _, prio, created)| (*prio, *created));
+            v.into_iter().map(|(id, t, k, _, _)| (id, t, k)).collect()
         };
         let mut counts = self.active_slot_counts();
         let mut activated = Vec::new();
@@ -685,6 +729,7 @@ impl DaemonState {
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         };
 
         // E23 定时启动：start_at 未来 → 延迟入引擎（记录 Queued + 无句柄），
@@ -824,6 +869,7 @@ impl DaemonState {
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         };
 
         // E23 定时启动：start_at 未来 → 延迟入引擎，到点由调度循环接入。
@@ -1082,6 +1128,7 @@ impl DaemonState {
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         };
         let mut rec = TaskRecord {
             seeding_since: None,
@@ -1262,6 +1309,7 @@ impl DaemonState {
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         };
 
         // E21 skip：目标文件已在 → 不入引擎，任务直接落 Completed
@@ -1442,6 +1490,7 @@ impl DaemonState {
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         };
 
         // E23 定时启动：start_at 未来 → 延迟入引擎，到点由调度循环接入。
@@ -1608,6 +1657,7 @@ impl DaemonState {
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         };
 
         // E23 定时启动：start_at 未来 → 延迟入引擎，到点由调度循环接入。
@@ -2426,6 +2476,305 @@ impl DaemonState {
             }
         }
         Ok(())
+    }
+
+    /// 强制宣告/重新校验/导出（Task 46）：公共前置——BT 任务预拒 + 引擎句柄
+    /// 解析（同 set_task_super_seeding 惯例）。
+    async fn bt_op_engine(
+        &self,
+        id: &str,
+        op_name: &str,
+    ) -> Result<
+        (
+            std::sync::Arc<dyn smart_dl_core::types::DownloadEngine>,
+            String,
+        ),
+        DaemonError,
+    > {
+        let rec = self
+            .tasks
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        let tid = rec
+            .engine_tid
+            .clone()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        if rec.engine_kind != EngineKind::Bt {
+            return Err(DaemonError::UnsupportedOp(format!(
+                "任务 {id} 的引擎不支持 {op_name}（仅 BT 任务）"
+            )));
+        }
+        Ok((self.engine_for(EngineKind::Bt)?, tid))
+    }
+
+    /// 强制宣告（Task 46，qbit/BitComet 任务右键对标）：tracker 宣告与
+    /// DHT 宣告可组合（`tracker`/`dht` 均真 = 两者都执行）。全部请求失败
+    /// 才返回 Err（单路失败聚合进错误文本）。
+    pub async fn announce_task(
+        &self,
+        id: &str,
+        tracker: bool,
+        dht: bool,
+    ) -> Result<(), DaemonError> {
+        if !tracker && !dht {
+            return Err(DaemonError::InvalidSource(
+                "announce 请求无效：tracker 与 dht 至少一项为 true".into(),
+            ));
+        }
+        let (engine, tid) = self.bt_op_engine(id, "强制宣告").await?;
+        let mut errs: Vec<String> = Vec::new();
+        if tracker {
+            if let Err(e) = engine.force_reannounce(&tid).await {
+                errs.push(format!("tracker 宣告失败: {e}"));
+            }
+        }
+        if dht {
+            if let Err(e) = engine.force_dht_announce(&tid).await {
+                errs.push(format!("DHT 宣告失败: {e}"));
+            }
+        }
+        if errs.len() == usize::from(tracker) + usize::from(dht) {
+            return Err(DaemonError::Engine(errs.join("; ")));
+        }
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.push_event(
+                    "force_announce",
+                    Some(format!("tracker={tracker} dht={dht}")),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// 强制重新校验（Task 46，qbit「强制重新校验」对标）：任务转入 checking，
+    /// 校验期下载/做种挂起，完成后自动恢复。仅下发引擎，不改记录态（状态
+    /// 推进由 bt_events 轮询自然回流）。
+    pub async fn recheck_task(&self, id: &str) -> Result<(), DaemonError> {
+        let (engine, tid) = self.bt_op_engine(id, "强制重新校验").await?;
+        engine
+            .force_recheck(&tid)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.push_event("force_recheck", None);
+            }
+        }
+        Ok(())
+    }
+
+    /// 导出 .torrent（Task 46，qbit「导出 .torrent」对标）：metainfo bencode
+    /// 字节。magnet 任务 metadata 未就绪 → 409（Other 语义）。
+    pub async fn export_task_torrent(&self, id: &str) -> Result<Vec<u8>, DaemonError> {
+        let (engine, tid) = self.bt_op_engine(id, "导出种子").await?;
+        engine.export_torrent(&tid).await.map_err(|e| match e {
+            smart_dl_core::types::EngineError::Unsupported => {
+                DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持导出种子"))
+            }
+            other => DaemonError::Engine(other.to_string()),
+        })
+    }
+
+    /// 生成 magnet URI（Task 46）：btih + dn + 全量 tracker。
+    pub async fn task_magnet_uri(&self, id: &str) -> Result<String, DaemonError> {
+        let (engine, tid) = self.bt_op_engine(id, "生成磁链").await?;
+        engine.magnet_uri(&tid).await.map_err(|e| match e {
+            smart_dl_core::types::EngineError::Unsupported => {
+                DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持生成磁链"))
+            }
+            other => DaemonError::Engine(other.to_string()),
+        })
+    }
+
+    /// Session 级 IP 封禁（Task 46，qbit「永久封禁」对标）：逐条校验 IP →
+    /// 下发 BT 引擎 → 成功者入列表并落盘。返回逐条结果（部分成功语义）。
+    /// 锁纪律：bt_bans 短锁（contains/push 各自持锁，不跨 await）。
+    pub async fn ban_ips(&self, ips: Vec<String>) -> Vec<(String, Result<(), String>)> {
+        let mut out = Vec::with_capacity(ips.len());
+        let engine = self.engine_for(EngineKind::Bt).ok();
+        let mut newly: Vec<String> = Vec::new();
+        for ip in ips {
+            let ip_trim = ip.trim().to_string();
+            let canon = ip_trim.parse::<std::net::IpAddr>().map(|p| p.to_string());
+            let res = match canon {
+                Err(e) => Err(format!("非法 IP: {e}")),
+                Ok(c) => {
+                    // 锁纪律：短锁取 bool，不跨 await（guard !Send）
+                    let already = self.bt_bans.lock().contains(&c);
+                    if already {
+                        Ok(()) // 幂等：已封禁直接成功
+                    } else if let Some(eng) = engine.as_ref() {
+                        match eng.ban_ip(&c).await {
+                            Ok(()) => {
+                                self.bt_bans.lock().push(c.clone());
+                                newly.push(c);
+                                Ok(())
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    } else {
+                        Err("BT 引擎不可用（feature 未启用）".into())
+                    }
+                }
+            };
+            out.push((ip_trim, res));
+        }
+        if !newly.is_empty() {
+            self.persist_bans();
+        }
+        out
+    }
+
+    /// 解除封禁（Task 46）：逐条下发 + 列表移除 + 落盘（幂等）。
+    /// 锁纪律：短锁判存/移除，await 一律在锁外（guard !Send 不跨 await）。
+    pub async fn unban_ips(&self, ips: Vec<String>) -> Vec<(String, Result<(), String>)> {
+        let mut out = Vec::with_capacity(ips.len());
+        let engine = self.engine_for(EngineKind::Bt).ok();
+        let mut removed = false;
+        for ip in ips {
+            let ip_trim = ip.trim().to_string();
+            let canon = ip_trim.parse::<std::net::IpAddr>().map(|p| p.to_string());
+            let res = match canon {
+                Err(e) => Err(format!("非法 IP: {e}")),
+                Ok(c) => {
+                    let present = self.bt_bans.lock().contains(&c);
+                    if !present {
+                        Ok(()) // 幂等：未封禁也算成功
+                    } else if let Some(eng) = engine.as_ref() {
+                        match eng.unban_ip(&c).await {
+                            Ok(()) => {
+                                self.bt_bans.lock().retain(|b| b != &c);
+                                removed = true;
+                                Ok(())
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    } else {
+                        Err("BT 引擎不可用（feature 未启用）".into())
+                    }
+                }
+            };
+            out.push((ip_trim, res));
+        }
+        if removed {
+            self.persist_bans();
+        }
+        out
+    }
+
+    /// 当前显式封禁列表快照（GET /security/bans）。
+    pub fn list_bans(&self) -> Vec<String> {
+        self.bt_bans.lock().clone()
+    }
+
+    /// 队列优先级设置（Task 46，qbit 队列位置对标）：仅对排队中任务（Queued
+    /// 且未接入引擎）有实际递补语义，但对任意任务均可设置（提前设定，等它
+    /// 未来落队时生效——qbit 同语义）。`action` 相对移动基于**当前排队集**
+    /// 的 (queue_priority, created_at) 排序：
+    /// - top/bottom：取队列极值 ∓1（队空 = 不变，返回原值）
+    /// - up/down：与相邻任务交换 priority；相邻并列时越级 ±1（保证严格移动）
+    ///
+    /// 返回设置后的 queue_priority（事件已记录）。
+    pub async fn set_task_priority(
+        &self,
+        id: &str,
+        value: Option<i32>,
+        action: Option<String>,
+    ) -> Result<i32, DaemonError> {
+        // 相对移动先在 tasks 快照外计算目标值（短锁读队列快照）
+        let mut new_val: Option<i32> = value;
+        if let Some(act) = &action {
+            let cur = {
+                let tasks = self.tasks.lock();
+                let rec = tasks
+                    .get(id)
+                    .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+                rec.task.queue_priority
+            };
+            // 排队集快照：Queued 无句柄任务，排序键 (priority, created_at)
+            let queue: Vec<(String, i32, std::time::Instant)> = {
+                let tasks = self.tasks.lock();
+                let mut v: Vec<(String, i32, std::time::Instant)> = tasks
+                    .iter()
+                    .filter(|(_, r)| r.engine_tid.is_none() && r.task.state == TaskState::Queued)
+                    .map(|(tid, r)| (tid.clone(), r.task.queue_priority, r.task.created_at))
+                    .collect();
+                v.sort_by_key(|(_, p, c)| (*p, *c));
+                v
+            };
+            match act.as_str() {
+                "top" => {
+                    new_val = Some(queue.iter().map(|(_, p, _)| *p).min().unwrap_or(cur) - 1);
+                }
+                "bottom" => {
+                    new_val = Some(queue.iter().map(|(_, p, _)| *p).max().unwrap_or(cur) + 1);
+                }
+                "up" | "down" => {
+                    let pos = queue.iter().position(|(tid, _, _)| tid == id);
+                    match pos {
+                        None => {
+                            // 不在当前排队集（运行中/暂停等）：无相邻语义 → 按极值移动
+                            new_val = if act == "up" {
+                                Some(queue.iter().map(|(_, p, _)| *p).min().unwrap_or(cur) - 1)
+                            } else {
+                                Some(queue.iter().map(|(_, p, _)| *p).max().unwrap_or(cur) + 1)
+                            };
+                        }
+                        Some(i) if act == "up" && i > 0 => {
+                            // 越过前一个：±1 而非取同值——并列时 (priority, created_at)
+                            // 排序仍按创建序，同值不保证上移（本任务创建晚则原地）
+                            new_val = Some(queue[i - 1].1 - 1);
+                        }
+                        Some(i) if act == "down" && i + 1 < queue.len() => {
+                            new_val = Some(queue[i + 1].1 + 1);
+                        }
+                        _ => new_val = Some(cur), // 已在队首/队尾：不变
+                    }
+                }
+                other => {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "未知 priority action {other:?}（支持 top/bottom/up/down）"
+                    )))
+                }
+            }
+        }
+        let Some(v) = new_val else {
+            return Err(DaemonError::InvalidSource(
+                "priority 请求无效：value 与 action 至少一项".into(),
+            ));
+        };
+        {
+            let mut tasks = self.tasks.lock();
+            let rec = tasks
+                .get_mut(id)
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            rec.task.queue_priority = v;
+            rec.push_event(
+                "priority_changed",
+                Some(match &action {
+                    Some(a) => format!("{a} → {v}"),
+                    None => v.to_string(),
+                }),
+            );
+        }
+        self.autosave();
+        Ok(v)
+    }
+
+    /// 封禁列表落盘（best-effort：失败仅 warn，运行时列表为准）。
+    fn persist_bans(&self) {
+        let Some(path) = self.bans_persist_path.clone() else {
+            return;
+        };
+        let bans = self.bt_bans.lock().clone();
+        if let Err(e) = super::persistence::write_bans_atomic(&path, &bans) {
+            tracing::warn!("bans.json 落盘失败 {path:?}: {e}");
+        }
     }
 
     /// 手动添加 peer（qbit「添加 peer」对标）：addr 逐条注入 BT 任务；
@@ -3355,6 +3704,7 @@ impl HttpSink for FallbackSink {
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         };
         let tid = self
             .http

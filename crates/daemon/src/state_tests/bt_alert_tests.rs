@@ -44,6 +44,7 @@ fn bt_rec(state: TaskState, ih: &str) -> TaskRecord {
             file_priorities: None,
             sequential: false,
             max_connections: None,
+            queue_priority: 0,
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,

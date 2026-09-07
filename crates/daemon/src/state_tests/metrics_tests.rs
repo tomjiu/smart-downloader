@@ -49,6 +49,7 @@ fn http_rec_with_rates(id: &str, down: u64, up: u64) -> TaskRecord {
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
             file_priorities: None,
             sequential: false,
         },

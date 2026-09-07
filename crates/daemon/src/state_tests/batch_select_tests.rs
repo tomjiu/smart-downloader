@@ -44,6 +44,7 @@ fn insert_rec(state: &DaemonState, id: &str, kind: EngineKind, st: TaskState) {
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         },
         engine_tid: Some(id.to_string()),
         engine_kind: kind,

@@ -132,6 +132,7 @@ impl HttpSink for EngineSink {
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         };
         let tid = self
             .engine
@@ -206,6 +207,7 @@ async fn full_flow_transfers_two_files_to_disk() {
         file_priorities: None,
         sequential: false,
         max_connections: None,
+        queue_priority: 0,
         metadata: smart_dl_core::task::TaskMetadata {
             name: None,
             added_at_unix: 0,

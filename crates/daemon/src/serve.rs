@@ -144,6 +144,7 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
         )
         .with_cleanup(cfg.cleanup.clone())
         .with_start_jitter(cfg.scheduler.start_jitter_seconds)
+        .with_completion_action(&cfg.scheduler.completion_action)
         .with_limits_cfg(cfg.limits.clone())
         .with_queue_cfg(cfg.queue.clone())
         .with_config_path(args.config.clone())
@@ -162,6 +163,7 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
         )
         .with_cleanup(cfg.cleanup.clone())
         .with_start_jitter(cfg.scheduler.start_jitter_seconds)
+        .with_completion_action(&cfg.scheduler.completion_action)
         .with_limits_cfg(cfg.limits.clone())
         .with_queue_cfg(cfg.queue.clone())
         .with_config_path(args.config.clone())
@@ -202,6 +204,9 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
             let bt_arc: Arc<dyn smart_dl_core::types::DownloadEngine> = bt.clone();
             state = state.with_bt(bt_arc);
             tracing::info!("BT 引擎已启用, 落盘: {save:?}");
+            // Task 46：显式 IP 封禁重放（bans.json → libtorrent ip_filter；
+            // best-effort，单条失败仅 warn）
+            state.replay_bans().await;
             Some(core)
         } else {
             None

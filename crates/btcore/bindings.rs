@@ -518,6 +518,37 @@ unsafe extern "C" {
     ) -> lt_err;
 }
 unsafe extern "C" {
+    pub fn lt_unban_peer(
+        s: *mut lt_session,
+        ip: *const ::std::os::raw::c_char,
+    ) -> lt_err;
+}
+unsafe extern "C" {
+    pub fn lt_is_banned(
+        s: *mut lt_session,
+        ip: *const ::std::os::raw::c_char,
+        out: *mut i32,
+    ) -> lt_err;
+}
+unsafe extern "C" {
+    pub fn lt_force_reannounce(
+        s: *mut lt_session,
+        ih: *const ::std::os::raw::c_char,
+    ) -> lt_err;
+}
+unsafe extern "C" {
+    pub fn lt_force_dht_announce(
+        s: *mut lt_session,
+        ih: *const ::std::os::raw::c_char,
+    ) -> lt_err;
+}
+unsafe extern "C" {
+    pub fn lt_force_recheck(
+        s: *mut lt_session,
+        ih: *const ::std::os::raw::c_char,
+    ) -> lt_err;
+}
+unsafe extern "C" {
     pub fn lt_add_peer(
         s: *mut lt_session,
         ih: *const ::std::os::raw::c_char,

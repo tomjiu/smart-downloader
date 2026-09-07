@@ -145,6 +145,7 @@ fn bt_prio_task(id: &str, prios: Option<Vec<u32>>) -> DownloadTask {
         file_priorities: prios,
         sequential: false,
         max_connections: None,
+        queue_priority: 0,
         metadata: TaskMetadata {
             name: None,
             added_at_unix: 0,

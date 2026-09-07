@@ -26,6 +26,8 @@ impl DaemonState {
                 max_upload_kb_s: 0,
             }),
             webhook_url: Mutex::new(None),
+            completion_action: Mutex::new("none".to_string()),
+            completion_fired: std::sync::atomic::AtomicBool::new(false),
             webhook_client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .build()
@@ -46,6 +48,8 @@ impl DaemonState {
             live_config: Mutex::new(None),
             rss: Mutex::new(crate::rss::RssState::default()),
             rss_persist_path: None,
+            bt_bans: Mutex::new(Vec::new()),
+            bans_persist_path: None,
         }
     }
 
@@ -54,6 +58,18 @@ impl DaemonState {
         self.start_jitter_secs
             .store(secs, std::sync::atomic::Ordering::Relaxed);
         self
+    }
+
+    /// 注入完成动作（Task 46；serve 从 `[scheduler] completion_action` 传入）。
+    /// 非法值仅记 warn 并回落 none（配置合法性由 settings 校验面把关）。
+    pub fn with_completion_action(self, action: &str) -> Self {
+        *self.completion_action.lock() = normalize_completion_action(action);
+        self
+    }
+
+    /// 完成动作热更（settings PUT/refresh_config 路径）。
+    pub(crate) fn set_completion_action(&self, action: &str) {
+        *self.completion_action.lock() = normalize_completion_action(action);
     }
 
     /// 注入 HTTP 任务默认落盘目录（dest 未指定时使用；serve 从 `[download] dest_root` 传入）。
@@ -337,8 +353,43 @@ impl DaemonState {
             }
         }
         self.rss_persist_path = rss_path;
+        // Task 46：bans.json 回读（tasks.json 同目录；缺省空 = 无显式封禁）。
+        // 引擎侧重放由 serve 在 BT 引擎装配完成后调 replay_bans（best-effort）。
+        let bans_path = path.parent().map(|d| d.join("bans.json"));
+        if let Some(bp) = &bans_path {
+            match super::persistence::read_bans(bp) {
+                Ok(bans) if !bans.is_empty() => {
+                    tracing::info!("IP 封禁列表回读: {} 条", bans.len());
+                    self.bt_bans = Mutex::new(bans);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("bans.json 回读失败 {bp:?}: {e}"),
+            }
+        }
+        self.bans_persist_path = bans_path;
         self.persist_path = Some(path);
         self
+    }
+
+    /// 启动封禁重放（Task 46；serve 在 BT 引擎装配后调用）：逐条下发引擎
+    /// session 级 ban（best-effort：单条失败仅 warn，不阻断启动）。
+    pub async fn replay_bans(&self) {
+        let bans = self.bt_bans.lock().clone();
+        if bans.is_empty() {
+            return;
+        }
+        let Ok(engine) = self.engine_for(EngineKind::Bt) else {
+            tracing::warn!("IP 封禁重放跳过：BT 引擎不可用（feature 未启用）");
+            return;
+        };
+        let mut ok = 0usize;
+        for ip in &bans {
+            match engine.ban_ip(ip).await {
+                Ok(()) => ok += 1,
+                Err(e) => tracing::warn!("IP 封禁重放失败 {ip}: {e}"),
+            }
+        }
+        tracing::info!("IP 封禁重放完成: {ok}/{} 条", bans.len());
     }
 
     /// RSS bootstrap client 克隆（与 metalink bootstrap 同源 client；None = 测试装配）。
@@ -477,4 +528,84 @@ pub(super) fn ct_eq(a: &str, b: &str) -> bool {
         .zip(b.bytes())
         .fold(0u8, |acc, (x, y)| acc | (x ^ y))
         == 0
+}
+
+/// 完成动作归一化（Task 46）：trim + 小写；未知值回落 "none"（warn 由
+/// 调用方路径记录）。合法全集 = none/exit/shutdown/sleep/hibernate。
+pub(crate) fn normalize_completion_action(action: &str) -> String {
+    let a = action.trim().to_ascii_lowercase();
+    match a.as_str() {
+        "" | "none" => "none".to_string(),
+        "exit" | "shutdown" | "sleep" | "hibernate" => a,
+        other => {
+            tracing::warn!("未知 completion_action {other:?}，回落 none");
+            "none".to_string()
+        }
+    }
+}
+
+/// 完成动作执行（Task 46）：exit = 进程退出（桌面壳随之退出）；shutdown /
+/// sleep / hibernate = 系统级动作（跨平台命令 spawn，失败仅记日志）。
+/// 调用方保证一次性（fired 旗标）；此处 fire-and-forget，不阻塞完成链路。
+pub(crate) fn execute_completion_action(action: &str) {
+    tracing::info!("全部任务已终态，执行完成动作: {action}");
+    match action {
+        "exit" => {
+            // 给日志一帧落盘窗口后退出（桌面端壳会随 sidecar 退出联动收尾）
+            std::process::exit(0);
+        }
+        "shutdown" | "sleep" | "hibernate" => {
+            let res = system_power_action(action);
+            if let Err(e) = res {
+                tracing::error!("系统动作 {action} 执行失败: {e}");
+            }
+        }
+        _ => {} // none：不可达（调用方已过滤）
+    }
+}
+
+/// 系统电源动作（Task 46）：优先 systemctl（Linux systemd）；shutdown 另有
+/// 通用 `shutdown -h now` 兜底；Windows 走原生命令。spawn 不等待。
+fn system_power_action(action: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::process::Command;
+        let (sub, args): (&str, &[&str]) = match action {
+            "shutdown" => ("poweroff", &[]),
+            "sleep" => ("suspend", &[]),
+            "hibernate" => ("hibernate", &[]),
+            _ => return Ok(()),
+        };
+        let st = Command::new("systemctl").args([sub]).args(args).status();
+        match st {
+            Ok(s) if s.success() => Ok(()),
+            _ if action == "shutdown" => {
+                // 无 systemd（容器/无权限）→ 传统 shutdown 兜底
+                Command::new("shutdown")
+                    .arg("-h")
+                    .arg("now")
+                    .status()
+                    .map(|_| ())
+            }
+            Ok(s) => Err(std::io::Error::other(format!(
+                "systemctl {sub} 退出码非 0: {s}"
+            ))),
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::process::Command;
+        match action {
+            "shutdown" => Command::new("shutdown")
+                .args(["/s", "/t", "0"])
+                .status()
+                .map(|_| ()),
+            "sleep" | "hibernate" => Command::new("rundll32")
+                .args(["powrprof.dll,SetSuspendState", "0,1,0"])
+                .status()
+                .map(|_| ()),
+            _ => Ok(()),
+        }
+    }
 }

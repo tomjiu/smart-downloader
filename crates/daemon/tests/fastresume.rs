@@ -53,6 +53,7 @@ fn bt_task(id: &str, magnet: &str) -> DownloadTask {
         },
         limits: None,
         max_connections: None,
+        queue_priority: 0,
     }
 }
 

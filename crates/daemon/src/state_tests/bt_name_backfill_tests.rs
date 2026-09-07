@@ -44,6 +44,7 @@ fn insert_bt_downloading(state: &DaemonState, id: &str, ih: &str) {
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         },
         engine_tid: Some(ih.to_string()),
         engine_kind: EngineKind::Bt,

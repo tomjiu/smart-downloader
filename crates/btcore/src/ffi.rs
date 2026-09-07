@@ -355,6 +355,62 @@ impl Session {
         )
     }
 
+    /// 强制向全部 tracker 立即宣告（qbit/BitComet 任务右键对标；Task 46）。
+    pub fn force_reannounce(&self, ih: &str) -> Result<()> {
+        let i = self.ih(ih)?;
+        call(unsafe { lt_force_reannounce(self.raw, i.as_ptr()) }, || {
+            Ok(())
+        })
+    }
+
+    /// 强制 DHT 宣告（DHT 未启用时内核 no-op，不报错）。
+    pub fn force_dht_announce(&self, ih: &str) -> Result<()> {
+        let i = self.ih(ih)?;
+        call(
+            unsafe { lt_force_dht_announce(self.raw, i.as_ptr()) },
+            || Ok(()),
+        )
+    }
+
+    /// 强制重新校验（任务转入 checking；校验期下载/做种挂起，完成后自动恢复）。
+    pub fn force_recheck(&self, ih: &str) -> Result<()> {
+        let i = self.ih(ih)?;
+        call(unsafe { lt_force_recheck(self.raw, i.as_ptr()) }, || Ok(()))
+    }
+
+    /// Session 级 IP 封禁（幂等；内核走 ip_filter，列表 C++ 侧镜像可查回）。
+    /// `ih` = Some 时内核先验证任务存在（NotFound 语义），None 直接全 session 生效。
+    pub fn ban_ip(&self, ih: Option<&str>, ip: &str) -> Result<()> {
+        let a = cstr(ip)?;
+        let i = match ih {
+            Some(s) => Some(self.ih(s)?),
+            None => None,
+        };
+        let ih_ptr = match &i {
+            Some(c) => c.as_ptr(),
+            None => ptr::null(),
+        };
+        call(
+            unsafe { lt_ban_peer(self.raw, ih_ptr, a.as_ptr(), 0) },
+            || Ok(()),
+        )
+    }
+
+    /// 解除封禁（幂等：未封禁的 IP 也返回 Ok）。
+    pub fn unban_ip(&self, ip: &str) -> Result<()> {
+        let a = cstr(ip)?;
+        call(unsafe { lt_unban_peer(self.raw, a.as_ptr()) }, || Ok(()))
+    }
+
+    /// 查询显式封禁状态（true = 已封禁）。仅反映本层显式封禁（不含内核
+    /// auto-ban 的临时封禁）。
+    pub fn is_banned(&self, ip: &str) -> Result<bool> {
+        let a = cstr(ip)?;
+        let mut out: c_int = 0;
+        let code = unsafe { lt_is_banned(self.raw, a.as_ptr(), &mut out) };
+        call(code, || Ok(out != 0))
+    }
+
     pub fn resume(&self, ih: &str) -> Result<()> {
         let i = self.ih(ih)?;
         call(unsafe { lt_resume(self.raw, i.as_ptr()) }, || Ok(()))

@@ -64,6 +64,49 @@ impl Drop for TmpWriteGuard {
     }
 }
 
+/// IP 封禁列表原子落盘（Task 46）：与 write_tasks_atomic 同配方（唯一 tmp +
+/// 0600 + rename）。文件不含凭据，但保持 0600 口径一致（防面/深度防御）。
+pub fn write_bans_atomic(path: &Path, bans: &[String]) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(bans).map_err(std::io::Error::other)?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!(
+        "{}-{unique}.tmp",
+        path.file_name()
+            .map_or_else(|| "bans".to_string(), |f| f.to_string_lossy().to_string())
+    );
+    let tmp = path.with_file_name(tmp_name);
+    let write_guard = TmpWriteGuard { path: tmp.clone() };
+    let res = (|| {
+        std::fs::write(&tmp, &json)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, path)
+    })();
+    let renamed = res.is_ok();
+    drop(write_guard);
+    if !renamed {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// IP 封禁列表回读（Task 46）：文件不存在 = 空列表（首次启动）；解析失败
+/// 返回 Err（调用方 warn 后继续，封禁语义失效优于启动失败）。
+pub fn read_bans(path: &Path) -> std::io::Result<Vec<String>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    serde_json::from_str(&text).map_err(std::io::Error::other)
+}
+
 impl DaemonState {
     /// 序列化当前任务目录（持久化用）。`paused` 取自任务缓存态
     /// （pause/resume 处理器同步改写并 autosave，落盘时态准确）。
