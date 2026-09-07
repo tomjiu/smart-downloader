@@ -2420,6 +2420,25 @@ async fn rss_feeds_list(State(state): State<Arc<DaemonState>>) -> impl IntoRespo
     Json(serde_json::json!({ "feeds": feeds })).into_response()
 }
 
+/// 订阅设置更新请求（batch5.1）：interval_override_secs（0 = 跟随全局）。
+#[derive(Deserialize)]
+pub struct RssFeedUpdateReq {
+    #[serde(default)]
+    pub interval_override_secs: u64,
+}
+
+/// 订阅设置更新（batch5.1）：`PATCH /rss/feeds/:id`。
+async fn rss_feed_update(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<u64>,
+    Json(req): Json<RssFeedUpdateReq>,
+) -> Response {
+    match state.rss_update_feed(id, req.interval_override_secs) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => daemon_error_response(e, &id.to_string()),
+    }
+}
+
 async fn rss_feed_remove(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<u64>,
@@ -2578,7 +2597,10 @@ macro_rules! router_base {
             .route("/config/limit", post(config_set_limit))
             .route("/settings", get(settings_endpoint).put(settings_put))
             .route("/rss/feeds", get(rss_feeds_list).post(rss_feed_add))
-            .route("/rss/feeds/:id", delete(rss_feed_remove))
+            .route(
+                "/rss/feeds/:id",
+                delete(rss_feed_remove).patch(rss_feed_update),
+            )
             .route("/rss/items", get(rss_items_list))
             .route("/rss/rules", get(rss_rules_list).post(rss_rule_add))
             .route("/rss/rules/:id", delete(rss_rule_remove))

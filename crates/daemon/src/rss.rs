@@ -564,6 +564,20 @@ impl DaemonState {
         Ok((id, st.feeds.last().unwrap().title.clone(), count))
     }
 
+    /// 更新订阅设置（batch5.1）：interval_override_secs（0 = 跟随全局）。
+    /// 未知 id → Err NotFound。
+    pub fn rss_update_feed(&self, id: u64, interval_override_secs: u64) -> Result<(), DaemonError> {
+        let mut st = self.rss_state().lock();
+        let feed = st
+            .feeds
+            .iter_mut()
+            .find(|f| f.id == id)
+            .ok_or_else(|| DaemonError::NotFound(format!("feed {id} 不存在")))?;
+        feed.interval_override_secs = interval_override_secs;
+        self.rss_save(&st);
+        Ok(())
+    }
+
     /// 移除订阅（未知 id → false）。
     pub fn rss_remove_feed(&self, id: u64) -> bool {
         let mut st = self.rss_state().lock();
@@ -939,5 +953,43 @@ mod tests {
         };
         assert!(item_matches(&exclude_only, "Anything stable"));
         assert!(!item_matches(&exclude_only, "x ALPHA y"));
+    }
+
+    #[test]
+    fn rss_update_feed_interval_and_notfound() {
+        use crate::state::state_tests::FakeEngine;
+        use crate::state::DaemonState;
+        use std::sync::Arc;
+
+        let state = DaemonState::new(
+            Arc::new(FakeEngine::new(smart_dl_core::types::EngineKind::Http)),
+            vec![],
+        );
+        {
+            let mut st = state.rss_state().lock();
+            st.next_feed_id += 1;
+            let fid = st.next_feed_id;
+            st.feeds.push(RssFeed {
+                id: fid,
+                url: "https://example/rss.xml".into(),
+                title: "t".into(),
+                added_at_unix: 0,
+                last_refresh_unix: None,
+                interval_override_secs: 0,
+                items: vec![],
+            });
+        }
+        let id = 1;
+        state.rss_update_feed(id, 300).unwrap();
+        assert_eq!(
+            state.rss_state().lock().feeds[0].interval_override_secs,
+            300
+        );
+        assert!(state.rss_update_feed(id, 0).is_ok());
+        assert_eq!(state.rss_state().lock().feeds[0].interval_override_secs, 0);
+        assert!(
+            state.rss_update_feed(99, 100).is_err(),
+            "未知 id → NotFound"
+        );
     }
 }
