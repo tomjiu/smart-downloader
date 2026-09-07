@@ -31,6 +31,9 @@ export default function TaskDetail({
         const t = await client.getTask(id);
         if (!alive) return;
         setTask(t);
+        // 审查修复（P2）：顺序下载开关回读快照字段——原实现恒初始化 false，
+        // 已开启的任务显示“已关闭”且首点误发 true。
+        setSeq(Boolean(t.sequential));
       } catch {
         /* 抽屉期间任务可能被移除 */
       }
@@ -113,12 +116,24 @@ export default function TaskDetail({
                   className="qoder-btn qoder-btn--primary"
                   onClick={() =>
                     run(
-                      () =>
-                        client.taskLimit(
-                          task.task_id,
-                          down ? Number(down) || 0 : undefined,
-                          up ? Number(up) || 0 : undefined,
-                        ),
+                      () => {
+                        // 审查修复（P2）：非数字/负数输入不再静默变 0（=不限速），
+                        // 非法输入报错不发请求。
+                        const parse = (v: string) => {
+                          if (!v.trim()) return undefined;
+                          const n = Number(v);
+                          if (!Number.isFinite(n) || n < 0) {
+                            throw new Error("限速必须为非负数字");
+                          }
+                          return Math.floor(n);
+                        };
+                        const d = parse(down);
+                        const u = parse(up);
+                        if (d === undefined && u === undefined) {
+                          throw new Error("请至少填写一个方向的限速值");
+                        }
+                        return client.taskLimit(task.task_id, d, u);
+                      },
                       "限速已应用",
                     )
                   }

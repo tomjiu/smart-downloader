@@ -34,6 +34,11 @@ pub async fn probe_range(
         .header(reqwest::header::RANGE, "bytes=0-0")
         .timeout(Duration::from_secs(30));
     for (k, v) in headers {
+        // 审查修复：跳过用户自带的 Range 头，避免与探测用 bytes=0-0 叠加成
+        // 重复/冲突头（段路径 download.rs/engine.rs 已同款跳过，探测补齐）。
+        if k.eq_ignore_ascii_case("range") {
+            continue;
+        }
         req = req.header(k, v);
     }
     let resp = req
@@ -64,7 +69,11 @@ pub async fn probe_range(
 
     match status {
         reqwest::StatusCode::PARTIAL_CONTENT => {
-            let total = content_range_total(resp.headers()).or(resp.content_length());
+            // 审查修复（P1）：206 应答体只有 1 字节（探测 Range: bytes=0-0）。
+            // 旧实现 Content-Range 缺失/`bytes 0-0/*` 时回落 content_length()
+            // → total=1，任务只下 1 字节即 Completed 交付截断文件。206 分支
+            // 仅信 Content-Range；取不到 → None（落未知长度路径）。
+            let total = content_range_total(resp.headers());
             Ok(Probe {
                 range_supported: true,
                 etag,
