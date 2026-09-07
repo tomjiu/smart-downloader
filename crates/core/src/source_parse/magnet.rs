@@ -136,7 +136,10 @@ pub fn parse_magnet(uri: &str) -> Result<MagnetInfo, MagnetError> {
                             info.infohash = btih.to_ascii_lowercase();
                             seen_btih = true;
                         }
-                    } else {
+                        // 审查修复（P2）：其余非首个合法 v1 按文档契约「其余忽略」——
+                        // 原 else 分支会把 hybrid magnet 的 base32 v1 表示误判为
+                        // 非法 btih 整体报错（is_hex40 只认 hex，base32 长度/字集均不符）。
+                    } else if !seen_btih {
                         return Err(MagnetError::BadInfohash(v.to_string()));
                     }
                 } else if v.starts_with("urn:btmh:") {

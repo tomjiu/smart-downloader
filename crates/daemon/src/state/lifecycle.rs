@@ -514,6 +514,10 @@ impl DaemonState {
                 );
             }
         }
+        // Task 46 审查修复（P2）：completion_action 热重载跟随（字段文档承诺
+        // 「热重载跟随」；原实现仅启动时 with_completion_action 注入一次，
+        // 直接编辑 TOML 改完成动作被静默忽略）。
+        self.set_completion_action(&cfg.scheduler.completion_action);
     }
 }
 

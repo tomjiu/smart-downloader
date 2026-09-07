@@ -57,6 +57,11 @@ struct lt_session {
     std::string last_err;
     // Task 46：显式 IP 封禁列表（session 级 ip_filter 的 Rust 可查回镜像）。
     // 重启重放由 daemon 层持久化（bans.json）负责，C++ 侧仅运行时状态。
+    // 审查修复（P1）：banned 专锁——Session 被 unsafe impl Sync 且 daemon 以
+    // Arc 共享，ban/unban/is_banned 可从多个 tokio worker 并发调用，std::set
+    // 无锁并发修改 = 红黑树损坏 UB（同 err_mtx 已修过的同类问题）。独立叶子锁：
+    // 锁内不取其他锁，无锁序面。ip_filter 本身的并发由 libtorrent 内部保障。
+    mutable std::mutex ban_mtx;
     std::set<std::string> banned;
     // 审计修复（P1-4）：last_err 专锁——daemon 单 session 被 bt_events 轮询
     // 循环与 API handler（pause/remove/peers 等）并发调用，set_err 写与
@@ -145,8 +150,12 @@ int map_alert_kind(const lt::alert* a) {
 
 void fill_ih_from_torrent_alert(const lt::alert* a, char out[41]) {
     out[0] = '\0';
-    const auto* ta = dynamic_cast<const lt::torrent_alert*>(a);
-    if (ta && ta->handle.is_valid() && ta->handle.info_hashes().has_v1()) {
+    // type() + static_cast：不依赖 RTTI（vcpkg libtorrent 可能无 RTTI）。
+    // 审查修复（P2）：原 dynamic_cast 在 -fno-rtti 构建下恒空 → 所有扁平化
+    // alert 的 ih 为空串，daemon 按 ih 归位任务的终态推进整体失效。
+    if (a->type() < lt::torrent_alert::alert_type) return;
+    const auto* ta = static_cast<const lt::torrent_alert*>(a);
+    if (ta->handle.is_valid() && ta->handle.info_hashes().has_v1()) {
         hex_encode_v1(ta->handle.info_hashes().v1, out);
     }
 }
@@ -360,6 +369,25 @@ lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, 
                 p.url_seeds.emplace_back(*ws);
             }
         }
+        // 审查修复（P1）：幂等 add + errored 重建。daemon 侧失败重试/手动
+        // resume 会重新 add 同一 btih，而 libtorrent 默认 duplicate_is_error
+        // → session 内残存的 errored handle 使 add_torrent 抛 duplicate 异常，
+        // BT 任务重试机制全程失效。语义应为：同 btih = 同一下载——
+        //   * 存活 handle → 幂等返回 OK（不重复添加）；
+        //   * errored handle → 摘除后重加（保留数据，仅重建会话句柄）。
+        lt::info_hash_t existing_ih = p.info_hashes;
+        if (existing_ih.has_v1()) {
+            // libtorrent 2.0.x 的 find_torrent 仅接受 sha1_hash（v1）；2.1 的
+            // info_hash_t 重载不可用（Debian 2.0.11 本地构建同此口径）。
+            if (lt::torrent_handle dup = s->ses.find_torrent(existing_ih.v1); dup.is_valid()) {
+                lt::torrent_status st = dup.status();
+                if (!st.errc) {
+                    hex_encode_v1(existing_ih.v1, ih_out);
+                    return LT_OK; // 幂等：handle 存活，直接复用
+                }
+                s->ses.remove_torrent(dup, lt::remove_flags_t{}); // 保留数据仅重建句柄
+            }
+        }
         const lt::torrent_handle h = s->ses.add_torrent(p);
         const lt::info_hash_t ih = h.info_hashes();
         if (!ih.has_v1()) {
@@ -368,6 +396,7 @@ lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, 
         hex_encode_v1(ih.v1, ih_out);
         return LT_OK;
     } catch (...) {
+        set_err(s, "add_magnet: engine error (duplicate or invalid magnet)");
         return LT_ERR_ENGINE;
     }
 }
@@ -602,6 +631,18 @@ lt_err lt_remove(lt_session* s, const char* ih, int delete_data) {
         if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
         s->ses.remove_torrent(h, delete_data ? lt::session_handle::delete_files
                                              : lt::remove_flags_t{});
+        {
+            // 审查修复（P2）：清理该 ih 的 resume/read 残留——request_save_resume
+            // 已触发而 alert 未被取走时，bencode 永驻 resume_map（数十 KB 级/任务）；
+            // read_map 同理。持锁清理与既有锁序一致（mtx 叶子）。
+            std::lock_guard<std::mutex> lk(s->mtx);
+            s->resume_map.erase(ih);
+            const std::string prefix = std::string(ih) + ":";
+            for (auto it = s->read_map.begin(); it != s->read_map.end();) {
+                if (it->first.rfind(prefix, 0) == 0) it = s->read_map.erase(it);
+                else ++it;
+            }
+        }
         return LT_OK;
     } catch (...) {
         set_err(s, "engine error");
@@ -880,7 +921,10 @@ lt_err lt_ban_peer(lt_session* s, const char* ih, const char* ip, uint16_t /*por
             if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
         }
         const std::string a(ip);
-        if (s->banned.count(a)) return LT_OK; /* 幂等 */
+        {
+            std::lock_guard<std::mutex> lk(s->ban_mtx);
+            if (s->banned.count(a)) return LT_OK; /* 幂等 */
+        }
         boost::system::error_code ec;
         const lt::address addr = lt::make_address(a, ec);
         if (ec) { set_err(s, "invalid ip: " + a); return LT_ERR_ARG; }
@@ -888,6 +932,7 @@ lt_err lt_ban_peer(lt_session* s, const char* ih, const char* ip, uint16_t /*por
         /* ip_filter 语义：flags 0 = allowed，access_flags::blocked = 封禁 */
         f.add_rule(addr, addr, lt::ip_filter::access_flags::blocked);
         s->ses.set_ip_filter(f);
+        std::lock_guard<std::mutex> lk(s->ban_mtx);
         s->banned.insert(a);
         return LT_OK;
     } catch (...) {
@@ -901,7 +946,10 @@ lt_err lt_unban_peer(lt_session* s, const char* ip) {
     if (!s || !ip) return LT_ERR_ARG;
     try {
         const std::string a(ip);
-        if (!s->banned.count(a)) return LT_OK;
+        {
+            std::lock_guard<std::mutex> lk(s->ban_mtx);
+            if (!s->banned.count(a)) return LT_OK;
+        }
         boost::system::error_code ec;
         const lt::address addr = lt::make_address(a, ec);
         if (ec) { set_err(s, "invalid ip: " + a); return LT_ERR_ARG; }
@@ -909,19 +957,30 @@ lt_err lt_unban_peer(lt_session* s, const char* ip) {
         /* 解封 = 恢复 allow（flags 0）*/
         f.add_rule(addr, addr, 0);
         s->ses.set_ip_filter(f);
+        std::lock_guard<std::mutex> lk(s->ban_mtx);
         s->banned.erase(a);
         return LT_OK;
     } catch (...) {
+        set_err(s, "unban: engine error");
         return LT_ERR_ENGINE;
     }
 }
 
 /* 查询封禁状态：out = 1 已封禁 / 0 未封禁。读 banned 集合（O(log n)），
-   不查 libtorrent 内部（auto-ban 的临时封禁不入本集合，语义 = 显式封禁列表）。 */
+   不查 libtorrent 内部（auto-ban 的临时封禁不入本集合，语义 = 显式封禁列表）。
+   审查修复（P1）：ban_mtx 加锁读（并发 ban/unban 下 std::set 读 = UB）；
+   补 try/catch（原为本文件唯一无异常屏障的查询入口，std::string 分配
+   异常可穿越 extern "C"）。 */
 lt_err lt_is_banned(lt_session* s, const char* ip, int* out) {
     if (!s || !ip || !out) return LT_ERR_ARG;
-    *out = s->banned.count(std::string(ip)) ? 1 : 0;
-    return LT_OK;
+    try {
+        std::lock_guard<std::mutex> lk(s->ban_mtx);
+        *out = s->banned.count(std::string(ip)) ? 1 : 0;
+        return LT_OK;
+    } catch (...) {
+        set_err(s, "is_banned: engine error");
+        return LT_ERR_ENGINE;
+    }
 }
 
 lt_err lt_add_url_seed(lt_session* s, const char* ih, const char* url) {

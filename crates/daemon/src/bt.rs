@@ -370,14 +370,23 @@ fn save_fastresume_impl(
     loop_active: &std::sync::atomic::AtomicBool,
     ih: &str,
 ) -> Result<Option<PathBuf>, EngineError> {
-    core.request_save_resume(ih)
-        .map_err(|e| EngineError::Other(core_err(&e)))?;
+    // 审查修复（P2）：先注册 waiter 再 request。原顺序在 request 与注册之间
+    // 存在窗口——alert 循环若恰在此窗口 drain 到 RESUME alert，因无 waiter 而
+    // 丢弃（bt.rs pop 路径 dispatch 前查 waiter），导致 3s 超时误报。先注册
+    // 后 request 保证不漏任何分发；早到的 waiter 不产生副作用。
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     waiters
         .lock()
         .entry(ih.to_string())
         .or_default()
         .push(tx.clone());
+    core.request_save_resume(ih).map_err(|e| {
+        // request 失败则撤掉刚注册的 waiter，避免泄漏空通道
+        if let Some(w) = waiters.lock().get_mut(ih) {
+            w.retain(|w| !w.same_channel(&tx));
+        }
+        EngineError::Other(core_err(&e))
+    })?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut saved: Option<smart_dl_btcore::ResumeBytes> = None;
     // batch3-P1：常驻 alert 消费者存在 → 纯等分发（不自行 pop，双消费者互吞

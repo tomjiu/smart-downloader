@@ -404,10 +404,24 @@ impl DaemonState {
                 resp.status()
             )));
         }
-        let xml = resp
-            .text()
+        // 审查修复（P2）：限长读取（与 rss_refresh_all 的 16MB 上限同口径），
+        // 防恶意/超大 feed 撑爆内存（resp.text() 无上限）。
+        const FEED_MAX: usize = 16 * 1024 * 1024;
+        let mut xml_buf: Vec<u8> = Vec::new();
+        let mut resp = resp;
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| DaemonError::InvalidSource(format!("rss feed 读取失败: {e}")))?;
+            .map_err(|e| DaemonError::InvalidSource(format!("rss feed 读取失败: {e}")))?
+        {
+            if xml_buf.len() + chunk.len() > FEED_MAX {
+                return Err(DaemonError::InvalidSource(
+                    "rss feed 响应超过 16MB 上限".into(),
+                ));
+            }
+            xml_buf.extend_from_slice(&chunk);
+        }
+        let xml = String::from_utf8_lossy(&xml_buf).into_owned();
         let parsed = parse_feed(&xml).map_err(DaemonError::InvalidSource)?;
 
         let mut st = self.rss_state().lock();
