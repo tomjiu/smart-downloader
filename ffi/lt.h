@@ -174,6 +174,16 @@ lt_err lt_ban_peer(lt_session* s, const char* ih, const char* ip, uint16_t port)
 lt_err lt_unban_peer(lt_session* s, const char* ip);
 /* 查询：out = 1 已封禁 / 0 未封禁（读 C++ 侧 banned 集合，O(1)）。 */
 lt_err lt_is_banned(lt_session* s, const char* ip, int* out);
+/* IP 段封禁（batch5 对标：qB/BitComet IP filter 文件语义）：[start, end]
+   闭区间加入 ip_filter。start/end 为 IPv4/IPv6 字面量（同族）。 */
+lt_err lt_ban_range(lt_session* s, const char* start, const char* end);
+/* 首尾块优先（batch5 对标：qB「首尾块优先」）：每文件首/末块优先级置为
+   prio（0..=7，7 最高）。需要 metadata（否则 NOT_FOUND）。 */
+lt_err lt_set_piece_first_last(lt_session* s, const char* ih, int prio);
+/* 会话级存储模式（batch5 对标：qB「预分配磁盘空间」）：alloc 非 0 = 后续
+   新增任务预分配；影响 lt_add_magnet / lt_add_torrent_file 路径（fastresume
+   回灌保留原模式）。须在任务装配前调用。 */
+lt_err lt_set_storage_mode(lt_session* s, int alloc);
 lt_err lt_add_peer(lt_session* s, const char* ih, const char* ip, uint16_t port); /* 本地 seeder 直连注入 */
 lt_err lt_add_url_seed(lt_session* s, const char* ih, const char* url);
 lt_err lt_add_tracker(lt_session* s, const char* ih, const char* url);

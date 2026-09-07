@@ -400,6 +400,21 @@ impl BtCore {
         self.sess.unban_ip(ip)
     }
 
+    /// IP 段封禁（batch5 对标）：[start, end] 闭区间加入 ip_filter。
+    pub fn ban_ip_range(&self, start: &str, end: &str) -> ffi::Result<()> {
+        self.sess.ban_ip_range(start, end)
+    }
+
+    /// 首尾块优先（batch5 对标）：每文件首/末块优先级置为 prio（0..=7）。
+    pub fn set_piece_first_last(&self, ih: &str, prio: i32) -> ffi::Result<()> {
+        self.sess.set_piece_first_last(ih, prio)
+    }
+
+    /// 会话级存储模式（batch5 对标）：后续新增任务预分配开关。
+    pub fn set_storage_mode(&self, alloc: bool) -> ffi::Result<()> {
+        self.sess.set_storage_mode(alloc)
+    }
+
     /// 查询显式封禁状态（true = 已封禁；不含内核 auto-ban 临时封禁）。
     pub fn is_banned(&self, ip: &str) -> ffi::Result<bool> {
         self.sess.is_banned(ip)

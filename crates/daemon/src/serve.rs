@@ -4,6 +4,8 @@ use crate::config::Config;
 use crate::http;
 use crate::lockfile::InstanceLock;
 use crate::state::DaemonState;
+#[cfg(feature = "bt")]
+use smart_dl_core::types::DownloadEngine as _; // batch5：set_session_storage_allocate（trait 方法需在作用域）
 use smart_dl_provider::RemoteProvider;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -66,6 +68,12 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     let mut client_builder = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(30))
+        // batch5（重定向深度可配，qB 对标）：全局 client 策略 limited(n)，
+        // 合法域 1..=100（越界钳到边界，0 视作 1）。任务级代理 client
+        // （httpdl build_proxied_client）保持 reqwest 默认 10 跳。
+        .redirect(reqwest::redirect::Policy::limited(
+            cfg.download.max_redirects.clamp(1, 100) as usize,
+        ))
         // A5（cookie jar）：引擎共享 client 启用内存 cookie 存储——探测/段请求/
         // 重定向自动携带与更新（浏览器会话语义，登录型源一次会话全通）；
         // 同站跨任务共享 jar（同一 client）。任务级代理 client 同口径（见
@@ -200,13 +208,15 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
                                   // S1：启动期会话连接参数（监听端口/全局连接数上限；0 = 不下发）
             bt.apply_startup_conn(cfg.bt.listen_port, cfg.bt.max_connections)
                 .map_err(ServeError::Engine)?;
+            // batch5（存储模式）：会话级预分配开关，任务装配前注入（后续
+            // 全部新增生效；fastresume 回灌保留原模式）。
+            bt.set_session_storage_allocate(cfg.bt.storage_allocate)
+                .await
+                .map_err(|e| ServeError::Engine(e.to_string()))?;
             bt_typed = Some(bt.clone()); // Bug A：alert 循环的暂停意图压制句柄
             let bt_arc: Arc<dyn smart_dl_core::types::DownloadEngine> = bt.clone();
             state = state.with_bt(bt_arc);
             tracing::info!("BT 引擎已启用, 落盘: {save:?}");
-            // Task 46：显式 IP 封禁重放（bans.json → libtorrent ip_filter；
-            // best-effort，单条失败仅 warn）
-            state.replay_bans().await;
             Some(core)
         } else {
             None
@@ -220,6 +230,15 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     // 4c. 迅雷 SDK 引擎（Windows-only，免登录匿名 + 可选带身份模式；与 BT 共用 EngineKind::Bt）
     #[cfg(feature = "xunlei")]
     if cfg.xunlei.enabled {
+        // batch5-P2：与 BT 引擎互斥（共用 EngineKind::Bt 引擎槽）——原实现
+        // xunlei 后装配静默覆盖 bt，Task 46 全部 BT 右键能力（封禁/导出/
+        // 强制操作等）对 XunleiBtEngine 返回 Unsupported → 409，用户无从知晓。
+        if cfg.bt.enabled {
+            return Err(ServeError::Engine(
+                "配置 [bt].enabled 与 [xunlei].enabled 互斥（两引擎共用 BT 槽位）：请仅启用其一"
+                    .into(),
+            ));
+        }
         let save = cfg.xunlei_save_path();
         std::fs::create_dir_all(&save)
             .map_err(|e| ServeError::Engine(format!("Xunlei 落盘目录创建失败 {save:?}: {e}")))?;
@@ -335,6 +354,11 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
             }
         }
     }
+
+    // 4b-2. 显式 IP 封禁重放（Task 46；须在 with_storage 回读 bans.json 之后——
+    // 原在 §4 BT 装配处调用早于回读，bt_bans 恒为空，重放从未生效。
+    // best-effort：单条失败仅 warn；无 BT 引擎时内部自行 warn 跳过）
+    state.replay_bans().await;
 
     // 4c. BT alert 事件流（feature bt 且 BT 启用时）
     #[cfg(feature = "bt")]
@@ -481,7 +505,9 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
             tick.tick().await; // 首拍立即返回——启动时不抢跑，等第一个整周期
             loop {
                 tick.tick().await;
-                let (_, matched, _, errors) = st.rss_refresh_all().await;
+                // batch5（RSS 每 feed 独立间隔）：仅刷新到期 feed（feed 自带
+                // interval_override_secs>0 且未到期 → 跳过）；手动刷新仍全量。
+                let (_, matched, _, errors) = st.rss_refresh_due().await;
                 if matched > 0 {
                     tracing::info!("RSS 自动刷新命中 {matched} 条并建任务");
                 }

@@ -329,6 +329,10 @@ pub struct DaemonStats {
     pub down_bytes_s: u64,
     /// 聚合上行速率（B/s；仅 BT 等双向引擎非零）。
     pub up_bytes_s: u64,
+    /// 会话累计下行流量（batch5，字节；估算口径 = 速率×轮询间隔累加）。
+    pub session_down_bytes: u64,
+    /// 会话累计上行流量（batch5，字节；估算口径同上）。
+    pub session_up_bytes: u64,
 }
 
 /// 引擎种类 → 统计标签（`/stats` by_engine 键；与引擎 `id()` 不同，
@@ -454,9 +458,10 @@ pub struct AddHttpOpts {
     /// 循环激活；Some(过去)/None/0 = 立即。仅 HTTP 分支消费（AddTaskReq
     /// 直传）；BT/FTP 走各自 add 参传同语义字段。
     pub start_at_unix: Option<u64>,
-    /// 失败自动重试次数上限（E30，仅 HTTP/FTP 链路生效）：任务失败且预算未
-    /// 用尽时清引擎句柄回 Queued，按指数退避（2s/4s/8s…封顶 60s）由调度
-    /// 循环重激活。0 = 不自动重试（默认，保持既有一次性失败语义）。
+    /// 失败自动重试次数上限（E30；batch5 起全引擎生效——BT 拦截器
+    /// bt_alerts 早已接线、magnet/.torrent/FTP add 全部消费）：任务失败且
+    /// 预算未用尽时清引擎句柄回 Queued，按指数退避（2s/4s/8s…封顶 60s）
+    /// 由调度循环重激活。0 = 不自动重试（默认，保持既有一次性失败语义）。
     pub auto_retry: u32,
 }
 
@@ -649,9 +654,18 @@ pub struct DaemonState {
     pub(crate) rss_persist_path: Option<PathBuf>,
     /// BT 显式 IP 封禁列表（Task 46，qbit「永久封禁」对标）：有序去重；
     /// bans.json 持久化（重启重放），引擎侧 = libtorrent ip_filter。
+    /// 元素可为单 IP（"1.2.3.4"）或闭区间（"1.2.3.0-1.2.3.255"，batch5）。
     pub(crate) bt_bans: Mutex<Vec<String>>,
     /// bans.json 路径（with_storage 派生：tasks.json 同目录；None = 不落盘）。
     pub(crate) bans_persist_path: Option<PathBuf>,
+    /// ban/unban 操作串行化锁（batch5-P2）：contains→await→push 三段非原子，
+    /// 并发 ban(A)/unban(A) 交錯可使列表与内核脱节。tokio Mutex（guard Send，
+    /// 可跨 await）；叶子锁：ban/unban/replay/import 全部经此，无嵌套。
+    pub(crate) ban_ops: tokio::sync::Mutex<()>,
+    /// 会话累计流量（batch5 对标 qB 会话统计）：(down, up) 字节；由状态
+    /// 轮询循环按引擎缓存速率 × 轮询间隔累加（估算口径，见
+    /// accumulate_session_traffic）。Mutex 持锁极短（求和 + 加法）。
+    session_traffic: Mutex<(u64, u64)>,
 }
 
 /// 全局限速总阀门当前值（E16，KiB/s；0 = 不限）。

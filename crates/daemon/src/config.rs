@@ -57,6 +57,15 @@ pub struct DownloadCfg {
     /// 安全修复（V10-2）：磁盘预检严格模式——true = 磁盘可用空间不可探测时
     /// 拒绝入队（防预检被绕过后续盘写满）；false（默认）= 告警 + 放行（旧行为）。
     pub disk_precheck_strict: bool,
+    /// HTTP 重定向最大跳数（batch5 对标 qB）：全局 client
+    /// `redirect::Policy::limited(n)`；默认 10 = reqwest 默认值（不改变
+    /// 现有行为）。合法域 1..=100（越界钳到边界）；仅启动时生效（烘入 client）。
+    #[serde(default = "default_max_redirects")]
+    pub max_redirects: u32,
+}
+
+fn default_max_redirects() -> u32 {
+    10
 }
 
 /// BT 引擎配置。`encrypt` 缺省值是 `allow`（内核默认行为）而非空串，
@@ -113,6 +122,12 @@ pub struct BtCfg {
     /// （u32 serde default = 0 = 不启用，无需具名缺省函数。）
     #[serde(default)]
     pub max_seeding_time_min: u32,
+    /// 存储模式（batch5 对标 qB「预分配磁盘空间」）：true = 后续新增任务
+    /// 预分配完整文件大小（allocate，磁盘占用即时到位、碎片更少）；
+    /// false（默认）= 稀疏（sparse，按需增长）。fastresume 回灌任务保留
+    /// 原模式；仅启动时生效（会话级注入）。
+    #[serde(default)]
+    pub storage_allocate: bool,
 }
 
 /// 备用限速调度（S1，qbit「速度」页 alternate rate limits 对齐项）：
@@ -199,6 +214,7 @@ impl Default for BtCfg {
             extra_trackers: Vec::new(),
             max_share_ratio: default_bt_max_share_ratio(),
             max_seeding_time_min: 0,
+            storage_allocate: false,
         }
     }
 }
@@ -266,8 +282,9 @@ pub struct CleanupCfg {
 pub struct PostDownloadCfg {
     /// 完成后把落盘文件移动到该目录（目录自动创建；同盘 rename，跨盘
     /// copy+delete 回退；同名冲突自动改名 `name(1).ext`）。空 = 禁用（默认）。
-    /// 仅对单文件任务生效（BT 多文件目录跳过）；`conflict_policy=skip` 的
-    /// 任务不移动（尊重"既有文件保持原样"语义，钩子照发）。
+    /// batch5 起 BT 多文件目录任务也支持（目录整体移动，同名冲突改名
+    /// `name(1)`）；`conflict_policy=skip` 的任务不移动（尊重"既有文件
+    /// 保持原样"语义，钩子照发）。
     pub move_to: String,
     /// 完成后执行的外部程序路径（不带 shell 直启；任务上下文经环境变量
     /// 传入：SD_TASK_ID / SD_TASK_NAME / SD_FILE_PATH（移动后终路径）/
@@ -318,6 +335,7 @@ impl Default for Config {
                 proxy: String::new(),
                 max_download_kb_s: 0,
                 disk_precheck_strict: false,
+                max_redirects: 10,
             },
             bt: BtCfg {
                 enabled: true,
@@ -334,6 +352,7 @@ impl Default for Config {
                 extra_trackers: Vec::new(),
                 max_share_ratio: default_bt_max_share_ratio(),
                 max_seeding_time_min: 0,
+                storage_allocate: false,
             },
             limits: LimitsCfg::default(),
             queue: QueueCfg::default(),
@@ -492,6 +511,8 @@ impl Config {
             "persist_path": tasks_path,
             "max_download_kb_s": self.download.max_download_kb_s,
             "disk_precheck_strict": self.download.disk_precheck_strict,
+            "max_redirects": self.download.max_redirects,
+            "bt_storage_allocate": self.bt.storage_allocate,
             "max_upload_kb_s": self.bt.max_upload_kb_s,
             "proxy_enabled": !self.download.proxy.is_empty(),
             "provider_enabled": self.provider.enabled,

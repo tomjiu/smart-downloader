@@ -37,6 +37,7 @@ async fn conn_limit_bt_sets_resets_and_persists() {
             None,
             false,
             None,
+            0,
         )
         .await
         .unwrap();
