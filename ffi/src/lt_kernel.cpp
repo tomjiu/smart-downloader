@@ -249,8 +249,12 @@ lt_err lt_apply_network(lt_session* s,
         } else {
             sp.set_int(lt::settings_pack::proxy_type, 0);
         }
-        if (down_bytes > 0) sp.set_int(lt::settings_pack::download_rate_limit, static_cast<int>(down_bytes));
-        if (up_bytes > 0) sp.set_int(lt::settings_pack::upload_rate_limit, static_cast<int>(up_bytes));
+        // batch3-P2：限速钳制（与 lt_set_limits 同口径）——i64 超界时
+        // static_cast<int> 回绕为负/错值，限速被静默设错
+        if (down_bytes > 0) sp.set_int(lt::settings_pack::download_rate_limit,
+            static_cast<int>(down_bytes > INT32_MAX ? INT32_MAX : down_bytes));
+        if (up_bytes > 0) sp.set_int(lt::settings_pack::upload_rate_limit,
+            static_cast<int>(up_bytes > INT32_MAX ? INT32_MAX : up_bytes));
         s->ses.apply_settings(sp);
         return LT_OK;
     } catch (...) {
@@ -752,8 +756,10 @@ lt_err lt_peers(lt_session* s, const char* ih, lt_peer* buf, size_t cap, size_t*
             const std::string ipstr = ep.address().to_string();
             std::strncpy(o.ip, ipstr.c_str(), sizeof(o.ip) - 1);
             o.port = ep.port();
-            const std::string pid = pi.pid.to_string();
-            hex_encode_20(pid.c_str(), o.peer_id, sizeof(o.peer_id));
+            // batch3-P2：peer_id 单次 hex——sha1_hash::to_string() 已是 40 位
+            // hex 文本，旧实现对该文本再 hex 一次且截断为前 10 字节，与 lt.h
+            // 「原始 peer_id 的 hex」契约不符（peer 客户端识别全错）。
+            hex_encode_v1(pi.pid, o.peer_id);
             std::strncpy(o.client, pi.client.c_str(), sizeof(o.client) - 1);
             o.progress_ppm = pi.progress_ppm;
             o.down_rate = pi.payload_down_speed;
