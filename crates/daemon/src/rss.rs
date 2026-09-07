@@ -57,6 +57,11 @@ pub struct RssFeed {
     pub added_at_unix: u64,
     #[serde(default)]
     pub last_refresh_unix: Option<u64>,
+    /// 每 feed 独立刷新间隔（batch5 对标 qB RSS Downloader；秒）。0（默认）
+    /// = 跟随全局 `[rss] refresh_interval_secs`；>0 = 该 feed 最小刷新间隔
+    ///（自动刷新 ticker 中未到期即跳过；手动 POST /rss/refresh 仍全量）。
+    #[serde(default)]
+    pub interval_override_secs: u64,
     #[serde(default)]
     pub items: Vec<RssItem>,
 }
@@ -80,6 +85,17 @@ pub struct RssRule {
     /// 命中任务的落盘目录（None = default dest_root）。
     #[serde(default)]
     pub dest: Option<String>,
+    /// 关键词按正则解释（batch5 对标 qB「使用正则表达式」）：true = 必须含
+    /// 列表逐条按大小写不敏感正则匹配标题；false（默认）= 大小写不敏感子串。
+    /// 正则编译失败按不命中处理（warn 一次由调用方路径记日志；此处每条
+    /// 编译成本低，规则量级 ≤ 百）。
+    #[serde(default)]
+    pub use_regex: bool,
+    /// 集数过滤（batch5 对标 qB「集数过滤」）：如 `1x02;1x04-1x06;S02E01`。
+    /// 分号分隔多模式；`SxxEyy`/`NxxEyy`/`Nyy` 单集 + `A-B` 区间；标题中
+    /// 出现的所有 S/E 模式逐个提取，任一命中过滤集即通过；空/None = 不过滤。
+    #[serde(default)]
+    pub episode_filter: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -360,15 +376,113 @@ fn decode(
         .map_err(|e| format!("rss 属性解码失败: {e}"))
 }
 
-/// 规则匹配（大小写不敏感子串）：must 全命中 且 must_not 全不命中。
+/// 规则匹配（batch5）：关键词（子串或正则）must 全命中 且 must_not 全不命中，
+/// 且集数过滤（若配置）命中。
 pub fn item_matches(rule: &RssRule, title: &str) -> bool {
-    let lower = title.to_lowercase();
-    let hit = |k: &String| lower.contains(&k.trim().to_lowercase());
-    rule.must_contain.iter().all(hit) && !rule.must_not_contain.iter().any(hit)
+    let kw_ok = if rule.use_regex {
+        let re_hit = |k: &String| {
+            // 用户关键词即正则本体（不转义）；(?i) 大小写不敏感
+            regex::Regex::new(&format!("(?i){}", k.trim()))
+                .map(|re| re.is_match(title))
+                .unwrap_or(false)
+        };
+        rule.must_contain.iter().all(re_hit) && !rule.must_not_contain.iter().any(re_hit)
+    } else {
+        let lower = title.to_lowercase();
+        let hit = |k: &String| lower.contains(&k.trim().to_lowercase());
+        rule.must_contain.iter().all(hit) && !rule.must_not_contain.iter().any(hit)
+    };
+    if !kw_ok {
+        return false;
+    }
+    match &rule.episode_filter {
+        Some(f) if !f.trim().is_empty() => episode_filter_matches(f, title),
+        _ => true,
+    }
 }
 
-/// RSS 自动下载匹配失败键（规则名/关键词为空告警用，v1 未消费保留语义注释）。
-pub const RSS_RULE_DOC: &str = "must_contain 全命中且 must_not_contain 全不命中";
+/// 集数过滤命中（batch5）：解析过滤串为 (季,集) 单集/区间集合，与标题中
+/// 提取的全部 (季,集) 求交。任一标题集数命中集合即 true；过滤串非法
+/// → 一律不命中（保守，防误下整季）。
+pub fn episode_filter_matches(filter: &str, title: &str) -> bool {
+    let mut allow: Vec<EpisodeSel> = Vec::new();
+    for tok in filter.split(';') {
+        let tok = tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        match parse_episode_token(tok) {
+            Some(sel) => allow.push(sel),
+            None => return false,
+        }
+    }
+    if allow.is_empty() {
+        return false;
+    }
+    extract_episodes(title).into_iter().any(|ep| {
+        allow
+            .iter()
+            .any(|a| ep.0 == a.0 && ep.1 >= a.1 && ep.1 <= a.2)
+    })
+}
+
+/// 过滤集数选择：季 + 集闭区间 [start, end]。
+type EpisodeSel = (u32, u32, u32);
+
+/// 单 token 解析：`S02E03` / `2x03` / `2x03-2x06` / `S02E03-S02E06`。
+fn parse_episode_token(tok: &str) -> Option<EpisodeSel> {
+    let t = tok.trim().to_ascii_lowercase();
+    if let Some((x, y)) = t.split_once('-') {
+        let (s1, e1) = parse_s_e(x)?;
+        let (s2, e2) = parse_s_e(y)?;
+        if s1 != s2 || e2 < e1 {
+            return None; // 跨季/逆序区间不支持（保守拒绝）
+        }
+        Some((s1, e1, e2))
+    } else {
+        let (s, e) = parse_s_e(&t)?;
+        Some((s, e, e))
+    }
+}
+
+/// `s02e03` / `2x03` → (季, 集)。
+fn parse_s_e(tok: &str) -> Option<(u32, u32)> {
+    let t = tok.trim().to_ascii_lowercase();
+    if let Some(rest) = t.strip_prefix('s') {
+        let (s, e) = rest.split_once('e')?;
+        Some((s.trim().parse().ok()?, e.trim().parse().ok()?))
+    } else {
+        let (s, e) = t.split_once('x')?;
+        Some((s.trim().parse().ok()?, e.trim().parse().ok()?))
+    }
+}
+
+/// 标题集数提取（regex 实现）：扫描全部 `SxxEyy` 与 `NxxEyy`（大小写不敏感）。
+/// S 形态要求词边界防误吸（如 "S1E2" ok；"CASSEROLE" 不含合法 S..E.. 结构
+/// 自然不匹配）；x 形态要求 x 两侧均为数字。
+fn extract_episodes(title: &str) -> Vec<(u32, u32)> {
+    use std::sync::OnceLock;
+    static RE_S: OnceLock<regex::Regex> = OnceLock::new();
+    static RE_X: OnceLock<regex::Regex> = OnceLock::new();
+    let re_s = RE_S.get_or_init(|| {
+        regex::Regex::new(r"(?i)(?:^|[^a-z0-9])s(\d{1,3})e(\d{1,3})(?:[^0-9]|$)").unwrap()
+    });
+    let re_x = RE_X.get_or_init(|| {
+        regex::Regex::new(r"(?i)(?:^|[^a-z0-9])(\d{1,3})x(\d{1,3})(?:[^0-9]|$)").unwrap()
+    });
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    if let Some(c) = re_s.captures(title) {
+        if let (Some(s), Some(e)) = (c[1].parse().ok(), c[2].parse().ok()) {
+            out.push((s, e));
+        }
+    }
+    if let Some(c) = re_x.captures(title) {
+        if let (Some(s), Some(e)) = (c[1].parse().ok(), c[2].parse().ok()) {
+            out.push((s, e));
+        }
+    }
+    out
+}
 
 // ===== DaemonState 集成 =====
 
@@ -443,6 +557,7 @@ impl DaemonState {
             title,
             added_at_unix: now_unix(),
             last_refresh_unix: Some(now_unix()),
+            interval_override_secs: 0,
             items: parsed.items,
         });
         self.rss_save(&st);
@@ -472,7 +587,26 @@ impl DaemonState {
         feed_id: Option<u64>,
         tags: Vec<String>,
         dest: Option<String>,
+        use_regex: bool,
+        episode_filter: Option<String>,
     ) -> Result<u64, DaemonError> {
+        // batch5：use_regex 时逐条编译校验（非法正则 add 即拒，避免静默不命中）
+        if use_regex {
+            for k in &must_contain {
+                if regex::Regex::new(&format!("(?i){}", k.trim())).is_err() {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "正则非法（must_contain）: {k:?}"
+                    )));
+                }
+            }
+            for k in &must_not_contain {
+                if regex::Regex::new(&format!("(?i){}", k.trim())).is_err() {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "正则非法（must_not_contain）: {k:?}"
+                    )));
+                }
+            }
+        }
         if name.trim().is_empty() {
             return Err(DaemonError::InvalidSource("规则名不可为空".into()));
         }
@@ -498,6 +632,8 @@ impl DaemonState {
             feed_id,
             tags,
             dest,
+            use_regex,
+            episode_filter,
         });
         self.rss_save(&st);
         Ok(id)
@@ -515,20 +651,43 @@ impl DaemonState {
         removed
     }
 
-    /// 刷新全部订阅：拉取 → 条目合并（guid 去重）→ 规则匹配 → 自动建任务。
+    /// 刷新全部订阅（手动入口，force=true 不做到期过滤）：拉取 → 条目合并
+    ///（guid 去重）→ 规则匹配 → 自动建任务。
     ///
     /// 单 feed 拉取失败不整体失败（错误收集进返回 Vec）；返回
     /// `(新增条目总数, 命中并建任务数, task_ids, 错误列表)`。
     pub async fn rss_refresh_all(&self) -> (usize, usize, Vec<String>, Vec<String>) {
+        self.rss_refresh_impl(true).await
+    }
+
+    /// 刷新到期订阅（batch5 每 feed 独立间隔；ticker 入口）：
+    /// feed 自带 `interval_override_secs > 0` 且距上次刷新未到期 → 跳过。
+    pub async fn rss_refresh_due(&self) -> (usize, usize, Vec<String>, Vec<String>) {
+        self.rss_refresh_impl(false).await
+    }
+
+    /// 刷新实现（force=false 时按 feed 级间隔过滤）。
+    async fn rss_refresh_impl(&self, force: bool) -> (usize, usize, Vec<String>, Vec<String>) {
         let client = self.rss_client();
         let mut new_items_total = 0usize;
         let mut matched = 0usize;
         let mut task_ids: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
 
+        let now = now_unix();
         let feed_urls: Vec<(u64, String)> = {
             let st = self.rss_state().lock();
-            st.feeds.iter().map(|f| (f.id, f.url.clone())).collect()
+            st.feeds
+                .iter()
+                .filter(|f| {
+                    force
+                        || f.interval_override_secs == 0
+                        || f.last_refresh_unix
+                            .map(|t| now.saturating_sub(t) >= f.interval_override_secs)
+                            .unwrap_or(true)
+                })
+                .map(|f| (f.id, f.url.clone()))
+                .collect()
         };
 
         for (feed_id, url) in feed_urls {
@@ -767,6 +926,8 @@ mod tests {
             feed_id: None,
             tags: vec![],
             dest: None,
+            use_regex: false,
+            episode_filter: None,
         };
         assert!(item_matches(&rule, "Ubuntu 24.04.2 Desktop"));
         assert!(!item_matches(&rule, "Ubuntu 24.04 beta"));

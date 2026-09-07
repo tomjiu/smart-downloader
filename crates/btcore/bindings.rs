@@ -531,6 +531,23 @@ unsafe extern "C" {
     ) -> lt_err;
 }
 unsafe extern "C" {
+    pub fn lt_ban_range(
+        s: *mut lt_session,
+        start: *const ::std::os::raw::c_char,
+        end: *const ::std::os::raw::c_char,
+    ) -> lt_err;
+}
+unsafe extern "C" {
+    pub fn lt_set_piece_first_last(
+        s: *mut lt_session,
+        ih: *const ::std::os::raw::c_char,
+        prio: i32,
+    ) -> lt_err;
+}
+unsafe extern "C" {
+    pub fn lt_set_storage_mode(s: *mut lt_session, alloc: i32) -> lt_err;
+}
+unsafe extern "C" {
     pub fn lt_force_reannounce(
         s: *mut lt_session,
         ih: *const ::std::os::raw::c_char,

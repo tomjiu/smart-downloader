@@ -28,6 +28,8 @@ impl DaemonState {
             webhook_url: Mutex::new(None),
             completion_action: Mutex::new("none".to_string()),
             completion_fired: std::sync::atomic::AtomicBool::new(false),
+            ban_ops: tokio::sync::Mutex::new(()),
+            session_traffic: Mutex::new((0, 0)),
             webhook_client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(5))
                 .build()
@@ -70,6 +72,10 @@ impl DaemonState {
     /// 完成动作热更（settings PUT/refresh_config 路径）。
     pub(crate) fn set_completion_action(&self, action: &str) {
         *self.completion_action.lock() = normalize_completion_action(action);
+        // batch5-P2（热更补判）：原实现只在任务完成事件触发判定——若全部任务
+        // 已终态后才改配置/热重载启用 shutdown/exit，永远不会再有完成事件，
+        // 新设动作静默失效。注入后补判一次（空表/未全终态时内部自复位）。
+        self.maybe_run_completion_action();
     }
 
     /// 注入 HTTP 任务默认落盘目录（dest 未指定时使用；serve 从 `[download] dest_root` 传入）。
@@ -354,7 +360,8 @@ impl DaemonState {
         }
         self.rss_persist_path = rss_path;
         // Task 46：bans.json 回读（tasks.json 同目录；缺省空 = 无显式封禁）。
-        // 引擎侧重放由 serve 在 BT 引擎装配完成后调 replay_bans（best-effort）。
+        // 引擎侧重放由 serve 在 with_storage 之后调 replay_bans（batch5-P1：
+        // 原注释写"BT 装配完成后"，实际装配处调用早于本回读，恒空转）。
         let bans_path = path.parent().map(|d| d.join("bans.json"));
         if let Some(bp) = &bans_path {
             match super::persistence::read_bans(bp) {
@@ -371,8 +378,9 @@ impl DaemonState {
         self
     }
 
-    /// 启动封禁重放（Task 46；serve 在 BT 引擎装配后调用）：逐条下发引擎
+    /// 启动封禁重放（Task 46；serve 在 with_storage 之后调用）：逐条下发引擎
     /// session 级 ban（best-effort：单条失败仅 warn，不阻断启动）。
+    /// batch5：支持区间条目（"a-b" → ban_ip_range；Task 46 持久化格式扩展）。
     pub async fn replay_bans(&self) {
         let bans = self.bt_bans.lock().clone();
         if bans.is_empty() {
@@ -383,10 +391,16 @@ impl DaemonState {
             return;
         };
         let mut ok = 0usize;
-        for ip in &bans {
-            match engine.ban_ip(ip).await {
+        for entry in &bans {
+            let res = match entry.split_once('-') {
+                // 区间条目（batch5）："a-b"；split_once 对 IPv6 冒号无影响
+                //（用 '-' 分隔持久化格式，v6 字面量自身不含 '-'）
+                Some((a, b)) => engine.ban_ip_range(a, b).await,
+                None => engine.ban_ip(entry).await,
+            };
+            match res {
                 Ok(()) => ok += 1,
-                Err(e) => tracing::warn!("IP 封禁重放失败 {ip}: {e}"),
+                Err(e) => tracing::warn!("IP 封禁重放失败 {entry}: {e}"),
             }
         }
         tracing::info!("IP 封禁重放完成: {ok}/{} 条", bans.len());
@@ -555,13 +569,31 @@ pub(crate) fn execute_completion_action(action: &str) {
     tracing::info!("全部任务已终态，执行完成动作: {action}");
     match action {
         "exit" => {
-            // 给日志一帧落盘窗口后退出（桌面端壳会随 sidecar 退出联动收尾）
+            // batch5-P2：真给日志一帧落盘窗口（原注释称有窗口实则立即
+            // exit）；短眠后退出（桌面端壳会随 sidecar 退出联动收尾）。
+            std::thread::sleep(std::time::Duration::from_millis(250));
             std::process::exit(0);
         }
         "shutdown" | "sleep" | "hibernate" => {
-            let res = system_power_action(action);
-            if let Err(e) = res {
-                tracing::error!("系统动作 {action} 执行失败: {e}");
+            // batch5-P2：system_power_action 同步阻塞（systemctl 可能慢），
+            // 改 spawn_blocking 不占死 tokio worker。失败日志移入闭包内
+            // （原失败处理在同步路径，现 fire-and-forget）。
+            let act = action.to_string();
+            match tokio::runtime::Handle::try_current() {
+                Ok(h) => {
+                    // 运行时上下文：blocking 池执行（systemctl 可能慢，不占 worker）
+                    h.spawn_blocking(move || {
+                        if let Err(e) = system_power_action(&act) {
+                            tracing::error!("系统动作 {act} 执行失败: {e}");
+                        }
+                    });
+                }
+                Err(_) => {
+                    // 无 runtime（测试直调等）：同步兜底（旧行为）
+                    if let Err(e) = system_power_action(&act) {
+                        tracing::error!("系统动作 {act} 执行失败: {e}");
+                    }
+                }
             }
         }
         _ => {} // none：不可达（调用方已过滤）
