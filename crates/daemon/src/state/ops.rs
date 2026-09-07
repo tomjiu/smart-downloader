@@ -2428,6 +2428,211 @@ impl DaemonState {
         Ok(())
     }
 
+    /// 强制宣告/重新校验/导出（Task 46）：公共前置——BT 任务预拒 + 引擎句柄
+    /// 解析（同 set_task_super_seeding 惯例）。
+    async fn bt_op_engine(
+        &self,
+        id: &str,
+        op_name: &str,
+    ) -> Result<
+        (
+            std::sync::Arc<dyn smart_dl_core::types::DownloadEngine>,
+            String,
+        ),
+        DaemonError,
+    > {
+        let rec = self
+            .tasks
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        let tid = rec
+            .engine_tid
+            .clone()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        if rec.engine_kind != EngineKind::Bt {
+            return Err(DaemonError::UnsupportedOp(format!(
+                "任务 {id} 的引擎不支持 {op_name}（仅 BT 任务）"
+            )));
+        }
+        Ok((self.engine_for(EngineKind::Bt)?, tid))
+    }
+
+    /// 强制宣告（Task 46，qbit/BitComet 任务右键对标）：tracker 宣告与
+    /// DHT 宣告可组合（`tracker`/`dht` 均真 = 两者都执行）。全部请求失败
+    /// 才返回 Err（单路失败聚合进错误文本）。
+    pub async fn announce_task(
+        &self,
+        id: &str,
+        tracker: bool,
+        dht: bool,
+    ) -> Result<(), DaemonError> {
+        if !tracker && !dht {
+            return Err(DaemonError::InvalidSource(
+                "announce 请求无效：tracker 与 dht 至少一项为 true".into(),
+            ));
+        }
+        let (engine, tid) = self.bt_op_engine(id, "强制宣告").await?;
+        let mut errs: Vec<String> = Vec::new();
+        if tracker {
+            if let Err(e) = engine.force_reannounce(&tid).await {
+                errs.push(format!("tracker 宣告失败: {e}"));
+            }
+        }
+        if dht {
+            if let Err(e) = engine.force_dht_announce(&tid).await {
+                errs.push(format!("DHT 宣告失败: {e}"));
+            }
+        }
+        if errs.len() == usize::from(tracker) + usize::from(dht) {
+            return Err(DaemonError::Engine(errs.join("; ")));
+        }
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.push_event(
+                    "force_announce",
+                    Some(format!("tracker={tracker} dht={dht}")),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// 强制重新校验（Task 46，qbit「强制重新校验」对标）：任务转入 checking，
+    /// 校验期下载/做种挂起，完成后自动恢复。仅下发引擎，不改记录态（状态
+    /// 推进由 bt_events 轮询自然回流）。
+    pub async fn recheck_task(&self, id: &str) -> Result<(), DaemonError> {
+        let (engine, tid) = self.bt_op_engine(id, "强制重新校验").await?;
+        engine
+            .force_recheck(&tid)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.push_event("force_recheck", None);
+            }
+        }
+        Ok(())
+    }
+
+    /// 导出 .torrent（Task 46，qbit「导出 .torrent」对标）：metainfo bencode
+    /// 字节。magnet 任务 metadata 未就绪 → 409（Other 语义）。
+    pub async fn export_task_torrent(&self, id: &str) -> Result<Vec<u8>, DaemonError> {
+        let (engine, tid) = self.bt_op_engine(id, "导出种子").await?;
+        engine.export_torrent(&tid).await.map_err(|e| match e {
+            smart_dl_core::types::EngineError::Unsupported => {
+                DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持导出种子"))
+            }
+            other => DaemonError::Engine(other.to_string()),
+        })
+    }
+
+    /// 生成 magnet URI（Task 46）：btih + dn + 全量 tracker。
+    pub async fn task_magnet_uri(&self, id: &str) -> Result<String, DaemonError> {
+        let (engine, tid) = self.bt_op_engine(id, "生成磁链").await?;
+        engine.magnet_uri(&tid).await.map_err(|e| match e {
+            smart_dl_core::types::EngineError::Unsupported => {
+                DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持生成磁链"))
+            }
+            other => DaemonError::Engine(other.to_string()),
+        })
+    }
+
+    /// Session 级 IP 封禁（Task 46，qbit「永久封禁」对标）：逐条校验 IP →
+    /// 下发 BT 引擎 → 成功者入列表并落盘。返回逐条结果（部分成功语义）。
+    /// 锁纪律：bt_bans 短锁（contains/push 各自持锁，不跨 await）。
+    pub async fn ban_ips(&self, ips: Vec<String>) -> Vec<(String, Result<(), String>)> {
+        let mut out = Vec::with_capacity(ips.len());
+        let engine = self.engine_for(EngineKind::Bt).ok();
+        let mut newly: Vec<String> = Vec::new();
+        for ip in ips {
+            let ip_trim = ip.trim().to_string();
+            let canon = ip_trim.parse::<std::net::IpAddr>().map(|p| p.to_string());
+            let res = match canon {
+                Err(e) => Err(format!("非法 IP: {e}")),
+                Ok(c) => {
+                    // 锁纪律：短锁取 bool，不跨 await（guard !Send）
+                    let already = self.bt_bans.lock().contains(&c);
+                    if already {
+                        Ok(()) // 幂等：已封禁直接成功
+                    } else if let Some(eng) = engine.as_ref() {
+                        match eng.ban_ip(&c).await {
+                            Ok(()) => {
+                                self.bt_bans.lock().push(c.clone());
+                                newly.push(c);
+                                Ok(())
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    } else {
+                        Err("BT 引擎不可用（feature 未启用）".into())
+                    }
+                }
+            };
+            out.push((ip_trim, res));
+        }
+        if !newly.is_empty() {
+            self.persist_bans();
+        }
+        out
+    }
+
+    /// 解除封禁（Task 46）：逐条下发 + 列表移除 + 落盘（幂等）。
+    /// 锁纪律：短锁判存/移除，await 一律在锁外（guard !Send 不跨 await）。
+    pub async fn unban_ips(&self, ips: Vec<String>) -> Vec<(String, Result<(), String>)> {
+        let mut out = Vec::with_capacity(ips.len());
+        let engine = self.engine_for(EngineKind::Bt).ok();
+        let mut removed = false;
+        for ip in ips {
+            let ip_trim = ip.trim().to_string();
+            let canon = ip_trim.parse::<std::net::IpAddr>().map(|p| p.to_string());
+            let res = match canon {
+                Err(e) => Err(format!("非法 IP: {e}")),
+                Ok(c) => {
+                    let present = self.bt_bans.lock().contains(&c);
+                    if !present {
+                        Ok(()) // 幂等：未封禁也算成功
+                    } else if let Some(eng) = engine.as_ref() {
+                        match eng.unban_ip(&c).await {
+                            Ok(()) => {
+                                self.bt_bans.lock().retain(|b| b != &c);
+                                removed = true;
+                                Ok(())
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    } else {
+                        Err("BT 引擎不可用（feature 未启用）".into())
+                    }
+                }
+            };
+            out.push((ip_trim, res));
+        }
+        if removed {
+            self.persist_bans();
+        }
+        out
+    }
+
+    /// 当前显式封禁列表快照（GET /security/bans）。
+    pub fn list_bans(&self) -> Vec<String> {
+        self.bt_bans.lock().clone()
+    }
+
+    /// 封禁列表落盘（best-effort：失败仅 warn，运行时列表为准）。
+    fn persist_bans(&self) {
+        let Some(path) = self.bans_persist_path.clone() else {
+            return;
+        };
+        let bans = self.bt_bans.lock().clone();
+        if let Err(e) = super::persistence::write_bans_atomic(&path, &bans) {
+            tracing::warn!("bans.json 落盘失败 {path:?}: {e}");
+        }
+    }
+
     /// 手动添加 peer（qbit「添加 peer」对标）：addr 逐条注入 BT 任务；
     /// 逐条返回结果（部分成功语义——单条失败不影响其余）。非 BT 引擎 /
     /// 不支持注入 → 逐条 Err（HTTP 层 409）。事件一条汇总（成功率）。

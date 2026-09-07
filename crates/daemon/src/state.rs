@@ -640,6 +640,11 @@ pub struct DaemonState {
     pub(crate) rss: Mutex<crate::rss::RssState>,
     /// rss.json 路径（with_storage 派生：tasks.json 同目录；None = 不落盘）。
     pub(crate) rss_persist_path: Option<PathBuf>,
+    /// BT 显式 IP 封禁列表（Task 46，qbit「永久封禁」对标）：有序去重；
+    /// bans.json 持久化（重启重放），引擎侧 = libtorrent ip_filter。
+    pub(crate) bt_bans: Mutex<Vec<String>>,
+    /// bans.json 路径（with_storage 派生：tasks.json 同目录；None = 不落盘）。
+    pub(crate) bans_persist_path: Option<PathBuf>,
 }
 
 /// 全局限速总阀门当前值（E16，KiB/s；0 = 不限）。

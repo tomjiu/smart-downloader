@@ -366,6 +366,161 @@ pub struct SuperSeedingReq {
     pub enabled: bool,
 }
 
+/// 强制宣告请求（Task 46）：tracker / dht 至少一项真（否则 400）。
+#[derive(Deserialize)]
+pub struct AnnounceReq {
+    /// 强制向全部 tracker 宣告（缺省 true）。
+    #[serde(default = "default_true")]
+    pub tracker: bool,
+    /// 强制 DHT 宣告（缺省 false；DHT 未启用时内核 no-op）。
+    #[serde(default)]
+    pub dht: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// DaemonError → HTTP 错误响应（Task 46 统一辅助）：404 / 409(UnsupportedOp) /
+/// 400(InvalidSource) / 500 其余。
+fn daemon_error_response(e: DaemonError, _id: &str) -> Response {
+    let body = Json(serde_json::json!({ "error": e.to_string() }));
+    let status = match &e {
+        DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+        DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+        DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, body).into_response()
+}
+
+/// 成功 → 任务快照；失败 → 错误响应（Task 46 辅助；与既有手写 match 同语义）。
+async fn json_err_response(
+    res: Result<(), DaemonError>,
+    state: &Arc<DaemonState>,
+    id: &str,
+) -> Response {
+    match res {
+        Ok(()) => match state.task_snapshot(id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => daemon_error_response(e, id),
+    }
+}
+
+/// IP 封禁请求（Task 46）：`{"ips": ["1.2.3.4", ...]}`；非法 IP 逐条报错
+/// （部分成功语义，不整批拒绝）。
+#[derive(Deserialize)]
+pub struct BansReq {
+    pub ips: Vec<String>,
+}
+
+/// 强制宣告（Task 46）：`POST /tasks/:id/announce`。
+async fn task_announce(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<AnnounceReq>,
+) -> Response {
+    json_err_response(
+        state.announce_task(&id, req.tracker, req.dht).await,
+        &state,
+        &id,
+    )
+    .await
+}
+
+/// 强制重新校验（Task 46）：`POST /tasks/:id/recheck`。
+async fn task_recheck(State(state): State<Arc<DaemonState>>, Path(id): Path<String>) -> Response {
+    json_err_response(state.recheck_task(&id).await, &state, &id).await
+}
+
+/// 导出 .torrent（Task 46）：`GET /tasks/:id/export` →
+/// `application/x-bittorrent`（Content-Disposition 文件名 = 任务名.torrent）。
+async fn task_export(State(state): State<Arc<DaemonState>>, Path(id): Path<String>) -> Response {
+    match state.export_task_torrent(&id).await {
+        Ok(bytes) => {
+            let name = state
+                .task_snapshot(&id)
+                .await
+                .and_then(|s| s.name)
+                .unwrap_or_else(|| id.clone());
+            let safe: String = name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || "._- ()".contains(c) {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/x-bittorrent")],
+                [(
+                    axum::http::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{safe}.torrent\""),
+                )],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(e) => daemon_error_response(e, &id),
+    }
+}
+
+/// 生成 magnet URI（Task 46）：`GET /tasks/:id/magnet` → `{"magnet": "..."}`。
+async fn task_magnet(State(state): State<Arc<DaemonState>>, Path(id): Path<String>) -> Response {
+    match state.task_magnet_uri(&id).await {
+        Ok(m) => Json(serde_json::json!({ "magnet": m })).into_response(),
+        Err(e) => daemon_error_response(e, &id),
+    }
+}
+
+/// 批量封禁（Task 46）：`POST /security/bans`。
+async fn security_ban(State(state): State<Arc<DaemonState>>, Json(req): Json<BansReq>) -> Response {
+    let results = state.ban_ips(req.ips).await;
+    Json(serde_json::json!({
+        "banned": state.list_bans(),
+        "results": results
+            .into_iter()
+            .map(|(ip, r)| match r {
+                Ok(()) => serde_json::json!({ "ip": ip, "ok": true }),
+                Err(e) => serde_json::json!({ "ip": ip, "ok": false, "error": e }),
+            })
+            .collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+/// 批量解除封禁（Task 46）：`DELETE /security/bans`。
+async fn security_unban(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<BansReq>,
+) -> Response {
+    let results = state.unban_ips(req.ips).await;
+    Json(serde_json::json!({
+        "banned": state.list_bans(),
+        "results": results
+            .into_iter()
+            .map(|(ip, r)| match r {
+                Ok(()) => serde_json::json!({ "ip": ip, "ok": true }),
+                Err(e) => serde_json::json!({ "ip": ip, "ok": false, "error": e }),
+            })
+            .collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+/// 封禁列表（Task 46）：`GET /security/bans`。
+async fn security_list_bans(State(state): State<Arc<DaemonState>>) -> Response {
+    Json(serde_json::json!({ "banned": state.list_bans() })).into_response()
+}
+
 async fn task_super_seeding(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -2314,6 +2469,16 @@ macro_rules! router_base {
             .route("/tasks/:id/webseeds", post(task_webseeds))
             .route("/tasks/:id/peers", post(task_add_peers))
             .route("/tasks/:id/super-seeding", post(task_super_seeding))
+            .route("/tasks/:id/announce", post(task_announce))
+            .route("/tasks/:id/recheck", post(task_recheck))
+            .route("/tasks/:id/export", get(task_export))
+            .route("/tasks/:id/magnet", get(task_magnet))
+            .route(
+                "/security/bans",
+                get(security_list_bans)
+                    .post(security_ban)
+                    .delete(security_unban),
+            )
             .route("/tasks/:id/trackers", get(task_trackers_list))
             .route("/tasks/:id/trackers", post(task_trackers_add))
             .route("/tasks/:id/trackers", delete(task_trackers_remove))
