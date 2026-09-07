@@ -675,7 +675,8 @@ impl DaemonState {
         // B10：目标目录预检（创建/可写）；magnet 总大小元数据前未知 → 空间预检跳过
         // dest 未指定 → 默认落盘目录（与 HTTP 一致：default_dest_root 配置）
         let def = self.default_dest_root.lock().to_string_lossy().into_owned();
-        let dest_root = ensure_dest_root(dest_root.or(Some(def)), &self.dest_roots())?;
+        let dest_root =
+            ensure_dest_root(non_empty_dest(dest_root).or(Some(def)), &self.dest_roots())?;
         let canonical = CanonicalId {
             kind: CanonicalKind::Bt,
             identity: btih_of(&magnet).unwrap_or_else(|| magnet.clone()),
@@ -805,7 +806,8 @@ impl DaemonState {
     ) -> Result<TaskId, DaemonError> {
         // B10：目标目录预检（创建/可写）；dest 未指定 → 默认落盘目录（与 HTTP/BT-magnet 一致）
         let def = self.default_dest_root.lock().to_string_lossy().into_owned();
-        let dest_root = ensure_dest_root(dest_root.or(Some(def)), &self.dest_roots())?;
+        let dest_root =
+            ensure_dest_root(non_empty_dest(dest_root).or(Some(def)), &self.dest_roots())?;
         let Some(ih) = torrent_infohash(&torrent_bytes) else {
             return Err(DaemonError::InvalidSource(
                 ".torrent 解析失败：无法定位 info dict".into(),
@@ -961,7 +963,8 @@ impl DaemonState {
 
         // 2. 确保目标目录存在
         let def = self.default_dest_root.lock().to_string_lossy().into_owned();
-        let dest_root = ensure_dest_root(dest_root.or(Some(def)), &self.dest_roots())?;
+        let dest_root =
+            ensure_dest_root(non_empty_dest(dest_root).or(Some(def)), &self.dest_roots())?;
 
         // 3. 空间预检（总大小已知）
         precheck_space(&dest_root, total_size, self.disk_precheck_strict)?;
@@ -1223,7 +1226,7 @@ impl DaemonState {
         // dest 未指定 → 默认落盘目录（serve 配置 dest_root；未注入时为 daemon cwd）
         let def = self.default_dest_root.lock().to_string_lossy().into_owned();
         let dest = dest_root.or(Some(def));
-        let dest_root = ensure_dest_root(dest, &self.dest_roots())?;
+        let dest_root = ensure_dest_root(non_empty_dest(dest), &self.dest_roots())?;
         let canonical = CanonicalId {
             kind: CanonicalKind::Http,
             identity: canonical_http_url(&url), // D34：剥 token 参数后的 canonical 身份
@@ -1421,7 +1424,8 @@ impl DaemonState {
         }
         // B10：目标目录预检；目录总大小需 LIST 才可知 → 空间预检跳过（同 HTTP 逻辑）
         let def = self.default_dest_root.lock().to_string_lossy().into_owned();
-        let dest_root = ensure_dest_root(dest_root.or(Some(def)), &self.dest_roots())?;
+        let dest_root =
+            ensure_dest_root(non_empty_dest(dest_root).or(Some(def)), &self.dest_roots())?;
         let (user, pass) = smart_dl_core::source_parse::ftp::parse_ftp_auth(&url);
         // D34 复用 canonical 归一化（url 无 query 时基本原样）：FTP 身份键 = 归一化 URL
         let canonical = CanonicalId {
@@ -1590,7 +1594,8 @@ impl DaemonState {
         }
         // B10：目标目录预检（单文件 size 由引擎 add 时 stat，预检略过同 FTP 单文件）
         let def = self.default_dest_root.lock().to_string_lossy().into_owned();
-        let dest_root = ensure_dest_root(dest_root.or(Some(def)), &self.dest_roots())?;
+        let dest_root =
+            ensure_dest_root(non_empty_dest(dest_root).or(Some(def)), &self.dest_roots())?;
         // canonical 归一化同 FTP 键构方式；CanonicalKind::Sftp 与 ftp:// 键不相撞
         let canonical = CanonicalId {
             kind: CanonicalKind::Sftp,
@@ -3825,6 +3830,12 @@ fn parse_bt_peer(s: &str) -> Option<(String, u16)> {
 /// 某个白名单根内（拒 symlink 逃逸）；原始输入含 `..` 分量直接拒绝。
 /// `allowed_roots` 传空切片 = 不校验（仅测试/serve 初始化自身使用；
 /// 生产路径必须传非空，DaemonState 内部兜底 default_dest_root）。
+/// 空串 dest 归一为 None（回落默认根）。审查修复：`dest:""` 传入为 Some("")
+/// 绕过调用方 `or(Some(def))` 回落，ensure_dest_root 内空路径必然白名单越界。
+pub fn non_empty_dest(dest: Option<String>) -> Option<String> {
+    dest.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
 pub fn ensure_dest_root(
     dest: Option<String>,
     allowed_roots: &[PathBuf],
