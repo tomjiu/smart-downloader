@@ -298,18 +298,32 @@ impl HttpEngine {
             }
             return;
         }
-        let (url, headers, dest, pause_flag, stream_kind) = {
+        let (url, headers, dest, stream_kind) = {
             let tasks = self.inner.tasks.lock();
             match tasks.get(&tid) {
                 Some(t) => (
                     t.mirrors.first().cloned().unwrap_or_default(),
                     t.headers.clone(),
                     t.dest.clone(),
-                    t.pause.clone(),
                     t.stream,
                 ),
                 None => return,
             }
+        };
+        // batch6-P0：is_aborted = pause ∪ epoch 过期 ∪ 任务已移除——流式
+        // 循环的中止依据（旧实现只传 pause 旗标，resume 清旗标后旧循环永不
+        // 退出，与新循环并发 append 同一 .part）。epoch 捕获于 spawn 时刻，
+        // 新循环以新 epoch 成为唯一写者。
+        let is_aborted: Arc<dyn Fn() -> bool + Send + Sync> = {
+            let inner = self.inner.clone();
+            let tid = tid.clone();
+            Arc::new(move || {
+                let tasks = inner.tasks.lock();
+                match tasks.get(&tid) {
+                    Some(t) => t.pause.load(Ordering::SeqCst) || t.epoch != epoch,
+                    None => true,
+                }
+            })
         };
         let limiter = self
             .inner
@@ -343,7 +357,7 @@ impl HttpEngine {
                         dest.clone(),
                         limiter.clone(),
                         on_progress.clone(),
-                        pause_flag.clone(),
+                        is_aborted.clone(),
                     )
                     .await
                 }
@@ -355,7 +369,7 @@ impl HttpEngine {
                         dest.clone(),
                         limiter.clone(),
                         on_progress.clone(),
-                        pause_flag.clone(),
+                        is_aborted.clone(),
                     )
                     .await
                 }
@@ -1325,11 +1339,19 @@ impl DownloadEngine for HttpEngine {
 
     /// 真恢复（P4）：清暂停标志 + epoch+1 无条件 spawn 新循环（从段账本
     /// 恢复已完成段）。旧循环（若仍在收尾）在下一 gen/epoch 检查点自杀，
-    /// 且永不 finalize——并发下载仅重复写同内容字节，幂等无害。
+    /// 且永不 finalize。
+    /// batch6-P0：对运行中（Downloading）任务的 resume 不再重 spawn——
+    /// 旧实现无条件 epoch+1 + 新循环，普通路径幂等重复写同偏移同内容，
+    /// 但流式路径是 append 写（非定偏移），双写者 = 静默损坏交付（与 FTP
+    /// batch3-P0 同类；FTP 侧 was_paused 闸门已修，HTTP 侧此补齐）。运行
+    /// 中 = 无操作（幂等语义）；其余状态（Paused/Error 等）照旧重入。
     async fn resume(&self, id: &EngineTaskId) -> Result<(), EngineError> {
         let (gen, epoch, stream_kind) = {
             let mut tasks = self.inner.tasks.lock();
             let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
+            if t.state == EngineState::Downloading {
+                return Ok(());
+            }
             t.pause.store(false, Ordering::SeqCst);
             t.state = EngineState::Downloading;
             t.epoch += 1;

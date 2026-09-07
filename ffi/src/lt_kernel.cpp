@@ -529,6 +529,23 @@ static void set_err(lt_session* s, std::string m) {
 
 static lt_err fill_ih(lt_session* s, const lt::add_torrent_params& p, const char** web_seeds, char* ih_out) {
     try {
+        // 审查修复（batch6-P1，与 lt_add_magnet 同语义）：幂等 add + errored
+        // 重建——daemon 侧 E30 重试/手动 resume 会重新 add 同一 btih，而
+        // session 内残存的 errored handle 使 add_torrent 抛 duplicate，
+        // 重试对 .torrent/fastresume 路径（有 fastresume 文件的任务几乎
+        // 全部覆盖）全程失效。语义：存活 handle 幂等返回；errored 摘除后重加。
+        lt::info_hash_t existing_ih = p.info_hashes;
+        if (!existing_ih.has_v1() && p.ti) existing_ih = p.ti->info_hashes();
+        if (existing_ih.has_v1()) {
+            if (lt::torrent_handle dup = s->ses.find_torrent(existing_ih.v1); dup.is_valid()) {
+                lt::torrent_status st = dup.status();
+                if (!st.errc) {
+                    hex_encode_v1(existing_ih.v1, ih_out);
+                    return LT_OK; // 幂等：handle 存活，直接复用
+                }
+                s->ses.remove_torrent(dup, lt::remove_flags_t{}); // 保留数据仅重建句柄
+            }
+        }
         lt::torrent_handle h;
         if (p.ti) {
             lt::error_code ec;
@@ -1054,6 +1071,10 @@ lt_err lt_set_piece_first_last(lt_session* s, const char* ih, int prio) {
         if (num_pieces <= 0) { set_err(s, "no pieces"); return LT_ERR_ENGINE; }
         const int piece_len = tf->piece_length();
         if (piece_len <= 0) { set_err(s, "bad piece length"); return LT_ERR_ENGINE; }
+        // daemon 契约 prio==0 = 恢复默认；lt 中 piece priority 0 = skip（不下载）
+        // ——直接透传会把首/末块标成永不下载（小于一块的文件整个文件永不完成）。
+        // 映射到内核默认优先级（batch6-P1 修复，desktop-v0.2.0 审计发现）。
+        const int effective = (prio == 0) ? static_cast<int>(lt::default_priority) : prio;
         for (lt::file_index_t fi(0); fi < lt::file_index_t(fs.num_files()); ++fi) {
             if (fs.pad_file_at(fi)) continue;
             const std::int64_t off = fs.file_offset(fi);
@@ -1063,8 +1084,8 @@ lt_err lt_set_piece_first_last(lt_session* s, const char* ih, int prio) {
             int last = static_cast<int>((off + size - 1) / piece_len);
             if (last >= num_pieces) last = num_pieces - 1;
             if (first < 0 || first >= num_pieces) continue;
-            h.piece_priority(lt::piece_index_t(first), prio);
-            h.piece_priority(lt::piece_index_t(last), prio);
+            h.piece_priority(lt::piece_index_t(first), effective);
+            h.piece_priority(lt::piece_index_t(last), effective);
         }
         return LT_OK;
     } catch (...) {

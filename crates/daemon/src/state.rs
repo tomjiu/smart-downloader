@@ -662,6 +662,10 @@ pub struct DaemonState {
     /// 并发 ban(A)/unban(A) 交錯可使列表与内核脱节。tokio Mutex（guard Send，
     /// 可跨 await）；叶子锁：ban/unban/replay/import 全部经此，无嵌套。
     pub(crate) ban_ops: tokio::sync::Mutex<()>,
+    /// RSS 刷新串行化闸（batch6-P1）：手动刷新与 ticker 并发（或 UI 双击）时，
+    /// 两侧基于同一份未处理快照各自建任务 → 同一条目重复下载（先建任务成孤儿）。
+    /// tokio Mutex（guard Send 可跨 await）持有整轮 refresh，后到者排队串行。
+    pub(crate) rss_refresh_gate: tokio::sync::Mutex<()>,
     /// 会话累计流量（batch5 对标 qB 会话统计）：(down, up) 字节；由状态
     /// 轮询循环按引擎缓存速率 × 轮询间隔累加（估算口径，见
     /// accumulate_session_traffic）。Mutex 持锁极短（求和 + 加法）。

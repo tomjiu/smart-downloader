@@ -30,7 +30,6 @@ use crate::rate::RateLimiter;
 use smart_dl_core::types::EngineError;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// abort 约定错误串：pause()/remove() 置位 abort flag → 段间检查点返回此
@@ -283,7 +282,7 @@ struct RepNode {
     has_seg_base: bool,
     has_cp: bool,
     mime: Option<String>,
-    tpl: Option<Tpl>,
+    tpl: Option<(Tpl, TplMask)>,
     list: Option<SegList>,
 }
 
@@ -291,12 +290,27 @@ struct RepNode {
 struct SetNode {
     is_video: bool,
     has_cp: bool,
-    tpl: Option<Tpl>,
+    tpl: Option<(Tpl, TplMask)>,
     list: Option<SegList>,
     reps: Vec<RepNode>,
 }
 
-fn parse_tpl(elt: &Elt) -> Result<Tpl, String> {
+/// Rep 级 SegmentTemplate 显式属性掩码（batch6-P2，ISO 23009-1
+/// §5.3.9.4.2 属性覆盖继承语义）：Rep 级模板对 AS 级同名属性逐一覆盖，
+/// 缺失属性回退 AS 级同名字段（旧实现整元素替换 → AS 级带
+/// duration/timescale、Rep 级仅覆写 media/init 的合法清单被误拒）。
+#[derive(Debug, Clone, Copy, Default)]
+struct TplMask {
+    timescale: bool,
+    start_number: bool,
+    duration: bool,
+    timeline: bool,
+    init: bool,
+    media: bool,
+}
+
+fn parse_tpl(elt: &Elt) -> Result<(Tpl, TplMask), String> {
+    let mut mask = TplMask::default();
     let pos_u64 = |v: &str| -> Result<u64, String> {
         v.trim()
             .parse::<u64>()
@@ -304,6 +318,7 @@ fn parse_tpl(elt: &Elt) -> Result<Tpl, String> {
     };
     let timescale = match elt.attr("timescale") {
         Some(v) => {
+            mask.timescale = true;
             let ts = pos_u64(v)?;
             if ts == 0 {
                 return Err("DASH SegmentTemplate timescale 须为正".into());
@@ -313,11 +328,15 @@ fn parse_tpl(elt: &Elt) -> Result<Tpl, String> {
         None => 1,
     };
     let start_number = match elt.attr("startNumber") {
-        Some(v) => pos_u64(v)?,
+        Some(v) => {
+            mask.start_number = true;
+            pos_u64(v)?
+        }
         None => 1,
     };
     let duration = match elt.attr("duration") {
         Some(v) => {
+            mask.duration = true;
             let d = pos_u64(v)?;
             if d == 0 {
                 return Err("DASH SegmentTemplate duration 须为正".into());
@@ -329,6 +348,7 @@ fn parse_tpl(elt: &Elt) -> Result<Tpl, String> {
     let timeline = match elt.child("SegmentTimeline") {
         None => None,
         Some(stl) => {
+            mask.timeline = true;
             let mut entries = Vec::new();
             for s in stl.children.iter().filter(|e| e.name == "S") {
                 let d = match s.attr("d") {
@@ -364,20 +384,28 @@ fn parse_tpl(elt: &Elt) -> Result<Tpl, String> {
             Some(entries)
         }
     };
-    Ok(Tpl {
-        init: elt
-            .attr("initialization")
-            .filter(|s| !s.is_empty())
-            .map(String::from),
-        media: elt
-            .attr("media")
-            .filter(|s| !s.is_empty())
-            .map(String::from),
-        timescale,
-        start_number,
-        duration,
-        timeline,
-    })
+    mask.init = elt
+        .attr("initialization")
+        .filter(|s| !s.is_empty())
+        .is_some();
+    mask.media = elt.attr("media").filter(|s| !s.is_empty()).is_some();
+    Ok((
+        Tpl {
+            init: elt
+                .attr("initialization")
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            media: elt
+                .attr("media")
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            timescale,
+            start_number,
+            duration,
+            timeline,
+        },
+        mask,
+    ))
 }
 
 fn parse_list(elt: &Elt, base: String) -> Result<SegList, String> {
@@ -625,8 +653,37 @@ pub fn parse_mpd(base_url: &str, xml: &str) -> Result<DashPlan, String> {
         return Err("DASH SegmentBase（单文件索引 byte-range）v1 不支持——请用直链任务下载".into());
     }
 
-    // 分段寻址展开（Rep 级覆盖 AS 级；混用拒绝）
-    let tpl = chosen_rep.tpl.clone().or_else(|| chosen_set.tpl.clone());
+    // 分段寻址展开（batch6-P2：Rep 级对 AS 级按 ISO 23009-1 §5.3.9.4.2
+    // 逐属性覆盖继承——Rep 缺失的属性回退 AS 级同名字段；旧实现整元素
+    // 替换 → AS 级带 duration/timescale、Rep 级仅覆写 media/init 的合法
+    // 清单被误拒「缺 duration 且无 SegmentTimeline」。混用拒绝）
+    let tpl = match (chosen_set.tpl.as_ref(), chosen_rep.tpl.as_ref()) {
+        (Some((as_t, _)), Some((rep_t, rep_m))) => {
+            let mut t = rep_t.clone();
+            if !rep_m.timescale {
+                t.timescale = as_t.timescale;
+            }
+            if !rep_m.start_number {
+                t.start_number = as_t.start_number;
+            }
+            if !rep_m.duration {
+                t.duration = as_t.duration;
+            }
+            if !rep_m.timeline {
+                t.timeline = as_t.timeline.clone();
+            }
+            if !rep_m.init {
+                t.init = as_t.init.clone();
+            }
+            if !rep_m.media {
+                t.media = as_t.media.clone();
+            }
+            Some(t)
+        }
+        (_, Some((t, _))) => Some(t.clone()),
+        (Some((t, _)), None) => Some(t.clone()),
+        (None, None) => None,
+    };
     let list = chosen_rep.list.clone().or_else(|| chosen_set.list.clone());
     match (tpl, list) {
         (Some(_), Some(_)) => Err("DASH 混用 SegmentTemplate 与 SegmentList 寻址 v1 不支持".into()),
@@ -810,11 +867,13 @@ fn hex_encode(b: &[u8]) -> String {
 }
 
 /// 拉取文本资源（MPD 共用：任务级 headers 透传，30s 超时对齐探测口径）。
+/// batch6-P2：限长读取（16MB 封顶，与 HLS/RSS/metalink 引导同口径）。
 async fn fetch_text(
     client: &reqwest::Client,
     headers: &[(String, String)],
     url: &str,
 ) -> Result<String, EngineError> {
+    const FETCH_TEXT_MAX: usize = 16 * 1024 * 1024;
     let mut req = client.get(url).timeout(std::time::Duration::from_secs(30));
     for (k, v) in headers {
         req = req.header(k, v);
@@ -824,9 +883,21 @@ async fn fetch_text(
         .await
         .and_then(|r| r.error_for_status())
         .map_err(|e| EngineError::Other(format!("DASH 清单拉取失败: {e}")))?;
-    resp.text()
+    let mut out: Vec<u8> = Vec::new();
+    let mut resp = resp;
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| EngineError::Other(format!("DASH 清单读取失败: {e}")))
+        .map_err(|e| EngineError::Other(format!("DASH 清单读取失败: {e}")))?
+    {
+        if out.len() + chunk.len() > FETCH_TEXT_MAX {
+            return Err(EngineError::Other(format!(
+                "MPD 超过 {FETCH_TEXT_MAX} 字节上限"
+            )));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    String::from_utf8(out).map_err(|e| EngineError::Other(format!("MPD 非 UTF-8: {e}")))
 }
 
 #[allow(clippy::too_many_arguments)] // 协议会话要素，同 hls.rs 惯例
@@ -837,7 +908,7 @@ pub async fn download_dash(
     dest: PathBuf,
     limiter: Arc<RateLimiter>,
     on_progress: Arc<dyn Fn(u64) + Send + Sync>,
-    abort: Arc<AtomicBool>,
+    is_aborted: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> Result<(), EngineError> {
     let mpd_text = fetch_text(&client, &headers, &url).await?;
     let plan = parse_mpd(&url, &mpd_text).map_err(EngineError::Other)?;
@@ -895,14 +966,20 @@ pub async fn download_dash(
 
     let total_segs = items.len();
     for (idx, iurl) in items.iter().enumerate().skip(segments_done) {
-        // abort 检查点（段间）：pause/remove 置位 → 立即中断（账本已落，
-        // resume 凭 segments_done 续传）
-        if abort.load(Ordering::SeqCst) {
+        // abort 检查点（段间）：pause/remove/被新 epoch 取代 → 立即中断
+        // （账本已落，resume 凭 segments_done 续传）。batch6-P0：is_aborted
+        // 闭包同时校验 pause / epoch 过期 / 任务已移除——旧实现只看 pause
+        // 旗标（resume 会清掉），旧循环与 resume 新循环并发 append 同一
+        // .part（双写者静默损坏），保证 epoch 单写者不变量。
+        if is_aborted() {
             return Err(EngineError::Other(DASH_ABORTED_MSG.into()));
         }
-        let mut req = client
-            .get(iurl)
-            .timeout(std::time::Duration::from_secs(120));
+        // batch6-P1：段拉取不再设 120s 总超时（reqwest .timeout 含响应体）
+        // ——单文件表示（无分段 MPD，segments=[整个文件]）耗时必然超限，
+        // 任务永远无法完成；且 resp.bytes() 全量驻内存。改为流式写盘：
+        // 停滞由 client 级 read_timeout（idle 30s，serve/builder 同口径）
+        // 兑底，连接由 connect_timeout 兑底。
+        let mut req = client.get(iurl);
         for (k, v) in &headers {
             req = req.header(k, v);
         }
@@ -911,15 +988,17 @@ pub async fn download_dash(
             .await
             .and_then(|r| r.error_for_status())
             .map_err(|e| EngineError::Other(format!("段 {idx}/{total_segs} 拉取失败: {e}")))?;
-        let raw = resp
-            .bytes()
+        let mut resp = resp;
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| EngineError::Other(format!("段 {idx}/{total_segs} 读取失败: {e}")))?;
-        let payload = raw.to_vec();
-        limiter.wait(payload.len() as u64).await;
-        f.write_all(&payload)
-            .map_err(|e| EngineError::Other(format!("part 写入: {e}")))?;
-        bytes_done += payload.len() as u64;
+            .map_err(|e| EngineError::Other(format!("段 {idx}/{total_segs} 读取失败: {e}")))?
+        {
+            limiter.wait(chunk.len() as u64).await;
+            f.write_all(&chunk)
+                .map_err(|e| EngineError::Other(format!("part 写入: {e}")))?;
+            bytes_done += chunk.len() as u64;
+        }
         // batch3-P1：进度统一绝对累计语义（与回填同口径，见 hls 同批修复）
         on_progress(bytes_done);
         // 段完成即落账本（顺序前缀语义 → 崩溃后从下一段续）
@@ -935,7 +1014,11 @@ pub async fn download_dash(
     }
     drop(f);
 
-    // finalize：.part → dest
+    // finalize：.part → dest（batch6-P0：落位前终检——过期循环不得落位，
+    // 否则可在新循环写到一半时把 .part 改名交付半成品）。
+    if is_aborted() {
+        return Err(EngineError::Other(DASH_ABORTED_MSG.into()));
+    }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| EngineError::Other(format!("dest mkdir: {e}")))?;

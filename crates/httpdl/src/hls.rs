@@ -20,23 +20,31 @@
 // EXT-X-MAP（fMP4 init 段）、fMP4 段合流校验（裸拼接交付，由播放器解码）。
 use crate::rate::RateLimiter;
 use smart_dl_core::types::EngineError;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// abort 约定错误串：pause()/remove() 置位 abort flag → 段间检查点返回此
 /// 错误，spawn_hls_loop 识别后静默返回（任务状态由 pause()/remove() 管理）。
 pub const HLS_ABORTED_MSG: &str = "hls-aborted";
-use std::io::Write as _;
+
+/// 段数上限（对齐 dash MAX_SEGMENTS）：病态清单可声明数亿 URI 行直接 OOM。
+const MAX_SEGMENTS: usize = 1_000_000;
+/// key 缓存上限（batch6-P2）：超限清空重拉，正确性不受影响。
+const HLS_KEY_CACHE_MAX: usize = 64;
 
 /// 单段解密参数（RFC 8216 §4.3.2.4）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SegCrypto {
     None,
-    /// METHOD=AES-128：key URL + 16B IV。
+    /// METHOD=AES-128：key URL + IV。`None` = 清单未声明 IV →
+    /// 落段时按 media sequence number 推导（RFC 8216 §5.2）。
+    /// batch6-P2：旧实现用全零 IV 作「未声明」哨兵，显式
+    /// `IV=0x000…0` 的合法清单会被错误替换为序号推导值且无兕底
+    /// （HLS 无哈希校验 → 静默损坏）；改为 Option 根治混淆。
     Aes128 {
         key_url: String,
-        iv: [u8; 16],
+        iv: Option<[u8; 16]>,
     },
 }
 
@@ -149,6 +157,9 @@ pub fn parse_media_playlist(base_url: &str, text: &str) -> Result<MediaPlaylist,
         if line.starts_with('#') {
             continue; // 其余标签忽略（DISCONTINUITY/PROGRAM-DATE-TIME/注释等）
         }
+        if segments.len() >= MAX_SEGMENTS {
+            return Err(format!("HLS 段数异常（> {MAX_SEGMENTS}）"));
+        }
         // URI 行：前必有 EXTINF（结构健全性）
         let duration = pending_duration
             .take()
@@ -176,30 +187,12 @@ pub fn parse_media_playlist(base_url: &str, text: &str) -> Result<MediaPlaylist,
     if !seen_endlist {
         return Err("HLS 清单为 live 流（无 EXT-X-ENDLIST），v1 仅支持 VOD 点播".into());
     }
-    // IV 缺省：未在 EXT-X-KEY 声明 IV 时，AES-128 用该 key 下所有段的
-    // media sequence number（大端 16B）。key 是行内状态 → 解析时即知每段
-    // 的序号（段 i 的序列号 = media_sequence + i），无需延迟推导。
-    for (seq_off, seg) in (0u64..).zip(segments.iter_mut()) {
-        let seq = media_sequence + seq_off;
-        if let SegCrypto::Aes128 { iv, .. } = &mut seg.crypto {
-            // 解析时未显式 IV 的 key 已在 parse_key_attr 填了占位 0——
-            // 这里按序号回填仅当「key 声明无 IV」。为此 parse_key_attr 用
-            // has_iv 区分：无 IV → 此处回填。实现见下方重放逻辑。
-            if seg_has_placeholder_iv(iv, seq) {
-                *iv = iv_from_sequence(seq);
-            }
-        }
-    }
+    // IV 缺省：不再解析期回填（batch6-P2）——`iv=None` 保留到落段时
+    // 按段序号推导（download_hls 内）；显式 IV（含全零）原样保留。
     Ok(MediaPlaylist {
         segments,
         media_sequence,
     })
-}
-
-/// 占位判断：parse_key_attr 无 IV 时填 0 哨兵 + 下方重放按序号回填。
-/// （简化：显式 IV=全零与哨兵不可区分——全零 IV 现实中不存在，注释明示。）
-fn seg_has_placeholder_iv(iv: &[u8; 16], _seq: u64) -> bool {
-    iv.iter().all(|b| *b == 0)
 }
 
 /// IV 缺省推导：media sequence number 64-bit 大端，左补零 16 字节。
@@ -244,10 +237,7 @@ fn parse_key_attr(attrs: &str, base_url: &str) -> Result<Option<SegCrypto>, Stri
         "NONE" => Ok(None),
         "AES-128" => {
             let key_url = uri.ok_or("EXT-X-KEY METHOD=AES-128 缺 URI")?;
-            Ok(Some(SegCrypto::Aes128 {
-                key_url,
-                iv: iv.unwrap_or([0u8; 16]),
-            }))
+            Ok(Some(SegCrypto::Aes128 { key_url, iv }))
         }
         other => Err(format!("HLS v1 不支持加密方式: {other}")),
     }
@@ -367,11 +357,14 @@ fn hex_encode(b: &[u8]) -> String {
 /// （解密 + append）→ finalize 交付。
 /// `on_progress` 累计回调（字节）；`limiter` 段级限速（与既有引擎同口径）。
 /// 拉取文本资源（清单/key 共用：任务级 headers 透传，30s 超时对齐探测口径）。
+/// batch6-P2：限长读取（16MB 封顶，与 RSS feed/metalink 引导同口径）——
+/// 恶意/被劫持的清单服务器可在超时窗口内注入数 GB 字符串打爆内存。
 async fn fetch_text(
     client: &reqwest::Client,
     headers: &[(String, String)],
     url: &str,
 ) -> Result<String, EngineError> {
+    const FETCH_TEXT_MAX: usize = 16 * 1024 * 1024;
     let mut req = client.get(url).timeout(std::time::Duration::from_secs(30));
     for (k, v) in headers {
         req = req.header(k, v);
@@ -380,10 +373,22 @@ async fn fetch_text(
         .send()
         .await
         .and_then(|r| r.error_for_status())
-        .map_err(|e| EngineError::Other(format!("HLS 清单拉取失败: {e}")))?;
-    resp.text()
+        .map_err(|e| EngineError::Other(format!("清单拉取失败: {e}")))?;
+    let mut out: Vec<u8> = Vec::new();
+    let mut resp = resp;
+    while let Some(chunk) = resp
+        .chunk()
         .await
-        .map_err(|e| EngineError::Other(format!("HLS 清单读取失败: {e}")))
+        .map_err(|e| EngineError::Other(format!("清单读取失败: {e}")))?
+    {
+        if out.len() + chunk.len() > FETCH_TEXT_MAX {
+            return Err(EngineError::Other(format!(
+                "清单超过 {FETCH_TEXT_MAX} 字节上限"
+            )));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    String::from_utf8(out).map_err(|e| EngineError::Other(format!("清单非 UTF-8: {e}")))
 }
 
 #[allow(clippy::too_many_arguments)] // 协议会话要素，同 ftp.rs 惯例
@@ -394,7 +399,7 @@ pub async fn download_hls(
     dest: PathBuf,
     limiter: Arc<RateLimiter>,
     on_progress: Arc<dyn Fn(u64) + Send + Sync>,
-    abort: Arc<AtomicBool>,
+    is_aborted: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> Result<(), EngineError> {
     // master → media（最多一层变体）
     let mut playlist_url = url.clone();
@@ -457,9 +462,12 @@ pub async fn download_hls(
 
     let total_segs = playlist.segments.len();
     for (idx, seg) in playlist.segments.iter().enumerate().skip(segments_done) {
-        // abort 检查点（段间）：pause/remove 置位 → 立即中断（账本已落，
-        // resume 凭 segments_done 续传）
-        if abort.load(Ordering::SeqCst) {
+        // abort 检查点（段间）：pause/remove/被新 epoch 取代 → 立即中断
+        // （账本已落，resume 凭 segments_done 续传）。batch6-P0：旧实现只看
+        // pause 旗标（resume 会清掉）——旧循环与 resume 产生的新循环并发
+        // append 同一 .part（双写者静默损坏）；is_aborted 闭包同时校验
+        // pause / epoch 过期 / 任务已移除，保证 epoch 单写者不变量。
+        if is_aborted() {
             return Err(EngineError::Other(HLS_ABORTED_MSG.into()));
         }
         let mut req = client
@@ -506,11 +514,21 @@ pub async fn download_hls(
                         }
                         let mut k16 = [0u8; 16];
                         k16.copy_from_slice(&kb);
+                        // batch6-P2：缓存上限（逐段唯一 key URL 的病态清单
+                        // 会让 HashMap 无限增长）——超限清空重来，正确性不受
+                        // 影响（仅重拉 key）。
+                        if key_cache.len() >= HLS_KEY_CACHE_MAX {
+                            key_cache.clear();
+                        }
                         key_cache.insert(key_url.clone(), k16);
                         k16
                     }
                 };
-                aes128_cbc_decrypt(&raw, &key, iv).map_err(EngineError::Other)?
+                // batch6-P2：未声明 IV → 落段时按段序号推导
+                //（段序号 = media_sequence + idx，RFC 8216 §5.2）
+                let effective_iv =
+                    iv.unwrap_or_else(|| iv_from_sequence(playlist.media_sequence + idx as u64));
+                aes128_cbc_decrypt(&raw, &key, &effective_iv).map_err(EngineError::Other)?
             }
         };
         limiter.wait(payload.len() as u64).await;
@@ -534,7 +552,11 @@ pub async fn download_hls(
     }
     drop(f);
 
-    // finalize：.part → dest
+    // finalize：.part → dest（batch6-P0：落位前终检——过期循环不得落位，
+    // 否则可在新循环写到一半时把 .part 改名交付半成品）。
+    if is_aborted() {
+        return Err(EngineError::Other(HLS_ABORTED_MSG.into()));
+    }
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| EngineError::Other(format!("dest mkdir: {e}")))?;
@@ -625,10 +647,10 @@ mod tests {
             p.segments[0].crypto,
             SegCrypto::Aes128 {
                 key_url: "https://h/sub/key.bin".into(),
-                iv: [
+                iv: Some([
                     0x9c, 0x7d, 0xb8, 0x77, 0x85, 0x70, 0xd0, 0x5c, 0x31, 0x77, 0xc3, 0x49, 0xfd,
                     0x92, 0x36, 0xaa
-                ]
+                ])
             }
         );
     }
@@ -642,18 +664,38 @@ mod tests {
 #EXTINF:10,\ns1.ts\n\
 #EXT-X-ENDLIST\n";
         let p = parse_media_playlist("https://h/list.m3u8", text).unwrap();
+        // batch6-P2：解析不再回填（Option 语义）——None = 落段时推导
         assert_eq!(
             p.segments[0].crypto,
             SegCrypto::Aes128 {
                 key_url: "https://k/key".into(),
-                iv: iv_from_sequence(7)
+                iv: None
             }
         );
         assert_eq!(
             p.segments[1].crypto,
             SegCrypto::Aes128 {
                 key_url: "https://k/key".into(),
-                iv: iv_from_sequence(8)
+                iv: None
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_zero_iv_is_preserved() {
+        // batch6-P2 回归锚：显式 IV=全零是合法清单（罕见但合法），
+        // 不得被当作「未声明」哨兵替换为序号推导值。
+        let text = "#EXTM3U\n\
+#EXT-X-MEDIA-SEQUENCE:3\n\
+#EXT-X-KEY:METHOD=AES-128,URI=\"https://k/key\",IV=0x00000000000000000000000000000000\n\
+#EXTINF:10,\ns0.ts\n\
+#EXT-X-ENDLIST\n";
+        let p = parse_media_playlist("https://h/list.m3u8", text).unwrap();
+        assert_eq!(
+            p.segments[0].crypto,
+            SegCrypto::Aes128 {
+                key_url: "https://k/key".into(),
+                iv: Some([0u8; 16])
             }
         );
     }
