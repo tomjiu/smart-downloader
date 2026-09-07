@@ -131,8 +131,11 @@ impl DaemonState {
         let Some(path) = self.persist_path.clone() else {
             return;
         };
-        let data = self.persisted_tasks();
+        // 审查修复：快照必须落在 persist_lock 临界区内。原实现先快照后拿锁，
+        // T2（新状态）先写完、T1（旧快照）后拿锁写入 → tasks.json 长期缺
+        // T1 之后的任务/状态变更，重启即丢。锁内快照保证写入序 = 状态序。
         let _g = self.persist_lock.lock();
+        let data = self.persisted_tasks();
         if let Err(e) = write_tasks_atomic(&path, &data) {
             tracing::warn!("任务持久化失败 {path:?}: {e}");
         }

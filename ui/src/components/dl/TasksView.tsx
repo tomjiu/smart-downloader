@@ -78,7 +78,9 @@ export default function TasksView({
   };
 
   const add = async () => {
-    if (!url.trim()) return;
+    // 审查修复（P2）：busy 防抖——按钮有 disabled 约束但 Enter 键不受，
+    // 双击/双 Enter 会重复提交任务。
+    if (busy || !url.trim()) return;
     setBusy(true);
     setErr(null);
     try {

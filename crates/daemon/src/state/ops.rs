@@ -2604,15 +2604,22 @@ impl DaemonState {
             let res = match canon {
                 Err(e) => Err(format!("非法 IP: {e}")),
                 Ok(c) => {
-                    // 锁纪律：短锁取 bool，不跨 await（guard !Send）
+                    // 锁纪律：短锁，不跨 await（guard !Send）
+                    // 审查修复（P2）：contains + push 合并为单次加锁，消除
+                    // 并发 ban 同一 IP 时两段短锁窗口产生的重复条目（重复项
+                    // 会持久化进 bans.json）。
                     let already = self.bt_bans.lock().contains(&c);
                     if already {
                         Ok(()) // 幂等：已封禁直接成功
                     } else if let Some(eng) = engine.as_ref() {
                         match eng.ban_ip(&c).await {
                             Ok(()) => {
-                                self.bt_bans.lock().push(c.clone());
-                                newly.push(c);
+                                // 引擎成功后确认式入列（双重 contains 防御并发窗口）
+                                let mut bans = self.bt_bans.lock();
+                                if !bans.contains(&c) {
+                                    bans.push(c.clone());
+                                    newly.push(c);
+                                }
                                 Ok(())
                             }
                             Err(e) => Err(e.to_string()),
@@ -2709,10 +2716,26 @@ impl DaemonState {
             };
             match act.as_str() {
                 "top" => {
-                    new_val = Some(queue.iter().map(|(_, p, _)| *p).min().unwrap_or(cur) - 1);
+                    // 审查修复（P2）：saturating——用户先设 i32::MIN/MAX 后
+                    // -1/+1 溢出（debug panic、release 回绕破坏 top/bottom 语义）
+                    new_val = Some(
+                        queue
+                            .iter()
+                            .map(|(_, p, _)| *p)
+                            .min()
+                            .unwrap_or(cur)
+                            .saturating_sub(1),
+                    );
                 }
                 "bottom" => {
-                    new_val = Some(queue.iter().map(|(_, p, _)| *p).max().unwrap_or(cur) + 1);
+                    new_val = Some(
+                        queue
+                            .iter()
+                            .map(|(_, p, _)| *p)
+                            .max()
+                            .unwrap_or(cur)
+                            .saturating_add(1),
+                    );
                 }
                 "up" | "down" => {
                     let pos = queue.iter().position(|(tid, _, _)| tid == id);
@@ -2720,9 +2743,23 @@ impl DaemonState {
                         None => {
                             // 不在当前排队集（运行中/暂停等）：无相邻语义 → 按极值移动
                             new_val = if act == "up" {
-                                Some(queue.iter().map(|(_, p, _)| *p).min().unwrap_or(cur) - 1)
+                                Some(
+                                    queue
+                                        .iter()
+                                        .map(|(_, p, _)| *p)
+                                        .min()
+                                        .unwrap_or(cur)
+                                        .saturating_sub(1),
+                                )
                             } else {
-                                Some(queue.iter().map(|(_, p, _)| *p).max().unwrap_or(cur) + 1)
+                                Some(
+                                    queue
+                                        .iter()
+                                        .map(|(_, p, _)| *p)
+                                        .max()
+                                        .unwrap_or(cur)
+                                        .saturating_add(1),
+                                )
                             };
                         }
                         Some(i) if act == "up" && i > 0 => {
@@ -3802,27 +3839,53 @@ pub fn ensure_dest_root(
             )));
         }
     }
-    fs::create_dir_all(&p)
-        .map_err(|e| DaemonError::InvalidSource(format!("目标目录不可创建: {e}")))?;
-    // 2) 白名单校验：canonicalize 后比对前缀（同时拦截 symlink 指向白名单外）
+    // 2) 白名单校验：canonicalize 后比对前缀（同时拦截 symlink 指向白名单外）。
+    //    审查修复（P2）：白名单判定必须先于 create_dir_all——原顺序在白名单外
+    //    预创建任意目录后才拒绝（已认证调用方可借此预建目录结构）。
     if !allowed_roots.is_empty() {
-        let cp = p
-            .canonicalize()
-            .map_err(|e| DaemonError::InvalidSource(format!("目标目录规范化失败: {e}")))?;
-        let inside = allowed_roots.iter().any(|r| {
-            // root 不存在则先建（首启场景 root == dest 本身，上一步已建好）
-            let _ = fs::create_dir_all(r);
-            match r.canonicalize() {
-                Ok(cr) => cp.starts_with(&cr),
-                Err(_) => false,
+        // dest 未创建时 canonicalize 会失败 → 以 dest_root 视角校验父链：
+        // 逐级向上找第一个已存在祖先做前缀比对，再统一建目录。
+        let mut probe = p.clone();
+        let mut anchor = None;
+        loop {
+            if probe.exists() {
+                anchor = Some(probe.clone());
+                break;
             }
-        });
+            match probe.parent() {
+                Some(parent) if probe != parent => probe = parent.to_path_buf(),
+                _ => break,
+            }
+        }
+        let inside = match anchor {
+            Some(a) => a
+                .canonicalize()
+                .ok()
+                .map(|ca| {
+                    // p 与 anchor 的相对尾链无 `..`（第 1 步已拒），拼接比对
+                    let tail = p.strip_prefix(&a).unwrap_or(Path::new(""));
+                    ca.join(tail)
+                })
+                .map(|full| {
+                    allowed_roots.iter().any(|r| {
+                        let _ = fs::create_dir_all(r);
+                        match r.canonicalize() {
+                            Ok(cr) => full.starts_with(&cr),
+                            Err(_) => false,
+                        }
+                    })
+                })
+                .unwrap_or(false),
+            None => false,
+        };
         if !inside {
             return Err(DaemonError::InvalidSource(format!(
                 "dest 越界（不在允许的下载根目录内）: {raw}"
             )));
         }
     }
+    fs::create_dir_all(&p)
+        .map_err(|e| DaemonError::InvalidSource(format!("目标目录不可创建: {e}")))?;
     // 3) 可写探针：随机后缀防可预测竞态（V10-3）
     let probe = p.join(format!(
         ".write_probe-{}-{}",

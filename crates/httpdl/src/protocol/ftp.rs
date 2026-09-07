@@ -405,6 +405,15 @@ fn parse_ftp_url(url: &str) -> Option<(String, u16, FtpTarget, bool)> {
     if host.is_empty() {
         return None;
     }
+    // 审查修复 P0（CWE-147）：host/path 拒绝 CR/LF/NUL —— 恶意 URL
+    // （API/metalink/RSS 均可携带）不得经 RETR/NLST/CWD 命令注入。
+    // user/pass 侧防线见 core parse_ftp_auth 与 login() 终检。
+    if [host.as_str(), raw_path]
+        .iter()
+        .any(|s| s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0))
+    {
+        return None;
+    }
     let path = format!("/{raw_path}");
     let target = if path.ends_with('/') {
         FtpTarget::Dir(path)
@@ -537,6 +546,13 @@ impl FtpSession {
     /// read_response 的多行支持处理（RFC 959）。USER 2xx = 免密已登录，
     /// 跳过 PASS（部分服务器对多余 PASS 回 503）；3xx = 需要 PASS；其余 = 终态。
     async fn login(&mut self, user: &str, pass: &str) -> Result<(), String> {
+        // 审查修复 P0（CWE-147）终防线：凭据含 CR/LF/NUL → 拒绝登录。
+        // core parse_ftp_auth 哨兵 + parse_ftp_url 拒绝之外的第三层。
+        if user.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+            || pass.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+        {
+            return Err("credentials contain control characters".to_string());
+        }
         let user_resp = self.cmd(&format!("USER {user}")).await?;
         if user_resp.starts_with('3') {
             let pass_resp = self.cmd(&format!("PASS {pass}")).await?;
@@ -1242,6 +1258,14 @@ fn part_path_of(dest: &Path) -> PathBuf {
 }
 
 fn finalize_part(part: &Path, dest: &Path, total: u64) -> Result<(), String> {
+    // 审查修复（P1）：同 HTTP 引擎 finalize_part——换源/重下场景 dest 可能
+    // 已有旧内容且大小相同（finalize_to 幂等短路直接 Ok 不覆盖），远端同
+    // 尺寸内容变更后重下 → 旧内容被静默保留、新数据丢弃。先删 dest 强制落位。
+    if let Err(e) = std::fs::remove_file(dest) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("finalize_part: 删除目标文件失败 {dest:?}: {e}");
+        }
+    }
     let om = OutputManager::new(PathBuf::from("."));
     om.finalize_to(part, dest, total).map_err(|e| e.to_string())
 }
@@ -1519,7 +1543,7 @@ impl DownloadEngine for FtpEngine {
         })
     }
 
-    async fn remove(&self, id: &EngineTaskId, _delete_data: bool) -> Result<(), EngineError> {
+    async fn remove(&self, id: &EngineTaskId, delete_data: bool) -> Result<(), EngineError> {
         // 审计修复（P1-4）：置位暂停闸门再移除表项——运行中循环在段边界
         // 退出，不再继续占用带宽/写 .part/把文件 rename 落位。
         {
@@ -1529,10 +1553,25 @@ impl DownloadEngine for FtpEngine {
                 t.pause.store(true, Ordering::SeqCst);
             }
         }
-        let mut tasks = self.inner.tasks.lock();
-        tasks.remove(id).ok_or(EngineError::NotFound)?;
+        let (dest, is_dir) = {
+            let mut tasks = self.inner.tasks.lock();
+            let t = tasks.remove(id).ok_or(EngineError::NotFound)?;
+            (delete_data.then(|| t.dest.clone()), !t.files.is_empty())
+        };
         // 任务级限速登记一并回收（防表无限增长；与 HTTP engine 同口径）
         self.inner.limiters.lock().remove(id);
+        // 审查修复（P1）：delete_data=true 端到端生效。目录任务 dest 为任务
+        // 专属目录（dest_root/dir_name），整目录回收；单文件任务删文件 + part。
+        if let Some(dest) = dest {
+            if is_dir {
+                let _ = std::fs::remove_dir_all(&dest);
+            } else {
+                let _ = std::fs::remove_file(&dest);
+                let part = part_path_of(&dest);
+                let _ = std::fs::remove_file(&part);
+                let _ = std::fs::remove_file(ledger::ledger_path(&part));
+            }
+        }
         Ok(())
     }
 
@@ -1875,14 +1914,24 @@ mod tests {
         assert!(tls);
 
         // 默认端口仍 21（显式 AUTH TLS 惯例）
-        let (h, p, _, tls) = parse_ftp_url("ftps://host/dir/").unwrap();
+        let (h, p, t2, tls) = parse_ftp_url("ftps://host/dir/").unwrap();
         assert_eq!((h.as_str(), p), ("host", 21));
         assert!(tls);
-        assert_eq!((h.as_str(), p), ("host", 21));
-        assert_eq!(t, FtpTarget::File("/file.bin".to_string()));
+        assert_eq!(t2, FtpTarget::Dir("/dir/".to_string()));
 
         assert!(parse_ftp_url("http://host/x").is_none());
         assert!(parse_ftp_url("ftp://").is_none());
+    }
+
+    /// 审查修复 P0（CWE-147）：host/path 含 CR/LF/NUL 的 URL 一律拒绝。
+    #[test]
+    fn parse_ftp_url_rejects_injection() {
+        assert!(parse_ftp_url("ftp://host/a\r\nDELE /data").is_none());
+        assert!(parse_ftp_url("ftp://host/\nDELE /data").is_none());
+        assert!(parse_ftp_url("ftp://ho\rst/file").is_none());
+        assert!(parse_ftp_url("ftp://host/a\x00b").is_none());
+        // 合法 URL 不受影响
+        assert!(parse_ftp_url("ftp://host/file.bin").is_some());
     }
 
     /// 目录落位名：最后一段非空名称；根目录 → host（含端口净化）。

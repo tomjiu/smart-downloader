@@ -657,6 +657,13 @@ fn part_path_of(dest: &Path) -> PathBuf {
 }
 
 fn finalize_part(part: &Path, dest: &Path, total: u64) -> Result<(), String> {
+    // 审查修复（P1）：同 HTTP/FTP finalize_part——dest 旧内容同尺寸时
+    // finalize_to 幂等短路会静默保留旧数据。先删 dest 强制落位。
+    if let Err(e) = std::fs::remove_file(dest) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("finalize_part: 删除目标文件失败 {dest:?}: {e}");
+        }
+    }
     let om = smart_dl_core::session::output::OutputManager::new(PathBuf::from("."));
     om.finalize_to(part, dest, total).map_err(|e| e.to_string())
 }
@@ -906,7 +913,7 @@ impl DownloadEngine for SftpEngine {
         })
     }
 
-    async fn remove(&self, id: &EngineTaskId, _delete_data: bool) -> Result<(), EngineError> {
+    async fn remove(&self, id: &EngineTaskId, delete_data: bool) -> Result<(), EngineError> {
         // 审计修复（P1-4）：置位暂停闸门再移除——运行中循环在段边界退出，
         // 不再继续占用带宽/写 .part/把文件 rename 落位。
         {
@@ -916,10 +923,20 @@ impl DownloadEngine for SftpEngine {
                 t.pause.store(true, Ordering::SeqCst);
             }
         }
-        let mut tasks = self.inner.tasks.lock();
-        tasks.remove(id).ok_or(EngineError::NotFound)?;
+        let dest = {
+            let mut tasks = self.inner.tasks.lock();
+            let t = tasks.remove(id).ok_or(EngineError::NotFound)?;
+            delete_data.then(|| t.dest.clone())
+        };
         // 任务级限速登记一并回收（防表无限增长；与 FTP/HTTP 同口径）
         self.inner.limiters.lock().remove(id);
+        // 审查修复（P1）：delete_data=true 端到端生效——单文件任务删文件 + part。
+        if let Some(dest) = dest {
+            let _ = std::fs::remove_file(&dest);
+            let part = part_path_of(&dest);
+            let _ = std::fs::remove_file(&part);
+            let _ = std::fs::remove_file(ledger::ledger_path(&part));
+        }
         Ok(())
     }
 
