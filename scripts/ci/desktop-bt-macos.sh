@@ -55,9 +55,31 @@ do_setup() {
     export PKG_CONFIG_PATH="$BREW_PREFIX/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
     LT_CFLAGS="$(pkg-config --cflags libtorrent-rasterbar 2>/dev/null || true)"
     echo "    pkg-config cflags: ${LT_CFLAGS:-(空，回退 brew include)}"
+
+    # RTC 宏兜底（desktop-v0.2.0 首跑实证）：brew 2.1.0 的 .pc 未导出
+    # TORRENT_USE_OPENSSL，config.hpp 的 RTC #error 只看消费者宏是否与构建态
+    # 一致——探测编译决定是否显式补宏 + openssl 头路径（keg-only 不在默认
+    # 搜索路径）。基础编译通过则原样；失败则二分补旗标；仍失败交由正式
+    # 编译给出完整诊断。
+    local extra=()
+    probe_lt() { # $@ = 追加旗标 → session.hpp 语法级探测编译
+        printf '#include <libtorrent/session.hpp>\nint main() { return 0; }\n' \
+            | c++ -std=c++17 -fsyntax-only $LT_CFLAGS "$@" -x c++ - > /dev/null 2>&1
+    }
+    if probe_lt; then
+        echo "    probe: 基础编译通过（无需补宏）"
+    else
+        local ssl; ssl="$(brew --prefix openssl 2>/dev/null || true)"
+        if probe_lt -DTORRENT_USE_OPENSSL=1 -I"$ssl/include"; then
+            extra+=(-DTORRENT_USE_OPENSSL=1 -I"$ssl/include")
+            echo "    probe: 基础失败 → 采纳 -DTORRENT_USE_OPENSSL=1 + openssl include"
+        else
+            echo "    probe: 补宏后仍失败（正式编译将给出完整诊断）" >&2
+        fi
+    fi
     mkdir -p "$HOME/bt-native-macos/lib"
     # shellcheck disable=SC2086
-    c++ -std=c++17 -O2 -fPIC -DNDEBUG $LT_CFLAGS -I"$REPO_ROOT/ffi" -I"$BREW_PREFIX/include" \
+    c++ -std=c++17 -O2 -fPIC -DNDEBUG $LT_CFLAGS ${extra+"${extra[@]}"} -I"$REPO_ROOT/ffi" -I"$BREW_PREFIX/include" \
         -c "$REPO_ROOT/ffi/src/lt_kernel.cpp" -o "$HOME/bt-native-macos/lib/lt_kernel.o"
     ar rcs "$HOME/bt-native-macos/lib/liblt_kernel.a" "$HOME/bt-native-macos/lib/lt_kernel.o"
     rm -f "$HOME/bt-native-macos/lib/lt_kernel.o"
