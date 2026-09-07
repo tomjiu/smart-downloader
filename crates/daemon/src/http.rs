@@ -543,6 +543,55 @@ async fn security_list_bans(State(state): State<Arc<DaemonState>>) -> Response {
     Json(serde_json::json!({ "banned": state.list_bans() })).into_response()
 }
 
+/// IP 段批量导入请求（batch5）：`text` = DAT（PeerGuardian）或 P2P 格式
+/// 文本（逐行一个区间；`#` 注释与空行跳过）。
+#[derive(Deserialize)]
+pub struct BansImportReq {
+    pub text: String,
+}
+
+/// IP 段批量导入（batch5 对标 qB/BitComet IP filter 文件）：`POST /security/bans/import`。
+/// 部分成功语义：逐行解析，可解析行入引擎，失败行收集进 errors。
+async fn security_ban_import(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<BansImportReq>,
+) -> Response {
+    let (imported, errors) = state.import_ban_ranges(&req.text).await;
+    let status = if imported == 0 && !errors.is_empty() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "imported": imported,
+            "errors": errors,
+            "banned": state.list_bans(),
+        })),
+    )
+        .into_response()
+}
+
+/// 首尾块优先请求（batch5）：`{"priority": 7}`（0..=7；0 = 恢复默认）。
+#[derive(Deserialize)]
+pub struct PiecePriorityReq {
+    pub priority: i32,
+}
+
+/// 首尾块优先（batch5 对标 qB）：`POST /tasks/:id/piece-priority`。
+/// 每文件首/末块优先级提升（边下边播 seek 场景）；metadata 未就绪 → 409。
+async fn task_piece_first_last(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<PiecePriorityReq>,
+) -> Response {
+    match state.set_task_piece_first_last(&id, req.priority).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => daemon_error_response(e, &id),
+    }
+}
+
 async fn task_super_seeding(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -1589,7 +1638,13 @@ async fn add_task(
                 #[cfg(feature = "bt")]
                 {
                     state
-                        .add_torrent_task_opts(bytes, req.dest, req.sequential, req.start_at_unix)
+                        .add_torrent_task_opts(
+                            bytes,
+                            req.dest,
+                            req.sequential,
+                            req.start_at_unix,
+                            req.auto_retry.unwrap_or(0),
+                        )
                         .await
                         .map(|id| vec![id])
                 }
@@ -2298,6 +2353,12 @@ struct AddRssRuleReq {
     tags: Vec<String>,
     #[serde(default)]
     dest: Option<String>,
+    /// batch5：关键词按正则解释（qB「使用正则表达式」对标）。
+    #[serde(default)]
+    use_regex: bool,
+    /// batch5：集数过滤（qB「集数过滤」对标），如 `1x02;1x04-1x06`。
+    #[serde(default)]
+    episode_filter: Option<String>,
 }
 
 fn default_rule_enabled() -> bool {
@@ -2412,6 +2473,8 @@ async fn rss_rule_add(
         req.feed_id,
         req.tags,
         req.dest,
+        req.use_regex,
+        req.episode_filter,
     ) {
         Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
         Err(e) => {
@@ -2439,6 +2502,8 @@ async fn rss_rules_list(State(state): State<Arc<DaemonState>>) -> impl IntoRespo
                 "feed_id": r.feed_id,
                 "tags": r.tags,
                 "dest": r.dest,
+                "use_regex": r.use_regex,
+                "episode_filter": r.episode_filter,
             })
         })
         .collect();
@@ -2495,6 +2560,7 @@ macro_rules! router_base {
             .route("/tasks/:id/recheck", post(task_recheck))
             .route("/tasks/:id/priority", post(task_priority))
             .route("/tasks/:id/export", get(task_export))
+            .route("/tasks/:id/piece-priority", post(task_piece_first_last))
             .route("/tasks/:id/magnet", get(task_magnet))
             .route(
                 "/security/bans",
@@ -2502,6 +2568,8 @@ macro_rules! router_base {
                     .post(security_ban)
                     .delete(security_unban),
             )
+            // batch5：IP 段批量导入（DAT/P2P 文本；部分成功语义）
+            .route("/security/bans/import", post(security_ban_import))
             .route("/tasks/:id/trackers", get(task_trackers_list))
             .route("/tasks/:id/trackers", post(task_trackers_add))
             .route("/tasks/:id/trackers", delete(task_trackers_remove))

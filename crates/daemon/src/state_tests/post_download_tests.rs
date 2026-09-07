@@ -119,8 +119,9 @@ async fn post_move_skipped_for_conflict_skip_tasks() {
 }
 
 #[tokio::test]
-async fn post_move_skipped_for_directory_task() {
-    // 落盘路径是目录（BT 多文件）→ 移动跳过
+async fn post_move_directory_task_moved_whole() {
+    // batch5（F2 对标翻转）：落盘路径是目录（BT 多文件）→ 目录整体移动
+    //（原行为 = 跳过；对标 qB「完成后移动」对 BT 目录任务同样生效）。
     let dir = tempfile::tempdir().unwrap();
     let inbox = tempfile::tempdir().unwrap();
     let fake = Arc::new(FakeEngine::new(EngineKind::Http));
@@ -129,13 +130,28 @@ async fn post_move_skipped_for_directory_task() {
         .with_post_download(Some(inbox.path().to_string_lossy().into_owned()), None);
 
     let id = completed_task_with_file(&state, "c.torrent", "bundle", b"").await;
-    // 把落盘路径改成目录
+    // 把落盘路径改成目录（含一个子文件，验证非空目录完整搬家）
     std::fs::remove_file(dir.path().join("bundle")).unwrap();
-    std::fs::create_dir(dir.path().join("bundle")).unwrap();
+    std::fs::create_dir_all(dir.path().join("bundle/sub")).unwrap();
+    std::fs::write(dir.path().join("bundle/a.bin"), b"A").unwrap();
+    std::fs::write(dir.path().join("bundle/sub/b.bin"), b"B").unwrap();
     state.publish_task_completed(&id);
 
-    assert!(dir.path().join("bundle").is_dir(), "目录任务不得被移动");
-    assert!(!inbox.path().join("bundle").exists());
+    assert!(
+        !dir.path().join("bundle").exists(),
+        "源目录应已搬走"
+    );
+    assert!(
+        inbox.path().join("bundle/a.bin").is_file(),
+        "目录整体移入目标（含子文件）"
+    );
+    assert!(
+        inbox.path().join("bundle/sub/b.bin").is_file(),
+        "嵌套结构保留"
+    );
+    let tasks = state.tasks.lock();
+    let rec = tasks.get(&id).unwrap();
+    assert!(rec.events.iter().any(|e| e.op == "post_move"), "有 post_move 事件");
 }
 
 #[cfg(unix)]

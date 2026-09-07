@@ -79,6 +79,9 @@ struct lt_session {
     // flag（不回溯既有任务；daemon 在任务装配前 apply 故覆盖全部任务）。
     // 审计修复（P1-4）：与 last_err 同族——apply 与 add 跨线程无同步，改 atomic。
     std::atomic<bool> pex_disabled{false};
+    // batch5（存储模式）：会话级预分配开关，同 pex_disabled 语义族（装配前
+    // apply 后续全部新增生效；fastresume 回灌保留原模式不覆盖）。atomic。
+    std::atomic<bool> storage_allocate{false};
 
     explicit lt_session(const char* path)
         : ses(lt::session_params())
@@ -354,6 +357,13 @@ void apply_pex_policy(lt_session* s, lt::add_torrent_params& p) {
     if (s->pex_disabled) p.flags |= lt::torrent_flags::disable_pex;
 }
 
+// batch5（存储模式）：会话级预分配开关落地（sparse/allocate）。
+void apply_storage_policy(lt_session* s, lt::add_torrent_params& p) {
+    p.storage_mode = s->storage_allocate.load()
+                         ? lt::storage_mode_allocate
+                         : lt::storage_mode_sparse;
+}
+
 lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, char* ih_out) {
     if (!s || !magnet || !ih_out) return LT_ERR_ARG;
     try {
@@ -364,6 +374,7 @@ lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, 
         p.flags &= ~lt::torrent_flags::auto_managed;
         p.flags |= lt::torrent_flags::paused;
         apply_pex_policy(s, p);
+        apply_storage_policy(s, p);
         if (web_seeds) {
             for (const char** ws = web_seeds; *ws != nullptr; ++ws) {
                 p.url_seeds.emplace_back(*ws);
@@ -584,6 +595,7 @@ lt_err lt_add_torrent_file(lt_session* s, const uint8_t* meta, size_t len, const
         p.flags &= ~lt::torrent_flags::auto_managed;
         p.flags |= lt::torrent_flags::paused;
         apply_pex_policy(s, p);
+        apply_storage_policy(s, p);
         set_web_seeds(p, web_seeds);
         return fill_ih(s, p, web_seeds, ih_out);
     } catch (...) {
@@ -921,18 +933,18 @@ lt_err lt_ban_peer(lt_session* s, const char* ih, const char* ip, uint16_t /*por
             if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
         }
         const std::string a(ip);
-        {
-            std::lock_guard<std::mutex> lk(s->ban_mtx);
-            if (s->banned.count(a)) return LT_OK; /* 幂等 */
-        }
         boost::system::error_code ec;
         const lt::address addr = lt::make_address(a, ec);
         if (ec) { set_err(s, "invalid ip: " + a); return LT_ERR_ARG; }
+        /* batch5-P1：get→add→set 读改写全程持锁——原两段式只护集合，
+           并发 ban/unban 的 filter 快照互相覆盖丢规则（镜像与真实 filter
+           脱节）。ban_mtx 为叶子锁：锁内不取其他锁，无锁序面。 */
+        std::lock_guard<std::mutex> lk(s->ban_mtx);
+        if (s->banned.count(a)) return LT_OK; /* 幂等 */
         auto f = s->ses.get_ip_filter();
         /* ip_filter 语义：flags 0 = allowed，access_flags::blocked = 封禁 */
         f.add_rule(addr, addr, lt::ip_filter::access_flags::blocked);
         s->ses.set_ip_filter(f);
-        std::lock_guard<std::mutex> lk(s->ban_mtx);
         s->banned.insert(a);
         return LT_OK;
     } catch (...) {
@@ -946,18 +958,36 @@ lt_err lt_unban_peer(lt_session* s, const char* ip) {
     if (!s || !ip) return LT_ERR_ARG;
     try {
         const std::string a(ip);
-        {
-            std::lock_guard<std::mutex> lk(s->ban_mtx);
-            if (!s->banned.count(a)) return LT_OK;
+        /* batch5：区间条目（"a-b"）→ 整段恢复 allow（与 lt_ban_range 对称；
+           单 IP/IPv6 字面量不含 '-'，无歧义）。 */
+        const auto dash = a.find('-');
+        boost::system::error_code ec, ec2;
+        lt::address addr, addr2;
+        bool is_range = false;
+        if (dash != std::string::npos) {
+            addr = lt::make_address(a.substr(0, dash), ec);
+            addr2 = lt::make_address(a.substr(dash + 1), ec2);
+            if (!ec && !ec2 && addr.is_v4() == addr2.is_v4() && addr <= addr2) {
+                is_range = true;
+            } else {
+                set_err(s, "invalid range: " + a);
+                return LT_ERR_ARG;
+            }
+        } else {
+            addr = lt::make_address(a, ec);
+            if (ec) { set_err(s, "invalid ip: " + a); return LT_ERR_ARG; }
         }
-        boost::system::error_code ec;
-        const lt::address addr = lt::make_address(a, ec);
-        if (ec) { set_err(s, "invalid ip: " + a); return LT_ERR_ARG; }
-        auto f = s->ses.get_ip_filter();
-        /* 解封 = 恢复 allow（flags 0）*/
-        f.add_rule(addr, addr, 0);
-        s->ses.set_ip_filter(f);
+        /* batch5-P1：同 ban，读改写全程持锁（叶子锁）*/
         std::lock_guard<std::mutex> lk(s->ban_mtx);
+        if (!s->banned.count(a)) return LT_OK;
+        auto f = s->ses.get_ip_filter();
+        /* 解封 = 恢复 allow（flags 0；区间则整段恢复）*/
+        if (is_range) {
+            f.add_rule(addr, addr2, 0);
+        } else {
+            f.add_rule(addr, addr, 0);
+        }
+        s->ses.set_ip_filter(f);
         s->banned.erase(a);
         return LT_OK;
     } catch (...) {
@@ -981,6 +1011,74 @@ lt_err lt_is_banned(lt_session* s, const char* ip, int* out) {
         set_err(s, "is_banned: engine error");
         return LT_ERR_ENGINE;
     }
+}
+
+/* IP 段封禁（batch5 对标）：[start, end] 闭区间加入 ip_filter（libtorrent
+   原生支持区间规则）。同族校验（v4 对 v4 / v6 对 v6）；镜像集合存
+   "start-end" 复合串（lt_is_banned 单 IP 查询语义不变 = 只匹配显式单 IP；
+   区间命中查询交由 daemon 层 list 口径）。叶子锁 ban_mtx 全程持锁
+   （与 batch5-P1 ban/unban 同纪律）。 */
+lt_err lt_ban_range(lt_session* s, const char* start, const char* end) {
+    if (!s || !start || !end) return LT_ERR_ARG;
+    try {
+        boost::system::error_code ec1, ec2;
+        const lt::address a1 = lt::make_address(start, ec1);
+        const lt::address a2 = lt::make_address(end, ec2);
+        if (ec1) { set_err(s, "invalid start ip"); return LT_ERR_ARG; }
+        if (ec2) { set_err(s, "invalid end ip"); return LT_ERR_ARG; }
+        if (a1.is_v4() != a2.is_v4()) { set_err(s, "ip family mismatch"); return LT_ERR_ARG; }
+        if (a1 > a2) { set_err(s, "start > end"); return LT_ERR_ARG; }
+        std::lock_guard<std::mutex> lk(s->ban_mtx);
+        auto f = s->ses.get_ip_filter();
+        f.add_rule(a1, a2, lt::ip_filter::access_flags::blocked);
+        s->ses.set_ip_filter(f);
+        s->banned.insert(std::string(start) + "-" + std::string(end));
+        return LT_OK;
+    } catch (...) {
+        set_err(s, "ban_range: engine error");
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* 首尾块优先（batch5 对标）：逐文件（跳过 pad 文件）按 offset/size 派生
+   首/末 piece 下标，priority 置为 prio。其余块不动。需要 metadata。 */
+lt_err lt_set_piece_first_last(lt_session* s, const char* ih, int prio) {
+    if (!s || !ih || prio < 0 || prio > 7) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        const std::shared_ptr<const lt::torrent_info> tf = h.torrent_file();
+        if (!tf) { set_err(s, "metadata not ready"); return LT_ERR_NOT_FOUND; }
+        const lt::file_storage& fs = tf->files();
+        const int num_pieces = tf->num_pieces();
+        if (num_pieces <= 0) { set_err(s, "no pieces"); return LT_ERR_ENGINE; }
+        const int piece_len = tf->piece_length();
+        if (piece_len <= 0) { set_err(s, "bad piece length"); return LT_ERR_ENGINE; }
+        for (lt::file_index_t fi(0); fi < lt::file_index_t(fs.num_files()); ++fi) {
+            if (fs.pad_file_at(fi)) continue;
+            const std::int64_t off = fs.file_offset(fi);
+            const std::int64_t size = fs.file_size(fi);
+            if (size <= 0) continue;
+            const int first = static_cast<int>(off / piece_len);
+            int last = static_cast<int>((off + size - 1) / piece_len);
+            if (last >= num_pieces) last = num_pieces - 1;
+            if (first < 0 || first >= num_pieces) continue;
+            h.piece_priority(lt::piece_index_t(first), prio);
+            h.piece_priority(lt::piece_index_t(last), prio);
+        }
+        return LT_OK;
+    } catch (...) {
+        set_err(s, "piece first/last: engine error");
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* 会话级存储模式（batch5 对标）：atomic 写；后续新增任务生效（见
+   apply_storage_policy），fastresume 回灌路径不读此开关（保留原模式）。 */
+lt_err lt_set_storage_mode(lt_session* s, int alloc) {
+    if (!s) return LT_ERR_ARG;
+    s->storage_allocate.store(alloc != 0);
+    return LT_OK;
 }
 
 lt_err lt_add_url_seed(lt_session* s, const char* ih, const char* url) {

@@ -1,3 +1,6 @@
+// batch5：snapshot_json 的 serde_json::json! 大字面量宏展开深度需要
+#![recursion_limit = "512"]
+
 //! 守护进程（M6 交付）：事件协议（D36）/ WS 背压 / CLI（D26）/ 健康（§11）/
 //! HTTP API + 任务状态（M2–M5 集成）。
 
