@@ -44,6 +44,10 @@ pub fn spawn_http_events(
                     _ => {}
                 }
             }
+            // batch5（会话累计流量）：每轮按本轮缓存速率 × 间隔累加
+            //（BT/HTTP/FTP/SFTP 速率快照都在 poll_engine_states 写入的
+            // engine_status 缓存中，单点累加覆盖全部轮询引擎）
+            state.accumulate_session_traffic(interval);
         }
     })
 }

@@ -29,7 +29,8 @@ impl DaemonState {
     /// 完成动作判定（Task 46）：action != none 且未触发过 → 全任务终态检查。
     /// 空任务表不触发（无意义）；非终态任务存在（含 Paused/Queued/Seeding）
     /// 阻塞触发——qbit 同语义（暂停/做种中均算未完成）。触发后置位 fired。
-    fn maybe_run_completion_action(&self) {
+    /// pub(crate)：lifecycle 的 set_completion_action 热更后补判（batch5-P2）。
+    pub(crate) fn maybe_run_completion_action(&self) {
         let action = self.completion_action.lock().clone();
         if action == "none" || action.is_empty() {
             return;
@@ -95,21 +96,44 @@ impl DaemonState {
             return; // 无名任务（BT metadata 未回填等）→ 无落盘文件可定位
         };
         let src = dest_root.join(&name);
-        // 单文件门控：路径不存在 / 是目录（BT 多文件）→ 移动无意义；
-        // hook 仍照发（webhook 同口径：通知尽力而为）
+        // batch5：单文件（move_completed_file）与目录（BT 多文件任务，
+        // move_completed_dir）都支持；不存在 → 跳过；hook 仍照发
+        //（webhook 同口径：通知尽力而为）
         let is_file = src.is_file();
+        let is_dir = src.is_dir();
         let mut final_path = src.clone();
 
         // 1) 移动（conflict-skip 任务不动既有文件——尊重 skip 语义）
         if let Some(dst_dir) = &move_to {
             if conflict_skip {
                 tracing::info!("post_download: 任务 {task_id} 为 conflict-skip，既有文件不移动");
-            } else if !is_file {
+            } else if !is_file && !is_dir {
                 tracing::info!(
-                    "post_download: 任务 {task_id} 落盘路径非单文件（{:?}），移动跳过",
+                    "post_download: 任务 {task_id} 落盘路径不存在（{:?}），移动跳过",
                     src
                 );
-            } else {
+            } else if is_dir {
+                match Self::move_completed_dir(&src, dst_dir, &name) {
+                    Ok(target) => {
+                        tracing::info!("post_download: 任务 {task_id} 目录已移动 → {target:?}");
+                        final_path = target.clone();
+                        let mut tasks = self.tasks.lock();
+                        if let Some(rec) = tasks.get_mut(task_id) {
+                            rec.push_event(
+                                "post_move",
+                                Some(target.to_string_lossy().into_owned()),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("post_download: 任务 {task_id} 目录移动失败: {e}");
+                        let mut tasks = self.tasks.lock();
+                        if let Some(rec) = tasks.get_mut(task_id) {
+                            rec.push_event("post_move", Some(format!("failed: {e}")));
+                        }
+                    }
+                }
+            } else if is_file {
                 match Self::move_completed_file(&src, dst_dir, &name) {
                     Ok(target) => {
                         tracing::info!("post_download: 任务 {task_id} 文件已移动 → {target:?}");
@@ -595,6 +619,35 @@ impl DaemonState {
         Ok(target)
     }
 
+    /// 完成后目录整体移动（batch5，BT 多文件任务；与 move_completed_file
+    /// 同语义）：同盘 rename；跨盘 copy_dir_all + remove_dir_all 回退
+    ///（目录无原子跨盘移动；回退中途失败会留部分副本，错误信息如实报告）。
+    /// 同名冲突自动改名 `name(1)`（复用 bump_conflict_name）。
+    pub(super) fn move_completed_dir(
+        src: &Path,
+        dst_dir: &Path,
+        name: &str,
+    ) -> Result<PathBuf, String> {
+        fs::create_dir_all(dst_dir).map_err(|e| format!("目标目录创建失败 {dst_dir:?}: {e}"))?;
+        let target_name = if dst_dir.join(name).exists() {
+            DaemonState::bump_conflict_name(dst_dir, name)
+                .ok_or_else(|| format!("目标目录同名冲突且改名候选耗尽: {dst_dir:?}/{name}"))?
+        } else {
+            name.to_string()
+        };
+        let target = dst_dir.join(target_name);
+        if let Err(e) = fs::rename(src, &target) {
+            // 跨设备 rename 失败（EXDEV）→ 递归 copy + remove 回退
+            copy_dir_recursive(src, &target).map_err(|e2| {
+                let _ = fs::remove_dir_all(&target); // 半份拷贝不留垃圾
+                format!("rename 失败（{e}）且递归 copy 回退也失败: {e2}")
+            })?;
+            fs::remove_dir_all(src)
+                .map_err(|e| format!("copy 成功但源目录删除失败（存在重复副本）: {e}"))?;
+        }
+        Ok(target)
+    }
+
     pub async fn add_link_task_opts(
         &self,
         link: String,
@@ -606,14 +659,22 @@ impl DaemonState {
             NormalizedSource::Magnet(m) => {
                 #[cfg(feature = "bt")]
                 {
+                    // batch5（E30 贯通 BT）：magnet 入口同 consuming opts.auto_retry
                     return self
-                        .add_bt_task_opts(m, dest_root, opts.sequential, opts.start_at_unix)
+                        .add_bt_task_opts(
+                            m,
+                            dest_root,
+                            opts.sequential,
+                            opts.start_at_unix,
+                            opts.auto_retry,
+                        )
                         .await;
                 }
                 #[cfg(not(feature = "bt"))]
                 {
                     let _ = opts.sequential;
                     let _ = opts.start_at_unix;
+                    let _ = opts.auto_retry;
                     Err(DaemonError::InvalidSource(format!(
                         "magnet 需 BT 引擎（编译时启用 --features daemon/bt）: {m}"
                     )))
@@ -626,12 +687,13 @@ impl DaemonState {
                 #[cfg(feature = "ftp")]
                 {
                     return self
-                        .add_ftp_task_opts(u, dest_root, opts.start_at_unix)
+                        .add_ftp_task_opts(u, dest_root, opts.start_at_unix, opts.auto_retry)
                         .await;
                 }
                 #[cfg(not(feature = "ftp"))]
                 {
                     let _ = opts.start_at_unix;
+                    let _ = opts.auto_retry;
                     Err(DaemonError::InvalidSource(format!(
                         "ftp 需 FTP 引擎（编译时启用 --features ftp）: {u}"
                     )))
@@ -663,7 +725,8 @@ impl DaemonState {
 
     /// 添加 BT 任务（feature `bt`，顺序下载 opts 直通入口）：btih canonical 查重 → 引擎 add → TaskCreated 事件。
     /// `start_at_unix`（E23）：Some(未来) = 延迟入引擎（不调 engine.add），
-    /// 到点由调度循环激活。
+    /// 到点由调度循环激活。`auto_retry`（batch5，E30 贯通 BT）：失败自动
+    /// 重试次数上限（拦截器 bt_alerts 已接线，指数退避；0 = 不重试）。
     #[cfg(feature = "bt")]
     pub(super) async fn add_bt_task_opts(
         &self,
@@ -671,6 +734,7 @@ impl DaemonState {
         dest_root: Option<String>,
         sequential: bool,
         start_at_unix: Option<u64>,
+        auto_retry: u32,
     ) -> Result<TaskId, DaemonError> {
         // B10：目标目录预检（创建/可写）；magnet 总大小元数据前未知 → 空间预检跳过
         // dest 未指定 → 默认落盘目录（与 HTTP 一致：default_dest_root 配置）
@@ -716,7 +780,10 @@ impl DaemonState {
             acquisitions: vec![],
             aggregate: Default::default(),
             state: TaskState::Queued,
-            retry: Default::default(),
+            retry: RetryState {
+                retries: 0,
+                max_retries: auto_retry,
+            },
             created_at: std::time::Instant::now(),
             file_priorities: None,
             sequential,
@@ -790,12 +857,13 @@ impl DaemonState {
         torrent_bytes: Vec<u8>,
         dest_root: Option<String>,
     ) -> Result<TaskId, DaemonError> {
-        self.add_torrent_task_opts(torrent_bytes, dest_root, false, None)
+        self.add_torrent_task_opts(torrent_bytes, dest_root, false, None, 0)
             .await
     }
 
     /// 顺序下载变体：`sequential` 写入任务 + 引擎 add 后立即下发 flag。
     /// `start_at_unix`（E23）：Some(未来) = 延迟入引擎，到点由调度循环激活。
+    /// `auto_retry`（batch5，E30 贯通 BT）：同 magnet 入口。
     #[cfg(feature = "bt")]
     pub async fn add_torrent_task_opts(
         &self,
@@ -803,6 +871,7 @@ impl DaemonState {
         dest_root: Option<String>,
         sequential: bool,
         start_at_unix: Option<u64>,
+        auto_retry: u32,
     ) -> Result<TaskId, DaemonError> {
         // B10：目标目录预检（创建/可写）；dest 未指定 → 默认落盘目录（与 HTTP/BT-magnet 一致）
         let def = self.default_dest_root.lock().to_string_lossy().into_owned();
@@ -857,7 +926,10 @@ impl DaemonState {
             acquisitions: vec![],
             aggregate: Default::default(),
             state: TaskState::Queued,
-            retry: Default::default(),
+            retry: RetryState {
+                retries: 0,
+                max_retries: auto_retry,
+            },
             created_at: std::time::Instant::now(),
             file_priorities: None,
             sequential,
@@ -1224,9 +1296,11 @@ impl DaemonState {
         let backup_md5 = backup_md5.map(|s| normalize_digest(&s));
         // B10：目标目录预检（创建/可写）；HTTP 大小在响应头才知 → 空间预检跳过
         // dest 未指定 → 默认落盘目录（serve 配置 dest_root；未注入时为 daemon cwd）
+        // batch5-P2：与其余 5 处调用点同构——non_empty_dest 包 dest_root 本身，
+        // Some("") 时回落默认根（原包在 or 之后，默认根本身为空串时会落 cwd）
         let def = self.default_dest_root.lock().to_string_lossy().into_owned();
-        let dest = dest_root.or(Some(def));
-        let dest_root = ensure_dest_root(non_empty_dest(dest), &self.dest_roots())?;
+        let dest_root =
+            ensure_dest_root(non_empty_dest(dest_root).or(Some(def)), &self.dest_roots())?;
         let canonical = CanonicalId {
             kind: CanonicalKind::Http,
             identity: canonical_http_url(&url), // D34：剥 token 参数后的 canonical 身份
@@ -1407,7 +1481,7 @@ impl DaemonState {
         url: String,
         dest_root: Option<String>,
     ) -> Result<TaskId, DaemonError> {
-        self.add_ftp_task_opts(url, dest_root, None).await
+        self.add_ftp_task_opts(url, dest_root, None, 0).await
     }
 
     /// 定时变体（E23）：`start_at_unix` Some(未来) = 延迟入引擎，到点由
@@ -1418,6 +1492,7 @@ impl DaemonState {
         url: String,
         dest_root: Option<String>,
         start_at_unix: Option<u64>,
+        auto_retry: u32,
     ) -> Result<TaskId, DaemonError> {
         if !url.starts_with("ftp://") && !url.starts_with("ftps://") {
             return Err(DaemonError::InvalidSource(url));
@@ -1480,7 +1555,10 @@ impl DaemonState {
             acquisitions: vec![],
             aggregate: Default::default(),
             state: TaskState::Queued,
-            retry: Default::default(),
+            retry: RetryState {
+                retries: 0,
+                max_retries: auto_retry,
+            },
             created_at: std::time::Instant::now(),
             file_priorities: None,
             sequential: false,
@@ -2080,7 +2158,31 @@ impl DaemonState {
                 st.up_bytes_s += s.up_rate;
             }
         }
+        let (sd, su) = *self.session_traffic.lock();
+        st.session_down_bytes = sd;
+        st.session_up_bytes = su;
         st
+    }
+
+    /// 会话累计流量累加（batch5 对标 qB 会话统计）：按引擎缓存速率 × 轮询
+    /// 间隔估算（down/up 各自 saturating_add）。由状态轮询循环每轮调用——
+    /// 估算口径：速率快照为轮询期代表值，间隔恒定故累计曲线与真实流量
+    /// 同形状；重启清零（会话语义）。
+    pub(crate) fn accumulate_session_traffic(&self, interval: std::time::Duration) {
+        let tasks = self.tasks.lock();
+        let mut d = 0u64;
+        let mut u = 0u64;
+        for rec in tasks.values() {
+            if let Some(s) = &rec.engine_status {
+                d += s.down_rate;
+                u += s.up_rate;
+            }
+        }
+        drop(tasks);
+        let secs = interval.as_secs_f64();
+        let mut t = self.session_traffic.lock();
+        t.0 = t.0.saturating_add((d as f64 * secs) as u64);
+        t.1 = t.1.saturating_add((u as f64 * secs) as u64);
     }
 
     /// 任务级速率样本（A4 `/metrics` histogram 数据源）：`(engine 标签,
@@ -2543,12 +2645,21 @@ impl DaemonState {
         if errs.len() == usize::from(tracker) + usize::from(dht) {
             return Err(DaemonError::Engine(errs.join("; ")));
         }
+        // batch5-P2：部分失败不再静默吞——失败摘要入事件详情 + warn 日志
+        //（原仅全部失败才上抛，单路失败无日志无事件，用户无从知晓）。
+        if !errs.is_empty() {
+            tracing::warn!("任务 {id} 强制宣告部分失败: {}", errs.join("; "));
+        }
         {
             let mut tasks = self.tasks.lock();
             if let Some(rec) = tasks.get_mut(id) {
                 rec.push_event(
                     "force_announce",
-                    Some(format!("tracker={tracker} dht={dht}")),
+                    Some(if errs.is_empty() {
+                        format!("tracker={tracker} dht={dht}")
+                    } else {
+                        format!("tracker={tracker} dht={dht}; 部分失败: {}", errs.join("; "))
+                    }),
                 );
             }
         }
@@ -2573,14 +2684,47 @@ impl DaemonState {
         Ok(())
     }
 
+    /// 首尾块优先（batch5，qbit「首尾块优先」对标）：每文件首/末块优先级
+    /// 置为 prio（0..=7；0 = 恢复默认）。需要 metadata（未就绪 → 409 可重试）。
+    pub async fn set_task_piece_first_last(&self, id: &str, prio: i32) -> Result<(), DaemonError> {
+        if !(0..=7).contains(&prio) {
+            return Err(DaemonError::InvalidSource(format!(
+                "piece 优先级须在 0..=7（收到的 {prio}）"
+            )));
+        }
+        let (engine, tid) = self.bt_op_engine(id, "首尾块优先").await?;
+        engine
+            .set_piece_first_last(&tid, prio)
+            .await
+            .map_err(|e| match e {
+                smart_dl_core::types::EngineError::Unsupported => {
+                    DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持首尾块优先"))
+                }
+                smart_dl_core::types::EngineError::NotFound => {
+                    DaemonError::NotFound(id.to_string())
+                }
+                other => DaemonError::Engine(other.to_string()),
+            })?;
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.push_event("piece_first_last", Some(format!("priority={prio}")));
+            }
+        }
+        Ok(())
+    }
+
     /// 导出 .torrent（Task 46，qbit「导出 .torrent」对标）：metainfo bencode
-    /// 字节。magnet 任务 metadata 未就绪 → 409（Other 语义）。
+    /// 字节。magnet 任务 metadata 未就绪 → 409（batch5：NotReady/Unsupported
+    /// 统一映射，原 Other → 500 与文档承诺 409 相悖）；任务不在引擎 → 404。
     pub async fn export_task_torrent(&self, id: &str) -> Result<Vec<u8>, DaemonError> {
         let (engine, tid) = self.bt_op_engine(id, "导出种子").await?;
         engine.export_torrent(&tid).await.map_err(|e| match e {
             smart_dl_core::types::EngineError::Unsupported => {
                 DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持导出种子"))
             }
+            smart_dl_core::types::EngineError::NotReady(msg) => DaemonError::UnsupportedOp(msg),
+            smart_dl_core::types::EngineError::NotFound => DaemonError::NotFound(id.to_string()),
             other => DaemonError::Engine(other.to_string()),
         })
     }
@@ -2592,20 +2736,25 @@ impl DaemonState {
             smart_dl_core::types::EngineError::Unsupported => {
                 DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持生成磁链"))
             }
+            smart_dl_core::types::EngineError::NotFound => DaemonError::NotFound(id.to_string()),
             other => DaemonError::Engine(other.to_string()),
         })
     }
 
     /// Session 级 IP 封禁（Task 46，qbit「永久封禁」对标）：逐条校验 IP →
     /// 下发 BT 引擎 → 成功者入列表并落盘。返回逐条结果（部分成功语义）。
-    /// 锁纪律：bt_bans 短锁（contains/push 各自持锁，不跨 await）。
+    /// 锁纪律：短锁判存，await 在锁外（guard !Send 不跨 await）。
+    /// batch5-P2：全程持 `ban_ops` 串行锁（tokio Mutex，guard Send 可跨
+    /// await）——原 contains→await→push 三段非原子，并发 ban(A)/unban(A)
+    /// 交錯使列表与内核脱节；batch5 另支持 v4-mapped IPv6 归一与区间条目。
     pub async fn ban_ips(&self, ips: Vec<String>) -> Vec<(String, Result<(), String>)> {
+        let _serial = self.ban_ops.lock().await; // 串行化：与 unban/import 互斥
         let mut out = Vec::with_capacity(ips.len());
         let engine = self.engine_for(EngineKind::Bt).ok();
         let mut newly: Vec<String> = Vec::new();
         for ip in ips {
             let ip_trim = ip.trim().to_string();
-            let canon = ip_trim.parse::<std::net::IpAddr>().map(|p| p.to_string());
+            let canon = normalize_ban_entry(&ip_trim);
             let res = match canon {
                 Err(e) => Err(format!("非法 IP: {e}")),
                 Ok(c) => {
@@ -2643,14 +2792,16 @@ impl DaemonState {
     }
 
     /// 解除封禁（Task 46）：逐条下发 + 列表移除 + 落盘（幂等）。
-    /// 锁纪律：短锁判存/移除，await 一律在锁外（guard !Send 不跨 await）。
+    /// 锁纪律：短锁判存/移除，await 一律在锁外（guard !Send 不跨 await）；
+    /// batch5-P2：全程持 `ban_ops` 串行锁（同 ban_ips）。
     pub async fn unban_ips(&self, ips: Vec<String>) -> Vec<(String, Result<(), String>)> {
+        let _serial = self.ban_ops.lock().await; // 串行化：与 ban/import 互斥
         let mut out = Vec::with_capacity(ips.len());
         let engine = self.engine_for(EngineKind::Bt).ok();
         let mut removed = false;
         for ip in ips {
             let ip_trim = ip.trim().to_string();
-            let canon = ip_trim.parse::<std::net::IpAddr>().map(|p| p.to_string());
+            let canon = normalize_ban_entry(&ip_trim);
             let res = match canon {
                 Err(e) => Err(format!("非法 IP: {e}")),
                 Ok(c) => {
@@ -2679,6 +2830,55 @@ impl DaemonState {
         out
     }
 
+    /// IP 段批量导入（batch5 对标：qB/BitComet IP filter 文件语义）：解析
+    /// DAT（"000.000.000.000 - 000.000.000.255 , 000 , name"）与 P2P
+    /// （"range:1.2.3.0-1.2.3.255,desc"）两格式文本，逐区间下发引擎
+    /// ban_ip_range，成功者以 "start-end" 复合串入列表并落盘。
+    /// 锁纪律：全程持 `ban_ops` 串行锁（同 ban/unban）。
+    /// 返回 (成功区间数, 逐行错误列表)。
+    pub async fn import_ban_ranges(&self, text: &str) -> (usize, Vec<String>) {
+        let _serial = self.ban_ops.lock().await; // 串行化
+        let engine = self.engine_for(EngineKind::Bt).ok();
+        let mut imported = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        let mut newly: Vec<String> = Vec::new();
+        for (lineno, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((a, b)) = parse_ban_range_line(line) else {
+                errors.push(format!(
+                    "L{}: 无法解析区间（{}）",
+                    lineno + 1,
+                    truncate_len(line, 48)
+                ));
+                continue;
+            };
+            if engine.is_none() {
+                errors.push("BT 引擎不可用（feature 未启用）".into());
+                break;
+            }
+            let eng = engine.as_ref().unwrap();
+            match eng.ban_ip_range(&a, &b).await {
+                Ok(()) => {
+                    let entry = format!("{a}-{b}");
+                    let mut bans = self.bt_bans.lock();
+                    if !bans.contains(&entry) {
+                        bans.push(entry.clone());
+                        newly.push(entry);
+                    }
+                    imported += 1;
+                }
+                Err(e) => errors.push(format!("L{}: 引擎拒绝 {a}-{b}: {}", lineno + 1, e)),
+            }
+        }
+        if !newly.is_empty() {
+            self.persist_bans();
+        }
+        (imported, errors)
+    }
+
     /// 当前显式封禁列表快照（GET /security/bans）。
     pub fn list_bans(&self) -> Vec<String> {
         self.bt_bans.lock().clone()
@@ -2698,90 +2898,98 @@ impl DaemonState {
         value: Option<i32>,
         action: Option<String>,
     ) -> Result<i32, DaemonError> {
-        // 相对移动先在 tasks 快照外计算目标值（短锁读队列快照）
+        // 相对移动先在 tasks 快照外计算目标值（短锁读队列快照）。
+        // batch5-P2：语义对齐文档「同给以 value 优先」——原实现 action 一律
+        // 覆盖 value；现在 value 已给出时跳过 action 计算。
         let mut new_val: Option<i32> = value;
-        if let Some(act) = &action {
-            let cur = {
-                let tasks = self.tasks.lock();
-                let rec = tasks
-                    .get(id)
-                    .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
-                rec.task.queue_priority
-            };
-            // 排队集快照：Queued 无句柄任务，排序键 (priority, created_at)
-            let queue: Vec<(String, i32, std::time::Instant)> = {
-                let tasks = self.tasks.lock();
-                let mut v: Vec<(String, i32, std::time::Instant)> = tasks
-                    .iter()
-                    .filter(|(_, r)| r.engine_tid.is_none() && r.task.state == TaskState::Queued)
-                    .map(|(tid, r)| (tid.clone(), r.task.queue_priority, r.task.created_at))
-                    .collect();
-                v.sort_by_key(|(_, p, c)| (*p, *c));
-                v
-            };
-            match act.as_str() {
-                "top" => {
-                    // 审查修复（P2）：saturating——用户先设 i32::MIN/MAX 后
-                    // -1/+1 溢出（debug panic、release 回绕破坏 top/bottom 语义）
-                    new_val = Some(
-                        queue
-                            .iter()
-                            .map(|(_, p, _)| *p)
-                            .min()
-                            .unwrap_or(cur)
-                            .saturating_sub(1),
-                    );
-                }
-                "bottom" => {
-                    new_val = Some(
-                        queue
-                            .iter()
-                            .map(|(_, p, _)| *p)
-                            .max()
-                            .unwrap_or(cur)
-                            .saturating_add(1),
-                    );
-                }
-                "up" | "down" => {
-                    let pos = queue.iter().position(|(tid, _, _)| tid == id);
-                    match pos {
-                        None => {
-                            // 不在当前排队集（运行中/暂停等）：无相邻语义 → 按极值移动
-                            new_val = if act == "up" {
-                                Some(
-                                    queue
-                                        .iter()
-                                        .map(|(_, p, _)| *p)
-                                        .min()
-                                        .unwrap_or(cur)
-                                        .saturating_sub(1),
-                                )
-                            } else {
-                                Some(
-                                    queue
-                                        .iter()
-                                        .map(|(_, p, _)| *p)
-                                        .max()
-                                        .unwrap_or(cur)
-                                        .saturating_add(1),
-                                )
-                            };
-                        }
-                        Some(i) if act == "up" && i > 0 => {
-                            // 越过前一个：±1 而非取同值——并列时 (priority, created_at)
-                            // 排序仍按创建序，同值不保证上移（本任务创建晚则原地）
-                            new_val = Some(queue[i - 1].1 - 1);
-                        }
-                        Some(i) if act == "down" && i + 1 < queue.len() => {
-                            new_val = Some(queue[i + 1].1 + 1);
-                        }
-                        _ => new_val = Some(cur), // 已在队首/队尾：不变
+        if new_val.is_none() {
+            if let Some(act) = &action {
+                let cur = {
+                    let tasks = self.tasks.lock();
+                    let rec = tasks
+                        .get(id)
+                        .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+                    rec.task.queue_priority
+                };
+                // 排队集快照：Queued 无句柄任务，排序键 (priority, created_at)
+                let queue: Vec<(String, i32, std::time::Instant)> = {
+                    let tasks = self.tasks.lock();
+                    let mut v: Vec<(String, i32, std::time::Instant)> = tasks
+                        .iter()
+                        .filter(|(_, r)| {
+                            r.engine_tid.is_none() && r.task.state == TaskState::Queued
+                        })
+                        .map(|(tid, r)| (tid.clone(), r.task.queue_priority, r.task.created_at))
+                        .collect();
+                    v.sort_by_key(|(_, p, c)| (*p, *c));
+                    v
+                };
+                match act.as_str() {
+                    "top" => {
+                        // 审查修复（P2）：saturating——用户先设 i32::MIN/MAX 后
+                        // -1/+1 溢出（debug panic、release 回绕破坏 top/bottom 语义）
+                        new_val = Some(
+                            queue
+                                .iter()
+                                .map(|(_, p, _)| *p)
+                                .min()
+                                .unwrap_or(cur)
+                                .saturating_sub(1),
+                        );
                     }
-                }
-                other => {
-                    return Err(DaemonError::InvalidSource(format!(
-                        "未知 priority action {other:?}（支持 top/bottom/up/down）"
-                    )))
+                    "bottom" => {
+                        new_val = Some(
+                            queue
+                                .iter()
+                                .map(|(_, p, _)| *p)
+                                .max()
+                                .unwrap_or(cur)
+                                .saturating_add(1),
+                        );
+                    }
+                    "up" | "down" => {
+                        let pos = queue.iter().position(|(tid, _, _)| tid == id);
+                        match pos {
+                            None => {
+                                // 不在当前排队集（运行中/暂停等）：无相邻语义 → 按极值移动
+                                new_val = if act == "up" {
+                                    Some(
+                                        queue
+                                            .iter()
+                                            .map(|(_, p, _)| *p)
+                                            .min()
+                                            .unwrap_or(cur)
+                                            .saturating_sub(1),
+                                    )
+                                } else {
+                                    Some(
+                                        queue
+                                            .iter()
+                                            .map(|(_, p, _)| *p)
+                                            .max()
+                                            .unwrap_or(cur)
+                                            .saturating_add(1),
+                                    )
+                                };
+                            }
+                            Some(i) if act == "up" && i > 0 => {
+                                // 越过前一个：±1 而非取同值——并列时 (priority, created_at)
+                                // 排序仍按创建序，同值不保证上移（本任务创建晚则原地）
+                                // batch5-P2：saturating（同 top/bottom 分支）——邻值
+                                // 为 i32::MIN/MAX 时原裸 ±1 溢出（debug panic / release 回绕）
+                                new_val = Some(queue[i - 1].1.saturating_sub(1));
+                            }
+                            Some(i) if act == "down" && i + 1 < queue.len() => {
+                                new_val = Some(queue[i + 1].1.saturating_add(1));
+                            }
+                            _ => new_val = Some(cur), // 已在队首/队尾：不变
+                        }
+                    }
+                    other => {
+                        return Err(DaemonError::InvalidSource(format!(
+                            "未知 priority action {other:?}（支持 top/bottom/up/down）"
+                        )))
+                    }
                 }
             }
         }
@@ -3983,5 +4191,170 @@ fn engine_state_to_task(st: &EngineState, kind: EngineKind) -> TaskState {
         EngineState::Completed => TaskState::Completed,
         EngineState::Seeding => TaskState::Seeding,
         EngineState::Error => TaskState::Failed,
+    }
+}
+
+/// 封禁条目归一化（batch5-P2）：单 IP 解析为规范字符串；v4-mapped IPv6
+/// （`::ffff:1.2.3.4`）优先转回 v4 形式——否则 libtorrent add_rule 落在
+/// v6 族规则，拦不住实际以 v4 连入的 peer。区间条目（"a-b"）返回原样
+/// （引擎侧 lt_ban_range 校验同族/有序）。非法 → Err。
+pub(crate) fn normalize_ban_entry(s: &str) -> Result<String, String> {
+    let t = s.trim();
+    if let Some((a, b)) = t.split_once('-') {
+        // 区间条目：两端各自可解析 + 同族（v4 对 v4 / v6 对 v6）
+        let pa: std::net::IpAddr = a
+            .trim()
+            .parse()
+            .map_err(|e| format!("区间起点非法 {a:?}: {e}"))?;
+        let pb: std::net::IpAddr = b
+            .trim()
+            .parse()
+            .map_err(|e| format!("区间终点非法 {b:?}: {e}"))?;
+        if pa.is_ipv4() != pb.is_ipv4() {
+            return Err(format!("区间 {t:?} 地址族不一致"));
+        }
+        return Ok(format!("{}-{}", pa, pb));
+    }
+    let ip: std::net::IpAddr = t.parse().map_err(|e| format!("{t:?}: {e}"))?;
+    Ok(match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => v6.to_string(),
+        },
+        v4 => v4.to_string(),
+    })
+}
+
+/// IP filter 文本行 → 区间 (start, end)（batch5 对标：qB/BitComet 导入）：
+/// - DAT（PeerGuardian .dat）：`000.000.000.000 - 000.000.000.255 , 000 , name`
+///   （按第一个 ` - ` 切两端，再截 `,` 后的元信息）；
+/// - P2P（.p2p）：`range:1.2.3.0-1.2.3.255,description` 或
+///   `1.2.3.0-1.2.3.255,description`。
+///
+/// 无法解析 → None。
+pub(crate) fn parse_ban_range_line(line: &str) -> Option<(String, String)> {
+    let l = line.trim();
+    let l = l.strip_prefix("range:").unwrap_or(l);
+    // DAT 逗号元信息截断（保留前两段中的 IP 区间部分）
+    let body = l.split(',').next().unwrap_or(l);
+    let body = body.trim();
+    let (a, b) = body.split_once('-')?;
+    let a = a.trim();
+    let b = b.trim();
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    let pa: std::net::IpAddr = a.parse().ok()?;
+    let pb: std::net::IpAddr = b.parse().ok()?;
+    if pa.is_ipv4() != pb.is_ipv4() || pb < pa {
+        return None;
+    }
+    Some((pa.to_string(), pb.to_string()))
+}
+
+/// 事件/日志用行截断（batch5）：超长行截尾加省略号，防错误列表膨胀。
+fn truncate_len(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(cap).collect();
+        format!("{cut}…")
+    }
+}
+
+#[cfg(test)]
+mod ban_entry_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_single_ips() {
+        assert_eq!(normalize_ban_entry(" 1.2.3.4 ").unwrap(), "1.2.3.4");
+        assert_eq!(
+            normalize_ban_entry("::ffff:1.2.3.4").unwrap(),
+            "1.2.3.4",
+            "v4-mapped IPv6 必须转回 v4（否则 ip_filter 落 v6 族拦不住 v4 peer）"
+        );
+        assert_eq!(normalize_ban_entry("2001:db8::1").unwrap(), "2001:db8::1");
+        assert!(normalize_ban_entry("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn normalize_range_entries() {
+        assert_eq!(
+            normalize_ban_entry("1.2.3.0-1.2.3.255").unwrap(),
+            "1.2.3.0-1.2.3.255"
+        );
+        assert!(normalize_ban_entry("1.2.3.0-::1").is_err(), "跨族拒绝");
+        assert!(normalize_ban_entry("1.2.3.9-x").is_err());
+    }
+
+    #[test]
+    fn parse_dat_and_p2p_lines() {
+        // DAT（PeerGuardian）
+        assert_eq!(
+            parse_ban_range_line("000.000.000.000 - 000.000.000.255 , 000 , bogus"),
+            None,
+            "DAT 前导零不是合法 IP 字面量（std 解析拒绝）→ 跳过该行"
+        );
+        assert_eq!(
+            parse_ban_range_line("1.2.3.0 - 1.2.3.255 , 000 , some range"),
+            Some(("1.2.3.0".into(), "1.2.3.255".into()))
+        );
+        // P2P
+        assert_eq!(
+            parse_ban_range_line("range:5.6.7.0-5.6.7.255,bad isp"),
+            Some(("5.6.7.0".into(), "5.6.7.255".into()))
+        );
+        assert_eq!(parse_ban_range_line("garbage line"), None);
+        assert_eq!(parse_ban_range_line("2.2.2.2-1.1.1.1"), None, "逆序拒绝");
+        // 注释与空行由调用方跳过；此处保证解析器对前缀 range: 的容忍
+        assert_eq!(
+            parse_ban_range_line("range:9.9.9.0-9.9.9.9"),
+            Some(("9.9.9.0".into(), "9.9.9.9".into()))
+        );
+    }
+
+    #[test]
+    fn truncate_len_caps() {
+        assert_eq!(truncate_len("abc", 5), "abc");
+        assert_eq!(truncate_len("abcdef", 5), "abcde…");
+    }
+}
+
+/// 递归目录拷贝（batch5；std::fs 无 copy_dir_all）：目录逐层创建 + 文件
+/// 逐个 copy（保留权限位 via fs::copy）。符号链接按目标内容展开（v1 从简：
+/// BT 数据目录内不应有 symlink）。
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else {
+            fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod copy_dir_tests {
+    use super::*;
+
+    #[test]
+    fn copy_dir_recursive_copies_tree() {
+        let td = tempfile::tempdir().unwrap();
+        let src = td.path().join("src");
+        fs::create_dir_all(src.join("nested/deep")).unwrap();
+        fs::write(src.join("a.bin"), b"AAA").unwrap();
+        fs::write(src.join("nested/b.bin"), b"BB").unwrap();
+        fs::write(src.join("nested/deep/c.txt"), b"C").unwrap();
+        let dst = td.path().join("dst");
+        copy_dir_recursive(&src, &dst).unwrap();
+        assert_eq!(fs::read(dst.join("a.bin")).unwrap(), b"AAA");
+        assert_eq!(fs::read(dst.join("nested/b.bin")).unwrap(), b"BB");
+        assert_eq!(fs::read(dst.join("nested/deep/c.txt")).unwrap(), b"C");
     }
 }

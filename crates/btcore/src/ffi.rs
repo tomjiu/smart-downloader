@@ -402,6 +402,34 @@ impl Session {
         call(unsafe { lt_unban_peer(self.raw, a.as_ptr()) }, || Ok(()))
     }
 
+    /// IP 段封禁（batch5 对标）：[start, end] 闭区间加入 ip_filter。
+    pub fn ban_ip_range(&self, start: &str, end: &str) -> Result<()> {
+        let a = cstr(start)?;
+        let b = cstr(end)?;
+        call(
+            unsafe { lt_ban_range(self.raw, a.as_ptr(), b.as_ptr()) },
+            || Ok(()),
+        )
+    }
+
+    /// 首尾块优先（batch5 对标）：每文件首/末块优先级置为 prio（0..=7）。
+    /// 需要 metadata（否则 NotFound）。
+    pub fn set_piece_first_last(&self, ih: &str, prio: i32) -> Result<()> {
+        let i = self.ih(ih)?;
+        call(
+            unsafe { lt_set_piece_first_last(self.raw, i.as_ptr(), prio) },
+            || Ok(()),
+        )
+    }
+
+    /// 会话级存储模式（batch5 对标）：后续新增任务预分配开关。
+    pub fn set_storage_mode(&self, alloc: bool) -> Result<()> {
+        call(
+            unsafe { lt_set_storage_mode(self.raw, alloc as i32) },
+            || Ok(()),
+        )
+    }
+
     /// 查询显式封禁状态（true = 已封禁）。仅反映本层显式封禁（不含内核
     /// auto-ban 的临时封禁）。
     pub fn is_banned(&self, ip: &str) -> Result<bool> {

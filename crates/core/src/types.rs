@@ -226,6 +226,11 @@ pub struct TrackerEntry {
 pub enum EngineError {
     #[error("task not found")]
     NotFound,
+    /// 暂态未就绪（batch5：magnet 任务 metadata 尚未收到）：调用方应映射
+    /// 409（可重试），而非 500（服务器故障）。与 Unsupported（永不支持）
+    /// 语义相反：NotReady 稍后重试可能成功。
+    #[error("not ready yet: {0}")]
+    NotReady(String),
     #[error("engine error: {0}")]
     Other(String),
     #[error("unsupported operation")]
@@ -425,6 +430,29 @@ pub trait DownloadEngine: Send + Sync {
     /// 解除 Session 级 IP 封禁（Task 46，qbit「解除封禁」对标；幂等：未封禁
     /// 的 IP 也返回 Ok）。仅 BT 引擎实现。
     async fn unban_ip(&self, _ip: &str) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// IP 段封禁（batch5 对标：qB/BitComet 的 IP filter 文件语义）。
+    /// start/end 为包含关系的 IPv4/IPv6 字面量。默认不支持。
+    async fn ban_ip_range(&self, _start: &str, _end: &str) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// 首尾块优先（batch5 对标：qB「首尾块优先」）：每文件首/末块优先级
+    /// 提升至 `prio`（0..=7，7 最高；0 = 恢复默认）。需要 metadata。默认不支持。
+    async fn set_piece_first_last(
+        &self,
+        _id: &EngineTaskId,
+        _prio: i32,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// 会话级存储模式（batch5 对标：qB「预分配磁盘空间」）：true = 后续
+    /// 新增任务预分配（allocate），false = 稀疏（sparse）。恢复任务保留
+    /// fastresume 原模式。须在任务装配前调用。默认不支持。
+    async fn set_session_storage_allocate(&self, _alloc: bool) -> Result<(), EngineError> {
         Err(EngineError::Unsupported)
     }
 

@@ -898,11 +898,11 @@ impl DownloadEngine for BtEngine {
     }
 
     /// 导出 .torrent（Task 46）：metainfo bencode；magnet 任务 metadata
-    /// 未就绪 → Other（调用方 409）。
+    /// 未就绪 → NotReady（batch5：调用方映射 409 可重试，原 Other → 500）。
     async fn export_torrent(&self, id: &EngineTaskId) -> Result<Vec<u8>, EngineError> {
         match self.core.metadata(id).map_err(bt_engine_err)? {
             Some(bytes) if !bytes.is_empty() => Ok(bytes),
-            _ => Err(EngineError::Other(
+            _ => Err(EngineError::NotReady(
                 "元数据未就绪（magnet 任务需先收到 metadata）".into(),
             )),
         }
@@ -935,6 +935,25 @@ impl DownloadEngine for BtEngine {
     /// 解除 Session 级 IP 封禁（Task 46；幂等）。
     async fn unban_ip(&self, ip: &str) -> Result<(), EngineError> {
         self.core.unban_ip(ip).map_err(bt_engine_err)
+    }
+
+    /// IP 段封禁（batch5 对标）：[start, end] 闭区间。
+    async fn ban_ip_range(&self, start: &str, end: &str) -> Result<(), EngineError> {
+        self.core.ban_ip_range(start, end).map_err(bt_engine_err)
+    }
+
+    /// 首尾块优先（batch5 对标）：prio 0..=7。
+    async fn set_piece_first_last(&self, id: &EngineTaskId, prio: i32) -> Result<(), EngineError> {
+        self.core
+            .set_piece_first_last(id, prio)
+            .map_err(bt_engine_err)
+    }
+
+    /// 会话级存储模式（batch5 对标）：装配期一次性注入。
+    async fn set_session_storage_allocate(&self, alloc: bool) -> Result<(), EngineError> {
+        self.core
+            .set_storage_mode(alloc)
+            .map_err(|e| EngineError::Other(format!("set storage mode: {e:?}")))
     }
 
     fn seeding_ratio_limit(&self) -> Option<f64> {
