@@ -377,14 +377,12 @@ async fn download_segment_attempts(
     Err(last)
 }
 
-/// 单文件下载核心：动态分段 + worker 池并行 + 账本续传。
-/// 分段策略与 FTP/HTTP 直链对齐（P0 方案A + P4 账本统一进度真源）：
-/// - 段粒度 `min_split`（0 = 默认 16MB）FIFO 队列（<16MB 单段）；
-/// - 并行 worker 数 = `segment_count(total)`（同一公式，2-8）；
-/// - 续传：`<part>.progress` 段账本为唯一凭据（缺失/损坏/失配 → 作废重下），
-///   每段完成原子落盘，finalize 后清理。
-// 参数即协议会话要素（主机/凭据/路径/目标/退避/进度回调），拆 struct 反而模糊调用点语义。
 /// download_file 结局（审计修复 P1-4）：Completed / Paused（语义与 FTP 同）。
+enum SftpOutcome {
+    Completed,
+    Paused,
+}
+
 /// batch3-P0：段边界暂停检查（与 FTP 同构）——旗标置位 → 锁存退出原因。
 fn pause_hit(pause: &Option<Arc<AtomicBool>>, paused_seen: &Arc<AtomicBool>) -> bool {
     if pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst)) {
@@ -392,11 +390,6 @@ fn pause_hit(pause: &Option<Arc<AtomicBool>>, paused_seen: &Arc<AtomicBool>) -> 
         return true;
     }
     false
-}
-
-enum SftpOutcome {
-    Completed,
-    Paused,
 }
 
 #[allow(clippy::too_many_arguments)]
