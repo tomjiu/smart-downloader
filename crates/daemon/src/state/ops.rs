@@ -455,9 +455,15 @@ impl DaemonState {
                 {
                     let mut tasks = self.tasks.lock();
                     match tasks.get_mut(id) {
-                        // 双检：激活间隙任务可能已被 resume 路径抢先激活/被移除。
-                        // 激活成功即消费重试安排（E30：next_retry_at 清零）。
-                        Some(rec) if rec.engine_tid.is_none() => {
+                        // 双检：激活间隙任务可能已被 resume 路径抢先激活/被移除/
+                        // 被用户暂停（batch6-P2：候选快照后用户 pause →
+                        // Queued→Paused，engine_tid 仍 None——不校验状态会把
+                        // 任务覆盖回 Downloading，违背用户暂停意图）。比对
+                        // 调用方快照态：resume 激活的快照态本来就是
+                        // Paused/Failed（合法），调度激活为 Queued；快照后
+                        // 状态被改写 = 间隙有并发意图 → 放弃本次激活。激活
+                        // 成功即消费重试安排（E30：next_retry_at 清零）。
+                        Some(rec) if rec.engine_tid.is_none() && rec.task.state == task.state => {
                             rec.engine_tid = Some(tid);
                             rec.task.metadata.next_retry_at_unix = 0;
                             // batch3-P1：激活即 Downloading（BT 任务无轮询纠偏，
@@ -2254,6 +2260,9 @@ impl DaemonState {
             .engine_tid
             .clone()
             .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        // batch6-P2：广播 from = 记录态实际值（旧实现硬编码 Downloading，
+        // 执法暂停发生在 Seeding 态时事件失真）
+        let from = rec.task.state.clone();
         self.engine_for(rec.engine_kind)?
             .pause(&tid)
             .await
@@ -2273,7 +2282,7 @@ impl DaemonState {
         self.autosave();
         self.hub.publish(SchedulerEvent::StateChanged {
             task_id: id.to_string(),
-            from: TaskState::Downloading(rec.engine_kind),
+            from,
             to: TaskState::Paused,
         });
         Ok(())
@@ -2349,16 +2358,40 @@ impl DaemonState {
             .resume(&tid)
             .await
             .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        // batch6-P1：做种态任务 resume 后记录态/计时收敛引擎实况——内核对
+        // 已完成种子 pause→resume 不再产生 finished alert，旧实现恒写
+        // Downloading → UI 恒显"下载中 100%"、seeding_since 永不重登记
+        // （max_seeding_time 对该任务从此失效，与执法注释承诺
+        // "resume 后再达标再次触发"相悖）。resume 后查询引擎实况：
+        // Seeding → 记录态 Seeding + 计时重起。
+        let engine = self.engine_for(rec.engine_kind)?;
+        let engine_seeding = if rec.engine_kind == EngineKind::Bt {
+            matches!(
+                engine.status(&tid).await.map(|s| s.state),
+                Ok(smart_dl_core::types::EngineState::Seeding)
+            )
+        } else {
+            false
+        };
         if let Some(rec) = self.tasks.lock().get_mut(id) {
             rec.push_event("resume", None);
-            rec.task.state = TaskState::Downloading(rec.engine_kind);
+            if engine_seeding {
+                rec.task.state = TaskState::Seeding;
+                rec.seeding_since = Some(std::time::Instant::now());
+            } else {
+                rec.task.state = TaskState::Downloading(rec.engine_kind);
+            }
         }
         // 恢复态同步持久化（P4 G5：与 pause 对称）
         self.autosave();
         self.hub.publish(SchedulerEvent::StateChanged {
             task_id: id.to_string(),
-            from: TaskState::Paused,
-            to: TaskState::Downloading(rec.engine_kind),
+            from: rec.task.state.clone(),
+            to: if engine_seeding {
+                TaskState::Seeding
+            } else {
+                TaskState::Downloading(rec.engine_kind)
+            },
         });
         Ok(())
     }
@@ -2574,6 +2607,10 @@ impl DaemonState {
                 smart_dl_core::types::EngineError::Unsupported => {
                     DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持超级种子"))
                 }
+                // batch6-P2：句柄已不存在 → NotFound 语义而非 500
+                smart_dl_core::types::EngineError::NotFound => {
+                    DaemonError::NotFound(id.to_string())
+                }
                 other => DaemonError::Engine(other.to_string()),
             })?;
         {
@@ -2634,11 +2671,18 @@ impl DaemonState {
         let mut errs: Vec<String> = Vec::new();
         if tracker {
             if let Err(e) = engine.force_reannounce(&tid).await {
+                // batch6-P2：句柄已不存在（引擎侧被摘）→ NotFound 语义而非 500
+                if matches!(e, smart_dl_core::types::EngineError::NotFound) {
+                    return Err(DaemonError::NotFound(id.to_string()));
+                }
                 errs.push(format!("tracker 宣告失败: {e}"));
             }
         }
         if dht {
             if let Err(e) = engine.force_dht_announce(&tid).await {
+                if matches!(e, smart_dl_core::types::EngineError::NotFound) {
+                    return Err(DaemonError::NotFound(id.to_string()));
+                }
                 errs.push(format!("DHT 宣告失败: {e}"));
             }
         }
@@ -2671,10 +2715,11 @@ impl DaemonState {
     /// 推进由 bt_events 轮询自然回流）。
     pub async fn recheck_task(&self, id: &str) -> Result<(), DaemonError> {
         let (engine, tid) = self.bt_op_engine(id, "强制重新校验").await?;
-        engine
-            .force_recheck(&tid)
-            .await
-            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        engine.force_recheck(&tid).await.map_err(|e| match e {
+            // batch6-P2：句柄已不存在 → NotFound 语义而非 500
+            smart_dl_core::types::EngineError::NotFound => DaemonError::NotFound(id.to_string()),
+            other => DaemonError::Engine(other.to_string()),
+        })?;
         {
             let mut tasks = self.tasks.lock();
             if let Some(rec) = tasks.get_mut(id) {
@@ -3857,7 +3902,15 @@ impl DaemonState {
         let elapsed_min = seeding_since
             .map(|t| t.elapsed().as_secs() / 60)
             .unwrap_or(0);
-        let ratio_hit = matches!((ratio_limit, ratio), (Some(l), Some(r)) if r >= l);
+        // batch6-P2：downloaded==0 且 uploaded>0 视作 ratio=∞（qbit 同口径）
+        // ——种子导入/已完整数据直接做种时 all-time downloaded=0，旧实现
+        // share_ratio 返回 None → 限制永不触发。
+        let ratio_infinite = st.total_downloaded == 0 && st.total_uploaded > 0;
+        let ratio_hit = match (ratio_limit, ratio) {
+            (Some(l), Some(r)) => r >= l,
+            (Some(_), None) => ratio_infinite,
+            _ => false,
+        };
         let time_hit = matches!((time_limit_min, elapsed_min), (Some(l), m) if m >= l as u64);
         if !ratio_hit && !time_hit {
             return;
@@ -4196,20 +4249,29 @@ fn engine_state_to_task(st: &EngineState, kind: EngineKind) -> TaskState {
 
 /// 封禁条目归一化（batch5-P2）：单 IP 解析为规范字符串；v4-mapped IPv6
 /// （`::ffff:1.2.3.4`）优先转回 v4 形式——否则 libtorrent add_rule 落在
-/// v6 族规则，拦不住实际以 v4 连入的 peer。区间条目（"a-b"）返回原样
-/// （引擎侧 lt_ban_range 校验同族/有序）。非法 → Err。
+/// v6 族规则，拦不住实际以 v4 连入的 peer。区间条目（"a-b"）两端同样
+/// 归一后再校验同族/有序（batch6-P2）。非法 → Err。
 pub(crate) fn normalize_ban_entry(s: &str) -> Result<String, String> {
     let t = s.trim();
     if let Some((a, b)) = t.split_once('-') {
-        // 区间条目：两端各自可解析 + 同族（v4 对 v4 / v6 对 v6）
-        let pa: std::net::IpAddr = a
-            .trim()
-            .parse()
-            .map_err(|e| format!("区间起点非法 {a:?}: {e}"))?;
-        let pb: std::net::IpAddr = b
-            .trim()
-            .parse()
-            .map_err(|e| format!("区间终点非法 {b:?}: {e}"))?;
+        // 区间条目（batch6-P2）：两端各自归一（v4-mapped IPv6 回 v4——否则
+        // add_rule 落 v6 族拦不住实际以 v4 连入的 peer，与单 IP 路径同口径）
+        // + 归一后同族校验
+        let norm = |x: &str| -> Result<std::net::IpAddr, String> {
+            let ip: std::net::IpAddr = x
+                .trim()
+                .parse()
+                .map_err(|e| format!("区间端点非法 {x:?}: {e}"))?;
+            Ok(match ip {
+                std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                    Some(v4) => std::net::IpAddr::V4(v4),
+                    None => std::net::IpAddr::V6(v6),
+                },
+                v4 => v4,
+            })
+        };
+        let pa = norm(a)?;
+        let pb = norm(b)?;
         if pa.is_ipv4() != pb.is_ipv4() {
             return Err(format!("区间 {t:?} 地址族不一致"));
         }
@@ -4244,8 +4306,18 @@ pub(crate) fn parse_ban_range_line(line: &str) -> Option<(String, String)> {
     if a.is_empty() || b.is_empty() {
         return None;
     }
-    let pa: std::net::IpAddr = a.parse().ok()?;
-    let pb: std::net::IpAddr = b.parse().ok()?;
+    // batch6-P2：两端 v4-mapped IPv6 归一（与 normalize_ban_entry 同口径）
+    let norm = |x: &str| -> Option<std::net::IpAddr> {
+        match x.parse::<std::net::IpAddr>().ok()? {
+            std::net::IpAddr::V6(v6) => Some(match v6.to_ipv4_mapped() {
+                Some(v4) => std::net::IpAddr::V4(v4),
+                None => std::net::IpAddr::V6(v6),
+            }),
+            v4 => Some(v4),
+        }
+    };
+    let pa = norm(a)?;
+    let pb = norm(b)?;
     if pa.is_ipv4() != pb.is_ipv4() || pb < pa {
         return None;
     }

@@ -118,3 +118,24 @@
 > 只停引擎不同步记录态的缺口）；UI 设置面板同步 extra_trackers / max_share_ratio /
 > max_seeding_time_min 三项。至此 qbit 做种限制对标补齐（时长口径=本次运行内，
 > 重启经重新 checking 重新计时——持久化口径待需求出现再议）。
+
+> 更新：2026-09-07（一）。**第六轮子智能体批量代码审查落地（batch6）**：三路并行
+> 审查（RSS+队列 / BT 运维+做种执法 / HLS+DASH+FTPS+FTP+Metalink），修复——
+> ① **P0 rss.rs**：CDATA 事件整体丢弃（quick-xml CData 独立变体，WordPress 等主流
+> feed 全挂）→ CData 分支 + 条目槽位累加语义；② **P0 httpdl**：HLS/DASH 流式循环
+> 缺 epoch 单写者闸门（pause→resume 双写者 append 同一 .part 静默损坏）→ is_aborted
+> 闭包（pause ∪ epoch 过期 ∪ 已移除）+ 落位前终检 + HTTP resume 运行态不重 spawn；
+> ③ P1：rss.json 唯一 tmp+0600+损坏留存（对齐 tasks.json V12 配方）、刷新互斥闸、
+> 规则首见命中去重、cap=0 无限重下防护、空白关键词拒绝、集数 captures_iter 全量提取、
+> DASH 单文件表示 120s 总超时+全量内存改流式、内核 piece priority 0 语义映射
+> （0=恢复默认而非 lt 的 skip）、fill_ih 幂等/errored 重建补齐 .torrent/fastresume
+> 路径（E30 重试死锁根治）、重启 Seeding 任务回登记（执法/统计不脱管 + 完成事件
+> 不重发）、resume 后引擎实况收敛（seeding_since 重登记）、downloaded==0 ratio∞
+> 口径、激活窗口暂停意图守卫、pause/resume 广播 from 态实值化；④ P2：FTPS 全局
+> 共享 connector（TLS 会话复用，vsftpd require_ssl_reuse 默认配置兼容）、HLS 段数
+> 上限/key 缓存上限/清单 16MB 限长（DASH 同步）、显式全零 IV 保留（Option 根治
+> 哨兵混淆）、SegmentTemplate Rep 级逐属性继承（ISO 23009-1）、封禁区间 v4-mapped
+> 归一、recheck/announce/super-seeding NotFound 语义（500→404）。**暂缓项**（下轮）：
+> 配额闸门 TOCTOU 预留槽位改造（add 在途窗口超卖，四入口统一）、完成动作全表快照
+> 竞态（同根因）、ban 重放失败脏标记重试、created_at 持久化（重启 FIFO 保序）、
+> FTP 续传 MDTM 指纹（G2 缺陷类 FTP 残留）。
