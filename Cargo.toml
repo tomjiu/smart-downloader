@@ -13,7 +13,7 @@ members = [
 exclude = ["spike/cxx"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 # Task 5-a（2026-08-30）：dev/test 只保留行表级调试信息。
