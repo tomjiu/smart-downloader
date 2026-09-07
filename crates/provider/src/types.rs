@@ -89,5 +89,10 @@ pub(crate) fn now_unix() -> u64 {
 
 /// 直链是否已过期。
 pub(crate) fn link_expired(file: &ResolvedRemoteFile, now: u64) -> bool {
-    file.expires_at.map(|e| e < now).unwrap_or(false)
+    // 审查修复（P2）：60s 安全边距——余量 1 秒内的直链放行长传输必然中途
+    // 过期（靠 SinkError::Expired 兜底恢复 = 重复传输）；e == now 也应判过期。
+    const EXPIRY_MARGIN_S: u64 = 60;
+    file.expires_at
+        .map(|e| e <= now + EXPIRY_MARGIN_S)
+        .unwrap_or(false)
 }

@@ -386,9 +386,13 @@ async fn download_segment_streaming(
 
 /// batch3-P1：解析 `Content-Range: bytes START-END/TOTAL` 的 START。
 /// `bytes */TOTAL`（unsatisfied）返回 None。
-fn parse_content_range_start(v: &str) -> Option<u64> {
-    let rest = v.trim().strip_prefix("bytes")?.trim().strip_prefix('=')?;
-    let unit = rest.trim().split('/').next()?.trim();
+pub(crate) fn parse_content_range_start(v: &str) -> Option<u64> {
+    // 兼容 RFC 7233 标准格式 `bytes START-END/TOTAL`（空格分隔）与常见
+    // 非标准写法 `bytes=START-END/TOTAL`（等号紧贴）。旧实现只认等号格式，
+    // 标准格式的 Content-Range 恒解析为 None → 错位 206 被宽容放行。
+    let rest = v.trim().strip_prefix("bytes")?.trim();
+    let rest = rest.strip_prefix('=').unwrap_or(rest);
+    let unit = rest.split('/').next()?.trim();
     let start = unit.split('-').next()?.trim();
     start.parse().ok()
 }

@@ -456,8 +456,25 @@ async fn download_loop_unknown(
         }
     };
     let mode = match resp.status() {
-        reqwest::StatusCode::PARTIAL_CONTENT => 1u8, // 续传：append
-        reqwest::StatusCode::OK => 2u8,              // 全量：truncate 重下
+        reqwest::StatusCode::PARTIAL_CONTENT => {
+            // 审查修复：206 续传前必须校验 Content-Range 首字节 == 断点 start。
+            // 服务器/中间缓存错位应答（含「bytes 0-N/…」归一化劣化）会把数据
+            // append 到错误偏移，产出「旧前缀+新尾部」混合文件。不符或缺失
+            // 一律降级为全量重下（truncate），与 200 路径同语义。
+            let cr_ok = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::download::parse_content_range_start)
+                .map(|st| st == start)
+                .unwrap_or(false);
+            if cr_ok {
+                1u8 // 续传：append
+            } else {
+                2u8 // 错位/缺失 Content-Range：truncate 全量重下
+            }
+        }
+        reqwest::StatusCode::OK => 2u8, // 全量：truncate 重下
         s => {
             finish(
                 &inner,
@@ -538,12 +555,15 @@ async fn download_loop_unknown(
     if !still_current {
         return;
     }
-    if total_written == 0 {
+    if total_written == 0 && base > 0 {
+        // 审查修复（P2）：续传场景 written==0 = 源截短/异常，保持报错。
+        // （base==0 且空体 = 合法空文件，落下方 finalize 空文件路径——
+        // FTP/SFTP/分段路径均可交付空文件，此路径原先永远报错。）
         finish(
             &inner,
             &tid,
             EngineState::Error,
-            Some("响应体为空（0 字节）".into()),
+            Some("续传响应体为空（源可能已变更）".into()),
         );
         return;
     }
@@ -934,6 +954,22 @@ fn remove_credentials(part: &Path) {
 fn remove_part(part: &Path) {
     let _ = std::fs::remove_file(part);
     remove_credentials(part);
+}
+
+/// 审查修复（P1）：delete_data=true 的落盘清理——dest 本体 + 各代次 .part
+/// 加全部续传凭据（etag 副文件/段账本/HLS/DASH ledger）。换源残留的旧代次
+/// part 一并回收（gen0 常态 + 1..=3 防御性枚举，cleanup_old_parts 最多留一代）。
+fn delete_task_files(dest: &Path) {
+    let _ = std::fs::remove_file(dest);
+    for g in 0..=3u64 {
+        let part = part_path_of(dest, g);
+        if !part.exists() {
+            continue;
+        }
+        let _ = std::fs::remove_file(crate::hls::hls_ledger_path(&part));
+        let _ = std::fs::remove_file(crate::dash::dash_ledger_path(&part));
+        remove_part(&part);
+    }
 }
 
 /// finalize 成功后清理旧代次的 .part 及其凭据（gen0 的 `<dest>.part` 或上一 gen）。
@@ -1334,15 +1370,22 @@ impl DownloadEngine for HttpEngine {
     async fn remove(&self, id: &EngineTaskId, _delete_data: bool) -> Result<(), EngineError> {
         // 先取暂停标志快照并置位：在飞 worker 在段边界尽快退出，
         // 不再向已移除任务的 .part 继续写入。
-        let pause_flag = self.inner.tasks.lock().get(id).map(|t| t.pause.clone());
-        let mut tasks = self.inner.tasks.lock();
-        tasks.remove(id).ok_or(EngineError::NotFound)?;
-        drop(tasks);
+        let (pause_flag, dest) = {
+            let mut tasks = self.inner.tasks.lock();
+            let t = tasks.remove(id).ok_or(EngineError::NotFound)?;
+            let dest = _delete_data.then(|| t.dest.clone());
+            (Some(t.pause.clone()), dest)
+        };
         if let Some(f) = pause_flag {
             f.store(true, Ordering::SeqCst);
         }
         // 限速器条目随任务清理（防泄漏）。
         self.inner.limiters.lock().remove(id);
+        // 审查修复（P1）：delete_data=true 端到端生效（daemon remove 契约
+        // 「删落盘文件」）——dest 本体 + 各代次 .part + 全部续传凭据。
+        if let Some(dest) = dest {
+            delete_task_files(&dest);
+        }
         Ok(())
     }
 

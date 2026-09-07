@@ -517,19 +517,22 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
         .await
         .map_err(ServeError::Io)?;
 
-    #[cfg(feature = "bt")]
-    if let Some(h) = alert_handle {
-        h.abort(); // 进程退出前停止 alert 轮询（锁随 _lock drop 释放）
-    }
-
     // G4：优雅退出前保存活跃 BT 任务 fastresume（crash 时凭据尽可能新）。
-    // alert 循环已 abort → save 内部 pop_alerts 无消费竞态；同步直调阻塞
-    // 主线程 ≤3s/任务——进程正在退出，可接受。逐任务 best-effort，失败不阻断退出。
+    // 审查修复（P1）：保存必须放在 abort **之前**。原实现先 abort 再保存，
+    // 而 save_fastresume_impl 在 alert_loop_active=true 时纯等 mpsc 分发，
+    // 分发者恰是唯一被 abort 的 pop_alerts 消费者 → 每任务空转 3s 超时，
+    // fastresume 全部不落盘，重启后 BT 任务全量 re-check。先保存后 abort
+    // 保证分发链路存活；同步直调阻塞主线程 ≤3s/任务——进程正在退出，可接受。
     #[cfg(feature = "bt")]
     if let Some(bt) = &bt_typed {
         for tid in state_arc.active_bt_tids() {
             let _ = bt.save_resume_now(&tid);
         }
+    }
+
+    #[cfg(feature = "bt")]
+    if let Some(h) = alert_handle {
+        h.abort(); // 进程退出前停止 alert 轮询（锁随 _lock drop 释放）
     }
 
     Ok(())
