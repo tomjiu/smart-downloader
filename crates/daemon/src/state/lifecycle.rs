@@ -322,8 +322,21 @@ impl DaemonState {
 
     /// 启用任务持久化（每次变更自动写 JSON 到 `path`）。
     /// 同时派生 RSS 状态持久化路径（tasks.json 同目录 rss.json，qbit RSS 对标）。
+    /// batch3-P1：回读 rss.json——旧实现只写不读（RssState::load 零调用点），
+    /// 重启后订阅/规则全部丢失，规则自动下载静默停摆。
     pub fn with_storage(mut self, path: PathBuf) -> Self {
-        self.rss_persist_path = path.parent().map(|d| d.join("rss.json"));
+        let rss_path = path.parent().map(|d| d.join("rss.json"));
+        if let Some(rp) = &rss_path {
+            if let Some(st) = crate::rss::RssState::load(rp) {
+                tracing::info!(
+                    "RSS 状态回读: {} feeds / {} rules",
+                    st.feeds.len(),
+                    st.rules.len()
+                );
+                self.rss = parking_lot::Mutex::new(st);
+            }
+        }
+        self.rss_persist_path = rss_path;
         self.persist_path = Some(path);
         self
     }

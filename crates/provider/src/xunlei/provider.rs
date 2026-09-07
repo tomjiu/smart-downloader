@@ -155,7 +155,11 @@ impl XunleiProvider {
             device_id,
             captcha_token: String::new(),
             user_id: String::new(),
-            access_token_expires_at: now_unix() + 43200, // 12h，实际以 token 响应为准
+            // batch3-P1：TTL 以 JWT exp 为准（auth::jwt_exp 现成），仅解析失败
+            // 回退 12h——旧实现硬编码 43200 且 device 流丢弃服务端 expires_in，
+            // 实际 TTL 更短时到期后 drive 请求 401 循环（无 401 驱动刷新）。
+            access_token_expires_at: crate::xunlei::auth::jwt_exp(&access_token)
+                .unwrap_or_else(|| now_unix() + 43200),
             captcha_token_expires_at: 0,
         };
         // 从 access_token（JWT sub）解析 user_id，captcha/init 需要。

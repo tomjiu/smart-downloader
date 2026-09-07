@@ -70,10 +70,19 @@ impl XunleiHandle {
         let torrent_bytes = torrent_bytes.to_vec();
         let save = save.to_path_buf();
         task::spawn_blocking(move || {
-            // 将 torrent 写入临时文件
+            // 将 torrent 写入临时文件。
+            // batch3-P1：文件名唯一化（进程 ID → 进程 ID + 全局原子计数）——
+            // 旧实现同一进程内并发 create_bt_task 共用固定名，A 写入后 B 覆盖，
+            // A 调 SDK 时读到 B 的种子 → 任务内容静默错乱；且文件从不删除，
+            // 每次创建泄漏一份种子字节到 %TEMP%。
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let temp_dir = std::env::temp_dir().join("xunlei-ffi");
             let _ = std::fs::create_dir_all(&temp_dir);
-            let torrent_path = temp_dir.join(format!("task-{}.torrent", std::process::id()));
+            let torrent_path = temp_dir.join(format!(
+                "task-{}-{}.torrent",
+                std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
             std::fs::write(&torrent_path, &torrent_bytes).map_err(|e| {
                 XunleiError::Other(format!("failed to write temp torrent file: {}", e))
             })?;
@@ -101,15 +110,19 @@ impl XunleiHandle {
                 let mut task_id: u32 = 0;
                 let r = (sym.XL_CreateBTTask_V2)(&mut param, &mut task_id);
                 if r != 0 {
+                    let _ = std::fs::remove_file(&torrent_path);
                     return Err(XunleiError::with_context(r, "XL_CreateBTTask_V2 failed"));
                 }
 
                 if task_id == 0 {
+                    let _ = std::fs::remove_file(&torrent_path);
                     return Err(XunleiError::Other(
                         "XL_CreateBTTask_V2 returned null task_id".into(),
                     ));
                 }
 
+                // batch3-P1：SDK 已消费临时文件 → 即刻清理（防 %TEMP% 种子堆积）
+                let _ = std::fs::remove_file(&torrent_path);
                 Ok(TaskId(task_id as u64))
             }
         })

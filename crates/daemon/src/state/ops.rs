@@ -394,6 +394,9 @@ impl DaemonState {
                         Some(rec) if rec.engine_tid.is_none() => {
                             rec.engine_tid = Some(tid);
                             rec.task.metadata.next_retry_at_unix = 0;
+                            // batch3-P1：激活即 Downloading（BT 任务无轮询纠偏，
+                            // 与 add 路径同口径；HTTP 任务轮询稍后幂等确认）
+                            rec.task.state = TaskState::Downloading(kind);
                             rec.push_event("scheduled_start", None);
                         }
                         _ => return false,
@@ -716,6 +719,10 @@ impl DaemonState {
             events: vec![],
         };
         rec.push_event("add", None);
+        // batch3-P1：记录态同步 Downloading——BT 无 HTTP 式 2s 轮询纠偏
+        //（轮询候选过滤只认 Downloading/Seeding），旧实现记录恒 Queued：
+        // GET /tasks 全程显示排队、/stats 聚合速率漏 BT、名称回填被推迟。
+        rec.task.state = TaskState::Downloading(EngineKind::Bt);
         self.tasks.lock().insert(task_id.clone(), rec);
         self.autosave();
         self.hub.publish(SchedulerEvent::TaskCreated {
@@ -849,6 +856,10 @@ impl DaemonState {
             events: vec![],
         };
         rec.push_event("add", None);
+        // batch3-P1：记录态同步 Downloading——BT 无 HTTP 式 2s 轮询纠偏
+        //（轮询候选过滤只认 Downloading/Seeding），旧实现记录恒 Queued：
+        // GET /tasks 全程显示排队、/stats 聚合速率漏 BT、名称回填被推迟。
+        rec.task.state = TaskState::Downloading(EngineKind::Bt);
         self.tasks.lock().insert(task_id.clone(), rec);
         self.autosave();
         self.hub.publish(SchedulerEvent::TaskCreated {
@@ -1081,6 +1092,8 @@ impl DaemonState {
             events: vec![],
         };
         rec.push_event("xunlei-import", None);
+        // batch3-P1：记录态同步 Downloading（与前两处 BT add 同口径）
+        rec.task.state = TaskState::Downloading(EngineKind::Bt);
 
         // 8. peer 注入（best-effort）：把 cfg 里的 bt:// 地址注入引擎
         if let Ok(cfg_obj) = XlbtCfg::parse(&cfg) {
@@ -1659,9 +1672,33 @@ impl DaemonState {
         let resp = resp
             .error_for_status()
             .map_err(|e| DaemonError::InvalidSource(format!("metalink 引导拉取失败: {e}")))?;
-        resp.text()
+        // batch3-P2：限长读取（16MB 封顶）——旧 resp.text() 不限量，已认证
+        // 客户端指向高带宽/无限流响应可在 read_timeout 窗口内注入数 GB 字符串
+        // 打爆 daemon 内存（OOM）。
+        const METALINK_MAX: u64 = 16 * 1024 * 1024;
+        if let Some(len) = resp.content_length() {
+            if len > METALINK_MAX {
+                return Err(DaemonError::InvalidSource(format!(
+                    "metalink 引导响应过大: {len} 字节（上限 {METALINK_MAX}）"
+                )));
+            }
+        }
+        let mut xml: Vec<u8> = Vec::new();
+        let mut resp = resp;
+        while let Some(chunk) = resp
+            .chunk()
             .await
-            .map_err(|e| DaemonError::InvalidSource(format!("metalink 引导响应读取失败: {e}")))
+            .map_err(|e| DaemonError::InvalidSource(format!("metalink 读取失败: {e}")))?
+        {
+            if xml.len() as u64 + chunk.len() as u64 > METALINK_MAX {
+                return Err(DaemonError::InvalidSource(
+                    "metalink 引导响应超过 16MB 上限".into(),
+                ));
+            }
+            xml.extend_from_slice(&chunk);
+        }
+        String::from_utf8(xml)
+            .map_err(|e| DaemonError::InvalidSource(format!("metalink 编码非法: {e}")))
     }
 
     /// 创建 Metalink4 任务集（B1）：解析 RFC 5854 XML → 逐 `<file>` 展开为
