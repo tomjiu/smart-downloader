@@ -110,6 +110,9 @@ pub struct WebhookReq {
 #[serde(default)]
 pub struct SchedulerReq {
     pub start_jitter_seconds: Option<u32>,
+    /// 全部任务终态后动作（Task 46）：none/exit/shutdown/sleep/hibernate；
+    /// 非法值在应用层归一化回落 none。
+    pub completion_action: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -206,6 +209,7 @@ impl DaemonState {
                 "start_jitter_seconds": self
                     .start_jitter_secs
                     .load(std::sync::atomic::Ordering::Relaxed),
+                "completion_action": self.completion_action.lock().clone(),
             },
             "queue": {
                 "max_active_bt": queue.max_active_bt,
@@ -548,6 +552,15 @@ impl DaemonState {
                     cfg.scheduler.start_jitter_seconds = v;
                 }
                 applied.push("scheduler.start_jitter_seconds".into());
+            }
+            // Task 46：完成动作热更（归一化 + 回写 live_config）
+            if let Some(v) = &s.completion_action {
+                let norm = super::lifecycle::normalize_completion_action(v);
+                self.set_completion_action(&norm);
+                if let Some(cfg) = self.live_config.lock().as_mut() {
+                    cfg.scheduler.completion_action = norm.clone();
+                }
+                applied.push(format!("scheduler.completion_action={norm}"));
             }
         }
         if let Some(q) = &req.queue {

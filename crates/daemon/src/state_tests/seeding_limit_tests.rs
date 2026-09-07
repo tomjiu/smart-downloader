@@ -49,6 +49,7 @@ fn seeding_rec(id: &str, ih: &str, seeding_since: Option<std::time::Instant>) ->
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         },
         engine_tid: Some(ih.to_string()),
         engine_kind: EngineKind::Bt,

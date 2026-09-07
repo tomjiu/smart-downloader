@@ -285,6 +285,11 @@ pub struct SchedulerCfg {
     /// 则在 0..=N 秒内随机延迟启动（到点前不入引擎，与显式 start_at 同
     /// 机制）。0 = 关闭（默认，立即入引擎）。参与热重载（只影响新任务）。
     pub start_jitter_seconds: u32,
+    /// 全部任务终态后的动作（Task 46，qbit「下载完成后关机」对标）：
+    /// none（默认）/ exit（进程退出）/ shutdown（系统关机）/ sleep（休眠）/
+    /// hibernate。每进程会话最多触发一次（fired 旗标）；空任务表不触发。
+    #[serde(default)]
+    pub completion_action: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
