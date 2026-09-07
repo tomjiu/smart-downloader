@@ -181,9 +181,7 @@ impl BtEngine {
             core: Arc::new(core),
             save_path: save_path.to_path_buf(),
             pause_intents: parking_lot::Mutex::new(std::collections::HashMap::new()),
-            resume_waiters: Arc::new(parking_lot::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            resume_waiters: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             network: parking_lot::Mutex::new(BtNetwork {
                 proxy_url: proxy.map(|s| s.to_string()).filter(|s| !s.is_empty()),
                 down_kb_s,
