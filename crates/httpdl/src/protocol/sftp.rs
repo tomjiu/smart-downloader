@@ -23,7 +23,7 @@ use smart_dl_core::types::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
@@ -116,6 +116,9 @@ struct SftpTask {
     sequential: bool,
     /// 审计修复（P1-4）：真暂停闸门（与 FTP/HTTP 同构）。
     pause: Arc<AtomicBool>,
+    /// batch3-P0 epoch 单写者闸门（与 FTP 同构）：resume/remove 先自增；
+    /// 循环过期即退出且绝不 finalize，根治 pause→resume 竞态与双循环并发写。
+    epoch: Arc<AtomicU64>,
 }
 
 struct EngineInner {
@@ -382,6 +385,15 @@ async fn download_segment_attempts(
 ///   每段完成原子落盘，finalize 后清理。
 // 参数即协议会话要素（主机/凭据/路径/目标/退避/进度回调），拆 struct 反而模糊调用点语义。
 /// download_file 结局（审计修复 P1-4）：Completed / Paused（语义与 FTP 同）。
+/// batch3-P0：段边界暂停检查（与 FTP 同构）——旗标置位 → 锁存退出原因。
+fn pause_hit(pause: &Option<Arc<AtomicBool>>, paused_seen: &Arc<AtomicBool>) -> bool {
+    if pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst)) {
+        paused_seen.store(true, Ordering::SeqCst);
+        return true;
+    }
+    false
+}
+
 enum SftpOutcome {
     Completed,
     Paused,
@@ -402,7 +414,9 @@ async fn download_file(
     sequential: bool,
     on_progress: Arc<dyn Fn(u64) + Send + Sync>,
     pause: Option<Arc<AtomicBool>>,
+    epoch: Arc<AtomicU64>,
 ) -> Result<SftpOutcome, String> {
+    let epoch0 = epoch.load(Ordering::SeqCst);
     let part = part_path_of(dest);
     let ledger_path = ledger::ledger_path(&part);
     // 段账本加载（P4 唯一进度真源，与 FTP/HTTP 同口径）：合法账本 →
@@ -449,6 +463,8 @@ async fn download_file(
     } else {
         None
     };
+    // batch3-P0：暂停退出原因锁存槽（与 FTP 同构）
+    let paused_seen: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
     // worker 数：与 FTP/HTTP 同一公式（静态 2-8）。<16MB 单段时多出的 worker
     // 领不到段（Drained）即退，零开销。
@@ -466,10 +482,16 @@ async fn download_file(
         let ledger_path = ledger_path.clone();
         let on_progress = on_progress.clone();
         let pause = pause.clone();
+        let paused_seen = paused_seen.clone();
+        let epoch = epoch.clone();
         workers.spawn(async move {
             loop {
-                // 审计修复（P1-4）：段边界检查暂停旗标（与 FTP 同构）
-                if pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst)) {
+                // 审计修复（P1-4）：段边界检查暂停旗标（与 FTP 同构）；
+                // batch3-P0：epoch 过期即退出（新循环已成唯一写者）
+                if epoch.load(Ordering::SeqCst) != epoch0 {
+                    return Ok::<(), String>(());
+                }
+                if pause_hit(&pause, &paused_seen) {
                     return Ok::<(), String>(());
                 }
                 // 顺序模式：先拿 permit 再领取段，保证「在飞段数 ≤ 窗口」
@@ -532,7 +554,12 @@ async fn download_file(
     drop(workers);
     // 暂停优先于错误（审计修复 P1-4，与 FTP 同构）：置位后任何 worker
     // 错误/panic 都视为暂停退出；不清账本、不落位。
-    if pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst)) {
+    // batch3-P0：退出原因以锁存槽为准，epoch 过期同样视作暂停退出
+    //（不落位）；旗标活读仅兜底 err 退出未过检查点场景（保持原语义）。
+    if epoch0 != epoch.load(Ordering::SeqCst)
+        || paused_seen.load(Ordering::SeqCst)
+        || pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst))
+    {
         return Ok(SftpOutcome::Paused);
     }
     if let Some(e) = first_err {
@@ -575,9 +602,12 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
         tasks.get(&tid).map(|t| t.sequential).unwrap_or(false)
     };
     let min_split = inner.min_split;
-    let pause_flag = {
+    let (pause_flag, epoch_flag) = {
         let tasks = inner.tasks.lock();
-        tasks.get(&tid).map(|t| t.pause.clone())
+        tasks
+            .get(&tid)
+            .map(|t| (Some(t.pause.clone()), t.epoch.clone()))
+            .unwrap_or((None, Arc::new(AtomicU64::new(0))))
     };
     // 审计修复（P1-3）：进度改绝对赋值（max 语义，与 FTP/HTTP 同口径）——
     // 旧实现按增量 += 累加账本折算的绝对值 → 进度虚报。
@@ -589,7 +619,7 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
     });
     let r = download_file(
         &host, port, &user, &pass, &path, &dest, total, backoff, &limiter, min_split, sequential,
-        progress, pause_flag,
+        progress, pause_flag, epoch_flag,
     )
     .await;
     match r {
@@ -650,8 +680,13 @@ fn finish(inner: &Arc<EngineInner>, tid: &str, state: EngineState, error: Option
 }
 
 /// 现有 .part 已下载字节数（续传起点折算，仅展示口径；账本才是真源）。
-fn part_done(part: &Path) -> u64 {
-    std::fs::metadata(part).map(|m| m.len()).unwrap_or(0)
+/// batch3-P1：段账本折算已完成字节（P4 唯一进度真源）；无账本 → 0。
+fn ledger_done_bytes(part: &Path) -> u64 {
+    let lp = ledger::ledger_path(part);
+    ledger::load(&lp)
+        .filter(|l| l.validate_segments())
+        .map(|l| l.done.iter().map(|(s, e)| e - s + 1).sum::<u64>())
+        .unwrap_or(0)
 }
 
 #[async_trait::async_trait]
@@ -802,12 +837,15 @@ impl DownloadEngine for SftpEngine {
                     dest,
                     total,
                     state: EngineState::Downloading,
-                    done: part_done(&part),
+                    // batch3-P1：账本折算（.part 预分配长度恒 total，
+                    // 旧值会让重启后进度恒 100% 且 max 语义不可回退）
+                    done: ledger_done_bytes(&part),
                     rate: RateSample::default(),
                     error: None,
                     limit_kb_s: None,
                     sequential: task.sequential,
                     pause: Arc::new(AtomicBool::new(false)),
+                    epoch: Arc::new(AtomicU64::new(0)),
                 },
             );
         }
@@ -835,6 +873,8 @@ impl DownloadEngine for SftpEngine {
             let mut tasks = self.inner.tasks.lock();
             let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
             let was = t.state == EngineState::Paused;
+            // batch3-P0：先自增 epoch 再清旗标（与 FTP 同构）
+            t.epoch.fetch_add(1, Ordering::SeqCst);
             t.pause.store(false, Ordering::SeqCst);
             t.state = EngineState::Downloading;
             was
@@ -879,6 +919,7 @@ impl DownloadEngine for SftpEngine {
         {
             let tasks = self.inner.tasks.lock();
             if let Some(t) = tasks.get(id) {
+                t.epoch.fetch_add(1, Ordering::SeqCst);
                 t.pause.store(true, Ordering::SeqCst);
             }
         }
