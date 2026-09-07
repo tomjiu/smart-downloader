@@ -10,7 +10,7 @@
 //! 重启后 add 同一 magnet/torrent 时按 infohash 查 `.fastresume` → `add_torrent_resume`
 //! 回灌 → libtorrent 恢复 piece 位图 + metadata，免全盘 checking / 免重新抓取 metadata。
 
-use smart_dl_btcore::{AlertKind, BtCore, TorrentStatus};
+use smart_dl_btcore::{BtCore, TorrentStatus};
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
     BtSessionPatch, Capability, DownloadEngine, DownloadSource, EngineError, EngineKind,
