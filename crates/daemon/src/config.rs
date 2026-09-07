@@ -403,10 +403,27 @@ impl Config {
 
     /// 原子落盘（tmp + rename，S1）：`PUT /settings?persist=true` 用。
     /// 目标目录不存在 → Err。
+    /// batch3-P2：tmp 名唯一化（并发 PUT 不再互踩同一固定名）+ fsync
+    ///（rename 先于数据落盘 → 断电配置损坏）+ 0600（配置含 http_token/proxy
+    /// 凭据，旧实现 rename 后回落 umask 0644 泄露）。
     pub fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
+        use std::io::Write;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
         let text = self.to_toml_string()?;
-        let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, &text).map_err(|e| format!("写入临时文件 {tmp:?} 失败: {e}"))?;
+        let tmp = path.with_extension(format!("toml.tmp.{}", SEQ.fetch_add(1, Ordering::Relaxed)));
+        let mut f =
+            std::fs::File::create(&tmp).map_err(|e| format!("创建临时文件 {tmp:?} 失败: {e}"))?;
+        f.write_all(text.as_bytes())
+            .map_err(|e| format!("写入临时文件 {tmp:?} 失败: {e}"))?;
+        f.sync_all()
+            .map_err(|e| format!("刷盘临时文件 {tmp:?} 失败: {e}"))?;
+        drop(f);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
         std::fs::rename(&tmp, path).map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
             format!("替换配置 {path:?} 失败: {e}")
