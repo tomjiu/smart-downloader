@@ -597,6 +597,13 @@ pub struct DaemonState {
     /// 任务完成 Webhook URL（E17）：Some = 完成态时 POST 通知；None = 禁用。
     /// serve 从 `[webhook] url` 注入，热重载跟随（refresh_config）。
     webhook_url: Mutex<Option<String>>,
+    /// 全部任务终态后的动作（Task 46，qbit 对标）：none/exit/shutdown/sleep/
+    /// hibernate。serve 从 `[scheduler] completion_action` 注入 + 热重载跟随；
+    /// 每会话最多触发一次（completion_fired）。
+    completion_action: Mutex<String>,
+    /// 完成动作已触发旗标（Task 46）：防重复（exit/shutdown 后无意义；
+    /// sleep 唤醒后新任务不再触发——qbit 同为会话级一次性）。
+    completion_fired: std::sync::atomic::AtomicBool,
     /// Webhook 投递 client（共享连接池；完成频率低，单实例足够）。
     webhook_client: reqwest::Client,
     /// Metalink 引导 XML 拉取 client（B1）：serve 注入引擎全局 client 克隆
@@ -640,6 +647,11 @@ pub struct DaemonState {
     pub(crate) rss: Mutex<crate::rss::RssState>,
     /// rss.json 路径（with_storage 派生：tasks.json 同目录；None = 不落盘）。
     pub(crate) rss_persist_path: Option<PathBuf>,
+    /// BT 显式 IP 封禁列表（Task 46，qbit「永久封禁」对标）：有序去重；
+    /// bans.json 持久化（重启重放），引擎侧 = libtorrent ip_filter。
+    pub(crate) bt_bans: Mutex<Vec<String>>,
+    /// bans.json 路径（with_storage 派生：tasks.json 同目录；None = 不落盘）。
+    pub(crate) bans_persist_path: Option<PathBuf>,
 }
 
 /// 全局限速总阀门当前值（E16，KiB/s；0 = 不限）。

@@ -101,6 +101,7 @@ async fn conn_limit_replays_on_restore() {
             file_priorities: None,
             sequential: false,
             max_connections: Some(80),
+            queue_priority: 0,
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,

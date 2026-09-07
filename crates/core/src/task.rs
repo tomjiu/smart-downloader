@@ -52,6 +52,17 @@ pub struct DownloadTask {
     /// （metadata 未就绪也可设，handle 级参数）。旧 tasks.json 无此字段自动补 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<u32>,
+    /// 队列优先级（Task 46，qbit 队列位置对标）：值越小越优先（i32 允许负数
+    /// 表达 top 上移链）；相同值按创建序 FIFO。仅影响 S1-b 排队递补顺序
+    /// （activate_due_tasks 排序键 (queue_priority, created_at)），对已接入
+    /// 引擎的运行中任务无语义（qbit 同语义：改 priority 只影响排队位）。
+    /// 持久化字段；旧 tasks.json 无此字段自动补 0。
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub queue_priority: i32,
+}
+
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
 }
 
 /// 任务级限速（KiB/s）。语义：`None` = 不调整（保持现状/走全局）；

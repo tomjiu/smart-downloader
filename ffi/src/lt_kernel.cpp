@@ -39,6 +39,7 @@
 #include <memory>
 #include <atomic>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -54,6 +55,9 @@ struct lt_session {
     uint32_t dropped = 0;
     uint32_t mask = 0;
     std::string last_err;
+    // Task 46：显式 IP 封禁列表（session 级 ip_filter 的 Rust 可查回镜像）。
+    // 重启重放由 daemon 层持久化（bans.json）负责，C++ 侧仅运行时状态。
+    std::set<std::string> banned;
     // 审计修复（P1-4）：last_err 专锁——daemon 单 session 被 bt_events 轮询
     // 循环与 API handler（pause/remove/peers 等）并发调用，set_err 写与
     // lt_err_str 读此前无任何同步（std::string 重分配期被读 = UB）。
@@ -863,11 +867,61 @@ lt_err lt_take_resume_data(lt_session* s, const char* ih, uint8_t* buf, size_t c
     return LT_OK;
 }
 
-lt_err lt_ban_peer(lt_session* s, const char* /*ih*/, const char* /*ip*/, uint16_t /*port*/) {
-    // v2：2.x 公开 API 无 per-endpoint ban（ban_ip 在 aux_ 内部）；v1 存根
-    if (!s) return LT_ERR_ARG;
-    set_err(s, "ban_peer: not implemented (2.x public API lacks endpoint ban)");
-    return LT_ERR_ENGINE;
+/* v2 真实现（Task 46，qbit「封禁 IP」对标）：libtorrent 2.x 公开 API 无
+   per-endpoint ban，session 级走 ip_filter（1.2/2.x 均有 set/get_ip_filter）。
+   封禁集合同步存 s->banned（daemon 重启重放由 Rust 层持久化负责）。
+   幂等：已在集合中直接 LT_OK。ih 仅验证任务存在（封禁作用域 = 全 session，
+   与 qbit「永久封禁」一致；port 无作用——filter 按 address 匹配）。 */
+lt_err lt_ban_peer(lt_session* s, const char* ih, const char* ip, uint16_t /*port*/) {
+    if (!s || !ip) return LT_ERR_ARG;
+    try {
+        if (ih) {
+            const lt::torrent_handle h = find_handle(s, ih);
+            if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        }
+        const std::string a(ip);
+        if (s->banned.count(a)) return LT_OK; /* 幂等 */
+        boost::system::error_code ec;
+        const lt::address addr = lt::make_address(a, ec);
+        if (ec) { set_err(s, "invalid ip: " + a); return LT_ERR_ARG; }
+        auto f = s->ses.get_ip_filter();
+        /* ip_filter 语义：flags 0 = allowed，access_flags::blocked = 封禁 */
+        f.add_rule(addr, addr, lt::ip_filter::access_flags::blocked);
+        s->ses.set_ip_filter(f);
+        s->banned.insert(a);
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* 解除封禁（qbit「解除封禁」对标）：filter 规则恢复 allow + 集合移除。
+   未封禁的 IP 幂等 LT_OK（filter 层规则本就不存在）。 */
+lt_err lt_unban_peer(lt_session* s, const char* ip) {
+    if (!s || !ip) return LT_ERR_ARG;
+    try {
+        const std::string a(ip);
+        if (!s->banned.count(a)) return LT_OK;
+        boost::system::error_code ec;
+        const lt::address addr = lt::make_address(a, ec);
+        if (ec) { set_err(s, "invalid ip: " + a); return LT_ERR_ARG; }
+        auto f = s->ses.get_ip_filter();
+        /* 解封 = 恢复 allow（flags 0）*/
+        f.add_rule(addr, addr, 0);
+        s->ses.set_ip_filter(f);
+        s->banned.erase(a);
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* 查询封禁状态：out = 1 已封禁 / 0 未封禁。读 banned 集合（O(log n)），
+   不查 libtorrent 内部（auto-ban 的临时封禁不入本集合，语义 = 显式封禁列表）。 */
+lt_err lt_is_banned(lt_session* s, const char* ip, int* out) {
+    if (!s || !ip || !out) return LT_ERR_ARG;
+    *out = s->banned.count(std::string(ip)) ? 1 : 0;
+    return LT_OK;
 }
 
 lt_err lt_add_url_seed(lt_session* s, const char* ih, const char* url) {
@@ -930,6 +984,50 @@ lt_err lt_set_seed_mode(lt_session* s, const char* ih, int on) {
         } else {
             h.unset_flags(lt::torrent_flags::seed_mode);
         }
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* —— 强制操作三件套（Task 46，qbit/BitComet 任务右键对标）—— */
+
+/* 强制向全部 tracker 立即宣告。libtorrent 侧无同步错误通道（宣告失败走
+   tracker_error alert），成功路径恒 LT_OK；仅句柄不存在报 NOT_FOUND。 */
+lt_err lt_force_reannounce(lt_session* s, const char* ih) {
+    if (!s || !ih) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        h.force_reannounce();
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* 强制 DHT 宣告。DHT 未启用时 libtorrent 内部 no-op（不报错）——
+   与 qbit 行为一致，上层无需预检 DHT 开关。 */
+lt_err lt_force_dht_announce(lt_session* s, const char* ih) {
+    if (!s || !ih) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        h.force_dht_announce();
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* 强制重新校验：任务转入 checking（校验期下载/做种挂起，完成后自动恢复）。
+   magnet 元数据未就绪时 libtorrent 侧 no-op。 */
+lt_err lt_force_recheck(lt_session* s, const char* ih) {
+    if (!s || !ih) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        h.force_recheck();
         return LT_OK;
     } catch (...) {
         return LT_ERR_ENGINE;

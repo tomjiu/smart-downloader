@@ -372,6 +372,38 @@ impl BtCore {
     pub fn metadata(&self, ih: &str) -> ffi::Result<Option<Vec<u8>>> {
         self.sess.metadata(ih)
     }
+
+    // —— 强制操作三件套 + IP 封禁（Task 46） ——
+
+    /// 强制向全部 tracker 立即宣告（qbit/BitComet 任务右键对标）。
+    pub fn force_reannounce(&self, ih: &str) -> ffi::Result<()> {
+        self.sess.force_reannounce(ih)
+    }
+
+    /// 强制 DHT 宣告（DHT 未启用时内核 no-op，不报错）。
+    pub fn force_dht_announce(&self, ih: &str) -> ffi::Result<()> {
+        self.sess.force_dht_announce(ih)
+    }
+
+    /// 强制重新校验：任务转入 checking（校验期下载/做种挂起，完成后自动恢复）。
+    pub fn force_recheck(&self, ih: &str) -> ffi::Result<()> {
+        self.sess.force_recheck(ih)
+    }
+
+    /// Session 级 IP 封禁（幂等；ih = Some 时先验证任务存在）。
+    pub fn ban_ip(&self, ih: Option<&str>, ip: &str) -> ffi::Result<()> {
+        self.sess.ban_ip(ih, ip)
+    }
+
+    /// 解除封禁（幂等）。
+    pub fn unban_ip(&self, ip: &str) -> ffi::Result<()> {
+        self.sess.unban_ip(ip)
+    }
+
+    /// 查询显式封禁状态（true = 已封禁；不含内核 auto-ban 临时封禁）。
+    pub fn is_banned(&self, ip: &str) -> ffi::Result<bool> {
+        self.sess.is_banned(ip)
+    }
 }
 
 #[cfg(test)]

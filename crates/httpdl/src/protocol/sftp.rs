@@ -1258,6 +1258,7 @@ mod tests {
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         };
 
         let engine = SftpEngine::new().with_min_split(128 * 1024);
@@ -1329,6 +1330,7 @@ mod tests {
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         };
         let engine = SftpEngine::with_backoff(Backoff::default());
         let err = engine.add(&task).await.unwrap_err();
@@ -1381,6 +1383,7 @@ mod tests {
             },
             limits: None,
             max_connections: None,
+            queue_priority: 0,
         };
         let engine = SftpEngine::with_backoff(Backoff::default());
         let started = std::time::Instant::now();
