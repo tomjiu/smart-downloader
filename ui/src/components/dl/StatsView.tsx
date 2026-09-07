@@ -2,7 +2,7 @@
 /// 统计视图：KPI 卡 + 引擎/状态分布 + 速率曲线。
 
 import type { Stats, TaskListItem } from "@/lib/daemon/types";
-import { fmtSpeed } from "@/lib/daemon/format";
+import { fmtBytes, fmtSpeed } from "@/lib/daemon/format";
 import SpeedChart, { type SpeedPoint } from "./SpeedChart";
 
 function StatCard({
@@ -56,6 +56,8 @@ export default function StatsView({
     by_engine: {},
     down_bytes_s: 0,
     up_bytes_s: 0,
+    session_down_bytes: 0,
+    session_up_bytes: 0,
   };
   const active = ["Downloading", "Seeding", "Transferring", "FallbackProvider"].reduce(
     (a, k) => a + (st.by_state[k] ?? 0),
@@ -72,8 +74,8 @@ export default function StatsView({
   return (
     <div className="dl-enter" style={{ display: "grid", gap: 16 }}>
       <div className="dl-grid dl-grid--stats">
-        <StatCard icon="cloud-download" tone="var(--accent)" label="总下载速度" value={fmtSpeed(st.down_bytes_s)} sub={`${history.length} 个采样点`} />
-        <StatCard icon="arrow-up" tone="var(--info)" label="总上传速度" value={fmtSpeed(st.up_bytes_s)} />
+        <StatCard icon="cloud-download" tone="var(--accent)" label="总下载速度" value={fmtSpeed(st.down_bytes_s)} sub={`会话累计 ${fmtBytes(st.session_down_bytes)}`} />
+        <StatCard icon="arrow-up" tone="var(--info)" label="总上传速度" value={fmtSpeed(st.up_bytes_s)} sub={`会话累计 ${fmtBytes(st.session_up_bytes)}`} />
         <StatCard icon="play" tone="var(--warning)" label="活跃任务" value={String(active)} sub={`共 ${st.total} 个任务`} fill={st.total ? (active / st.total) * 100 : 0} />
         <StatCard icon="database" tone="var(--success)" label="累计完成任务" value={String(doneCount)} sub={`列表共 ${tasks.length} 项`} fill={tasks.length ? (doneCount / tasks.length) * 100 : 0} />
       </div>
