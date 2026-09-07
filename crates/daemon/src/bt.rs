@@ -537,9 +537,10 @@ impl DownloadEngine for BtEngine {
         let core = self.core.clone();
         let waiters = self.resume_waiters.clone();
         let save_path = self.save_path.clone();
+        let loop_active = self.alert_loop_active.clone();
         let ih = id.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            save_fastresume_impl(&core, &waiters, &save_path, &ih)
+            save_fastresume_impl(&core, &waiters, &save_path, &loop_active, &ih)
         })
         .await;
         Ok(())
@@ -567,9 +568,10 @@ impl DownloadEngine for BtEngine {
         let core = self.core.clone();
         let waiters = self.resume_waiters.clone();
         let save_path = self.save_path.clone();
+        let loop_active = self.alert_loop_active.clone();
         let ih = id.clone();
         let _ = tokio::task::spawn_blocking(move || {
-            save_fastresume_impl(&core, &waiters, &save_path, &ih)
+            save_fastresume_impl(&core, &waiters, &save_path, &loop_active, &ih)
         })
         .await;
         self.set_pause_intent(id, false);
