@@ -3,6 +3,9 @@
 /// NEXT_PUBLIC_DAEMON 或 localStorage 覆盖；Bearer token 可选。
 
 import type {
+  RssFeed,
+  RssItem,
+  RssRule,
   SchedulerEventEnvelope,
   Settings,
   SettingsApplyReport,
@@ -111,6 +114,49 @@ export class DaemonClient {
       method: "POST",
       body: JSON.stringify({ proxy }),
     });
+  }
+  /// 首尾块优先（batch5 对标 qB）：每文件首/末块优先级；prio 0..=7（0=恢复）
+  taskPieceFirstLast(id: string, priority: number) {
+    return req(`/tasks/${id}/piece-priority`, {
+      method: "POST",
+      body: JSON.stringify({ priority }),
+    });
+  }
+
+  // ---- RSS ----
+  rssFeeds(): Promise<{ feeds: RssFeed[] }> {
+    return req("/rss/feeds");
+  }
+  rssItems(feedId?: number): Promise<{ items: RssItem[] }> {
+    return req(`/rss/items${feedId != null ? `?feed_id=${feedId}` : ""}`);
+  }
+  rssRules(): Promise<{ rules: RssRule[] }> {
+    return req("/rss/rules");
+  }
+  rssAddFeed(url: string) {
+    return req("/rss/feeds", { method: "POST", body: JSON.stringify({ url }) });
+  }
+  rssRemoveFeed(id: number) {
+    return req(`/rss/feeds/${id}`, { method: "DELETE" });
+  }
+  rssAddRule(body: {
+    name: string;
+    enabled: boolean;
+    must_contain: string[];
+    must_not_contain: string[];
+    feed_id: number | null;
+    tags: string[];
+    dest: string | null;
+    use_regex: boolean;
+    episode_filter: string | null;
+  }): Promise<{ id: number }> {
+    return req("/rss/rules", { method: "POST", body: JSON.stringify(body) });
+  }
+  rssRemoveRule(id: number) {
+    return req(`/rss/rules/${id}`, { method: "DELETE" });
+  }
+  rssRefresh() {
+    return req("/rss/refresh", { method: "POST" });
   }
 
   // 全局

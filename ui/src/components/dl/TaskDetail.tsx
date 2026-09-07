@@ -156,6 +156,23 @@ export default function TaskDetail({
 
                 {task.engine === "bt" && (
                   <>
+                    <label className="dl-field-label">首尾块优先（边下边播）</label>
+                    <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      <button
+                        className="qoder-btn qoder-btn--ghost"
+                        aria-label="开启首尾块优先"
+                        onClick={() => run(() => client.taskPieceFirstLast(task.task_id, 7), "已提升首尾块优先级")}
+                      >
+                        <span className="qoder-icon qoder-icon--check" /> 开启
+                      </button>
+                      <button
+                        className="qoder-btn qoder-btn--ghost"
+                        aria-label="恢复默认块优先级"
+                        onClick={() => run(() => client.taskPieceFirstLast(task.task_id, 0), "已恢复默认块优先级")}
+                      >
+                        恢复
+                      </button>
+                    </div>
                     <label className="dl-field-label">连接数上限</label>
                     <input
                       className="qoder-input"

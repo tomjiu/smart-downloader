@@ -77,6 +77,9 @@ pub struct BtSessionReq {
     pub max_share_ratio: Option<f64>,
     /// 做种时长上限（分钟，qbit「做种时间限制」对标）；0 = 不启用。
     pub max_seeding_time_min: Option<u32>,
+    /// 存储模式（batch5 对标 qB「预分配磁盘空间」）：true = 新任务预分配。
+    /// 会话级开关，仅重启时注入引擎（PUT 仅持久化）。
+    pub storage_allocate: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -84,6 +87,8 @@ pub struct BtSessionReq {
 pub struct DownloadReq {
     pub dest_root: Option<String>,
     pub disk_precheck_strict: Option<bool>,
+    /// HTTP 重定向最大跳数（batch5，1..=100）；仅重启时烘入 client。
+    pub max_redirects: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -183,11 +188,13 @@ impl DaemonState {
                 "extra_trackers": cfg.bt.extra_trackers,
                 "max_share_ratio": cfg.bt.max_share_ratio,
                 "max_seeding_time_min": cfg.bt.max_seeding_time_min,
+                "storage_allocate": cfg.bt.storage_allocate,
                 "bt_available": self.engines.contains_key(&EngineKind::Bt),
             },
             "download": {
                 "dest_root": self.default_dest_root.lock().display().to_string(),
                 "disk_precheck_strict": self.disk_precheck_strict,
+                "max_redirects": cfg.download.max_redirects,
             },
             "cleanup": {
                 "auto_remove_completed_days": self.cleanup.lock().auto_remove_completed_days,
@@ -318,6 +325,13 @@ impl DaemonState {
                     return Err(DaemonError::InvalidSource(
                         "download.dest_root 不能为空".into(),
                     ));
+                }
+            }
+            if let Some(v) = d.max_redirects {
+                if !(1..=100).contains(&v) {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "download.max_redirects = {v} 无效：须在 1..=100"
+                    )));
                 }
             }
         }
@@ -474,6 +488,13 @@ impl DaemonState {
                     applied.push(format!("bittorrent.{k}"));
                 }
             }
+            // batch5：存储模式——会话级开关，重启装配时注入引擎（PUT 仅持久化）
+            if let Some(v) = bt.storage_allocate {
+                if let Some(cfg) = self.live_config.lock().as_mut() {
+                    cfg.bt.storage_allocate = v;
+                }
+                restart_required.push("bittorrent.storage_allocate".into());
+            }
         }
         if let Some(d) = &req.download {
             if let Some(root) = d.dest_root.as_deref() {
@@ -501,6 +522,14 @@ impl DaemonState {
                     cfg.download.disk_precheck_strict = v;
                 }
                 restart_required.push("download.disk_precheck_strict".into());
+            }
+            if let Some(v) = d.max_redirects {
+                // 重定向策略烘入全局 client（reqwest Client 不可变）——仅落盘
+                // + 重启生效；越界钳制发生在 serve 使用点（1..=100）。
+                if let Some(cfg) = self.live_config.lock().as_mut() {
+                    cfg.download.max_redirects = v;
+                }
+                restart_required.push("download.max_redirects".into());
             }
         }
         if let Some(c) = &req.cleanup {
