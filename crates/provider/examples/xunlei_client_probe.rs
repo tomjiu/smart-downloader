@@ -75,7 +75,13 @@ async fn main() {
     if !tok.refresh_token.is_empty() {
         auth.refresh_token = tok.refresh_token.clone();
     }
-    // 回写登录态（续期成果不丢）
+    // 回写登录态（续期成果不丢）——batch3-P2：0600 权限落盘（旧裸 fs::write
+    // 以 0644 落 access/refresh_token；本示例使用本地简化结构，不走 auth::save）
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(Path::new(&path), std::fs::Permissions::from_mode(0o600));
+    }
     let _ = std::fs::write(
         Path::new(&path),
         serde_json::to_string_pretty(&auth).unwrap(),

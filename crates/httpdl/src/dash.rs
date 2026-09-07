@@ -920,7 +920,8 @@ pub async fn download_dash(
         f.write_all(&payload)
             .map_err(|e| EngineError::Other(format!("part 写入: {e}")))?;
         bytes_done += payload.len() as u64;
-        on_progress(payload.len() as u64);
+        // batch3-P1：进度统一绝对累计语义（与回填同口径，见 hls 同批修复）
+        on_progress(bytes_done);
         // 段完成即落账本（顺序前缀语义 → 崩溃后从下一段续）
         save_ledger(
             &ledger_path,

@@ -20,7 +20,7 @@ use smart_dl_core::types::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -151,6 +151,11 @@ struct FtpTask {
     /// 「假暂停」（旧实现仅改状态字段，worker 继续跑完全程且 finish 会把
     /// Paused 覆写成 Completed）；remove() 同旗标复用 → 退出后不落位。
     pause: Arc<AtomicBool>,
+    /// batch3-P0 epoch 单写者闸门：resume/remove 置位旗标前先自增；下载循环
+    /// 开头快照 epoch0，worker 段边界与 join 判定均校验 epoch 未变——
+    /// 旧循环在任何新循环 spawn 后即「过期」，绝不 finalize、绝不继续领段，
+    /// 根治 pause→resume 竞态（空洞文件落位 + 双循环并发写 .part）。
+    epoch: Arc<AtomicU64>,
 }
 
 struct EngineInner {
@@ -270,15 +275,29 @@ impl FtpEngine {
         let mut total = 0u64;
         let mut done = 0u64;
         for e in entries {
+            // batch3-P1：条目名净化（sanitize_rel）——旧实现只滤 '/'\\'.'..'
+            // 四字符，恶意/被入侵服务器 LIST 输出形如 `C:evil.txt`（Windows
+            // 带盘符前缀）经 Path::join 直接替换 base 逃出 dest_root；与
+            // 单文件路径 sanitize_rel 口径对齐，非法条目跳过（拒杀整任务）。
+            let safe_name = match smart_dl_core::session::output::sanitize_rel(&e.name) {
+                Ok(pb) => pb,
+                Err(_) => {
+                    println!("ftp] 目录条目名非法，跳过: {:?}", e.name);
+                    continue;
+                }
+            };
             let fpath = format!("{}/{}", dir_prefix, e.name);
-            let dest = dest_dir.join(&e.name);
+            let dest = dest_dir.join(&safe_name);
             let part = part_path_of(&dest);
             if let Ok(md) = std::fs::metadata(&part) {
                 if md.len() > e.size {
                     let _ = std::fs::remove_file(&part);
                 }
             }
-            let d = part_done(&part);
+            // batch3-P1：初始进度由账本折算（download_file 同口径）——
+            // .part 已预分配 set_len(total)，part_done()==total 会让
+            // 重启/重加任务进度恒 100%（G1 明令禁止「预分配长度当进度」）
+            let d = ledger_done_bytes(&part);
             total += e.size;
             done += d;
             files.push(FtpFile {
@@ -312,6 +331,7 @@ impl FtpEngine {
                     limit_kb_s: None,
                     sequential: task.sequential,
                     pause: Arc::new(AtomicBool::new(false)),
+                    epoch: Arc::new(AtomicU64::new(0)),
                 },
             );
         }
@@ -803,6 +823,23 @@ enum FtpOutcome {
     Paused,
 }
 
+/// 审计修复（batch3-P0）：暂停退出原因锁存——worker 因旗标退出时置位本槽，
+/// join 后判槽而非活读旗标。旧实现 join 后重新读旗标，pause→resume 竞态
+/// 下（resume 清旗标 + spawn 新循环先于旧循环检查点）旧循环误判 Completed
+/// → 把预分配 .part（含 0 填充空洞）rename 成 dest，新循环下载的完整数据
+/// 再被 finalize_to 幂等短路丢弃 → 空洞文件永久交付为 Completed。
+/// 锁存后无论旗标何时被 resume 清除，本次循环的真实退出原因不可回退。
+type PausedSeen = Arc<AtomicBool>;
+
+/// 段边界暂停检查：旗标置位 → 锁存退出原因 + 退出（在飞段已收尾记账）。
+fn pause_hit(pause: &Option<Arc<AtomicBool>>, paused_seen: &PausedSeen) -> bool {
+    if pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst)) {
+        paused_seen.store(true, Ordering::SeqCst);
+        return true;
+    }
+    false
+}
+
 /// 单文件下载核心（单文件/目录任务共用）：动态分段 + worker 池并行 + 账本续传。
 /// 分段策略与 HTTP 直链对齐（P0 方案A + P4 账本统一进度真源）：
 /// - 段粒度 `min_split`（0 = 默认 16MB）FIFO 队列（<16MB 单段）；
@@ -826,7 +863,9 @@ async fn download_file(
     on_progress: Arc<dyn Fn(u64) + Send + Sync>,
     use_tls: bool,
     pause: Option<Arc<AtomicBool>>,
+    epoch: Arc<AtomicU64>,
 ) -> Result<FtpOutcome, String> {
+    let epoch0 = epoch.load(Ordering::SeqCst);
     let part = part_path_of(dest);
     let ledger_path = ledger::ledger_path(&part);
     // 段账本加载（P4 唯一进度真源，与 HTTP engine.rs 同口径）：合法账本 →
@@ -875,6 +914,7 @@ async fn download_file(
     } else {
         None
     };
+    let paused_seen: PausedSeen = Arc::new(AtomicBool::new(false));
 
     // worker 数：与 HTTP 同一公式（静态 2-8）。<16MB 单段时多出的 worker
     // 领不到段（Drained）即退，零开销。
@@ -892,11 +932,19 @@ async fn download_file(
         let ledger_path = ledger_path.clone();
         let on_progress = on_progress.clone();
         let pause = pause.clone();
+        let paused_seen = paused_seen.clone();
+        let epoch = epoch.clone();
         workers.spawn(async move {
             loop {
                 // 审计修复（P1-4）：段边界检查暂停旗标——置位即退出（在飞段
                 // 已完成收尾记账，账本保留），不再领取新段。
-                if pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst)) {
+                // batch3-P0：退出原因锁存到 paused_seen，join 后判槽不判旗标；
+                // epoch 已变 → 本循环已被 resume/remove 取代（过期），立即退出，
+                // 防双循环并发写 .part / 互踩账本。
+                if epoch.load(Ordering::SeqCst) != epoch0 {
+                    return Ok::<(), String>(());
+                }
+                if pause_hit(&pause, &paused_seen) {
                     return Ok::<(), String>(());
                 }
                 // 顺序模式：先拿 permit 再领取段，保证「在飞段数 ≤ 窗口」
@@ -961,8 +1009,14 @@ async fn download_file(
         }
     }
     drop(workers);
-    // 暂停优先于错误：置位后任何 worker 错误/panic 都视为暂停退出（账本已记账）
-    if pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst)) {
+    // 暂停优先于错误：退出原因以锁存槽为准（batch3-P0），旗标活读仅兜底
+    // 「worker 因 err 退出未过检查点」场景（保持原「暂停优先于错误」语义）；
+    // 置位后任何 worker 错误/panic 都视为暂停退出（账本已记账）。
+    // 不再依赖 join 后的旗标现状：resume 清旗标不会把暂停循环改成 Completed。
+    if epoch0 != epoch.load(Ordering::SeqCst)
+        || paused_seen.load(Ordering::SeqCst)
+        || pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst))
+    {
         return Ok(FtpOutcome::Paused);
     }
     if let Some(e) = first_err {
@@ -1010,9 +1064,12 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
         tasks.get(&tid).map(|t| t.sequential).unwrap_or(false)
     };
     let min_split = inner.min_split;
-    let pause_flag = {
+    let (pause_flag, epoch_flag) = {
         let tasks = inner.tasks.lock();
-        tasks.get(&tid).map(|t| t.pause.clone())
+        tasks
+            .get(&tid)
+            .map(|t| (Some(t.pause.clone()), t.epoch.clone()))
+            .unwrap_or((None, Arc::new(AtomicU64::new(0))))
     };
     // 审计修复（P1-3）：进度改绝对赋值（HTTP 同款 max 语义）——download_file
     // 回传的是文件内绝对完成字节（账本折算），旧实现按增量 += 累加 →
@@ -1025,7 +1082,7 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
     });
     let r = download_file(
         &host, port, &user, &pass, &path, &dest, total, backoff, &limiter, min_split, sequential,
-        progress, use_tls, pause_flag,
+        progress, use_tls, pause_flag, epoch_flag,
     )
     .await;
     match r {
@@ -1040,7 +1097,7 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
 /// 目录任务下载循环：逐文件串行 download_file，落位 `<dest>/<文件名>`；
 /// 任一文件终态失败 → 整任务 Error（错误消息带文件名）。
 async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Backoff) {
-    let (host, port, user, pass, dir_dest, files, use_tls, pause_flag) = {
+    let (host, port, user, pass, dir_dest, files, use_tls, pause_flag, epoch_flag) = {
         let tasks = inner.tasks.lock();
         let t = tasks.get(&tid).unwrap();
         (
@@ -1055,8 +1112,10 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
                 .collect::<Vec<_>>(),
             t.use_tls,
             t.pause.clone(),
+            t.epoch.clone(),
         )
     };
+    let epoch0 = epoch_flag.load(Ordering::SeqCst);
     // add 时已建目录；此处幂等兜底（目录被外部删除的场景）
     if let Err(e) = std::fs::create_dir_all(&dir_dest) {
         finish(
@@ -1078,8 +1137,9 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
         if fstate == EngineState::Completed {
             continue;
         }
-        // 段边界暂停：不 finish（pause() 已置 Paused，resume 重入本循环）
-        if pause_flag.load(Ordering::SeqCst) {
+        // 段边界暂停：不 finish（pause() 已置 Paused，resume 重入本循环）；
+        // batch3-P0：epoch 已变 → 本循环过期（新循环已 spawn），立即退出防双循环。
+        if pause_flag.load(Ordering::SeqCst) || epoch_flag.load(Ordering::SeqCst) != epoch0 {
             return;
         }
         let dest = dir_dest.join(&name);
@@ -1136,6 +1196,7 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
             progress,
             use_tls,
             Some(pause_flag.clone()),
+            epoch_flag.clone(),
         )
         .await;
         match r {
@@ -1359,13 +1420,16 @@ impl DownloadEngine for FtpEngine {
                             dest,
                             total,
                             state: EngineState::Downloading,
-                            done: part_done(&part),
+                            // batch3-P1：账本折算（.part 预分配长度恒 total，
+                            // 旧值会让重启后进度恒 100% 且 max 语义不可回退）
+                            done: ledger_done_bytes(&part),
                             rate: RateSample::default(),
                             error: None,
                             files: vec![],
                             limit_kb_s: None,
                             sequential: task.sequential,
                             pause: Arc::new(AtomicBool::new(false)),
+                            epoch: Arc::new(AtomicU64::new(0)),
                         },
                     );
                 }
@@ -1399,6 +1463,10 @@ impl DownloadEngine for FtpEngine {
             let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
             let dir = !t.files.is_empty();
             let was_paused = t.state == EngineState::Paused;
+            // batch3-P0：先自增 epoch 再清旗标——旧循环在下一个检查点即过期
+            // 退出（即使旗标已 false 也不会误判 Completed/继续领段），
+            // 新循环以新 epoch 成为唯一写者。
+            t.epoch.fetch_add(1, Ordering::SeqCst);
             t.pause.store(false, Ordering::SeqCst);
             t.state = EngineState::Downloading;
             (dir, was_paused)
@@ -1457,6 +1525,7 @@ impl DownloadEngine for FtpEngine {
         {
             let tasks = self.inner.tasks.lock();
             if let Some(t) = tasks.get(id) {
+                t.epoch.fetch_add(1, Ordering::SeqCst);
                 t.pause.store(true, Ordering::SeqCst);
             }
         }
@@ -1509,8 +1578,14 @@ async fn probe_size(
 }
 
 /// 现有 .part 已下载字节数（续传起点）。
-fn part_done(part: &Path) -> u64 {
-    std::fs::metadata(part).map(|m| m.len()).unwrap_or(0)
+/// batch3-P1：段账本折算已完成字节（P4 唯一进度真源）；无账本 → 0。
+/// .part 因预分配 set_len(total) 长度恒等于 total，不可作为进度证据。
+fn ledger_done_bytes(part: &Path) -> u64 {
+    let lp = ledger::ledger_path(part);
+    ledger::load(&lp)
+        .filter(|l| l.validate_segments())
+        .map(|l| l.done.iter().map(|(s, e)| e - s + 1).sum::<u64>())
+        .unwrap_or(0)
 }
 
 /// 探测目录列表：连接 + 登录 + PASV + LIST → 目录文本（数据连接读到 EOF）。

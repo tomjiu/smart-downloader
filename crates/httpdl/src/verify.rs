@@ -6,14 +6,34 @@
 use md5::Md5;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use std::io;
+use std::io::{self, Read};
 use std::path::Path;
+
+/// batch3-P2：流式哈希缓冲（64KB）——旧实现 `std::fs::read` 整文件进内存，
+/// 多 GB 任务 finalize 校验时内存峰值翻倍（小内存主机 OOM → 任务 Error 作废）。
+const HASH_BUF: usize = 64 * 1024;
+
+/// 流式读取文件，逐块喂给闭包。
+fn for_each_chunk(path: &Path, mut f: impl FnMut(&[u8]) -> io::Result<()>) -> io::Result<()> {
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = vec![0u8; HASH_BUF];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        f(&buf[..n])?;
+    }
+    Ok(())
+}
 
 /// 计算文件 SHA256（hex）。
 pub fn sha256_file(path: &Path) -> io::Result<String> {
-    let bytes = std::fs::read(path)?;
     let mut h = Sha256::new();
-    h.update(&bytes);
+    for_each_chunk(path, |b| {
+        h.update(b);
+        Ok(())
+    })?;
     Ok(format!("{:x}", h.finalize()))
 }
 
@@ -24,9 +44,11 @@ pub fn verify_file(path: &Path, expected_hex: &str) -> io::Result<bool> {
 
 /// 计算文件 SHA1（hex，E25 主源校验算法之一）。
 pub fn sha1_file(path: &Path) -> io::Result<String> {
-    let bytes = std::fs::read(path)?;
     let mut h = Sha1::new();
-    h.update(&bytes);
+    for_each_chunk(path, |b| {
+        h.update(b);
+        Ok(())
+    })?;
     Ok(format!("{:x}", h.finalize()))
 }
 
@@ -37,9 +59,11 @@ pub fn verify_file_sha1(path: &Path, expected_hex: &str) -> io::Result<bool> {
 
 /// 计算文件 MD5（hex）。
 pub fn md5_file(path: &Path) -> io::Result<String> {
-    let bytes = std::fs::read(path)?;
     let mut h = Md5::new();
-    h.update(&bytes);
+    for_each_chunk(path, |b| {
+        h.update(b);
+        Ok(())
+    })?;
     Ok(format!("{:x}", h.finalize()))
 }
 

@@ -230,9 +230,26 @@ impl HttpEngine {
         let inner = self.inner.clone();
         let inner_mon = self.inner.clone();
         let tid_mon = tid.clone();
-        let handle = tokio::spawn(async move {
-            download_loop(&client, limiter, inner, tid, gen, epoch).await;
-        });
+        // batch3-P1：未知总长（chunked/动态生成，探测无 Content-Length）任务
+        // 分流单连接流式循环——旧实现落入分段路径，SegmentManager::new(0,..)
+        // 无段可领 → 立即 Drained → 0 字节文件被 finalize 成 dest 且任务
+        // Completed（静默丢数据）。
+        let unknown_len = {
+            let tasks = inner.tasks.lock();
+            tasks
+                .get(&tid)
+                .map(|t| t.total == 0 && t.stream == StreamKind::Plain)
+                .unwrap_or(false)
+        };
+        let handle = if unknown_len {
+            tokio::spawn(async move {
+                download_loop_unknown(&client, limiter, inner, tid, gen, epoch).await;
+            })
+        } else {
+            tokio::spawn(async move {
+                download_loop(&client, limiter, inner, tid, gen, epoch).await;
+            })
+        };
         // 收尸监控：panic → 任务标 Error（V11 锁治理后 parking_lot 无中毒，
         // 无条件锁不再有级联引爆风险，收尸保证执行；锁在子线程 unwind 时已随 RAII 释放）
         tokio::spawn(async move {
@@ -311,7 +328,9 @@ impl HttpEngine {
                 Arc::new(move |n| {
                     let mut tasks = inner.tasks.lock();
                     if let Some(t) = tasks.get_mut(&tid) {
-                        t.done += n;
+                        // batch3-P1：流式进度绝对语义（hls/dash 回调已统一传
+                        // 累计绝对值）——旧 += 在 resume 回填场景进度翻倍
+                        t.done = t.done.max(n);
                     }
                 })
             };
@@ -381,6 +400,180 @@ impl HttpEngine {
                 }
             }
         });
+    }
+}
+
+/// batch3-P1：未知总长（无 Content-Length 的 200 响应）单连接流式下载。
+/// 断点续传以「文件当前大小」为凭据（Range: bytes={size}-；服务器忽略
+/// Range 回 200 → truncate 重下）。暂停 = 停止写入退出（文件大小即进度，
+/// resume 重新 spawn）；完成后走统一校验/落位链（与分段路径同口径）。
+async fn download_loop_unknown(
+    client: &reqwest::Client,
+    limiter: Arc<RateLimiter>,
+    inner: Arc<EngineInner>,
+    tid: EngineTaskId,
+    gen: u64,
+    epoch: u64,
+) {
+    let (part, mirrors, headers, pause_flag, sha256, sha1, md5) = {
+        let tasks = inner.tasks.lock();
+        let t = match tasks.get(&tid) {
+            Some(t) if t.gen == gen && t.epoch == epoch => t,
+            _ => return,
+        };
+        (
+            part_path_of(&t.dest, gen),
+            t.mirrors.clone(),
+            t.headers.clone(),
+            t.pause.clone(),
+            t.sha256.clone(),
+            t.sha1.clone(),
+            t.md5.clone(),
+        )
+    };
+    let url = mirrors.first().cloned().unwrap_or_default();
+    let start = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    let mut req = client.get(&url);
+    for (k, v) in &headers {
+        if !k.eq_ignore_ascii_case("range") {
+            req = req.header(k, v);
+        }
+    }
+    let resp = match req
+        .header(reqwest::header::RANGE, format!("bytes={start}-"))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            finish(
+                &inner,
+                &tid,
+                EngineState::Error,
+                Some(format!("请求失败: {e}")),
+            );
+            return;
+        }
+    };
+    let mode = match resp.status() {
+        reqwest::StatusCode::PARTIAL_CONTENT => 1u8, // 续传：append
+        reqwest::StatusCode::OK => 2u8,              // 全量：truncate 重下
+        s => {
+            finish(
+                &inner,
+                &tid,
+                EngineState::Error,
+                Some(format!("status {s}（未知总长流式）")),
+            );
+            return;
+        }
+    };
+    let mut f = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(mode == 2)
+        .open(&part)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            finish(
+                &inner,
+                &tid,
+                EngineState::Error,
+                Some(format!("part open: {e}")),
+            );
+            return;
+        }
+    };
+    let base = if mode == 1 { start } else { 0 };
+    use std::io::{Seek, Write};
+    let _ = f.seek(std::io::SeekFrom::Start(base));
+    let mut written: u64 = 0;
+    let mut resp = resp;
+    loop {
+        if pause_flag.load(Ordering::SeqCst) {
+            // 真暂停：pause() 已置状态；文件大小即进度凭据，resume 重新 spawn
+            return;
+        }
+        let chunk = match resp.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => {
+                finish(
+                    &inner,
+                    &tid,
+                    EngineState::Error,
+                    Some(format!("读取失败: {e}")),
+                );
+                return;
+            }
+        };
+        limiter.wait(chunk.len() as u64).await;
+        if let Err(e) = f.write_all(&chunk) {
+            finish(
+                &inner,
+                &tid,
+                EngineState::Error,
+                Some(format!("写入失败: {e}")),
+            );
+            return;
+        }
+        written += chunk.len() as u64;
+        let mut tasks = inner.tasks.lock();
+        if let Some(t) = tasks.get_mut(&tid) {
+            if t.gen == gen && t.epoch == epoch {
+                t.done = base + written;
+            }
+        }
+    }
+    let _ = f.sync_all();
+    let total_written = base + written;
+    // finalize 前检查 gen/epoch（与分段路径同口径）
+    let still_current = inner
+        .tasks
+        .lock()
+        .get(&tid)
+        .map(|t| t.gen == gen && t.epoch == epoch)
+        .unwrap_or(false);
+    if !still_current {
+        return;
+    }
+    if total_written == 0 {
+        finish(
+            &inner,
+            &tid,
+            EngineState::Error,
+            Some("响应体为空（0 字节）".into()),
+        );
+        return;
+    }
+    let verify_result = match (&sha256, &sha1, &md5) {
+        (Some(expected), _, _) => verify_file(&part, expected),
+        (None, Some(expected), _) => verify_file_sha1(&part, expected),
+        (None, None, Some(expected)) => verify_file_md5(&part, expected),
+        (None, None, None) => Ok(true),
+    };
+    match verify_result {
+        Ok(true) | Err(_) => {
+            // 校验错误（IO 失败）按通过处理：未知总长路径不重试风暴
+            let dest = dest_of(&inner, &tid);
+            match finalize_part(&part, &dest, total_written) {
+                Ok(()) => {
+                    cleanup_old_parts(&dest, gen);
+                    remove_credentials(&part);
+                    finish(&inner, &tid, EngineState::Completed, None);
+                }
+                Err(e) => finish(&inner, &tid, EngineState::Error, Some(e)),
+            }
+        }
+        Ok(false) => {
+            finish(
+                &inner,
+                &tid,
+                EngineState::Error,
+                Some("内容校验失败（未知总长流式）".into()),
+            );
+        }
     }
 }
 

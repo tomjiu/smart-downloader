@@ -48,6 +48,10 @@ pub fn spawn_alert_loop(
     interval: Duration,
     guard: Option<Arc<crate::bt::BtEngine>>,
 ) -> tokio::task::JoinHandle<()> {
+    // batch3-P1：置位常驻消费者旗标 → save_fastresume 纯等分发不自行 pop
+    if let Some(g) = &guard {
+        g.mark_alert_loop_active();
+    }
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;

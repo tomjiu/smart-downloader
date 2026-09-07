@@ -36,10 +36,23 @@ pub struct QuarkShareLink {
 
 /// 识别并解析夸克分享链接；非夸克分享返回 None。
 pub fn parse_share_link(url: &str) -> Option<QuarkShareLink> {
-    let lower = url.trim().to_ascii_lowercase();
-    let rest = lower
+    // batch3-P2：仅 scheme/host 归一小写，path/query 保留原文——URL path 与
+    // query 大小写敏感，整条 to_ascii_lowercase 会破坏含大写的 pwd_id/提取码
+    //（百度解析侧已明确「保留原始大小写」，两处口径对齐）。
+    let trimmed = url.trim();
+    let scheme_end = trimmed.find("://")?;
+    let host_start = scheme_end + 3;
+    let host_end = trimmed[host_start..].find('/').map(|i| host_start + i)?;
+    let lowered_host = trimmed[host_start..host_end].to_ascii_lowercase();
+    let normalized = format!(
+        "{}{}{}",
+        trimmed[..host_start].to_ascii_lowercase(),
+        lowered_host,
+        &trimmed[host_end..]
+    );
+    let rest = normalized
         .strip_prefix("https://pan.quark.cn/s/")
-        .or_else(|| lower.strip_prefix("http://pan.quark.cn/s/"))?;
+        .or_else(|| normalized.strip_prefix("http://pan.quark.cn/s/"))?;
     // path 段在 `?`/`#` 之前
     let path_end = rest.find(['?', '#']).unwrap_or(rest.len());
     let pwd_id = rest[..path_end].trim_end_matches('/').to_string();

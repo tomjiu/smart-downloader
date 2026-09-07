@@ -155,7 +155,23 @@ impl DaemonState {
             let engine = match self.engine_for(pt.engine_kind) {
                 Ok(e) => e,
                 Err(e) => {
+                    // batch3-P1：引擎不可用（feature 未启用/BT 初始化失败等）时
+                    // 不得静默丢弃记录——旧实现 continue 后首次 autosave 以内存
+                    // 表整体重写 tasks.json，任务从持久化中无声消失。与 add 失败
+                    // 路径同口径：插入记录 + Failed + 事件，用户可见可清理。
                     tracing::warn!("恢复任务 {} 引擎不可用: {e}", t.id);
+                    let mut rec = TaskRecord {
+                        seeding_since: None,
+                        task: t,
+                        engine_tid: None,
+                        engine_kind: pt.engine_kind,
+                        engine_status: None,
+                        events: vec![],
+                    };
+                    rec.task.state = TaskState::Failed;
+                    rec.push_event("restore_failed", Some(format!("engine 不可用: {e}")));
+                    self.tasks.lock().insert(rec.task.id.clone(), rec);
+                    restored += 1;
                     continue;
                 }
             };

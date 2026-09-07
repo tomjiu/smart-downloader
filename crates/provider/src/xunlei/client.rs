@@ -311,15 +311,15 @@ impl Client {
         let mut h = HeaderMap::new();
         h.insert(
             AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", state.access_token)).unwrap(),
+            crate::xunlei::client::safe_header_value(&format!("Bearer {}", state.access_token)),
         );
         h.insert(
             "x-device-id",
-            HeaderValue::from_str(device_id_32(&state.device_id)).unwrap(),
+            crate::xunlei::client::safe_header_value(device_id_32(&state.device_id)),
         );
         h.insert(
             "x-captcha-token",
-            HeaderValue::from_str(&state.captcha_token).unwrap(),
+            crate::xunlei::client::safe_header_value(&state.captcha_token),
         );
         h.insert("x-client-id", HeaderValue::from_static(tier.client_id));
         h.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -443,10 +443,13 @@ impl Client {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-captcha-token",
-            HeaderValue::from_str(&captcha_token).unwrap(),
+            crate::xunlei::client::safe_header_value(&captcha_token),
         );
         headers.insert("x-client-id", HeaderValue::from_static(self.tier.client_id));
-        headers.insert("x-device-id", HeaderValue::from_str(did32).unwrap());
+        headers.insert(
+            "x-device-id",
+            crate::xunlei::client::safe_header_value(did32),
+        );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         let resp = self
@@ -778,10 +781,13 @@ impl Client {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-captcha-token",
-            HeaderValue::from_str(&cap.captcha_token).unwrap(),
+            crate::xunlei::client::safe_header_value(&cap.captcha_token),
         );
         headers.insert("x-client-id", HeaderValue::from_static(self.tier.client_id));
-        headers.insert("x-device-id", HeaderValue::from_str(did32).unwrap());
+        headers.insert(
+            "x-device-id",
+            crate::xunlei::client::safe_header_value(did32),
+        );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         let resp = self
@@ -886,7 +892,10 @@ impl Client {
             return Ok(AuthState {
                 access_token: verify.access_token,
                 refresh_token: verify.refresh_token,
-                device_id: String::new(),
+                // batch3-P1：回填调用方 device_id——旧实现空串落盘后三要素头
+                // （x-device-id/captcha_sign）永久残缺，drive API 持续拒绝；
+                // CLI 示例 xunlei_sms_login 曾被迫打补丁绕过。
+                device_id: device_id.to_string(),
                 captcha_token: String::new(),
                 user_id,
                 access_token_expires_at: now + verify.expires_in,
@@ -967,10 +976,13 @@ impl Client {
         let mut headers = HeaderMap::new();
         headers.insert(
             "x-captcha-token",
-            HeaderValue::from_str(&cap2.captcha_token).unwrap(),
+            crate::xunlei::client::safe_header_value(&cap2.captcha_token),
         );
         headers.insert("x-client-id", HeaderValue::from_static(self.tier.client_id));
-        headers.insert("x-device-id", HeaderValue::from_str(did32).unwrap());
+        headers.insert(
+            "x-device-id",
+            crate::xunlei::client::safe_header_value(did32),
+        );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
 
         let resp = self
@@ -1002,7 +1014,8 @@ impl Client {
         Ok(AuthState {
             access_token: resp.access_token,
             refresh_token: resp.refresh_token,
-            device_id: String::new(),
+            // batch3-P1：回填调用方 device_id（同分支 1，防空串落盘）
+            device_id: device_id.to_string(),
             captcha_token: String::new(),
             user_id,
             access_token_expires_at: now + resp.expires_in,
@@ -1294,6 +1307,17 @@ pub struct DeviceCode {
     pub verification_uri: String,
     pub expires_in: u64,
     pub interval: u64,
+}
+
+/// batch3-P2：Header 安全净化——服务端/落盘凭据可能含控制字符或非 ASCII，
+/// `HeaderValue::from_str` 会拒绝（旧代码 unwrap 直接 panic 拖垮任务链）。
+/// 非法字符被过滤后仍失败 → 空头（服务端按未提供处理，可重刷 captcha）。
+pub(crate) fn safe_header_value(v: &str) -> HeaderValue {
+    let cleaned: String = v
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .collect();
+    HeaderValue::from_str(cleaned.trim()).unwrap_or(HeaderValue::from_static(""))
 }
 
 /// token 端点成功响应（refresh / 设备码轮询成功共用结构）。
