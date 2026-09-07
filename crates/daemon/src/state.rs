@@ -709,4 +709,4 @@ pub use settings::{SettingsApplyReport, SettingsReq};
 
 #[cfg(test)]
 #[path = "state_tests/mod.rs"]
-mod state_tests;
+pub(crate) mod state_tests;
