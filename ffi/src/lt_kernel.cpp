@@ -1074,7 +1074,7 @@ lt_err lt_set_piece_first_last(lt_session* s, const char* ih, int prio) {
         // daemon 契约 prio==0 = 恢复默认；lt 中 piece priority 0 = skip（不下载）
         // ——直接透传会把首/末块标成永不下载（小于一块的文件整个文件永不完成）。
         // 映射到内核默认优先级（batch6-P1 修复，desktop-v0.2.0 审计发现）。
-        const int effective = (prio == 0) ? static_cast<int>(lt::default_download_priority) : prio;
+        const int effective = (prio == 0) ? static_cast<int>(lt::default_priority) : prio;
         for (lt::file_index_t fi(0); fi < lt::file_index_t(fs.num_files()); ++fi) {
             if (fs.pad_file_at(fi)) continue;
             const std::int64_t off = fs.file_offset(fi);
