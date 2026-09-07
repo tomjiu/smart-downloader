@@ -300,7 +300,6 @@ impl BtEngine {
     fn save_fastresume(&self, ih: &str) -> Result<Option<PathBuf>, EngineError> {
         save_fastresume_impl(&self.core, &self.resume_waiters, &self.save_path, ih)
     }
-    }
 
     /// 保存指定任务的 fastresume（公开入口：daemon 周期/退出时机保存，P4 G4）。
     /// 返回落盘路径；未就绪（无 metadata）/超时/失败 → None（best-effort）。
