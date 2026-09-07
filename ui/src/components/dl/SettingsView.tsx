@@ -316,6 +316,13 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
             onChange={(e) => patch("bittorrent", "max_seeding_time_min", num(e.target.value) ?? 0)}
           />
           <div className="dl-field-help">qBittorrent 同名能力：做种达到分享率或时长任一上限即自动暂停（可手动恢复）</div>
+          <label className="dl-field-label">存储模式（预分配）<Effective kind="restart" /></label>
+          <Switch
+            label="预分配"
+            on={s.bittorrent.storage_allocate}
+            onChange={(v) => patch("bittorrent", "storage_allocate", v)}
+          />
+          <div className="dl-field-help">开 = 新 BT 任务预分配完整文件大小（磁盘占用即时到位、碎片更少）；关 = 稀疏按需增长；fastresume 恢复任务保留原模式</div>
           <label className="dl-field-label">新任务自动追加 tracker<Effective kind="now" /></label>
           <textarea
             className="qoder-input"
@@ -362,6 +369,16 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           <label className="dl-field-label">磁盘预检严格模式 <Effective kind="restart" /></label>
           <Switch label="严格预检" on={s.download.disk_precheck_strict} onChange={(v) => patch("download", "disk_precheck_strict", v)} />
           <div className="dl-field-help">开 = 空间不可探测时拒绝入队（防预检被绕过）；关 = 告警放行</div>
+          <label className="dl-field-label">HTTP 重定向最大跳数 <Effective kind="restart" /></label>
+          <input
+            className="qoder-input"
+            type="number"
+            min={1}
+            max={100}
+            value={s.download.max_redirects}
+            onChange={(e) => patch("download", "max_redirects", num(e.target.value) ?? 10)}
+          />
+          <div className="dl-field-help">1..=100；默认 10（reqwest 默认值），仅启动时烘入 client</div>
           <label className="dl-field-label">错峰随机延迟（秒）<Effective kind="now" /></label>
           <input className="qoder-input" type="number" min={0} value={s.scheduler.start_jitter_seconds} onChange={(e) => patch("scheduler", "start_jitter_seconds", num(e.target.value) ?? 0)} />
           <div className="dl-field-help">新任务在 0..=N 秒内随机延迟启动；0 = 关闭</div>
@@ -377,7 +394,7 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           <label className="dl-field-label">完成 Webhook <Effective kind="now" /></label>
           <input className="qoder-input" placeholder="https://… 任务完成时 POST 通知；留空禁用" value={s.webhook.url} onChange={(e) => patch("webhook", "url", e.target.value)} />
           <label className="dl-field-label">完成后移动到 <Effective kind="now" /></label>
-          <input className="qoder-input" placeholder="目录路径；留空禁用（仅单文件任务）" value={s.post_download.move_to} onChange={(e) => patch("post_download", "move_to", e.target.value)} />
+          <input className="qoder-input" placeholder="目录路径；留空禁用（BT 目录任务整体移动）" value={s.post_download.move_to} onChange={(e) => patch("post_download", "move_to", e.target.value)} />
           <label className="dl-field-label">完成后钩子程序 <Effective kind="now" /></label>
           <input className="qoder-input" placeholder="可执行程序路径；上下文经 SD_* 环境变量传入" value={s.post_download.hook} onChange={(e) => patch("post_download", "hook", e.target.value)} />
           <label className="dl-field-label">自动清理已完成任务（天）<Effective kind="now" /></label>

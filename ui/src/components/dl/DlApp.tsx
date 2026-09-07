@@ -13,6 +13,7 @@ import { fmtSpeed } from "@/lib/daemon/format";
 import TasksView from "./TasksView";
 import StatsView from "./StatsView";
 import LogsView from "./LogsView";
+import RssView from "./RssView";
 import SettingsView from "./SettingsView";
 import TaskDetail from "./TaskDetail";
 
@@ -21,6 +22,7 @@ type SpeedPoint = { down: number; up: number };
 const NAV = [
   { key: "tasks", label: "任务", icon: "list-unordered" },
   { key: "stats", label: "统计", icon: "graph" },
+  { key: "rss", label: "RSS", icon: "radio-tower" },
   { key: "logs", label: "日志", icon: "output" },
   { key: "settings", label: "设置", icon: "settings-gear" },
 ] as const;
@@ -168,6 +170,7 @@ export default function DlApp() {
               />
             )}
             {view === "stats" && <StatsView stats={stats} history={historyRef.current} tasks={tasks} />}
+            {view === "rss" && <RssView onToast={toast} />}
             {view === "logs" && <LogsView events={events} />}
             {view === "settings" && <SettingsView onToast={toast} />}
           </div>
