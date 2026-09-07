@@ -46,6 +46,8 @@ impl DaemonState {
             live_config: Mutex::new(None),
             rss: Mutex::new(crate::rss::RssState::default()),
             rss_persist_path: None,
+            bt_bans: Mutex::new(Vec::new()),
+            bans_persist_path: None,
         }
     }
 
@@ -337,8 +339,43 @@ impl DaemonState {
             }
         }
         self.rss_persist_path = rss_path;
+        // Task 46：bans.json 回读（tasks.json 同目录；缺省空 = 无显式封禁）。
+        // 引擎侧重放由 serve 在 BT 引擎装配完成后调 replay_bans（best-effort）。
+        let bans_path = path.parent().map(|d| d.join("bans.json"));
+        if let Some(bp) = &bans_path {
+            match super::persistence::read_bans(bp) {
+                Ok(bans) if !bans.is_empty() => {
+                    tracing::info!("IP 封禁列表回读: {} 条", bans.len());
+                    self.bt_bans = Mutex::new(bans);
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("bans.json 回读失败 {bp:?}: {e}"),
+            }
+        }
+        self.bans_persist_path = bans_path;
         self.persist_path = Some(path);
         self
+    }
+
+    /// 启动封禁重放（Task 46；serve 在 BT 引擎装配后调用）：逐条下发引擎
+    /// session 级 ban（best-effort：单条失败仅 warn，不阻断启动）。
+    pub async fn replay_bans(&self) {
+        let bans = self.bt_bans.lock().clone();
+        if bans.is_empty() {
+            return;
+        }
+        let Ok(engine) = self.engine_for(EngineKind::Bt) else {
+            tracing::warn!("IP 封禁重放跳过：BT 引擎不可用（feature 未启用）");
+            return;
+        };
+        let mut ok = 0usize;
+        for ip in &bans {
+            match engine.ban_ip(ip).await {
+                Ok(()) => ok += 1,
+                Err(e) => tracing::warn!("IP 封禁重放失败 {ip}: {e}"),
+            }
+        }
+        tracing::info!("IP 封禁重放完成: {ok}/{} 条", bans.len());
     }
 
     /// RSS bootstrap client 克隆（与 metalink bootstrap 同源 client；None = 测试装配）。

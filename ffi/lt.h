@@ -167,12 +167,27 @@ lt_err lt_request_save_resume(lt_session* s, const char* ih);
 lt_err lt_take_resume_data(lt_session* s, const char* ih, uint8_t* buf, size_t cap, size_t* out_len);
 
 /* —— 控制/限制（6）—— */
-lt_err lt_ban_peer(lt_session* s, const char* ih, const char* ip, uint16_t port); /* v2：Session IP ban 实现 */
+/* v2 真实现：session 级 IP 封禁（libtorrent ip_filter，持久列表由 daemon 层维护）。
+   幂等：重复封禁同一 IP 返回 LT_OK。ih 仅用于验证任务存在（封禁本身作用于全 session）。 */
+lt_err lt_ban_peer(lt_session* s, const char* ih, const char* ip, uint16_t port);
+/* 解除封禁（qbit「解除 IP 封禁」对标）：恢复该 IP 允许；未封禁 → LT_OK（幂等）。 */
+lt_err lt_unban_peer(lt_session* s, const char* ip);
+/* 查询：out = 1 已封禁 / 0 未封禁（读 C++ 侧 banned 集合，O(1)）。 */
+lt_err lt_is_banned(lt_session* s, const char* ip, int* out);
 lt_err lt_add_peer(lt_session* s, const char* ih, const char* ip, uint16_t port); /* 本地 seeder 直连注入 */
 lt_err lt_add_url_seed(lt_session* s, const char* ih, const char* url);
 lt_err lt_add_tracker(lt_session* s, const char* ih, const char* url);
 lt_err lt_set_sequential(lt_session* s, const char* ih, int on);
 lt_err lt_set_limits(lt_session* s, const char* ih, int64_t down_limit, int64_t up_limit); /* 字节/秒；0=不限 */
+
+/* —— 强制操作三件套（qbit/BitComet 任务右键对标，Task 46）—— */
+/* 强制向全部 tracker 立即宣告（force_reannounce）。任务不存在 → LT_ERR_NOT_FOUND。 */
+lt_err lt_force_reannounce(lt_session* s, const char* ih);
+/* 强制 DHT 宣告（force_dht_announce；DHT 关闭时 libtorrent 内部 no-op，不报错）。 */
+lt_err lt_force_dht_announce(lt_session* s, const char* ih);
+/* 强制重新校验（force_recheck）：状态转入 checking；校验期下载/做种挂起。 */
+lt_err lt_force_recheck(lt_session* s, const char* ih);
+
 /* 任务级连接数上限（S1-c）：>0 = torrent_handle::set_max_connections；
    0 = 复位为会话级 connections_limit 当前值（qbit「无限制」回到全局口径）。 */
 lt_err lt_torrent_set_max_connections(lt_session* s, const char* ih, int max_connections);

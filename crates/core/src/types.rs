@@ -382,6 +382,52 @@ pub trait DownloadEngine: Send + Sync {
         Err(EngineError::Unsupported)
     }
 
+    /// 强制向全部 tracker 立即宣告（qbit/BitComet 任务右键对标，Task 46）：
+    /// 仅 BT 引擎实现（libtorrent force_reannounce）；其余引擎 → `Unsupported`。
+    async fn force_reannounce(&self, _id: &EngineTaskId) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// 强制 DHT 宣告（Task 46）：仅 BT 引擎实现（libtorrent
+    /// force_dht_announce；DHT 未启用时内核 no-op 不报错）；其余引擎 →
+    /// `Unsupported`。
+    async fn force_dht_announce(&self, _id: &EngineTaskId) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// 强制重新校验（Task 46，qbit「强制重新校验」对标）：任务转入 checking
+    /// （校验期下载/做种挂起，完成后自动恢复）。仅 BT 引擎实现；其余引擎 →
+    /// `Unsupported`。
+    async fn force_recheck(&self, _id: &EngineTaskId) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// 导出 .torrent（Task 46，qbit「导出 .torrent」对标）：返回 metainfo
+    /// bencode 字节。magnet 来源任务在 metadata 就绪前返回
+    /// `EngineError::Other`（调用方提示「元数据未就绪」）。仅 BT 引擎实现。
+    async fn export_torrent(&self, _id: &EngineTaskId) -> Result<Vec<u8>, EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// 生成 magnet URI（Task 46）：`magnet:?xt=urn:btih:<ih>&dn=<name>&tr=...`
+    /// （trackers 全量拼入）。仅 BT 引擎实现；其余引擎 → `Unsupported`。
+    async fn magnet_uri(&self, _id: &EngineTaskId) -> Result<String, EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// Session 级 IP 封禁（Task 46，qbit「永久封禁」对标）：与 per-task
+    /// `ban_peer` 不同，本方法作用于引擎整个会话（BT = libtorrent ip_filter，
+    /// 幂等）。仅 BT 引擎实现；其余引擎 → `Unsupported`。
+    async fn ban_ip(&self, _ip: &str) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// 解除 Session 级 IP 封禁（Task 46，qbit「解除封禁」对标；幂等：未封禁
+    /// 的 IP 也返回 Ok）。仅 BT 引擎实现。
+    async fn unban_ip(&self, _ip: &str) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
     /// 做种分享率上限快照（F3 执法面）：`Some(>0.0)` = Seeding 态达标自动
     /// 暂停；`None`/`Some(0.0)` = 未启用。仅 BT 引擎返回非 None。同步只读
     /// （读引擎会话快照），供状态轮询每轮执法判断。
