@@ -137,10 +137,7 @@ async fn post_move_directory_task_moved_whole() {
     std::fs::write(dir.path().join("bundle/sub/b.bin"), b"B").unwrap();
     state.publish_task_completed(&id);
 
-    assert!(
-        !dir.path().join("bundle").exists(),
-        "源目录应已搬走"
-    );
+    assert!(!dir.path().join("bundle").exists(), "源目录应已搬走");
     assert!(
         inbox.path().join("bundle/a.bin").is_file(),
         "目录整体移入目标（含子文件）"
@@ -151,7 +148,10 @@ async fn post_move_directory_task_moved_whole() {
     );
     let tasks = state.tasks.lock();
     let rec = tasks.get(&id).unwrap();
-    assert!(rec.events.iter().any(|e| e.op == "post_move"), "有 post_move 事件");
+    assert!(
+        rec.events.iter().any(|e| e.op == "post_move"),
+        "有 post_move 事件"
+    );
 }
 
 #[cfg(unix)]

@@ -52,6 +52,9 @@ export interface Stats {
   by_engine: Record<string, number>;
   down_bytes_s: number;
   up_bytes_s: number;
+  /** 会话累计流量（batch5；估算口径） */
+  session_down_bytes: number;
+  session_up_bytes: number;
 }
 
 export interface GlobalLimits {
@@ -97,9 +100,16 @@ export interface Settings {
     extra_trackers: string[];
     max_share_ratio: number;
     max_seeding_time_min: number;
+    /** 存储模式：true = 新任务预分配（batch5，重启生效） */
+    storage_allocate: boolean;
     bt_available: boolean;
   };
-  download: { dest_root: string; disk_precheck_strict: boolean };
+  download: {
+    dest_root: string;
+    disk_precheck_strict: boolean;
+    /** HTTP 重定向最大跳数（batch5，1..=100，重启生效） */
+    max_redirects: number;
+  };
   cleanup: {
     auto_remove_completed_days: number;
     auto_remove_keep_data: boolean;
@@ -113,6 +123,45 @@ export interface Settings {
     max_active_ftp: number;
   };
   meta: { persist_path: string | null };
+}
+
+// ---- RSS（qbit RSS Downloader 对标，batch5）----
+
+export interface RssItem {
+  feed_id: number;
+  feed_title: string;
+  guid: string;
+  title: string;
+  url: string;
+  pub_date?: string | null;
+  task_id?: string | null;
+}
+
+export interface RssFeed {
+  id: number;
+  url: string;
+  title: string;
+  added_at_unix: number;
+  last_refresh_unix?: number | null;
+  /** 每 feed 独立刷新间隔（秒；0 = 跟随全局） */
+  interval_override_secs?: number;
+  item_count: number;
+  pending_count: number;
+}
+
+export interface RssRule {
+  id: number;
+  name: string;
+  enabled: boolean;
+  must_contain: string[];
+  must_not_contain: string[];
+  feed_id?: number | null;
+  tags: string[];
+  dest?: string | null;
+  /** 关键词按正则解释（batch5） */
+  use_regex?: boolean;
+  /** 集数过滤，如 `1x02;1x04-1x06`（batch5） */
+  episode_filter?: string | null;
 }
 
 export interface SettingsApplyReport {
