@@ -95,6 +95,9 @@ pub struct BtEngine {
             >,
         >,
     >,
+    /// batch3-P1：alert ring 是否已有常驻消费者（bt_events spawn_alert_loop）。
+    /// true → save_fastresume 纯等分发；false（测试/无循环装配）→ 自行 pop 兜底。
+    alert_loop_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// BtEngine 会话级网络策略快照（E16）。`proxy_url` 保存原始 URL 串（None =
@@ -182,6 +185,7 @@ impl BtEngine {
             save_path: save_path.to_path_buf(),
             pause_intents: parking_lot::Mutex::new(std::collections::HashMap::new()),
             resume_waiters: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            alert_loop_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             network: parking_lot::Mutex::new(BtNetwork {
                 proxy_url: proxy.map(|s| s.to_string()).filter(|s| !s.is_empty()),
                 down_kb_s,
@@ -276,6 +280,12 @@ impl BtEngine {
         dispatch_resume_alerts(&self.resume_waiters, alerts);
     }
 
+    /// batch3-P1：spawn_alert_loop 启动时置位（此后 save_fastresume 纯等分发）。
+    pub fn mark_alert_loop_active(&self) {
+        self.alert_loop_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// .fastresume 文件路径（按 infohash 命名——避开文件名转义问题，且 magnet 无需
     /// 知道 torrent 名即可定位）。
     fn fastresume_path(&self, ih: &str) -> PathBuf {
@@ -296,7 +306,13 @@ impl BtEngine {
     /// alert ring 单消费者化后本函数仅等待分发，其他 alert 全部流向 bt_events。
     /// resume 未就绪（暂无 metadata/超时）→ Ok(None) 不落盘。
     fn save_fastresume(&self, ih: &str) -> Result<Option<PathBuf>, EngineError> {
-        save_fastresume_impl(&self.core, &self.resume_waiters, &self.save_path, ih)
+        save_fastresume_impl(
+            &self.core,
+            &self.resume_waiters,
+            &self.save_path,
+            &self.alert_loop_active,
+            ih,
+        )
     }
 
     /// 保存指定任务的 fastresume（公开入口：daemon 周期/退出时机保存，P4 G4）。
@@ -351,6 +367,7 @@ fn save_fastresume_impl(
     core: &Arc<BtCore>,
     waiters: &ResumeWaiters,
     save_path: &Path,
+    loop_active: &std::sync::atomic::AtomicBool,
     ih: &str,
 ) -> Result<Option<PathBuf>, EngineError> {
     core.request_save_resume(ih)
@@ -363,26 +380,43 @@ fn save_fastresume_impl(
         .push(tx.clone());
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut saved: Option<smart_dl_btcore::ResumeBytes> = None;
+    // batch3-P1：常驻 alert 消费者存在 → 纯等分发（不自行 pop，双消费者互吞
+    // 是本批修的缺陷）；无消费者（单元测试直连 BtEngine）→ 自行 pop 兜底，
+    // 与旧行为一致（此时 ring 无其他消费者，无互吞问题）。
+    let poll_ring = !loop_active.load(std::sync::atomic::Ordering::SeqCst);
     while std::time::Instant::now() < deadline {
-        match rx.try_recv() {
-            Ok(a) => {
-                tracing::debug!("fastresume: RESUME alert ready={}", a.is_resume_ready());
-                if a.is_resume_ready() {
-                    if let Ok(r) = core.take_resume_data(ih) {
-                        saved = Some(r);
-                    } else {
-                        tracing::warn!("fastresume: take_resume_data 失败（未就绪）");
+        if poll_ring {
+            if let Ok(alerts) = core.pop_alerts(256) {
+                for a in alerts {
+                    if a.kind == smart_dl_btcore::AlertKind::Resume && a.is_resume_ready() {
+                        if let Ok(r) = core.take_resume_data(ih) {
+                            saved = Some(r);
+                        } else {
+                            tracing::warn!("fastresume: take_resume_data 失败（未就绪）");
+                        }
                     }
                 }
             }
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
+        } else {
+            match rx.try_recv() {
+                Ok(a) => {
+                    tracing::debug!("fastresume: RESUME alert ready={}", a.is_resume_ready());
+                    if a.is_resume_ready() {
+                        if let Ok(r) = core.take_resume_data(ih) {
+                            saved = Some(r);
+                        } else {
+                            tracing::warn!("fastresume: take_resume_data 失败（未就绪）");
+                        }
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
             }
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
         }
         if saved.is_some() {
             break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     // 注销等待者（防止表无限增长）
     if let Some(list) = waiters.lock().get_mut(ih) {
