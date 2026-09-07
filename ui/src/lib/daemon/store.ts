@@ -139,6 +139,12 @@ export class DaemonClient {
   rssRemoveFeed(id: number) {
     return req(`/rss/feeds/${id}`, { method: "DELETE" });
   }
+  rssUpdateFeed(id: number, intervalOverrideSecs: number) {
+    return req(`/rss/feeds/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ interval_override_secs: intervalOverrideSecs }),
+    });
+  }
   rssAddRule(body: {
     name: string;
     enabled: boolean;

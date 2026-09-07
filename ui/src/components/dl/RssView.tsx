@@ -148,10 +148,25 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
               <b style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 320 }}>{f.title}</b>
               <span className="qoder-badge qoder-badge--default">{f.item_count} 条</span>
               <span className="qoder-badge qoder-badge--warning">{f.pending_count} 待匹配</span>
-              {f.interval_override_secs ? (
-                <span className="qoder-badge qoder-badge--default">间隔 {f.interval_override_secs}s</span>
-              ) : null}
               <div style={{ flex: 1 }} />
+              <input
+                className="qoder-input"
+                style={{ width: 120 }}
+                type="number"
+                min={0}
+                aria-label={`订阅 ${f.title} 刷新间隔（秒）`}
+                defaultValue={f.interval_override_secs ?? 0}
+                title="刷新间隔（秒；0 = 跟随全局），失焦保存"
+                onMouseOver={(e) => ((e.target as HTMLInputElement).dataset.v = (e.target as HTMLInputElement).value)}
+                onFocus={(e) => ((e.target as HTMLInputElement).dataset.v = e.target.value)}
+                onBlur={(e) => {
+                  const el = e.target as HTMLInputElement;
+                  const next = Number(el.value) || 0;
+                  if (String(next) !== (el.dataset.v ?? "")) {
+                    run(() => client.rssUpdateFeed(f.id, next), `订阅间隔已更新为 ${next}s`);
+                  }
+                }}
+              />
               <button
                 className="qoder-btn qoder-btn--ghost"
                 aria-label={`删除订阅 ${f.title}`}
