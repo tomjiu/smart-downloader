@@ -420,6 +420,28 @@ pub struct BansReq {
     pub ips: Vec<String>,
 }
 
+/// 队列优先级请求（Task 46）：绝对值 `{"priority": 3}` 或相对移动
+/// `{"action": "top"|"bottom"|"up"|"down"}`（二选一，同给以 value 优先）。
+#[derive(Deserialize)]
+pub struct PriorityReq {
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub action: Option<String>,
+}
+
+/// 队列优先级设置（Task 46）：`POST /tasks/:id/priority`。
+async fn task_priority(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<PriorityReq>,
+) -> Response {
+    match state.set_task_priority(&id, req.priority, req.action).await {
+        Ok(v) => Json(serde_json::json!({ "queue_priority": v })).into_response(),
+        Err(e) => daemon_error_response(e, &id),
+    }
+}
+
 /// 强制宣告（Task 46）：`POST /tasks/:id/announce`。
 async fn task_announce(
     State(state): State<Arc<DaemonState>>,
@@ -2471,6 +2493,7 @@ macro_rules! router_base {
             .route("/tasks/:id/super-seeding", post(task_super_seeding))
             .route("/tasks/:id/announce", post(task_announce))
             .route("/tasks/:id/recheck", post(task_recheck))
+            .route("/tasks/:id/priority", post(task_priority))
             .route("/tasks/:id/export", get(task_export))
             .route("/tasks/:id/magnet", get(task_magnet))
             .route(
