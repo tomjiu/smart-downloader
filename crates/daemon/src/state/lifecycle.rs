@@ -23,6 +23,7 @@ impl DaemonState {
             pending_file_prio: Mutex::new(HashSet::new()),
             slot_reservations: Mutex::new(HashSet::new()),
             ban_replay_failed: Mutex::new(Vec::new()),
+            extra_allowed_hosts: Vec::new(),
             global_limits: Mutex::new(GlobalLimits {
                 max_download_kb_s: 0,
                 max_upload_kb_s: 0,
@@ -103,6 +104,24 @@ impl DaemonState {
     /// `Authorization: Bearer <token>`；None = 未配置（serve 已保证非回环监听拒绝启动）。
     pub fn with_http_token(mut self, token: Option<String>) -> Self {
         self.http_token = token.filter(|t| !t.is_empty());
+        self
+    }
+
+    /// tokenless 模式判定（batch8）：http_token 为 None（空串已过滤）。
+    /// Host/Origin 同源守卫仅在此模式激活——配置 token 后攻击者无凭据，
+    /// 且反代域名 Host 合法性不应被收紧。
+    pub(crate) fn tokenless(&self) -> bool {
+        self.http_token.is_none()
+    }
+
+    /// 注入 tokenless 模式额外放行的 Host 名（batch8）：反向代理/本机域名
+    /// 场景（如 `myhost.local`）。仅 tokenless 模式消费；配置 token 后无效。
+    pub fn with_extra_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
+        self.extra_allowed_hosts = hosts
+            .into_iter()
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
         self
     }
 

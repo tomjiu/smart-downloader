@@ -174,7 +174,9 @@ impl DaemonState {
                 "effective_max_upload_kb_s": effective.max_upload_kb_s,
             },
             "connection": {
-                "proxy": cfg.download.proxy,
+                // batch8（P2）：脱敏回显——代理 URL 可带 user:pass@（与
+                // /config 快照同口径），明文凭据不出设置面。
+                "proxy": smart_dl_core::types::redact_url(&cfg.download.proxy),
                 "bt_listen_port": cfg.bt.listen_port,
                 "bt_max_connections": cfg.bt.max_connections,
             },
