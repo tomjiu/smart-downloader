@@ -183,8 +183,20 @@ impl DaemonState {
             let hook_task_id = task_id.to_string();
             let hook_prog = prog.clone();
             std::thread::spawn(move || {
+                // batch8（P3）：剥离敏感环境变量再继承——hook 子进程此前
+                // 可读到 SMART_DL_HTTP_TOKEN / SD_L1_TOKEN / SD_NAS_*，
+                // 第三方 hook 脚本（或其依赖链）泄凭据面收窄。
+                let mut clean: Vec<(String, String)> = std::env::vars()
+                    .filter(|(k, _)| {
+                        k != "SMART_DL_HTTP_TOKEN"
+                            && !k.starts_with("SD_L1_")
+                            && !k.starts_with("SD_NAS_")
+                    })
+                    .collect();
+                clean.extend(envs);
                 match std::process::Command::new(&hook_prog)
-                    .envs(envs)
+                    .env_clear()
+                    .envs(clean)
                     .stdin(std::process::Stdio::null())
                     .output()
                 {
@@ -1667,6 +1679,15 @@ impl DaemonState {
         }
         // S1-b 队列门控（batch7 预留槽位，同 HTTP 口径）：engine.add 成功
         // attach / 失败回滚；目录 files 同步改为就位后直接改写占位记录。
+        // batch8（P2）：ftp:// 明文传输显式告警（凭据与数据均不加密）；
+        // 敏感内容建议 ftps://（RFC 4217 显式 TLS，全链强制校验）。
+        if let DownloadSource::Ftp { url, .. } = &task.source {
+            if url.starts_with("ftp://") {
+                tracing::warn!(
+                    "FTP 任务 {task_id} 使用明文 ftp://（凭据与数据均不加密传输）；如源站支持建议改用 ftps://"
+                );
+            }
+        }
         let engine = self.engine_for(EngineKind::Ftp)?;
         if !self.gate_or_enqueue(&task, EngineKind::Ftp) {
             return Ok(task_id);
@@ -4027,10 +4048,22 @@ impl HttpSink for FallbackSink {
         dest_root: std::path::PathBuf,
         name: Option<String>,
     ) -> Result<(), SinkError> {
-        // 目标父目录（rel_path 可能含子目录）
+        // 目标父目录（rel_path 可能含子目录）。
+        // batch8（P2）：云端文件名（provider 原样透传）先 sanitize_rel 再
+        // join——绝对路径名此前可整体替换 base，在 dest_root 外任意建目录
+        // （引擎落盘前的最后一道 mkdir 同源防线）。
         if let Some(rel) = &name {
-            if let Some(parent) = dest_root.join(rel).parent() {
-                let _ = std::fs::create_dir_all(parent);
+            match smart_dl_core::session::output::sanitize_rel(rel) {
+                Ok(safe) => {
+                    if let Some(parent) = dest_root.join(&safe).parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                }
+                Err(e) => {
+                    return Err(SinkError::Failed(format!(
+                        "云端文件名非法（sanitize 拒绝）: {e}"
+                    )))
+                }
             }
         }
         let task = DownloadTask {

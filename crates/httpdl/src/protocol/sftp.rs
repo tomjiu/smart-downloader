@@ -35,23 +35,102 @@ const SFTP_CHUNK: usize = 64 * 1024;
 /// 连接/认证失败重试次数（连接层退避；与 ftp.rs CONNECT_ATTEMPTS 同口径）。
 const CONNECT_ATTEMPTS: u32 = 4;
 
-/// v1 主机密策略：`check_server_key` 全接受。
-///
-/// 背景：严格校验需要 known_hosts 基础设施（TOFU 首录 + 换钥提示 + 存储/更新
-/// 面），v1 不引入。风险敞口 = 首次连接的 MITM（密码仍走加密通道传输，
-/// 不明文暴露）；与 v1 FTPS 不暴露 insecure 口子的立场差异：SFTP 的
-/// 主机密是「每次连接都要决策」的交互面，静默失败比显式接受更伤可用性，
-/// 故 v1 显式接受 + 文档声明，known_hosts 后续按需补（rustls 不受限）。
-struct AcceptHostKey;
+/// 0600 权限收紧（known_hosts 指纹文件；非 Unix 空实现）。
+fn fs_0600(p: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        Ok(())
+    }
+}
 
-impl russh::client::Handler for AcceptHostKey {
+/// batch8（P1）：SFTP 主机密 TOFU（Trust On First Use）校验——
+/// 旧实现 `check_server_key` 全接受：首次连接的 MITM 可截获密码与全部数据。
+/// 现按指纹 TOFU：未知主机首录 + 接受；已录匹配接受；**已录失配拒绝**
+/// （换钥 = 中间人/服务器重装，显式报错由人工清理 known_hosts 文件恢复）。
+struct SftpKnownHosts {
+    /// 持久化文件（JSON：`{"host:port": ["SHA256:..."]}`，0600 原子写；
+    /// serve 注入 daemon 数据目录）。None = 内存 TOFU（进程生命周期）。
+    path: Option<PathBuf>,
+    /// host:port → 指纹列表（启动加载 + 运行缓存）。
+    entries: Mutex<HashMap<String, Vec<String>>>,
+}
+
+impl SftpKnownHosts {
+    fn new(path: Option<PathBuf>) -> Self {
+        let entries = path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        Self {
+            path,
+            entries: Mutex::new(entries),
+        }
+    }
+
+    /// TOFU 判定（返回 true = 接受该主机密）。
+    fn check_tofu(&self, host_port: &str, fp: &str) -> bool {
+        let mut entries = self.entries.lock();
+        match entries.get(host_port) {
+            Some(list) if list.iter().any(|f| f == fp) => true,
+            Some(list) => {
+                tracing::error!(
+                    "SFTP 主机密变更（疑似中间人攻击或服务器重装）：{host_port} 已录 {:?} 收到 {fp}；确认安全后删除记录文件 {:?} 恢复连接",
+                    list, self.path
+                );
+                false
+            }
+            None => {
+                entries.insert(host_port.to_string(), vec![fp.to_string()]);
+                if let Some(p) = &self.path {
+                    if let Some(dir) = p.parent() {
+                        let _ = std::fs::create_dir_all(dir);
+                    }
+                    if let Ok(json) = serde_json::to_string_pretty(&*entries) {
+                        let tmp = p.with_extension("json.tmp");
+                        if std::fs::write(&tmp, json.as_bytes()).is_ok() {
+                            let _ = std::fs::rename(&tmp, p);
+                            let _ = fs_0600(p);
+                        }
+                    }
+                }
+                tracing::info!("SFTP 首次连接 {host_port}，已记录主机密指纹 {fp}（TOFU）");
+                true
+            }
+        }
+    }
+}
+
+/// 主机密守卫（russh Handler；每连接构造一个）。
+struct SftpHostKeyGuard {
+    host_port: String,
+    store: Arc<SftpKnownHosts>,
+}
+
+impl russh::client::Handler for SftpHostKeyGuard {
     type Error = russh::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        server_public_key: &russh::keys::PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        use russh::keys::PublicKeyOrCertificate;
+        let fp = match server_public_key {
+            PublicKeyOrCertificate::PublicKey { key, .. } => {
+                key.fingerprint(russh::keys::HashAlg::Sha256).to_string()
+            }
+            PublicKeyOrCertificate::Certificate(cert) => cert
+                .public_key()
+                .fingerprint(russh::keys::HashAlg::Sha256)
+                .to_string(),
+        };
+        Ok(self.store.check_tofu(&self.host_port, &fp))
     }
 }
 
@@ -129,6 +208,8 @@ struct EngineInner {
     limiters: Mutex<HashMap<EngineTaskId, Arc<RateLimiter>>>,
     /// 动态分段粒度（字节，0 = 默认 16MB）；测试注入小粒度覆盖多段路径。
     min_split: u64,
+    /// batch8：SFTP 主机密 TOFU 库（None 路径 = 内存 TOFU，进程生命周期）。
+    known_hosts: Arc<SftpKnownHosts>,
 }
 
 /// SFTP 引擎（动态分段并行下载：每段独立 SSH 会话 + SFTP offset 读取）。
@@ -162,6 +243,7 @@ impl SftpEngine {
                 limiter: Arc::new(RateLimiter::new(download_kb_s)),
                 limiters: Mutex::new(HashMap::new()),
                 min_split: 0,
+                known_hosts: Arc::new(SftpKnownHosts::new(None)),
             }),
         }
     }
@@ -171,6 +253,15 @@ impl SftpEngine {
     pub fn with_min_split(mut self, min_split: u64) -> Self {
         if let Some(inner) = Arc::get_mut(&mut self.inner) {
             inner.min_split = min_split;
+        }
+        self
+    }
+
+    /// 注入主机密 TOFU 持久化文件（batch8；serve 从 daemon 数据目录传入
+    /// `known_hosts.json`）。缺省 = 内存 TOFU（进程生命周期，重启重录）。
+    pub fn with_known_hosts_path(mut self, path: Option<PathBuf>) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.known_hosts = Arc::new(SftpKnownHosts::new(path));
         }
         self
     }
@@ -195,11 +286,16 @@ async fn connect_sftp(
     port: u16,
     user: &str,
     pass: &str,
+    store: &Arc<SftpKnownHosts>,
 ) -> Result<russh_sftp::client::SftpSession, String> {
     let config = Arc::new(russh::client::Config::default());
+    let guard = SftpHostKeyGuard {
+        host_port: format!("{host}:{port}"),
+        store: store.clone(),
+    };
     let mut handle = tokio::time::timeout(
         SFTP_CONNECT_TIMEOUT,
-        russh::client::connect(config, (host, port), AcceptHostKey),
+        russh::client::connect(config, (host, port), guard),
     )
     .await
     .map_err(|_| "ssh connect timeout".to_string())?
@@ -231,8 +327,9 @@ async fn probe_size(
     user: &str,
     pass: &str,
     path: &str,
+    store: &Arc<SftpKnownHosts>,
 ) -> Result<u64, String> {
-    let sftp = connect_sftp(host, port, user, pass).await?;
+    let sftp = connect_sftp(host, port, user, pass, store).await?;
     let md = sftp
         .metadata(path)
         .await
@@ -258,8 +355,9 @@ async fn download_segment(
     seg: DynSegment,
     part: &Path,
     limiter: &RateLimiter,
+    store: &Arc<SftpKnownHosts>,
 ) -> Result<(), String> {
-    let sftp = connect_sftp(host, port, user, pass).await?;
+    let sftp = connect_sftp(host, port, user, pass, store).await?;
     let mut f = sftp
         .open(path)
         .await
@@ -316,11 +414,14 @@ async fn download_segment_with_retry(
     part: &Path,
     limiter: &RateLimiter,
     backoff: &Backoff,
+    store: &Arc<SftpKnownHosts>,
 ) -> Result<(), String> {
     let mut stack: Vec<DynSegment> = vec![seg];
     while let Some(cur) = stack.pop() {
-        match download_segment_attempts(host, port, user, pass, path, cur, part, limiter, backoff)
-            .await
+        match download_segment_attempts(
+            host, port, user, pass, path, cur, part, limiter, backoff, store,
+        )
+        .await
         {
             Ok(()) => {}
             Err(e) if is_terminal(&e) => {
@@ -359,10 +460,11 @@ async fn download_segment_attempts(
     part: &Path,
     limiter: &RateLimiter,
     backoff: &Backoff,
+    store: &Arc<SftpKnownHosts>,
 ) -> Result<(), String> {
     let mut last = String::new();
     for attempt in 1..=CONNECT_ATTEMPTS {
-        match download_segment(host, port, user, pass, path, seg, part, limiter).await {
+        match download_segment(host, port, user, pass, path, seg, part, limiter, store).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 if attempt < CONNECT_ATTEMPTS && !is_terminal(&e) {
@@ -408,6 +510,7 @@ async fn download_file(
     on_progress: Arc<dyn Fn(u64) + Send + Sync>,
     pause: Option<Arc<AtomicBool>>,
     epoch: Arc<AtomicU64>,
+    known_hosts: Arc<SftpKnownHosts>,
 ) -> Result<SftpOutcome, String> {
     let epoch0 = epoch.load(Ordering::SeqCst);
     let part = part_path_of(dest);
@@ -477,6 +580,7 @@ async fn download_file(
         let pause = pause.clone();
         let paused_seen = paused_seen.clone();
         let epoch = epoch.clone();
+        let inner_known = known_hosts.clone();
         workers.spawn(async move {
             loop {
                 // 审计修复（P1-4）：段边界检查暂停旗标（与 FTP 同构）；
@@ -506,7 +610,16 @@ async fn download_file(
                     }
                 };
                 download_segment_with_retry(
-                    &host, port, &user, &pass, &path, seg, &part, &limiter, &backoff,
+                    &host,
+                    port,
+                    &user,
+                    &pass,
+                    &path,
+                    seg,
+                    &part,
+                    &limiter,
+                    &backoff,
+                    &inner_known,
                 )
                 .await?;
                 // 段完成：记账 + 账本原子落盘 + 进度回报（锁内一并）
@@ -611,8 +724,21 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
         }
     });
     let r = download_file(
-        &host, port, &user, &pass, &path, &dest, total, backoff, &limiter, min_split, sequential,
-        progress, pause_flag, epoch_flag,
+        &host,
+        port,
+        &user,
+        &pass,
+        &path,
+        &dest,
+        total,
+        backoff,
+        &limiter,
+        min_split,
+        sequential,
+        progress,
+        pause_flag,
+        epoch_flag,
+        inner.known_hosts.clone(),
     )
     .await;
     match r {
@@ -785,7 +911,7 @@ impl DownloadEngine for SftpEngine {
             let mut last = String::new();
             let mut size: Option<u64> = None;
             for attempt in 1..=CONNECT_ATTEMPTS {
-                match probe_size(&host, port, &user, &pass, &path).await {
+                match probe_size(&host, port, &user, &pass, &path, &self.inner.known_hosts).await {
                     Ok(t) => {
                         size = Some(t);
                         break;
@@ -1219,6 +1345,7 @@ mod tests {
             },
             &part,
             &RateLimiter::new(0),
+            &Arc::new(SftpKnownHosts::new(None)),
         )
         .await
         .unwrap();
@@ -1416,5 +1543,43 @@ mod tests {
             "NoSuchFile 应终态失败不重试，实际耗时 {:?}",
             started.elapsed()
         );
+    }
+
+    /// batch8（P1）：主机密 TOFU——首录接受并持久化；同指纹复连接受；
+    /// 换钥拒绝；旧档（0600）格式可回读。
+    #[test]
+    fn sftp_known_hosts_tofu_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let kh_path = dir.path().join("sftp_known_hosts.json");
+        let store = Arc::new(SftpKnownHosts::new(Some(kh_path.clone())));
+
+        // 首录：接受
+        assert!(store.check_tofu("h1:22", "SHA256:AAA"));
+        assert!(kh_path.exists(), "首录必须落盘");
+        // 同指纹复连：接受
+        assert!(store.check_tofu("h1:22", "SHA256:AAA"));
+        // 同主机新指纹：拒绝（换钥）
+        assert!(!store.check_tofu("h1:22", "SHA256:BBB"));
+        // 其他主机独立首录
+        assert!(store.check_tofu("h2:2222", "SHA256:CCC"));
+
+        // 新 store 实例从文件回读：记录保留（h1 只认 AAA）
+        let store2 = SftpKnownHosts::new(Some(kh_path.clone()));
+        assert!(store2.check_tofu("h1:22", "SHA256:AAA"));
+        assert!(!store2.check_tofu("h1:22", "SHA256:BBB"));
+        assert!(store2.check_tofu("h2:2222", "SHA256:CCC"));
+
+        // Unix：0600
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&kh_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "known_hosts 必须 0600");
+        }
+
+        // None 路径 = 内存 TOFU（不落盘、进程生命周期）
+        let mem = SftpKnownHosts::new(None);
+        assert!(mem.check_tofu("m:1", "SHA256:X"));
+        assert!(!mem.check_tofu("m:1", "SHA256:Y"));
     }
 }
