@@ -268,9 +268,14 @@ impl DownloadEngine for XunleiBtEngine {
             total,
             down_rate: 0, // 速度字段待 dump 还原
             up_rate: 0,
+            // E33：xunlei SDK 速度/累计字段尚未 dump 还原，恒 0（快照序列化省略）
+            total_downloaded: 0,
+            total_uploaded: 0,
             num_peers: info.peer_count,
             num_seeds: 0, // xunlei SDK 不区分 seed/peer
             error,
+            // E9：xunlei 引擎暂不参与名字回填（XLTaskInfo 未还原 name 字段）
+            name: None,
         })
     }
 

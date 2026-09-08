@@ -2,6 +2,7 @@
 //! 未映射到 API 的命令（logs/config/fallback）给出明确提示（v1 无对应端点）。
 
 use crate::cli::{CliCommand, CliError};
+use std::time::Duration;
 
 pub struct CliClient {
     base: String,
@@ -27,7 +28,10 @@ impl CliClient {
     /// 注入 `Authorization: Bearer <token>`（与 daemon 的 auth_mw 配对）；
     /// None = 未认证模式（回环未配置 token 的兼容行为）。
     pub fn new(base: &str, token: Option<&str>) -> Self {
-        let mut builder = reqwest::Client::builder();
+        // 安全修复（H-9）：CLI 是短命令交互，总超时防 daemon 无响应时挂死。
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(60));
         if let Some(t) = token.filter(|t| !t.is_empty()) {
             let mut headers = reqwest::header::HeaderMap::new();
             if let Ok(v) = reqwest::header::HeaderValue::from_str(&format!("Bearer {t}")) {
@@ -129,6 +133,10 @@ impl CliClient {
             // 保留防御分支保证穷尽性（提示用户直接运行命令而非经 --server 转发）。
             CliCommand::XunleiLogin { .. } => Err(CliError::Unknown(
                 "xunlei-login 为本地命令，不经过 daemon：请直接运行 smart-dl-daemon xunlei-login"
+                    .to_string(),
+            )),
+            CliCommand::BaiduResolve { .. } => Err(CliError::Unknown(
+                "baidu-resolve 为本地命令，不经过 daemon：请直接运行 smart-dl-daemon baidu-resolve"
                     .to_string(),
             )),
         }

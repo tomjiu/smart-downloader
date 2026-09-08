@@ -161,7 +161,11 @@ impl VipSpeedupClient {
         inner_base: impl Into<String>,
     ) -> Self {
         Self {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
             speedup_base: speedup_base.into().trim_end_matches('/').to_string(),
             cert_base: cert_base.into().trim_end_matches('/').to_string(),
             inner_base: inner_base.into().trim_end_matches('/').to_string(),

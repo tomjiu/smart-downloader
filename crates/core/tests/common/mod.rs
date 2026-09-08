@@ -62,9 +62,18 @@ pub fn make_task(id: &str, name: &str) -> DownloadTask {
             max_retries: 3,
         },
         created_at: std::time::Instant::now(),
+        file_priorities: None,
+        sequential: false,
         metadata: TaskMetadata {
             name: Some(name.to_string()),
             added_at_unix: 1,
+            tags: Vec::new(),
+            finished_at_unix: 0,
+            start_at_unix: 0,
+            next_retry_at_unix: 0,
         },
+        limits: None,
+        max_connections: None,
+        queue_priority: 0,
     }
 }

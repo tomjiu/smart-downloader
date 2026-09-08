@@ -1,13 +1,18 @@
 //! HttpEngine（§14，impl DownloadEngine）：M4a 骨架 + M4b 多连接并行下载/镜像/换源/校验。
-//! add = 探测 → 规划 → 登记 → 后台下载循环；段失败 → 镜像轮换；校验失败 → 重下 1 次 → 降级接受。
+//! add = 探测 → 规划 → 登记 → 后台下载循环（主源探测失败自动落备用源）；段失败 → 镜像轮换；
+//! 校验失败 → 重下 1 次 → 隔离试错轮换（备用源优先，多候选逐一隔离）→ 降级接受。update_sources 并发探测全部候选源 + 评分播种，
+//! 任一存活即换源成功（不再首源死即拒）。P4 续传：段账本（`<part>.progress`）为唯一进度真源；
+//! pause 真停（段边界退出）；epoch 单写者模型（resume 无条件新 epoch 循环，旧循环在检查点自杀且永不 finalize）。
 
-use crate::download::{download_dynamic, download_full_stream};
-use crate::range::probe_range;
-use crate::rate::RateLimiter;
-use crate::resume;
+use crate::dash;
+use crate::download::{download_dynamic, update_score, DynamicLedger, DynamicOutcome, SCORE_MIN};
+use crate::hls;
+use crate::ledger;
+use crate::range::{multi_source_ok, probe_range, Probe};
+use crate::rate::{RateLimiter, RateSample};
 use crate::segment_manager::DEFAULT_MIN_SPLIT;
-use crate::verify::{verify_file, verify_file_md5};
-use parking_lot::Mutex;
+use crate::verify::{verify_file, verify_file_md5, verify_file_sha1};
+use parking_lot::{Mutex, RwLock};
 use smart_dl_core::identity::ContentIdentity;
 use smart_dl_core::session::output::OutputManager;
 use smart_dl_core::task::DownloadTask;
@@ -18,6 +23,7 @@ use smart_dl_core::types::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,17 +35,22 @@ struct HttpTask {
     headers: Vec<(String, String)>,
     /// 候选源列表（add 初始单 URL；update_sources 替换）。
     mirrors: Vec<String>,
-    /// 当前源 ETag（换源对比）。
+    /// 当前源 ETag（换源对比 + 账本写入）。
     etag: Option<String>,
+    /// 内容指纹备援（E26）：Last-Modified 原始串（账本写入 + 换源同步）。
+    last_modified: Option<String>,
     dest: PathBuf,
-    /// 续传起点（0 = 全新下载；>0 = 跳过 [0, offset) 动态领取剩余段）。
-    offset: u64,
     state: EngineState,
     done: u64,
     total: u64,
+    /// 速率采样器（E11）：status() 读取时增量采样（B/s），daemon /stats 聚合消费。
+    rate: RateSample,
     error: Option<String>,
     sha256: Option<String>,
-    /// 备用源内容 MD5 校验目标（切备用源后生效；主源阶段 None）。
+    /// 主源 SHA1 校验目标（E25；优先级 sha256 > sha1 > md5；切备用源后清空）。
+    sha1: Option<String>,
+    /// 主源 MD5 校验目标（E25；优先级末位）。切备用源后本槽被 backup_md5
+    /// 接管（同一槽位：主源摘要已随主源失败作废，语义不冲突）。
     md5: Option<String>,
     verify_attempts: u32,
     /// 备用源 URL（主源两次校验失败后切换）。
@@ -48,18 +59,58 @@ struct HttpTask {
     backup_md5: Option<String>,
     /// 备用源是否已使用（避免无限切换）。
     backup_used: bool,
+    /// 校验失败轮换池（E3 隔离试错）：多候选表两次校验失败后，逐一以唯一源
+    /// 身份重下重校验的候选队列（评分降序；backup_url 除外——它走专属优先
+    /// 分支）。空池且当前表单源 = 无隔离试错价值 → 走降级接受（Q-B5 保留）。
+    rotate_pool: Vec<String>,
+    /// 源站 Range 能力（probe 结论）：false（服务器忽略 Range → 200 全文件）
+    /// 时路由到未知总长单流循环——分段器的 206 硬要求对非 Range 源必败
+    /// （Linux 实弹验收发现；该循环对 200 有 truncate 全量重下同语义分支）。
+    range_supported: bool,
     /// 换源代次：etag 变化 → gen+1 → 旧下载循环退出、新循环启动。
     /// .part 路径随 gen 隔离（`dest.<gen>.part`），避免新旧循环并发写同一文件。
     gen: u64,
-    /// 源站 Range 能力（probe 结论）：false → 整流下载路径（服务器忽略 Range，
-    /// 分段器的 206 硬要求必败）。B-accept 补（Linux 实弹验收发现）。
-    range_supported: bool,
+    /// 循环代次（P4）：resume/重试重入 → epoch+1 并无条件 spawn 新循环；
+    /// 旧循环在 gen/epoch 检查点自杀，且永不 finalize（单写者收敛）。
+    epoch: u64,
+    /// 真暂停标志：置位后 worker 在段边界退出（在飞段收尾即止，不再领新段）。
+    pause: Arc<AtomicBool>,
+    /// 任务级下载限速（KiB/s 配置回显；None = 走全局）。实际生效速在
+    /// limiters 表的 RateLimiter 上（set_limits 运行中即时改率）。
+    limit_kb_s: Option<u32>,
+    /// 顺序下载（边下边播）：true = download_loop 每轮传给 download_dynamic，
+    /// 在飞段窗口收紧。set_sequential 运行中改写 → 下一次重下轮拾取。
+    sequential: bool,
+    /// 任务级代理 URL（E5 配置回显）：Some = 该任务专用 client 仅装此代理
+    /// （覆盖全局）；None = 引擎共享 client。实际生效 client 在 spawn/
+    /// update_sources/add 探测时按此字段构建。
+    proxy: Option<String>,
+    /// 最终落盘名（E9 配置回显）：add 落盘名决策结果（显式名回显同值；派生
+    /// 名 = CD → URL 末段 → 兑底链，已 sanitize_rel 终审）。status() 透出供
+    /// daemon 回填 metadata.name——引擎内部派生的名字不再对 daemon 隐身。
+    resolved_name: Option<String>,
+    /// C-HLS/C-DASH：流式清单任务类型（.m3u8/.mpd URL 分流）——resume/
+    /// update_sources 按此分流到对应流式循环/拒绝；status/pause/remove/
+    /// limits 与普通任务同链。
+    stream: StreamKind,
+}
+
+/// 流式清单任务类型（C-HLS/C-DASH）：Plain = 普通分段链任务。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamKind {
+    Plain,
+    Hls,
+    Dash,
 }
 
 struct EngineInner {
     tasks: Mutex<HashMap<EngineTaskId, HttpTask>>,
     /// Mirror 加权评分（URL → 分数）：跨任务持久，成功 +1 / 失败 -2，clamp [-4, +4]。
     mirror_scores: Arc<Mutex<HashMap<String, i64>>>,
+    /// 任务级限速器（tid → limiter）；未登记的任务走引擎全局 limiter。
+    /// 与全局不同：任务条目内的 RateLimiter 速率可运行中热调（set_rate_kb_s），
+    /// 且串联引擎全局 limiter 作上游（E16 总阀门，全局约束不因任务级限速被绕过）。
+    limiters: Mutex<HashMap<EngineTaskId, Arc<RateLimiter>>>,
 }
 
 /// HTTP 引擎：reqwest 传输 + 自研调度层（D29）。
@@ -69,12 +120,55 @@ pub struct HttpEngine {
     /// 跨段共享限速器（0 = 不限）。
     limiter: Arc<RateLimiter>,
     inner: Arc<EngineInner>,
+    /// 运行时全局代理（S1 设置面）：`set_global_proxy` 热改；逐任务 client
+    /// 构建时与任务级代理合并（任务级优先）。启动时全局代理已烘入共享
+    /// client，本字段仅存运行中变更（None = 沿用启动口径，不重烘）。
+    global_proxy: Arc<RwLock<Option<String>>>,
+}
+
+/// 从代理 URL 提取 `user:pass@`（E5：任务级代理 reqwest basic_auth 用；
+/// 与 daemon serve.rs 全局代理同一格式约定，BT 引擎由 btcore::parse_proxy
+/// 解析同一格式）。无凭据 → None。
+pub fn proxy_auth_of(url: &str) -> Option<(String, String)> {
+    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
+    let (auth, _) = rest.rsplit_once('@')?;
+    let (u, p) = auth.split_once(':').unwrap_or((auth, ""));
+    Some((u.to_string(), p.to_string()))
+}
+
+/// 任务级代理 client 构建（E5）：配置与 serve.rs 全局 client 同口径——
+/// connect 10s + read 30s（H-9：不设总超时护长下载）；proxy URL 非法返回 Err
+/// （daemon add 时调用本函数校验，spawn 时重建失败则任务标 Error）。
+pub fn build_proxied_client(proxy_url: &str) -> Result<reqwest::Client, String> {
+    let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| e.to_string())?;
+    // 凭据与代理体合成同一个 Proxy（ClientBuilder.proxy() 为追加语义：
+    // 先 push 无凭据再 push 带凭据会由前者先命中，凭据丢失 → 条件单次）
+    let proxy = match proxy_auth_of(proxy_url) {
+        Some((u, p)) => proxy.basic_auth(&u, &p),
+        None => proxy,
+    };
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .read_timeout(std::time::Duration::from_secs(30))
+        // A5（cookie jar）：任务级 client 各自独立 jar（与全局 client 隔离），
+        // 探测/段请求/重定向自动携带与更新；Cookie 任务头仍可显式覆盖。
+        .cookie_store(true)
+        .proxy(proxy)
+        .build()
+        .map_err(|e| e.to_string())
 }
 
 impl HttpEngine {
     /// 不限速引擎（默认路径，兼容既有测试）。
     pub fn new(client: reqwest::Client) -> Self {
         Self::new_limited(client, 0)
+    }
+
+    /// 引擎共享 client 只读访问（B1 metalink 引导 XML 下载复用）：全局代理 /
+    /// cookie jar / 超时口径与任务探测下载全链同源，避免 daemon 侧另建临时
+    /// client 造成两套网络配置。仅读语义，调用方不得复用为引擎写路径。
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
     }
 
     /// `download_kb_s` = 全局下载限速 KiB/s（0 = 不限）。
@@ -85,23 +179,81 @@ impl HttpEngine {
             inner: Arc::new(EngineInner {
                 tasks: Mutex::new(HashMap::new()),
                 mirror_scores: Arc::new(Mutex::new(HashMap::new())),
+                limiters: Mutex::new(HashMap::new()),
             }),
+            global_proxy: Arc::new(RwLock::new(None)),
         }
     }
 
-    /// 启动下载循环（代次 gen）。
+    /// 启动下载循环（代次 gen + 循环代次 epoch）。
     /// 可靠性修复（V11，报告第二轮）：不再丢弃 JoinHandle——监控任务捕获
     /// 下载循环 panic，把任务标 Error（修复前 panic 任务静默变僵尸：状态
     /// 永停 Downloading、无 Failed 事件、无收尸路径）。
-    fn spawn_download(&self, tid: EngineTaskId, gen: u64) {
-        let client = self.client.clone();
-        let limiter = self.limiter.clone();
+    fn spawn_download(&self, tid: EngineTaskId, gen: u64, epoch: u64) {
+        // E5 任务级代理：Some(proxy) → 构建任务专用 client（仅装该代理，覆盖
+        // 全局）；None → 引擎共享 client（可能含全局 [download] proxy）。
+        // S1 补充：任务无代理且运行时全局代理已设置 → 合并运行时全局代理
+        // （新任务生效语义；启动时代理已烘入共享 client，此处仅运行中变更）。
+        // 构建失败（add 时已校验过，此处兜底）→ 任务标 Error 不 spawn。
+        let (client, spawn_err) = {
+            let runtime_global = self.global_proxy.read().clone().filter(|s| !s.is_empty());
+            let tasks = self.inner.tasks.lock();
+            match tasks
+                .get(&tid)
+                .and_then(|t| t.proxy.as_deref())
+                .map(|s| s.to_string())
+                .or(runtime_global)
+            {
+                Some(p) => match build_proxied_client(&p) {
+                    Ok(c) => (c, None),
+                    Err(e) => (
+                        self.client.clone(),
+                        Some(format!("任务级 proxy client 构建失败: {e}")),
+                    ),
+                },
+                None => (self.client.clone(), None),
+            }
+        };
+        if let Some(msg) = spawn_err {
+            let mut tasks = self.inner.tasks.lock();
+            if let Some(t) = tasks.get_mut(&tid) {
+                t.state = EngineState::Error;
+                t.error = Some(msg);
+            }
+            return;
+        }
+        // 任务级限速优先，未登记回退全局（跨段共享口径不变）；登记条目
+        // 已在 set_limits 时串联全局上游（E16），此处直接取用即可。
+        let limiter = self
+            .inner
+            .limiters
+            .lock()
+            .get(&tid)
+            .cloned()
+            .unwrap_or_else(|| self.limiter.clone());
         let inner = self.inner.clone();
         let inner_mon = self.inner.clone();
         let tid_mon = tid.clone();
-        let handle = tokio::spawn(async move {
-            download_loop(&client, limiter, inner, tid, gen).await;
-        });
+        // batch3-P1：未知总长（chunked/动态生成，探测无 Content-Length）任务
+        // 分流单连接流式循环——旧实现落入分段路径，SegmentManager::new(0,..)
+        // 无段可领 → 立即 Drained → 0 字节文件被 finalize 成 dest 且任务
+        // Completed（静默丢数据）。
+        let unknown_len = {
+            let tasks = inner.tasks.lock();
+            tasks
+                .get(&tid)
+                .map(|t| t.stream == StreamKind::Plain && (t.total == 0 || !t.range_supported))
+                .unwrap_or(false)
+        };
+        let handle = if unknown_len {
+            tokio::spawn(async move {
+                download_loop_unknown(&client, limiter, inner, tid, gen, epoch).await;
+            })
+        } else {
+            tokio::spawn(async move {
+                download_loop(&client, limiter, inner, tid, gen, epoch).await;
+            })
+        };
         // 收尸监控：panic → 任务标 Error（V11 锁治理后 parking_lot 无中毒，
         // 无条件锁不再有级联引爆风险，收尸保证执行；锁在子线程 unwind 时已随 RAII 释放）
         tokio::spawn(async move {
@@ -111,7 +263,154 @@ impl HttpEngine {
                     tracing::error!("[V11] tid={tid_mon}: {msg}");
                     let mut tasks = inner_mon.tasks.lock();
                     if let Some(t) = tasks.get_mut(&tid_mon) {
-                        if t.gen == gen {
+                        // 仅当前 gen/epoch 的循环 panic 才标记任务
+                        //（过期循环的死与任务状态无关）
+                        if t.gen == gen && t.epoch == epoch {
+                            t.state = EngineState::Error;
+                            t.error = Some(msg);
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    /// 流式清单下载循环 spawn（C-HLS/C-DASH）：client/limiter/收尸监控与
+    /// spawn_download 同口径；abort = 任务 pause flag（pause()/remove() 置位
+    /// → 段间退出，`hls-aborted`/`dash-aborted` 约定错误静默返回——状态由
+    /// pause()/remove() 管理）；resume() epoch+1 → 旧循环在下一 abort 检查点
+    /// 自杀，新循环凭段账本续传。
+    fn spawn_stream_loop(&self, tid: EngineTaskId, epoch: u64) {
+        let (client, spawn_err) = {
+            let tasks = self.inner.tasks.lock();
+            match tasks.get(&tid).and_then(|t| t.proxy.as_deref()) {
+                Some(p) => match build_proxied_client(p) {
+                    Ok(c) => (c, None),
+                    Err(e) => (
+                        self.client.clone(),
+                        Some(format!("任务级 proxy client 构建失败: {e}")),
+                    ),
+                },
+                None => (self.client.clone(), None),
+            }
+        };
+        if let Some(msg) = spawn_err {
+            let mut tasks = self.inner.tasks.lock();
+            if let Some(t) = tasks.get_mut(&tid) {
+                t.state = EngineState::Error;
+                t.error = Some(msg);
+            }
+            return;
+        }
+        let (url, headers, dest, stream_kind) = {
+            let tasks = self.inner.tasks.lock();
+            match tasks.get(&tid) {
+                Some(t) => (
+                    t.mirrors.first().cloned().unwrap_or_default(),
+                    t.headers.clone(),
+                    t.dest.clone(),
+                    t.stream,
+                ),
+                None => return,
+            }
+        };
+        // batch6-P0：is_aborted = pause ∪ epoch 过期 ∪ 任务已移除——流式
+        // 循环的中止依据（旧实现只传 pause 旗标，resume 清旗标后旧循环永不
+        // 退出，与新循环并发 append 同一 .part）。epoch 捕获于 spawn 时刻，
+        // 新循环以新 epoch 成为唯一写者。
+        let is_aborted: Arc<dyn Fn() -> bool + Send + Sync> = {
+            let inner = self.inner.clone();
+            let tid = tid.clone();
+            Arc::new(move || {
+                let tasks = inner.tasks.lock();
+                match tasks.get(&tid) {
+                    Some(t) => t.pause.load(Ordering::SeqCst) || t.epoch != epoch,
+                    None => true,
+                }
+            })
+        };
+        let limiter = self
+            .inner
+            .limiters
+            .lock()
+            .get(&tid)
+            .cloned()
+            .unwrap_or_else(|| self.limiter.clone());
+        let inner = self.inner.clone();
+        let inner_mon = self.inner.clone();
+        let tid_mon = tid.clone();
+        let handle = tokio::spawn(async move {
+            let on_progress: Arc<dyn Fn(u64) + Send + Sync> = {
+                let inner = inner.clone();
+                let tid = tid.clone();
+                Arc::new(move |n| {
+                    let mut tasks = inner.tasks.lock();
+                    if let Some(t) = tasks.get_mut(&tid) {
+                        // batch3-P1：流式进度绝对语义（hls/dash 回调已统一传
+                        // 累计绝对值）——旧 += 在 resume 回填场景进度翻倍
+                        t.done = t.done.max(n);
+                    }
+                })
+            };
+            let result = match stream_kind {
+                StreamKind::Dash => {
+                    dash::download_dash(
+                        client.clone(),
+                        url.clone(),
+                        headers.clone(),
+                        dest.clone(),
+                        limiter.clone(),
+                        on_progress.clone(),
+                        is_aborted.clone(),
+                    )
+                    .await
+                }
+                _ => {
+                    hls::download_hls(
+                        client.clone(),
+                        url.clone(),
+                        headers.clone(),
+                        dest.clone(),
+                        limiter.clone(),
+                        on_progress.clone(),
+                        is_aborted.clone(),
+                    )
+                    .await
+                }
+            };
+            // 状态落定：仅当前 epoch 的循环有权（过期循环静默退出）；
+            // abort 中断（pause/remove 已管状态）不落 Error。
+            let aborted = matches!(&result, Err(e) if {
+                let msg = e.to_string();
+                msg.contains(hls::HLS_ABORTED_MSG) || msg.contains(dash::DASH_ABORTED_MSG)
+            });
+            let mut tasks = inner.tasks.lock();
+            if let Some(t) = tasks.get_mut(&tid) {
+                if t.epoch != epoch {
+                    return;
+                }
+                match result {
+                    Ok(()) => {
+                        t.state = EngineState::Completed;
+                        t.error = None;
+                    }
+                    Err(_e) if aborted => {}
+                    Err(e) => {
+                        t.state = EngineState::Error;
+                        t.error = Some(e.to_string());
+                    }
+                }
+            }
+        });
+        // 收尸监控（同 spawn_download）
+        tokio::spawn(async move {
+            if let Err(join_err) = handle.await {
+                if join_err.is_panic() {
+                    let msg = format!("流式下载循环 panic: {join_err}");
+                    tracing::error!("tid={tid_mon}: {msg}");
+                    let mut tasks = inner_mon.tasks.lock();
+                    if let Some(t) = tasks.get_mut(&tid_mon) {
+                        if t.epoch == epoch {
                             t.state = EngineState::Error;
                             t.error = Some(msg);
                         }
@@ -122,29 +421,240 @@ impl HttpEngine {
     }
 }
 
+/// batch3-P1：未知总长（无 Content-Length 的 200 响应）单连接流式下载。
+/// 断点续传以「文件当前大小」为凭据（Range: bytes={size}-；服务器忽略
+/// Range 回 200 → truncate 重下）。暂停 = 停止写入退出（文件大小即进度，
+/// resume 重新 spawn）；完成后走统一校验/落位链（与分段路径同口径）。
+async fn download_loop_unknown(
+    client: &reqwest::Client,
+    limiter: Arc<RateLimiter>,
+    inner: Arc<EngineInner>,
+    tid: EngineTaskId,
+    gen: u64,
+    epoch: u64,
+) {
+    let (part, mirrors, headers, pause_flag, sha256, sha1, md5) = {
+        let tasks = inner.tasks.lock();
+        let t = match tasks.get(&tid) {
+            Some(t) if t.gen == gen && t.epoch == epoch => t,
+            _ => return,
+        };
+        (
+            part_path_of(&t.dest, gen),
+            t.mirrors.clone(),
+            t.headers.clone(),
+            t.pause.clone(),
+            t.sha256.clone(),
+            t.sha1.clone(),
+            t.md5.clone(),
+        )
+    };
+    let url = mirrors.first().cloned().unwrap_or_default();
+    let start = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+    let mut req = client.get(&url);
+    for (k, v) in &headers {
+        if !k.eq_ignore_ascii_case("range") {
+            req = req.header(k, v);
+        }
+    }
+    let resp = match req
+        .header(reqwest::header::RANGE, format!("bytes={start}-"))
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            finish(
+                &inner,
+                &tid,
+                EngineState::Error,
+                Some(format!("请求失败: {e}")),
+            );
+            return;
+        }
+    };
+    let mode = match resp.status() {
+        reqwest::StatusCode::PARTIAL_CONTENT => {
+            // 审查修复：206 续传前必须校验 Content-Range 首字节 == 断点 start。
+            // 服务器/中间缓存错位应答（含「bytes 0-N/…」归一化劣化）会把数据
+            // append 到错误偏移，产出「旧前缀+新尾部」混合文件。不符或缺失
+            // 一律降级为全量重下（truncate），与 200 路径同语义。
+            let cr_ok = resp
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .and_then(crate::download::parse_content_range_start)
+                .map(|st| st == start)
+                .unwrap_or(false);
+            if cr_ok {
+                1u8 // 续传：append
+            } else {
+                2u8 // 错位/缺失 Content-Range：truncate 全量重下
+            }
+        }
+        reqwest::StatusCode::OK => 2u8, // 全量：truncate 重下
+        s => {
+            finish(
+                &inner,
+                &tid,
+                EngineState::Error,
+                Some(format!("status {s}（未知总长流式）")),
+            );
+            return;
+        }
+    };
+    let mut f = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(mode == 2)
+        .open(&part)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            finish(
+                &inner,
+                &tid,
+                EngineState::Error,
+                Some(format!("part open: {e}")),
+            );
+            return;
+        }
+    };
+    let base = if mode == 1 { start } else { 0 };
+    use std::io::{Seek, Write};
+    let _ = f.seek(std::io::SeekFrom::Start(base));
+    let mut written: u64 = 0;
+    let mut resp = resp;
+    loop {
+        if pause_flag.load(Ordering::SeqCst) {
+            // 真暂停：pause() 已置状态；文件大小即进度凭据，resume 重新 spawn
+            return;
+        }
+        let chunk = match resp.chunk().await {
+            Ok(Some(c)) => c,
+            Ok(None) => break,
+            Err(e) => {
+                finish(
+                    &inner,
+                    &tid,
+                    EngineState::Error,
+                    Some(format!("读取失败: {e}")),
+                );
+                return;
+            }
+        };
+        limiter.wait(chunk.len() as u64).await;
+        if let Err(e) = f.write_all(&chunk) {
+            finish(
+                &inner,
+                &tid,
+                EngineState::Error,
+                Some(format!("写入失败: {e}")),
+            );
+            return;
+        }
+        written += chunk.len() as u64;
+        let mut tasks = inner.tasks.lock();
+        if let Some(t) = tasks.get_mut(&tid) {
+            if t.gen == gen && t.epoch == epoch {
+                t.done = base + written;
+            }
+        }
+    }
+    let _ = f.sync_all();
+    let total_written = base + written;
+    // finalize 前检查 gen/epoch（与分段路径同口径）
+    let still_current = inner
+        .tasks
+        .lock()
+        .get(&tid)
+        .map(|t| t.gen == gen && t.epoch == epoch)
+        .unwrap_or(false);
+    if !still_current {
+        return;
+    }
+    if total_written == 0 && base > 0 {
+        // 审查修复（P2）：续传场景 written==0 = 源截短/异常，保持报错。
+        // （base==0 且空体 = 合法空文件，落下方 finalize 空文件路径——
+        // FTP/SFTP/分段路径均可交付空文件，此路径原先永远报错。）
+        finish(
+            &inner,
+            &tid,
+            EngineState::Error,
+            Some("续传响应体为空（源可能已变更）".into()),
+        );
+        return;
+    }
+    let verify_result = match (&sha256, &sha1, &md5) {
+        (Some(expected), _, _) => verify_file(&part, expected),
+        (None, Some(expected), _) => verify_file_sha1(&part, expected),
+        (None, None, Some(expected)) => verify_file_md5(&part, expected),
+        (None, None, None) => Ok(true),
+    };
+    match verify_result {
+        Ok(true) | Err(_) => {
+            // 校验错误（IO 失败）按通过处理：未知总长路径不重试风暴
+            let dest = dest_of(&inner, &tid);
+            match finalize_part(&part, &dest, total_written) {
+                Ok(()) => {
+                    cleanup_old_parts(&dest, gen);
+                    remove_credentials(&part);
+                    finish(&inner, &tid, EngineState::Completed, None);
+                }
+                Err(e) => finish(&inner, &tid, EngineState::Error, Some(e)),
+            }
+        }
+        Ok(false) => {
+            finish(
+                &inner,
+                &tid,
+                EngineState::Error,
+                Some("内容校验失败（未知总长流式）".into()),
+            );
+        }
+    }
+}
+
 async fn download_loop(
     client: &reqwest::Client,
     limiter: Arc<RateLimiter>,
     inner: Arc<EngineInner>,
     tid: EngineTaskId,
     gen: u64,
+    epoch: u64,
 ) {
     loop {
-        // 快照任务参数（不跨 await 持锁）
-        let (part, offset, mirrors_raw, total, sha256, md5, range_supported) = {
+        // 快照任务参数（不跨 await 持锁）；gen/epoch 失配 → 本循环作废
+        let (
+            part,
+            mirrors_raw,
+            total,
+            sha256,
+            sha1,
+            md5,
+            sequential,
+            etag,
+            last_modified,
+            pause_flag,
+            headers,
+        ) = {
             let tasks = inner.tasks.lock();
             let t = match tasks.get(&tid) {
-                Some(t) if t.gen == gen => t,
-                _ => return, // 换源代次已推进 → 本循环作废
+                Some(t) if t.gen == gen && t.epoch == epoch => t,
+                _ => return, // 换源代次/续传 epoch 已推进 → 本循环作废
             };
             (
                 part_path_of(&t.dest, gen),
-                t.offset,
                 t.mirrors.clone(),
                 t.total,
                 t.sha256.clone(),
+                t.sha1.clone(),
                 t.md5.clone(),
-                t.range_supported,
+                t.sequential,
+                t.etag.clone(),
+                t.last_modified.clone(),
+                t.pause.clone(),
+                t.headers.clone(),
             )
         };
 
@@ -155,49 +665,78 @@ async fn download_loop(
             mirrors.sort_by_key(|u| -scores.get(u).copied().unwrap_or(0));
         }
 
-        // Range 能力分流：有 Range → 动态分段；无（服务器忽略 Range → 200 全文件）
-        // → 整流单流（分段器 206 硬要求对非 Range 源必败，B-accept 补）。
-        let download_result = if range_supported {
-            download_dynamic(
-                client,
-                &part,
-                total,
-                offset,
-                DEFAULT_MIN_SPLIT,
-                &mirrors,
-                limiter.clone(),
-                Some(inner.mirror_scores.clone()),
-            )
-            .await
-        } else {
-            download_full_stream(client, &part, total, offset, &mirrors, limiter.clone()).await
+        // 段账本加载（P4 唯一进度真源）：合法账本 → 恢复已完成段 + 沿用其粒度；
+        // 缺失/损坏/total 失配 → 全新计划（add 决策已保证此处账本可信，
+        // 二次校验只防御运行中文件被外部改动）。
+        let ledger_path = ledger::ledger_path(&part);
+        let loaded =
+            ledger::load(&ledger_path).filter(|l| l.total == total && l.validate_segments());
+        let ledger_handle = DynamicLedger {
+            path: ledger_path,
+            etag: etag.clone(),
+            last_modified: last_modified.clone(),
+            min_split: loaded
+                .as_ref()
+                .map(|l| l.min_split)
+                .unwrap_or(DEFAULT_MIN_SPLIT),
+            done: loaded.map(|l| l.done).unwrap_or_default(),
         };
-        match download_result {
-            Ok(()) => {
-                // finalize 前检查代次：换源已发生 → 本循环结果作废（gen1 会重下）
+        let min_split = ledger_handle.min_split;
+
+        // 进度回调：单调更新 t.done（gen/epoch 门控：过期循环不污染进度）
+        let progress: Arc<dyn Fn(u64) + Send + Sync> = {
+            let inner = inner.clone();
+            let tid = tid.clone();
+            Arc::new(move |done| {
+                let mut tasks = inner.tasks.lock();
+                if let Some(t) = tasks.get_mut(&tid) {
+                    if t.gen == gen && t.epoch == epoch {
+                        t.done = t.done.max(done.min(t.total));
+                    }
+                }
+            })
+        };
+
+        match download_dynamic(
+            client,
+            &part,
+            total,
+            min_split,
+            &mirrors,
+            &headers,
+            limiter.clone(),
+            Some(inner.mirror_scores.clone()),
+            sequential,
+            Some(ledger_handle),
+            Some(pause_flag),
+            Some(progress),
+        )
+        .await
+        {
+            Ok(DynamicOutcome::Paused) => {
+                // 真暂停退出：pause() 已置状态，在飞段已收尾并记账；
+                // 不得对未完整文件做校验/落位。
+                return;
+            }
+            Ok(DynamicOutcome::Completed) => {
+                // finalize 前检查 gen/epoch：换源/续传重入已发生 → 本循环结果作废
                 let still_current = inner
                     .tasks
                     .lock()
                     .get(&tid)
-                    .map(|t| t.gen == gen)
+                    .map(|t| t.gen == gen && t.epoch == epoch)
                     .unwrap_or(false);
                 if !still_current {
                     return;
                 }
-                // 整流路径：长度未知（probe 无 content-length）→ 以下载实际大小为准
-                let mut total = total;
-                if !range_supported && total == 0 {
-                    total = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-                    if let Some(t) = inner.tasks.lock().get_mut(&tid) {
-                        t.total = total;
-                    }
-                }
-                // 段全部落位 → 校验（sha256 或备用源 md5；均未提供 → 不校验直接落位）
+                // 段全部落位 → 校验（E25 主源 sha256/sha1/md5 择一 + 备用源 md5；
+                // 均未提供 → 不校验直接落位）
                 let dest = dest_of(&inner, &tid);
-                let verify_result = match (&sha256, &md5) {
-                    (Some(expected), _) => verify_file(&part, expected),
-                    (None, Some(expected)) => verify_file_md5(&part, expected),
-                    (None, None) => Ok(true),
+                let verify_result = match (&sha256, &sha1, &md5) {
+                    (Some(expected), _, _) => verify_file(&part, expected),
+                    (None, Some(expected), _) => verify_file_sha1(&part, expected),
+                    (None, None, Some(expected)) => verify_file_md5(&part, expected),
+                    (None, None, None) => Ok(true),
                 };
                 match verify_result {
                     Ok(true) => {
@@ -205,8 +744,8 @@ async fn download_loop(
                         match finalize_part(&part, &dest, total) {
                             Ok(()) => {
                                 cleanup_old_parts(&dest, gen);
-                                // 落位完成 → 清理续传凭据（.part 已移动，etag 副文件删除）
-                                let _ = std::fs::remove_file(resume::part_etag_path(&part));
+                                // 落位完成 → 清理续传凭据（.part 已改名，etag 副文件 + 段账本删除）
+                                remove_credentials(&part);
                                 finish(&inner, &tid, EngineState::Completed, None);
                             }
                             Err(e) => finish(&inner, &tid, EngineState::Error, Some(e)),
@@ -221,7 +760,7 @@ async fn download_loop(
                             t.verify_attempts
                         };
                         if attempts <= 1 {
-                            // 重下 1 次：作废 .part（含 etag 副文件）
+                            // 重下 1 次：作废 .part（含 etag 副文件 + 段账本）
                             remove_part(&part);
                             continue;
                         }
@@ -234,10 +773,29 @@ async fn download_loop(
                         if let (Some(bu), false) = (&backup_url, backup_used) {
                             let mut tasks = inner.tasks.lock();
                             let t = tasks.get_mut(&tid).unwrap();
+                            // 归因评分（E3）：唯一源两次校验失败 → 中毒直达下限（比段
+                            // 传输失败更强的证据，跨任务避雷）；多候选集体失败无法
+                            // 归因单一源（段可能混流）→ 不评分。
+                            if t.mirrors.len() == 1 {
+                                let bad = t.mirrors[0].clone();
+                                update_score(&inner.mirror_scores, &bad, SCORE_MIN);
+                            }
+                            // 播种轮换池（E3）：旧表多候选 → 备用源也失败后仍可逐一
+                            // 隔离试错（评分降序，排除备用源自身）；单候选表无隔离
+                            // 价值——它刚以唯一源身份整体失败两次。
+                            if t.rotate_pool.is_empty() && t.mirrors.len() > 1 {
+                                let mut pool: Vec<String> =
+                                    t.mirrors.iter().filter(|u| *u != bu).cloned().collect();
+                                {
+                                    let scores = inner.mirror_scores.lock();
+                                    pool.sort_by_key(|u| -scores.get(u).copied().unwrap_or(0));
+                                }
+                                t.rotate_pool = pool;
+                            }
                             t.backup_used = true;
                             t.mirrors = vec![bu.clone()];
-                            t.offset = 0; // 备用源可能是不同文件 → 全量重下
                             t.sha256 = None;
+                            t.sha1 = None;
                             t.md5 = backup_md5.clone();
                             t.verify_attempts = 0;
                             t.error = None;
@@ -247,8 +805,47 @@ async fn download_loop(
                             remove_part(&part);
                             continue;
                         }
-                        // 备用源也失败（或未配置）→ 降级接受 + 告警（Q-B5）
-                        let warn = if md5.is_some() {
+                        // 隔离试错轮换（E3）：池空且当前表多候选 → 播种（评分降序）；
+                        // 池非空 → 弹出下一候选，以唯一源身份完整重下重校验。
+                        // 归因评分同上：唯一源两次校验失败 → 中毒直达下限。
+                        let rotated = {
+                            let mut tasks = inner.tasks.lock();
+                            let t = tasks.get_mut(&tid).unwrap();
+                            if t.mirrors.len() == 1 {
+                                let bad = t.mirrors[0].clone();
+                                update_score(&inner.mirror_scores, &bad, SCORE_MIN);
+                            }
+                            if t.rotate_pool.is_empty() && t.mirrors.len() > 1 {
+                                let mut pool = t.mirrors.clone();
+                                {
+                                    let scores = inner.mirror_scores.lock();
+                                    pool.sort_by_key(|u| -scores.get(u).copied().unwrap_or(0));
+                                }
+                                t.rotate_pool = pool;
+                            }
+                            if t.rotate_pool.is_empty() {
+                                None
+                            } else {
+                                Some(t.rotate_pool.remove(0))
+                            }
+                        };
+                        if let Some(cand) = rotated {
+                            let mut tasks = inner.tasks.lock();
+                            let t = tasks.get_mut(&tid).unwrap();
+                            t.mirrors = vec![cand.clone()];
+                            t.verify_attempts = 0;
+                            t.error = None;
+                            t.state = EngineState::Downloading;
+                            drop(tasks);
+                            println!("ttpdl] {}: 校验失败，隔离试错轮换 → {cand}", tid);
+                            remove_part(&part);
+                            continue;
+                        }
+                        // 备用源与轮换池均耗尽（或未配置）→ 降级接受 + 告警（Q-B5）；
+                        // 告警点名当前生效算法（E25：sha256/sha1/md5 择一）
+                        let warn = if sha1.is_some() {
+                            "sha1 mismatch, accepted downgrade".to_string()
+                        } else if md5.is_some() {
                             "md5 mismatch, accepted downgrade".to_string()
                         } else {
                             "sha256 mismatch, accepted downgrade".to_string()
@@ -256,8 +853,8 @@ async fn download_loop(
                         match finalize_part(&part, &dest, total) {
                             Ok(()) => {
                                 cleanup_old_parts(&dest, gen);
-                                // 落位完成 → 清理续传凭据（.part 已移动，etag 副文件删除）
-                                let _ = std::fs::remove_file(resume::part_etag_path(&part));
+                                // 落位完成 → 清理续传凭据（.part 已改名，etag 副文件 + 段账本删除）
+                                remove_credentials(&part);
                                 finish(&inner, &tid, EngineState::Completed, Some(warn));
                                 return;
                             }
@@ -288,6 +885,19 @@ async fn download_loop(
                 if now_mirrors.as_deref() != Some(mirrors_raw.as_slice()) {
                     continue; // 换源已生效 → 用新列表重试
                 }
+                // 审计修复（P1-5）：Err 分支补 gen/epoch 守卫——500ms 窗口内
+                // resume()/set_task_proxy()（epoch+1 但 mirrors 不变）时，旧
+                // 循环不得把正在跑的新循环任务标 Error（auto-retry/事件链会
+                // 误响应）。Ok 分支 finalize 前已有同款 still_current 检查。
+                let still_current = inner
+                    .tasks
+                    .lock()
+                    .get(&tid)
+                    .map(|t| t.gen == gen && t.epoch == epoch)
+                    .unwrap_or(false);
+                if !still_current {
+                    return;
+                }
                 finish(&inner, &tid, EngineState::Error, Some(e));
                 return;
             }
@@ -308,8 +918,23 @@ fn finish(inner: &Arc<EngineInner>, tid: &str, state: EngineState, error: Option
     let mut tasks = inner.tasks.lock();
     if let Some(t) = tasks.get_mut(tid) {
         t.state = state;
-        t.done = t.total;
         t.error = error;
+        // done 不再强设 total（P4）：进度由账本回调单调维护，
+        // Error 退出时保留真实进度供 status 透出。
+    }
+}
+
+/// URL 路径末段（E4 弱信号文件名候选；E31 probe 预览同源复用）：剥 query/hash，
+/// 空段（目录型 URL）→ None。不做 percent-decode（避免双重解码；服务端真名
+/// 由 CD 路径负责）。
+pub fn url_basename(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let base = path.trim_end_matches('/').rsplit('/').next()?;
+    let base = base.trim();
+    if base.is_empty() {
+        None
+    } else {
+        Some(base.to_string())
     }
 }
 
@@ -337,16 +962,38 @@ fn part_path_of(dest: &Path, gen: u64) -> PathBuf {
     }
 }
 
-/// 删除 .part 及其 ETag 副文件（作废重下/清理共用）。
-fn remove_part(part: &Path) {
-    let _ = std::fs::remove_file(part);
-    let _ = std::fs::remove_file(resume::part_etag_path(part));
+/// 删除续传凭据（etag 副文件 + 段账本；.part 本体不动——finalize 改名后仅凭据残留）。
+fn remove_credentials(part: &Path) {
+    let _ = std::fs::remove_file(ledger::etag_sidecar_path(part));
+    ledger::remove(&ledger::ledger_path(part));
 }
 
-/// finalize 成功后清理旧代次的 .part（gen0 的 `<dest>.part` 或上一 gen）。
+/// 删除 .part 及其全部续传凭据（作废重下/清理共用）。
+fn remove_part(part: &Path) {
+    let _ = std::fs::remove_file(part);
+    remove_credentials(part);
+}
+
+/// 审查修复（P1）：delete_data=true 的落盘清理——dest 本体 + 各代次 .part
+/// 加全部续传凭据（etag 副文件/段账本/HLS/DASH ledger）。换源残留的旧代次
+/// part 一并回收（gen0 常态 + 1..=3 防御性枚举，cleanup_old_parts 最多留一代）。
+fn delete_task_files(dest: &Path) {
+    let _ = std::fs::remove_file(dest);
+    for g in 0..=3u64 {
+        let part = part_path_of(dest, g);
+        if !part.exists() {
+            continue;
+        }
+        let _ = std::fs::remove_file(crate::hls::hls_ledger_path(&part));
+        let _ = std::fs::remove_file(crate::dash::dash_ledger_path(&part));
+        remove_part(&part);
+    }
+}
+
+/// finalize 成功后清理旧代次的 .part 及其凭据（gen0 的 `<dest>.part` 或上一 gen）。
 fn cleanup_old_parts(dest: &Path, gen: u64) {
     if gen > 0 {
-        let _ = std::fs::remove_file(part_path_of(dest, gen - 1));
+        remove_part(&part_path_of(dest, gen - 1));
     }
 }
 
@@ -373,58 +1020,277 @@ impl DownloadEngine for HttpEngine {
     }
 
     async fn add(&self, task: &DownloadTask) -> Result<EngineTaskId, EngineError> {
-        let (url, headers, backup_url) = match &task.source {
+        let (url, headers, backup_url, proxy) = match &task.source {
             DownloadSource::Http {
                 url,
                 headers,
                 backup_url,
+                proxy,
                 ..
-            } => (url.clone(), headers.clone(), backup_url.clone()),
+            } => (
+                url.clone(),
+                headers.clone(),
+                backup_url.clone(),
+                proxy.clone(),
+            ),
             _ => return Err(EngineError::Other("source is not http".to_string())),
         };
-        let probe = probe_range(&self.client, &url, &headers).await?;
-        let total = probe.total.unwrap_or(0);
-
-        let rel = task
-            .metadata
-            .name
-            .clone()
-            .unwrap_or_else(|| "download.bin".to_string());
-        // 安全修复（V3）：任务名可能来自恶意 torrent/远端，join 前必须净化
-        // （拒 `..` / 绝对路径 / 盘符前缀），非法即拒任务。
-        let rel_pb = smart_dl_core::session::output::sanitize_rel(&rel)
-            .map_err(|e| EngineError::Other(e.to_string()))?;
-        let dest = task.dest_root.join(&rel_pb);
-        // 断点续传（#4）：.part 存在 → 探测+决策 → 从偏移续传或作废重下；
-        // 探测到的 ETag 持久化到 `<part>.etag` 供下次决策。
-        // P0 动态分段：只记录续传起点 offset，段由 SegmentManager 动态领取。
-        let part0 = part_path_of(&dest, 0);
-        let offset = if part0.exists() {
-            let part_len = std::fs::metadata(&part0).map(|m| m.len()).unwrap_or(0);
-            let part_etag = resume::read_part_etag(&part0);
-            match resume::decide_resume(part_len, part_etag.as_deref(), &probe) {
-                resume::ResumeDecision::ContinueFrom(off) => {
+        // E5 任务级代理：探测/下载全链均走任务专用 client（Some(proxy) 时）。
+        // 任务级代理的意义正是「只有代理可达源」——探测若用共享 client 直连，
+        // 代理专属源会在 add 时误判死亡。client 构建失败 → 任务拒绝（daemon
+        // 层已校验，此处同一函数再拦，双保险）。
+        let client = match &proxy {
+            Some(p) => build_proxied_client(p)
+                .map_err(|e| EngineError::Other(format!("任务级 proxy client 构建失败: {e}")))?,
+            None => self.client.clone(),
+        };
+        // C-HLS 分流：.m3u8 URL → HLS VOD 下载（不走 Range 探测/分段链——
+        // 清单是文本，total/Range 语义无意义）。备用源对 HLS 无意义（清单
+        // 内部自带段 URL），backup_url 静默忽略。落盘名：显式名 → 派生
+        // `<清单名>.ts`（sanitize_rel 终审）→ 兑底 download.ts。
+        if hls::is_hls_url(&url) {
+            let rel_pb: String = match &task.metadata.name {
+                Some(rel) => smart_dl_core::session::output::sanitize_rel(rel)
+                    .map_err(|e| EngineError::Other(e.to_string()))?
+                    .to_string_lossy()
+                    .into_owned(),
+                None => hls::derive_ts_name(&url).unwrap_or_else(|| "download.ts".to_string()),
+            };
+            let dest = task.dest_root.join(&rel_pb);
+            let resolved_name = rel_pb;
+            let tid = task.id.clone();
+            {
+                let mut tasks = self.inner.tasks.lock();
+                tasks.insert(
+                    tid.clone(),
+                    HttpTask {
+                        headers: headers.clone(),
+                        mirrors: vec![url.clone()],
+                        etag: None,
+                        last_modified: None,
+                        dest,
+                        state: EngineState::Downloading,
+                        done: 0,
+                        total: 0,
+                        rate: RateSample::default(),
+                        error: None,
+                        sha256: None,
+                        sha1: None,
+                        md5: None,
+                        verify_attempts: 0,
+                        backup_url: None,
+                        backup_md5: None,
+                        backup_used: false,
+                        rotate_pool: Vec::new(),
+                        gen: 0,
+                        epoch: 1,
+                        pause: Arc::new(AtomicBool::new(false)),
+                        limit_kb_s: None,
+                        sequential: task.sequential,
+                        proxy,
+                        resolved_name: Some(resolved_name),
+                        stream: StreamKind::Hls,
+                        range_supported: true,
+                    },
+                );
+            }
+            self.spawn_stream_loop(tid.clone(), 1);
+            return Ok(tid);
+        }
+        // C-DASH 分流：.mpd URL → DASH static VOD 下载（与 HLS 同哲学：清单
+        // 是文本，total/Range 语义无意义；MPD 解析失败/明确拒绝面在下载循环
+        // 内落 Error）。备用源对 DASH 无意义（清单自带段 URL），静默忽略。
+        // 落盘名：显式名 → 派生 `<清单名>.mp4`（sanitize_rel 终审）→ 兕底
+        // download.mp4。
+        if dash::is_dash_url(&url) {
+            let rel_pb: String = match &task.metadata.name {
+                Some(rel) => smart_dl_core::session::output::sanitize_rel(rel)
+                    .map_err(|e| EngineError::Other(e.to_string()))?
+                    .to_string_lossy()
+                    .into_owned(),
+                None => dash::derive_mp4_name(&url).unwrap_or_else(|| "download.mp4".to_string()),
+            };
+            let dest = task.dest_root.join(&rel_pb);
+            let resolved_name = rel_pb;
+            let tid = task.id.clone();
+            {
+                let mut tasks = self.inner.tasks.lock();
+                tasks.insert(
+                    tid.clone(),
+                    HttpTask {
+                        headers: headers.clone(),
+                        mirrors: vec![url.clone()],
+                        etag: None,
+                        last_modified: None,
+                        dest,
+                        state: EngineState::Downloading,
+                        done: 0,
+                        total: 0,
+                        rate: RateSample::default(),
+                        error: None,
+                        sha256: None,
+                        sha1: None,
+                        md5: None,
+                        verify_attempts: 0,
+                        backup_url: None,
+                        backup_md5: None,
+                        backup_used: false,
+                        rotate_pool: Vec::new(),
+                        gen: 0,
+                        epoch: 1,
+                        pause: Arc::new(AtomicBool::new(false)),
+                        limit_kb_s: None,
+                        sequential: task.sequential,
+                        proxy,
+                        resolved_name: Some(resolved_name),
+                        stream: StreamKind::Dash,
+                        range_supported: true,
+                    },
+                );
+            }
+            self.spawn_stream_loop(tid.clone(), 1);
+            return Ok(tid);
+        }
+        // 探测韧性（与 update_sources 并发探测同批）：主源探测失败且配置了备用源
+        // → 改用备用源建任务（身份切换与运行时“主源校验失败切备用源”同语义：
+        // sha256 → None、md5 ← backup_md5、backup_used = true 防运行时重复切换）。
+        // 双源均失败 → 返回双错（任务拒绝，同原语义）；无备用源 → 原样返回首错。
+        let mut fell_back_to: Option<String> = None;
+        let probe = match probe_range(&client, &url, &headers).await {
+            Ok(p) => p,
+            Err(primary_err) => match &backup_url {
+                Some(bu) => {
                     println!(
-                        "[httpdl] 断点续传 {}: 从偏移 {off} 继续 (part_len={part_len})",
+                        "[httpdl] {}: 主源探测失败（{primary_err}），尝试备用源",
                         task.id
                     );
-                    off
+                    match probe_range(&client, bu, &headers).await {
+                        Ok(p) => {
+                            fell_back_to = Some(bu.clone());
+                            p
+                        }
+                        Err(backup_err) => {
+                            return Err(EngineError::Other(format!(
+                                "主源与备用源探测均失败: {primary_err} / {backup_err}"
+                            )));
+                        }
+                    }
                 }
-                resume::ResumeDecision::Restart => {
-                    println!("[httpdl] 断点续传 {}: .part 不可信，作废重下", task.id);
+                None => return Err(primary_err),
+            },
+        };
+        let total = probe.total.unwrap_or(0);
+
+        // E24 多源并行：主源探测成功且配置备用源 → 备用源也探测；双源均为
+        // **强 ETag 且相等**（服务器生成的内容指纹一致，跨源内容混拼的安全性
+        // 证据，严于 aria2 的无条件多源）且 Range/总长一致 → mirrors 双源
+        // 起步（worker 轮转分摊段，段失败仍逐源回退；校验链不变——内容同质，
+        // 主源身份照用）。其余情形（弱/缺 ETag/不一致/备用源探测失败）保持
+        // 单源 + 兑底语义，零行为变化。探测仅 1 字节 Range 请求，时序成本
+        // 可忽略（兑底路径本就串行探测备用源）。
+        let dual_mirrors = if fell_back_to.is_none() {
+            if let Some(bu) = &backup_url {
+                match probe_range(&client, bu, &headers).await {
+                    Ok(bp) if multi_source_ok(&probe, &bp) => {
+                        println!(
+                            "[httpdl] {}: 双源同质（强 ETag 相等），多源并行下载启用",
+                            task.id
+                        );
+                        Some(vec![url.clone(), bu.clone()])
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 落盘名决策（E4）：
+        // - 用户显式名（metadata.name）→ 权威，非法即拒任务（V3 语义不变）；
+        // - 未提供 → 自动派生链：探测响应 Content-Disposition 文件名（服务端
+        //   声明最权威，含 RFC 5987 解码与目录成分剥离）→ URL 末段（弱信号，
+        //   与 FTP 引擎同语义）→ "download.bin" 兜底。派生候选经 sanitize_rel
+        //   终审，失败则逐级跳过（远端可控字段不得拒杀任务/制造穿越）。
+        let rel_pb = match &task.metadata.name {
+            Some(rel) => smart_dl_core::session::output::sanitize_rel(rel)
+                .map_err(|e| EngineError::Other(e.to_string()))?,
+            None => {
+                let mut chosen = std::path::PathBuf::from("download.bin");
+                let url_cand = url_basename(&url);
+                let candidates = probe.filename.iter().chain(url_cand.iter());
+                for cand in candidates {
+                    if let Ok(pb) = smart_dl_core::session::output::sanitize_rel(cand) {
+                        chosen = pb;
+                        break;
+                    }
+                }
+                chosen
+            }
+        };
+        let dest = task.dest_root.join(&rel_pb);
+        // E9：决策结果回显（显式名/派生名同口径）——daemon 轮询回填 metadata.name
+        let resolved_name = rel_pb.to_string_lossy().into_owned();
+        // 断点续传（P4 段账本版）：`<dest>.part` + `<dest>.part.progress` 账本为
+        // 唯一可信进度凭据。预分配 .part 的文件长度恒等于 total，不可作为进度
+        // 证据（G1：空洞文件假完成）；ETag 失配即作废（G2：混合内容文件）。
+        let part0 = part_path_of(&dest, 0);
+        let mut resume_done: Vec<(u64, u64)> = Vec::new();
+        if total == 0 {
+            // 未知长度（探测无 Content-Length/Content-Range）：无法分段，
+            // 旧凭据不可用（同 legacy 语义：无 total 不续传）
+            remove_part(&part0);
+        } else if part0.exists() {
+            let part_len = std::fs::metadata(&part0).map(|m| m.len()).unwrap_or(0);
+            let ld = ledger::load(&ledger::ledger_path(&part0));
+            match ledger::decide(part_len, ld.as_ref(), &probe) {
+                ledger::ResumeDecision::Resume { done, .. } => {
+                    println!(
+                        "[httpdl] 断点续传 {}: 恢复 {} 个已完成段（{}/{} 字节）",
+                        task.id,
+                        done.len(),
+                        done.iter().map(|(s, e)| e - s + 1).sum::<u64>(),
+                        total
+                    );
+                    resume_done = done;
+                }
+                ledger::ResumeDecision::Restart => {
+                    println!("[httpdl] 断点续传 {}: 凭据不可信，作废重下", task.id);
                     remove_part(&part0);
-                    0
                 }
             }
         } else {
-            0
-        };
-        resume::write_part_etag(&part0, probe.etag.as_deref());
-        let (sha256, backup_md5) = match &task.identity {
+            // 无 .part：清理孤儿凭据（上次 finalize 中断残留）
+            remove_credentials(&part0);
+        }
+        let done0: u64 = resume_done.iter().map(|(s, e)| e - s + 1).sum();
+        let (sha256, sha1, md5_primary, backup_md5) = match &task.identity {
             ContentIdentity::SingleFile {
-                sha256, backup_md5, ..
-            } => (sha256.clone(), backup_md5.clone()),
-            _ => (None, None),
+                sha256,
+                sha1,
+                md5,
+                backup_md5,
+                ..
+            } => (
+                sha256.clone(),
+                sha1.clone(),
+                md5.clone(),
+                backup_md5.clone(),
+            ),
+            _ => (None, None, None, None),
+        };
+        // 探测韧性初始化：主源失败已落备用源 → mirrors 以备用源起步，身份切换
+        // （sha256/sha1 → None / md5 ← backup_md5）与运行时切备用源完全同语义；
+        // backup_used = true —— 运行时再遇校验失败不再重复切向同一备用源。
+        // E24：双源同质门控通过 → 双 mirrors（身份仍为主源口径，内容一致）。
+        let (init_mirrors, init_sha256, init_sha1, init_md5, init_backup_used) = match &fell_back_to
+        {
+            Some(bu) => (vec![bu.clone()], None, None, backup_md5.clone(), true),
+            None => match dual_mirrors {
+                Some(m) => (m, sha256, sha1, md5_primary, false),
+                None => (vec![url.clone()], sha256, sha1, md5_primary, false),
+            },
         };
 
         let tid = task.id.clone();
@@ -434,63 +1300,255 @@ impl DownloadEngine for HttpEngine {
                 tid.clone(),
                 HttpTask {
                     headers,
-                    mirrors: vec![url.clone()],
+                    mirrors: init_mirrors,
                     etag: probe.etag.clone(),
+                    last_modified: probe.last_modified.clone(),
                     dest,
-                    offset,
                     state: EngineState::Downloading,
-                    done: 0,
+                    done: done0,
                     total,
+                    rate: RateSample::default(),
                     error: None,
-                    sha256,
-                    md5: None,
+                    sha256: init_sha256,
+                    sha1: init_sha1,
+                    md5: init_md5,
                     verify_attempts: 0,
                     backup_url,
                     backup_md5,
-                    backup_used: false,
+                    backup_used: init_backup_used,
+                    rotate_pool: Vec::new(),
                     gen: 0,
+                    epoch: 1,
+                    pause: Arc::new(AtomicBool::new(false)),
+                    limit_kb_s: None,
+                    sequential: task.sequential,
+                    proxy,
+                    resolved_name: Some(resolved_name),
+                    stream: StreamKind::Plain,
                     range_supported: probe.range_supported,
                 },
             );
         }
-        self.spawn_download(tid.clone(), 0);
+        self.spawn_download(tid.clone(), 0, 1);
         Ok(tid)
     }
 
+    /// 真暂停（P4）：置位暂停标志 → worker 在段边界退出（在飞段收尾即止，
+    /// 最多延迟一个段长）；下载循环见 Paused 结局后直接返回，不对未完整
+    /// 文件做校验/落位。进度凭据（段账本）已随段完成逐段落盘。
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError> {
         let mut tasks = self.inner.tasks.lock();
         let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
+        t.pause.store(true, Ordering::SeqCst);
         t.state = EngineState::Paused;
         Ok(())
     }
 
+    /// 真恢复（P4）：清暂停标志 + epoch+1 无条件 spawn 新循环（从段账本
+    /// 恢复已完成段）。旧循环（若仍在收尾）在下一 gen/epoch 检查点自杀，
+    /// 且永不 finalize。
+    /// batch6-P0：对运行中（Downloading）任务的 resume 不再重 spawn——
+    /// 旧实现无条件 epoch+1 + 新循环，普通路径幂等重复写同偏移同内容，
+    /// 但流式路径是 append 写（非定偏移），双写者 = 静默损坏交付（与 FTP
+    /// batch3-P0 同类；FTP 侧 was_paused 闸门已修，HTTP 侧此补齐）。运行
+    /// 中 = 无操作（幂等语义）；其余状态（Paused/Error 等）照旧重入。
     async fn resume(&self, id: &EngineTaskId) -> Result<(), EngineError> {
-        let mut tasks = self.inner.tasks.lock();
-        let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
-        t.state = EngineState::Downloading;
+        let (gen, epoch, stream_kind) = {
+            let mut tasks = self.inner.tasks.lock();
+            let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
+            if t.state == EngineState::Downloading {
+                return Ok(());
+            }
+            t.pause.store(false, Ordering::SeqCst);
+            t.state = EngineState::Downloading;
+            t.epoch += 1;
+            (t.gen, t.epoch, t.stream)
+        };
+        // C-HLS/C-DASH：流式任务 resume 走流式循环（清单重拉 + 段账本续传），
+        // 其余照旧
+        if stream_kind != StreamKind::Plain {
+            self.spawn_stream_loop(id.clone(), epoch);
+        } else {
+            self.spawn_download(id.clone(), gen, epoch);
+        }
         Ok(())
     }
 
     async fn status(&self, id: &EngineTaskId) -> Result<EngineStatus, EngineError> {
-        let tasks = self.inner.tasks.lock();
-        let t = tasks.get(id).ok_or(EngineError::NotFound)?;
+        let mut tasks = self.inner.tasks.lock();
+        let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
+        let down_rate = t.rate.sample(t.done);
         Ok(EngineStatus {
             state: t.state,
             metadata_received: true,
             files: vec![],
             total_done: t.done,
             total: t.total,
-            down_rate: 0,
+            down_rate,
             up_rate: 0,
+            // E33：HTTP 单向引擎无累计统计口径，恒 0（快照序列化省略）
+            total_downloaded: 0,
+            total_uploaded: 0,
             num_peers: 0,
             num_seeds: 0,
             error: t.error.clone(),
+            name: t.resolved_name.clone(),
         })
     }
 
     async fn remove(&self, id: &EngineTaskId, _delete_data: bool) -> Result<(), EngineError> {
+        // 先取暂停标志快照并置位：在飞 worker 在段边界尽快退出，
+        // 不再向已移除任务的 .part 继续写入。
+        let (pause_flag, dest) = {
+            let mut tasks = self.inner.tasks.lock();
+            let t = tasks.remove(id).ok_or(EngineError::NotFound)?;
+            let dest = _delete_data.then(|| t.dest.clone());
+            (Some(t.pause.clone()), dest)
+        };
+        if let Some(f) = pause_flag {
+            f.store(true, Ordering::SeqCst);
+        }
+        // 限速器条目随任务清理（防泄漏）。
+        self.inner.limiters.lock().remove(id);
+        // 审查修复（P1）：delete_data=true 端到端生效（daemon remove 契约
+        // 「删落盘文件」）——dest 本体 + 各代次 .part + 全部续传凭据。
+        if let Some(dest) = dest {
+            delete_task_files(&dest);
+        }
+        Ok(())
+    }
+
+    /// 任务级下载限速（trait 扩展）。任务专属 limiter 登记进 limiters 表，
+    /// 已持有的 Arc 热调速率 → 运行中的 chunk 立即按新速率节流，无需重启循环。
+    /// 仅 down 方向有意义：up 请求被显式拒绝（HTTP/FTP 无上传概念）。
+    async fn set_limits(
+        &self,
+        id: &EngineTaskId,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<(), EngineError> {
+        if up_kb_s.is_some() {
+            return Err(EngineError::Other(
+                "HTTP/FTP 引擎无上传方向，up_kb_s 不适用".to_string(),
+            ));
+        }
+        let Some(kb) = down_kb_s else { return Ok(()) }; // 双 None = no-op
+                                                         // 任务必须存在（不存在 → NotFound；remove 后迟到请求同理）
+        {
+            let mut tasks = self.inner.tasks.lock();
+            if !tasks.contains_key(id) {
+                return Err(EngineError::NotFound);
+            }
+            // 配置回显记到任务快照上（审计/透出口径）
+            if let Some(t) = tasks.get_mut(id) {
+                t.limit_kb_s = Some(kb);
+            }
+        }
+        let mut limiters = self.inner.limiters.lock();
+        match limiters.get(id) {
+            Some(lim) => lim.set_rate_kb_s(kb), // 已有限速器 → 原地热调
+            None => {
+                // E16：任务级 limiter 串联引擎全局（上游）——总阀门对任务级
+                // 限速任务同样生效（任务级不限 ≠ 绕过总阀门）。
+                limiters.insert(
+                    id.clone(),
+                    Arc::new(RateLimiter::new_chained(kb, &self.limiter)),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// 引擎全局限速热改（E16 trait 扩展）：热调引擎全局 limiter——所有未
+    /// 登记任务级限速的任务立即按新速率节流；任务级限速任务经链式上游
+    /// 同样受约束。仅 down 方向有意义：up 请求被显式拒绝（HTTP/FTP 无上传）。
+    async fn set_global_limits(
+        &self,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<(), EngineError> {
+        if up_kb_s.is_some() {
+            return Err(EngineError::Other(
+                "HTTP/FTP 引擎无上传方向，up_kb_s 不适用".to_string(),
+            ));
+        }
+        if let Some(kb) = down_kb_s {
+            self.limiter.set_rate_kb_s(kb);
+        }
+        Ok(())
+    }
+
+    /// 任务级顺序下载开关（trait 扩展）。语义：字段改写，下一次重下轮
+    /// （换源 / 校验失败 / 续传轮）拾取；运行中的当前轮不变（收尾在飞段）。
+    /// 新建任务在 add() 直接读 task.sequential → 立即生效。
+    async fn set_sequential(&self, id: &EngineTaskId, on: bool) -> Result<(), EngineError> {
         let mut tasks = self.inner.tasks.lock();
-        tasks.remove(id).ok_or(EngineError::NotFound)?;
+        match tasks.get_mut(id) {
+            Some(t) => {
+                t.sequential = on;
+                Ok(())
+            }
+            None => Err(EngineError::NotFound),
+        }
+    }
+
+    /// 任务级代理热改（E8 trait 扩展，仅 HTTP 引擎支持）。
+    ///
+    /// 语义分档：
+    /// - `Some(url)` 非法（reqwest 解析失败）→ `Other`，**不动现任务**（配置
+    ///   错误在调用方定性为入参 400，任务保持原状继续原 client 传输）。
+    /// - 下载中（`Downloading`）任务：锁内换 `proxy` 字段 + epoch+1，锁外
+    ///   `spawn_download` 重入（resume 同款路径）——新循环捕获新 client（从
+    ///   段账本恢复已完成段），旧循环在下一 gen/epoch 检查点自杀且永不
+    ///   finalize（并发收尾幂等，P4 既有收敛语义）。
+    /// - 暂停 / 终态（Completed/Error）任务：只改配置字段——下次 resume/
+    ///   spawn 自然用新 client；对已完成任务改 proxy 无传输意义但保持配置
+    ///   回显一致（审计口径：API 写了什么快照就是什么）。
+    async fn set_task_proxy(
+        &self,
+        id: &EngineTaskId,
+        proxy: Option<String>,
+    ) -> Result<(), EngineError> {
+        // 先试水新 client（非法 → 拒绝且零副作用；合法 → 构建产物即弃，
+        // spawn_download 会按任务字段重建——构建成本 ~µs 级，不值得跨锁传）
+        if let Some(p) = &proxy {
+            let _ = build_proxied_client(p).map_err(EngineError::Other)?;
+        }
+        let restart = {
+            let mut tasks = self.inner.tasks.lock();
+            let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
+            t.proxy = proxy;
+            let running = t.state == EngineState::Downloading;
+            if running {
+                t.epoch += 1;
+            }
+            running
+        };
+        if restart {
+            // 锁外取当前 gen/epoch（set 与 spawn 间无 await 点，无竞态窗口）
+            let (gen, epoch) = {
+                let tasks = self.inner.tasks.lock();
+                let t = tasks.get(id).ok_or(EngineError::NotFound)?;
+                (t.gen, t.epoch)
+            };
+            self.spawn_download(id.clone(), gen, epoch);
+        }
+        Ok(())
+    }
+
+    /// 引擎级全局代理热改（S1 设置面）：`Some(url)` = 后续新建任务走该代理
+    /// （逐任务 client 构建时合并，任务级代理仍优先）；`None` = 清除回启动
+    /// 口径（启动时已烘入共享 client 的代理不受影响）。非法 URL 试水拒绝
+    /// 零副作用（与 set_task_proxy 同语义）。存量任务不受扰（新任务生效）。
+    async fn set_global_proxy(&self, proxy: Option<&str>) -> Result<(), EngineError> {
+        let normalized = proxy
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        // 试水校验（合法 → 构建产物即弃；spawn 时按需重建，成本 µs 级）
+        if let Some(p) = &normalized {
+            let _ = build_proxied_client(p).map_err(EngineError::Other)?;
+        }
+        *self.global_proxy.write() = normalized;
         Ok(())
     }
 
@@ -507,19 +1565,75 @@ impl DownloadEngine for HttpEngine {
             return Err(EngineError::Other("empty source list".to_string()));
         }
         // 锁外探测（锁不跨 await：parking_lot guard 跨 await 会阻塞执行器）
-        let headers = {
+        // E5：探测 client 按任务级代理构建（与 add/下载循环同口径——代理专属
+        // 候选源只有经代理才可达，用共享 client 探测会误判死亡）。
+        let (headers, task_client) = {
             let tasks = self.inner.tasks.lock();
-            tasks.get(id).ok_or(EngineError::NotFound)?.headers.clone()
+            let t = tasks.get(id).ok_or(EngineError::NotFound)?;
+            let client = match &t.proxy {
+                Some(p) => build_proxied_client(p).map_err(EngineError::Other)?,
+                None => self.client.clone(),
+            };
+            (t.headers.clone(), client)
         };
-        let probe = probe_range(&self.client, &urls[0], &headers).await?;
+        // 并发探测全部候选源（源探测韧性）：原实现只探 urls[0]，首个候选死即
+        // 整表拒绝——尽管下载循环本可逐段轮换到其余存活源。现改为：任一候选
+        // 探测成功 → 安装全表（etag 决策取输入序首个成功，确定性与单探一致）；
+        // 全失败 → 返回首错（拒绝语义保留）。探测结果播种 mirror 评分
+        // （成功 +1 / 失败 -1，与段评分同 clamp 口径）→ 后续段调度
+        // （分数降序稳定排序）自动优先存活/健康源，死源沉底。
+        let mut probes = tokio::task::JoinSet::new();
+        for u in &urls {
+            let client = task_client.clone();
+            let u = u.clone();
+            let headers = headers.clone();
+            probes.spawn(async move {
+                let r = probe_range(&client, &u, &headers).await;
+                (u, r)
+            });
+        }
+        let mut by_url: HashMap<String, Result<Probe, EngineError>> = HashMap::new();
+        let mut join_errs: Vec<String> = Vec::new();
+        while let Some(joined) = probes.join_next().await {
+            match joined {
+                Ok((u, r)) => {
+                    by_url.insert(u, r);
+                }
+                Err(je) => join_errs.push(je.to_string()), // 探测任务 panic（不预期）；无 url 可归因
+            }
+        }
+        let probe = urls
+            .iter()
+            .find_map(|u| by_url.get(u).and_then(|r| r.as_ref().ok()).cloned())
+            .ok_or_else(|| {
+                urls.iter()
+                    .find_map(|u| by_url.get(u).and_then(|r| r.as_ref().err()).cloned())
+                    .unwrap_or_else(|| {
+                        EngineError::Other(format!("all source probes failed: {join_errs:?}"))
+                    })
+            })?;
+        // 评分播种：按输入序去重（重复 url 只计一次，避免重复加/扣分）
+        {
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for u in &urls {
+                if !seen.insert(u.as_str()) {
+                    continue;
+                }
+                let ok = by_url.get(u).is_some_and(|r| r.is_ok());
+                update_score(&self.inner.mirror_scores, u, if ok { 1 } else { -1 });
+            }
+        }
 
         let mut tasks = self.inner.tasks.lock();
         let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
+        if t.stream != StreamKind::Plain {
+            return Err(EngineError::Unsupported);
+        }
         let etag_changed = probe.etag.is_some() && t.etag.is_some() && probe.etag != t.etag;
         if etag_changed {
             // 新源内容变了 → 旧代次 .part 作废，重下（Q-B5：ETag 为准）。
             // gen+1 → 新循环用 `<dest>.<gen>.part`，与旧循环写隔离。
-            let _ = std::fs::remove_file(part_path_of(&t.dest, t.gen));
+            remove_part(&part_path_of(&t.dest, t.gen));
             t.done = 0;
             t.verify_attempts = 0;
             t.state = EngineState::Downloading;
@@ -527,17 +1641,23 @@ impl DownloadEngine for HttpEngine {
             t.gen += 1; // 废弃旧下载循环
         }
         t.mirrors = urls.clone();
+        // 新候选宇宙 → 轮换池重置（E3：旧池候选集合已过时）
+        t.rotate_pool.clear();
         if let Some(e) = &probe.etag {
             t.etag = Some(e.clone());
         }
-        let (spawn, new_gen) = if etag_changed {
-            (true, t.gen)
+        // E26：Last-Modified 与 etag 同口径（探测有则更新，账本随写随持久化）
+        if let Some(lm) = &probe.last_modified {
+            t.last_modified = Some(lm.clone());
+        }
+        let (spawn, new_gen, epoch) = if etag_changed {
+            (true, t.gen, t.epoch)
         } else {
-            (false, 0)
+            (false, 0, 0)
         };
         drop(tasks);
         if spawn {
-            self.spawn_download(id.clone(), new_gen);
+            self.spawn_download(id.clone(), new_gen, epoch);
         }
         Ok(())
     }

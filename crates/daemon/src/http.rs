@@ -1,26 +1,31 @@
 //! HTTP API（axum，M6）：任务 CRUD + 快照 + Provider 运行态 + WS 升级端点（M7）。
 
+use crate::events::{known_event_type_labels, Envelope};
 #[cfg(feature = "nas")]
 use crate::nas;
 use crate::state::{DaemonError, DaemonState};
 use crate::ws::Throttler;
-#[cfg(feature = "nas")]
+// E10：list_events 返回 Response；原仅 nas 使用，现两 feature 均用 → 提出 cfg。
 use axum::response::Response;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Query, State,
     },
-    http::{header, StatusCode},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
     middleware::{self, Next},
-    response::IntoResponse,
-    routing::{get, post},
+    response::{sse::Event as SseEvent, IntoResponse, Sse},
+    routing::{delete, get, post},
     Json, Router,
 };
 use base64::Engine as _;
 use serde::Deserialize;
+use std::collections::VecDeque;
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use crate::state::{known_engine_labels, known_state_labels, BatchAction, ListQuery};
 
 #[derive(Deserialize)]
 pub struct AddTaskReq {
@@ -28,9 +33,180 @@ pub struct AddTaskReq {
     pub url: Option<String>,
     #[serde(default)]
     pub dest: Option<String>,
-    /// .torrent 文件内容（标准 base64）。与 `url` 二选一，优先 torrent。
+    /// .torrent 文件内容（标准 base64）。与 `url`/`metalink_b64` 三选一，
+    /// 优先级 torrent > metalink > url。
     #[serde(default)]
     pub torrent_b64: Option<String>,
+    /// Metalink4 描述文件内容（B1，RFC 5854 XML，UTF-8，标准 base64）。
+    /// 与 `url`/`torrent_b64` 三选一；解析后逐 `<file>` 展开为 HTTP 任务
+    /// （主 URL + 次高 priority 备源 + 内建哈希直通校验链）。
+    /// 响应含 `task_ids`/`count`（`task_id` = 首个，向后兼容单任务语义）。
+    #[serde(default)]
+    pub metalink_b64: Option<String>,
+    /// 任务级下载限速 KiB/s（0 = 不限；缺省 = 走全局）。任务创建成功后应用。
+    #[serde(default)]
+    pub down_kb_s: Option<u32>,
+    /// 任务级上传限速 KiB/s（仅 BT 任务；0 = 不限）。
+    #[serde(default)]
+    pub up_kb_s: Option<u32>,
+    /// 顺序下载（边下边播）。HTTP = 在飞段窗口收紧；BT = sequential_download
+    /// flag；缺省 = 默认并行策略。
+    #[serde(default)]
+    pub sequential: bool,
+    /// 任务级代理 URL（E5，仅 HTTP 任务生效）：`http(s)://` / `socks5://` /
+    /// `socks4://`，可带 `user:pass@`；缺省 = 走全局 `[download] proxy`（若有）。
+    /// 非法代理 URL → 400；BT/FTP 任务携带此字段被忽略。
+    #[serde(default)]
+    pub proxy: Option<String>,
+    /// 任务级自定义请求头（E6，仅 HTTP 任务生效）：随探测与全部段请求下发
+    /// （H-8 链路）；典型用途 Referer/Cookie 反防盗链。BT/FTP 任务忽略。
+    #[serde(default)]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+    /// HTTP Basic 认证用户名（E6，仅 HTTP 任务生效）。与 `password` 组合成
+    /// Basic 凭据；`password` 缺省 = 空串。BT/FTP 任务忽略。
+    #[serde(default)]
+    pub username: Option<String>,
+    /// HTTP Basic 认证密码（E6，仅 HTTP 任务生效；可空串）。
+    #[serde(default)]
+    pub password: Option<String>,
+    /// 主源内容校验目标（E6，仅 HTTP 任务生效）：64 位十六进制 sha256。
+    /// 传入后内容校验失败走既有处置链（重下 → 备用源 → 隔离试错 → 降级）。
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// 主源 SHA1 校验目标（E25，仅 HTTP 任务生效）：40 位十六进制。
+    /// 与 `sha256`/`md5` 互斥（同时提供多个 → 400）。
+    #[serde(default)]
+    pub sha1: Option<String>,
+    /// 主源 MD5 校验目标（E25，仅 HTTP 任务生效）：32 位十六进制。
+    /// 与 `sha256`/`sha1` 互斥（同时提供多个 → 400）。
+    #[serde(default)]
+    pub md5: Option<String>,
+    /// 备用源 URL（E6，仅 HTTP 任务生效）：主源探测/校验失败自动兜底。
+    #[serde(default)]
+    pub backup_url: Option<String>,
+    /// 备用源 md5（E6，32 位十六进制）：必须与 `backup_url` 成对提供，
+    /// 备用源内容校验目标。
+    #[serde(default)]
+    pub backup_md5: Option<String>,
+    /// 用户显式落盘名（E6，仅 HTTP 任务生效）：非法路径 → 400；
+    /// 缺省 = 引擎派生链（Content-Disposition → URL 末段 → download.bin）。
+    #[serde(default)]
+    pub name: Option<String>,
+    /// 文件冲突策略（E21，仅 HTTP 显式名任务生效）：`overwrite`（默认）/
+    /// `rename`（自动改名 name(1).ext）/ `skip`（已存在则任务直接 Completed）。
+    #[serde(default)]
+    pub conflict_policy: Option<String>,
+    /// 定时启动时刻（E23，unix 秒）：未来时刻 = 到点前不入引擎（停留 Queued），
+    /// 由 daemon 调度循环激活；缺省/0/过去时刻 = 立即开始（宽容不 400）。
+    /// 错峰（`[scheduler] start_jitter_seconds`）仅在本字段缺省时叠加。
+    /// 对 HTTP/BT-magnet/.torrent/FTP 任务全开放；xunlei import 忽略
+    /// （导入语义 = 云端已完成的存量转移）。
+    #[serde(default)]
+    pub start_at_unix: Option<u64>,
+    /// 失败自动重试次数上限（E30，仅 HTTP/FTP 任务生效）：任务失败且预算未
+    /// 用尽时按指数退避（2s/4s/8s…封顶 60s）自动重新入队；用尽后落 Failed。
+    /// 缺省/0 = 不自动重试（一次性失败语义）。BT 任务忽略（alert 驱动语义
+    /// 不同）。取值 0..=10，越界 400。
+    #[serde(default)]
+    pub auto_retry: Option<u32>,
+}
+
+/// E31 探测预览请求：不建任务，仅探测 URL 元数据（add 前预览入口）。
+#[derive(Deserialize)]
+pub struct ProbeReq {
+    /// http(s) 直链（v1 仅支持 HTTP 源预览；magnet/ed2k/ftp → 400）。
+    pub url: String,
+    /// 任务级自定义请求头（同 add `headers` 语义：随探测请求下发，典型
+    /// Referer/Cookie 反防盗链）。
+    #[serde(default)]
+    pub headers: Option<std::collections::BTreeMap<String, String>>,
+    /// 任务级代理 URL（同 add `proxy` 语义：http(s)/socks5/socks4，可带
+    /// user:pass@；非法 → 400）。
+    #[serde(default)]
+    pub proxy: Option<String>,
+    /// HTTP Basic 认证用户名（探测请求携带）。
+    #[serde(default)]
+    pub username: Option<String>,
+    /// HTTP Basic 认证密码（可空串）。
+    #[serde(default)]
+    pub password: Option<String>,
+}
+
+/// E31 探测预览：`POST /probe` —— 复用引擎同源探测（GET Range: bytes=0-0）
+/// 取大小/服务端文件名/Range 支持/ETag/Last-Modified/Content-Type，不创建
+/// 任务。`suggest_name` 与引擎落盘名派生链完全一致（CD → URL 末段 →
+/// download.bin，逐候选 sanitize_rel 终审）。探测失败（网络/非 2xx/416
+/// 之外状态）→ 502；入参非法 → 400。url 不回显（请求方自持；凭据不二次暴露）。
+async fn probe_endpoint(
+    State(_state): State<Arc<DaemonState>>,
+    Json(req): Json<ProbeReq>,
+) -> Response {
+    let url = req.url.trim();
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "url 必须是 http(s):// 直链（v1 仅支持 HTTP 源预览）" })),
+        )
+            .into_response();
+    }
+    // 任务级代理（E5 同款试水：构建一次 client 即校验）
+    let client = match req.proxy.as_deref() {
+        Some(p) if !p.is_empty() => match smart_dl_httpdl::build_proxied_client(p) {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("proxy 非法 {p:?}: {e}") })),
+                )
+                    .into_response()
+            }
+        },
+        _ => reqwest::Client::new(),
+    };
+    let mut headers: Vec<(String, String)> = req
+        .headers
+        .map(|m| m.into_iter().collect())
+        .unwrap_or_default();
+    if let Some(u) = &req.username {
+        let cred = format!("{u}:{}", req.password.as_deref().unwrap_or(""));
+        headers.push((
+            "Authorization".into(),
+            format!(
+                "Basic {}",
+                base64::engine::general_purpose::STANDARD.encode(cred)
+            ),
+        ));
+    }
+    match smart_dl_httpdl::range::probe_range(&client, url, &headers).await {
+        Ok(p) => {
+            // suggest_name：与引擎落盘名决策（engine.rs E4 派生链）同源同序
+            let suggest = p
+                .filename
+                .iter()
+                .chain(smart_dl_httpdl::url_basename(url).iter())
+                .find_map(|c| smart_dl_core::session::output::sanitize_rel(c).ok())
+                .unwrap_or_else(|| std::path::PathBuf::from("download.bin"));
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "state": "ok",
+                    "total": p.total,
+                    "range_supported": p.range_supported,
+                    "filename": p.filename,
+                    "suggest_name": suggest.to_string_lossy(),
+                    "etag": p.etag,
+                    "last_modified": p.last_modified,
+                    "content_type": p.content_type,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({ "state": "unreachable", "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 #[cfg(feature = "xunlei-import")]
@@ -53,6 +229,603 @@ pub struct WebseedReq {
     pub urls: Vec<String>,
 }
 
+/// E29 tracker 运行时管理：`POST /tasks/:id/trackers` 批量追加（仅 BT 任务）。
+#[derive(Deserialize)]
+pub struct TrackersReq {
+    pub urls: Vec<String>,
+}
+
+/// E29：`DELETE /tasks/:id/trackers?url=...`（URL 精确匹配，无匹配 404）。
+#[derive(Deserialize)]
+pub struct RemoveTrackerQuery {
+    pub url: String,
+}
+
+/// 任务级限速（`POST /tasks/:id/limit`，P1 能力增强）。
+/// 字段语义：`None` = 不调整该方向；`0` = 不限速；`n` = 上限 n KiB/s。
+/// 合并口径见 `DaemonState::set_task_limits`（快照返回合并后全量配置）。
+#[derive(Deserialize)]
+pub struct LimitReq {
+    #[serde(default)]
+    pub down_kb_s: Option<u32>,
+    #[serde(default)]
+    pub up_kb_s: Option<u32>,
+}
+
+/// `POST /tasks/:id/limit`：设置/调整任务级限速，返回合并后的快照。
+async fn task_limit(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<LimitReq>,
+) -> impl IntoResponse {
+    match state.set_task_limits(&id, req.down_kb_s, req.up_kb_s).await {
+        Ok(_merged) => match state.task_snapshot(&id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+/// 任务级顺序下载（`POST /tasks/:id/sequential`，边下边播）。
+/// HTTP = 在飞段窗口收紧（运行中任务下轮拾取）；BT = sequential_download flag
+/// （即时生效）；FTP = 不支持（409）。
+#[derive(Deserialize)]
+pub struct SequentialReq {
+    pub sequential: bool,
+}
+
+/// 任务级连接数上限（`POST /tasks/:id/connections`，S1-c，qbit 每任务连接数）：
+/// `n > 0` = 上限；`n == 0` = 复位会话级默认。仅 BT 任务（其余 409）；
+/// 即时生效（handle 级参数，metadata 未就绪也可设）；持久化 + 恢复重放。
+#[derive(Deserialize)]
+pub struct ConnectionsReq {
+    pub max_connections: u32,
+}
+
+/// 手动添加 peer（`POST /tasks/:id/peers`，qbit「添加 peer」对标）：
+/// `addrs` 逐条注入（`ip:port`，支持 IPv6 `[::1]:6881`）；部分成功语义——
+/// 逐条回执 `[{addr, ok, error?}]`；任务非 BT → 全部回执 err（409）。
+#[derive(Deserialize)]
+pub struct AddPeersReq {
+    pub addrs: Vec<String>,
+}
+
+async fn task_add_peers(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<AddPeersReq>,
+) -> impl IntoResponse {
+    // 入参解析（同步、快）：非法 addr → 400 整体拒绝（与 /bt/metadata peers 同口径）
+    let mut parsed = Vec::with_capacity(req.addrs.len());
+    for a in &req.addrs {
+        match a.parse::<std::net::SocketAddr>() {
+            Ok(sa) => parsed.push(sa),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": format!("addrs 解析失败 {a:?}: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    if parsed.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "addrs 不能为空" })),
+        )
+            .into_response();
+    }
+    let results = state.add_task_peers(&id, parsed).await;
+    // 任务不存在 → 404；全部失败且为不支持语义 → 409；其余 200（部分成功也算成功）
+    if state.task_snapshot(&id).await.is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "not found" })),
+        )
+            .into_response();
+    }
+    let body: Vec<_> = results
+        .iter()
+        .map(|(addr, r)| match r {
+            Ok(()) => serde_json::json!({ "addr": addr, "ok": true }),
+            Err(e) => serde_json::json!({ "addr": addr, "ok": false, "error": e }),
+        })
+        .collect();
+    let any_ok = results.iter().any(|(_, r)| r.is_ok());
+    let any_unsupported = results.iter().any(|(_, r)| {
+        r.as_ref()
+            .is_err_and(|e| e.contains("仅 BT 任务支持添加 peer"))
+    });
+    let status = if any_ok || !any_unsupported {
+        StatusCode::OK
+    } else {
+        StatusCode::CONFLICT
+    };
+    (status, Json(serde_json::json!({ "results": body }))).into_response()
+}
+
+/// 超级种子开关（`POST /tasks/:id/super-seeding`，BitComet 首创 / qbit 任务
+/// 右键同名能力）：`{enabled: bool}`。仅 BT 任务（其余 409）；做种态生效、
+/// 下载中设置无效果（libtorrent seed_mode flag 语义，与 qbit 一致）。
+#[derive(Deserialize)]
+pub struct SuperSeedingReq {
+    pub enabled: bool,
+}
+
+/// 强制宣告请求（Task 46）：tracker / dht 至少一项真（否则 400）。
+#[derive(Deserialize)]
+pub struct AnnounceReq {
+    /// 强制向全部 tracker 宣告（缺省 true）。
+    #[serde(default = "default_true")]
+    pub tracker: bool,
+    /// 强制 DHT 宣告（缺省 false；DHT 未启用时内核 no-op）。
+    #[serde(default)]
+    pub dht: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// DaemonError → HTTP 错误响应（Task 46 统一辅助）：404 / 409(UnsupportedOp) /
+/// 400(InvalidSource) / 500 其余。
+fn daemon_error_response(e: DaemonError, _id: &str) -> Response {
+    let body = Json(serde_json::json!({ "error": e.to_string() }));
+    let status = match &e {
+        DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+        DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+        DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (status, body).into_response()
+}
+
+/// 成功 → 任务快照；失败 → 错误响应（Task 46 辅助；与既有手写 match 同语义）。
+async fn json_err_response(
+    res: Result<(), DaemonError>,
+    state: &Arc<DaemonState>,
+    id: &str,
+) -> Response {
+    match res {
+        Ok(()) => match state.task_snapshot(id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => daemon_error_response(e, id),
+    }
+}
+
+/// IP 封禁请求（Task 46）：`{"ips": ["1.2.3.4", ...]}`；非法 IP 逐条报错
+/// （部分成功语义，不整批拒绝）。
+#[derive(Deserialize)]
+pub struct BansReq {
+    pub ips: Vec<String>,
+}
+
+/// 队列优先级请求（Task 46）：绝对值 `{"priority": 3}` 或相对移动
+/// `{"action": "top"|"bottom"|"up"|"down"}`（二选一，同给以 value 优先）。
+#[derive(Deserialize)]
+pub struct PriorityReq {
+    #[serde(default)]
+    pub priority: Option<i32>,
+    #[serde(default)]
+    pub action: Option<String>,
+}
+
+/// 队列优先级设置（Task 46）：`POST /tasks/:id/priority`。
+async fn task_priority(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<PriorityReq>,
+) -> Response {
+    match state.set_task_priority(&id, req.priority, req.action).await {
+        Ok(v) => Json(serde_json::json!({ "queue_priority": v })).into_response(),
+        Err(e) => daemon_error_response(e, &id),
+    }
+}
+
+/// 强制宣告（Task 46）：`POST /tasks/:id/announce`。
+async fn task_announce(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<AnnounceReq>,
+) -> Response {
+    json_err_response(
+        state.announce_task(&id, req.tracker, req.dht).await,
+        &state,
+        &id,
+    )
+    .await
+}
+
+/// 强制重新校验（Task 46）：`POST /tasks/:id/recheck`。
+async fn task_recheck(State(state): State<Arc<DaemonState>>, Path(id): Path<String>) -> Response {
+    json_err_response(state.recheck_task(&id).await, &state, &id).await
+}
+
+/// 导出 .torrent（Task 46）：`GET /tasks/:id/export` →
+/// `application/x-bittorrent`（Content-Disposition 文件名 = 任务名.torrent）。
+async fn task_export(State(state): State<Arc<DaemonState>>, Path(id): Path<String>) -> Response {
+    match state.export_task_torrent(&id).await {
+        Ok(bytes) => {
+            let name = state
+                .task_snapshot(&id)
+                .await
+                .and_then(|s| s.name)
+                .unwrap_or_else(|| id.clone());
+            let safe: String = name
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || "._- ()".contains(c) {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect();
+            (
+                [(axum::http::header::CONTENT_TYPE, "application/x-bittorrent")],
+                [(
+                    axum::http::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{safe}.torrent\""),
+                )],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(e) => daemon_error_response(e, &id),
+    }
+}
+
+/// 生成 magnet URI（Task 46）：`GET /tasks/:id/magnet` → `{"magnet": "..."}`。
+async fn task_magnet(State(state): State<Arc<DaemonState>>, Path(id): Path<String>) -> Response {
+    match state.task_magnet_uri(&id).await {
+        Ok(m) => Json(serde_json::json!({ "magnet": m })).into_response(),
+        Err(e) => daemon_error_response(e, &id),
+    }
+}
+
+/// 批量封禁（Task 46）：`POST /security/bans`。
+async fn security_ban(State(state): State<Arc<DaemonState>>, Json(req): Json<BansReq>) -> Response {
+    let results = state.ban_ips(req.ips).await;
+    Json(serde_json::json!({
+        "banned": state.list_bans(),
+        "results": results
+            .into_iter()
+            .map(|(ip, r)| match r {
+                Ok(()) => serde_json::json!({ "ip": ip, "ok": true }),
+                Err(e) => serde_json::json!({ "ip": ip, "ok": false, "error": e }),
+            })
+            .collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+/// 批量解除封禁（Task 46）：`DELETE /security/bans`。
+async fn security_unban(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<BansReq>,
+) -> Response {
+    let results = state.unban_ips(req.ips).await;
+    Json(serde_json::json!({
+        "banned": state.list_bans(),
+        "results": results
+            .into_iter()
+            .map(|(ip, r)| match r {
+                Ok(()) => serde_json::json!({ "ip": ip, "ok": true }),
+                Err(e) => serde_json::json!({ "ip": ip, "ok": false, "error": e }),
+            })
+            .collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+/// 封禁列表（Task 46）：`GET /security/bans`。
+async fn security_list_bans(State(state): State<Arc<DaemonState>>) -> Response {
+    Json(serde_json::json!({ "banned": state.list_bans() })).into_response()
+}
+
+/// IP 段批量导入请求（batch5）：`text` = DAT（PeerGuardian）或 P2P 格式
+/// 文本（逐行一个区间；`#` 注释与空行跳过）。
+#[derive(Deserialize)]
+pub struct BansImportReq {
+    pub text: String,
+}
+
+/// IP 段批量导入（batch5 对标 qB/BitComet IP filter 文件）：`POST /security/bans/import`。
+/// 部分成功语义：逐行解析，可解析行入引擎，失败行收集进 errors。
+async fn security_ban_import(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<BansImportReq>,
+) -> Response {
+    let (imported, errors) = state.import_ban_ranges(&req.text).await;
+    let status = if imported == 0 && !errors.is_empty() {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::OK
+    };
+    (
+        status,
+        Json(serde_json::json!({
+            "imported": imported,
+            "errors": errors,
+            "banned": state.list_bans(),
+        })),
+    )
+        .into_response()
+}
+
+/// 首尾块优先请求（batch5）：`{"priority": 7}`（0..=7；0 = 恢复默认）。
+#[derive(Deserialize)]
+pub struct PiecePriorityReq {
+    pub priority: i32,
+}
+
+/// 首尾块优先（batch5 对标 qB）：`POST /tasks/:id/piece-priority`。
+/// 每文件首/末块优先级提升（边下边播 seek 场景）；metadata 未就绪 → 409。
+async fn task_piece_first_last(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<PiecePriorityReq>,
+) -> Response {
+    match state.set_task_piece_first_last(&id, req.priority).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => daemon_error_response(e, &id),
+    }
+}
+
+async fn task_super_seeding(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SuperSeedingReq>,
+) -> impl IntoResponse {
+    match state.set_task_super_seeding(&id, req.enabled).await {
+        Ok(()) => match state.task_snapshot(&id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+async fn task_connections(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<ConnectionsReq>,
+) -> impl IntoResponse {
+    match state
+        .set_task_max_connections(&id, req.max_connections)
+        .await
+    {
+        Ok(()) => match state.task_snapshot(&id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+async fn task_sequential(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SequentialReq>,
+) -> impl IntoResponse {
+    match state.set_task_sequential(&id, req.sequential).await {
+        Ok(()) => match state.task_snapshot(&id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+/// 任务级代理热改（`POST /tasks/:id/proxy`，E8）：`{"proxy": "http(s)://..."}`
+/// = 设置任务专用 client（覆盖全局）；`{"proxy": null}` 或 `{}` = 清除回共享
+/// client。仅 HTTP 任务（其余 409）；非法 URL 400（不发起连接，纯本地构建
+/// 试水）；下载中任务立即生效（旧循环检查点退出，进度凭段账本恢复）。
+#[derive(Deserialize)]
+pub struct SetProxyReq {
+    /// None（缺省/null）= 清除；空串拒绝（与 add 口径一致）。
+    #[serde(default)]
+    pub proxy: Option<String>,
+}
+
+async fn task_set_proxy(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<SetProxyReq>,
+) -> impl IntoResponse {
+    match state.set_task_proxy(&id, req.proxy).await {
+        Ok(()) => match state.task_snapshot(&id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+/// 任务重命名（`POST /tasks/:id/name`，E15）：`{"name": "..."}` = 设置
+/// （V3 校验同 add，非法路径分量 400）；`{"name": null}` 或 `{}` = 清除
+/// 显式名（回退派生链）。显示层改名——落盘路径 add 时已定，不迁移文件。
+#[derive(Deserialize)]
+pub struct RenameTaskReq {
+    /// None（缺省/null）= 清除；空白拒绝（与 add 口径一致）。
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// 任务标签设置（E18，`POST /tasks/:id/tags`）：**替换式**全量覆盖。
+/// `tags` 缺省/null 或空数组 = 清除全部；逐项 trim/去重，单项 1..=64 字符、
+/// 最多 16 个（超限 400）。
+#[derive(Deserialize)]
+pub struct TagsReq {
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
+}
+
+/// 任务标签设置（`POST /tasks/:id/tags`，E18）：返回归一化后的标签全集。
+async fn task_set_tags(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<TagsReq>,
+) -> impl IntoResponse {
+    match state.set_task_tags(&id, req.tags) {
+        Ok(tags) => Json(serde_json::json!({ "tags": tags })).into_response(),
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+async fn task_rename(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<RenameTaskReq>,
+) -> impl IntoResponse {
+    match state.set_task_name(&id, req.name) {
+        Ok(()) => match state.task_snapshot(&id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+/// 任务级子文件优先级（`POST /tasks/:id/files/priority`，P1 能力增强，仅 BT）。
+/// priority 语义同 libtorrent：0=不下载 / 1=低 / 4=默认 / 7=最高。
+#[derive(Deserialize)]
+pub struct FilePriorityReq {
+    pub priorities: Vec<FilePriorityEntry>,
+}
+
+#[derive(Deserialize)]
+pub struct FilePriorityEntry {
+    pub index: usize,
+    pub priority: u32,
+}
+
+/// `POST /tasks/:id/files/priority`：批量设置子文件优先级，响应 = 当前各文件
+/// 优先级快照（下标 = 文件序，与快照 files 对齐）。
+async fn task_file_priority(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<FilePriorityReq>,
+) -> impl IntoResponse {
+    let prio: Vec<(usize, u32)> = req
+        .priorities
+        .into_iter()
+        .map(|e| (e.index, e.priority))
+        .collect();
+    match state.set_task_file_priorities(&id, &prio).await {
+        Ok(prios) => {
+            let list: Vec<serde_json::Value> = prios
+                .into_iter()
+                .map(|p| match p {
+                    Some(v) => serde_json::json!(v),
+                    None => serde_json::Value::Null,
+                })
+                .collect();
+            Json(serde_json::json!({ "priorities": list })).into_response()
+        }
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
 async fn task_webseeds(
     State(state): State<Arc<DaemonState>>,
     Path(id): Path<String>,
@@ -60,6 +833,66 @@ async fn task_webseeds(
 ) -> impl IntoResponse {
     match state.add_webseeds(&id, &req.urls).await {
         Ok(n) => Json(serde_json::json!({ "added": n })).into_response(),
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+/// E29：`GET /tasks/:id/trackers`——列举当前 announce 表（URL + tier）。
+async fn task_trackers_list(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.list_trackers(&id).await {
+        Ok(v) => Json(serde_json::json!(v)).into_response(),
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+/// E29：`POST /tasks/:id/trackers`——批量追加（仅 BT 任务，非法 URL 400）。
+async fn task_trackers_add(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<TrackersReq>,
+) -> impl IntoResponse {
+    match state.add_trackers(&id, &req.urls).await {
+        Ok(n) => Json(serde_json::json!({ "added": n })).into_response(),
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+/// E29：`DELETE /tasks/:id/trackers?url=...`——精确删除（无匹配 404）。
+async fn task_trackers_remove(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Query(q): Query<RemoveTrackerQuery>,
+) -> impl IntoResponse {
+    match state.remove_tracker(&id, &q.url).await {
+        Ok(()) => Json(serde_json::json!({ "removed": q.url })).into_response(),
         Err(e) => {
             let body = Json(serde_json::json!({ "error": e.to_string() }));
             let status = match e {
@@ -218,7 +1051,11 @@ async fn bt_magnet_metadata(
 ///   盘符（与 fix/security-p0（PR #5）`sanitize_rel` 同构，合并后两处一致）；
 /// - 最终落盘点 = `<default_dest_root>/save_to`，不再接受任意绝对目标；
 /// - 父目录须已存在（保留原契约），且 canonicalize 后必须仍在根目录内——
-///   拦截已存在的 symlink 指向根外（写穿逃逸）。
+///   拦截已存在的 symlink 指向根外（写穿逃逸）；
+/// - 末段 symlink 设防（H-2，CWE-59）：parent canonicalize 只覆盖中间分量，
+///   dest 本身若为 symlink，`fs::write` 将写穿到链接目标（可越出根目录）。
+///   `symlink_metadata` 不跟随末段链接 → 恰好检测链接本体；末段为 symlink
+///   一律拒绝（含指向根内的链接——语义简单不留旁门）。
 ///
 /// 纯路径校验（仅 std，无 btcore 依赖）：不挂 cfg(bt)——无 bt 构建的测试
 /// 同样覆盖，亦可供其他落盘端点复用。
@@ -254,6 +1091,18 @@ pub fn validate_save_dest(root: &std::path::Path, raw: &str) -> Result<std::path
         .map_err(|e| format!("下载根目录不可达: {}: {e}", root.display()))?;
     if !parent_canon.starts_with(&root_canon) {
         return Err(format!("save_to 越界（解析后不在下载根目录内）: {raw}"));
+    }
+    // 末段 symlink 设防（H-2，CWE-59）：parent canonicalize 只解析中间分量；
+    // dest 本身是 symlink 时（如 save_to="evil.torrent" 且 root/evil.torrent
+    // → /etc/crontab），上面全部检查照过，后续 fs::write 却写穿到根外。
+    // symlink_metadata 读链接本体不读目标 → 恰好识别末段链接；
+    // 目标不存在（首次写入）→ Err 分支跳过，原语义不变。
+    if let Ok(md) = std::fs::symlink_metadata(&dest) {
+        if md.file_type().is_symlink() {
+            return Err(format!(
+                "save_to 目标已存在且为符号链接（拒绝写穿逃逸）: {raw}"
+            ));
+        }
     }
     Ok(dest)
 }
@@ -420,20 +1269,238 @@ async fn config_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResp
     Json(state.config_snapshot())
 }
 
-/// 删除任务（引擎 remove + 目录记录移除；delete_data=false 保留已下载文件）。
+/// 全局限速总阀门热改（`POST /config/limit`，E16）。
+///
+/// 请求体（两字段均可选，`Option` 缺省语义）：
+/// - `max_download_kb_s`：所有引擎合计下行上限（KiB/s；0 = 不限）
+/// - `max_upload_kb_s`：BT 合计上行上限（KiB/s；0 = 不限；HTTP/FTP 无上传）
+/// - 字段缺省/null = 该方向不调整；双缺省 = 纯查询（返回当前值）
+///
+/// 成功：200 + 当前生效 `{max_download_kb_s, max_upload_kb_s}`；
+/// 下发失败（如 BT settings_pack 错误）：500。不落盘——重启回到配置文件口径；
+/// `GET /config` 快照的两键随生效值同步刷新，`global_limits_changed` 事件广播。
+#[derive(Deserialize)]
+pub struct GlobalLimitReq {
+    #[serde(default)]
+    pub max_download_kb_s: Option<u32>,
+    #[serde(default)]
+    pub max_upload_kb_s: Option<u32>,
+}
+
+async fn config_set_limit(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<GlobalLimitReq>,
+) -> impl IntoResponse {
+    match state
+        .apply_global_limits(req.max_download_kb_s, req.max_upload_kb_s)
+        .await
+    {
+        Ok(g) => Json(g).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /settings`：设置面全量快照（S1）——各设置域当前值（基准限速 +
+/// 引擎实际生效值 + 备用窗口命中态 + 持久化目标路径）。
+async fn settings_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    Json(state.settings_snapshot())
+}
+
+/// `PUT /settings` 查询参数：`?persist=`（缺省 true；body 内 `persist` 字段优先）。
+#[derive(Deserialize)]
+struct SettingsQuery {
+    persist: Option<bool>,
+}
+
+/// `PUT /settings`（S1 设置面）：部分更新 + 可选落盘持久化。
+/// 验证失败 → 400（零副作用）；引擎下发失败 → 500；成功 → 应用报告
+/// （applied / restart_required / persisted / limits）+ `settings_changed` 事件。
+async fn settings_put(
+    State(state): State<Arc<DaemonState>>,
+    Query(q): Query<SettingsQuery>,
+    Json(req): Json<crate::state::SettingsReq>,
+) -> impl IntoResponse {
+    match state.apply_settings(req, q.persist.unwrap_or(true)).await {
+        Ok(report) => Json(report).into_response(),
+        Err(DaemonError::InvalidSource(m)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": m })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// 全局统计（任务按状态/引擎聚合 + 聚合速率，速率口径 1s 快照）。
+async fn stats_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    Json(state.stats())
+}
+
+/// Prometheus 指标（`GET /metrics`，E22）：text/plain 指标暴露格式（v1 从
+/// `stats()` 聚合派生——任务总数/按状态/按引擎/聚合速率）。标签值均来自
+/// 内部稳定标签（state/engine），无需转义。运维抓取口径：
+/// `scrape_configs: [{static_configs: [{targets: [daemon]}]}]`。
+async fn metrics_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let st = state.stats();
+    let mut out = String::with_capacity(2048);
+    out.push_str("# HELP smart_dl_tasks_total Number of download tasks by state and engine.\n");
+    out.push_str("# TYPE smart_dl_tasks_total gauge\n");
+    // 状态维度
+    for (label, n) in &st.by_state {
+        out.push_str(&format!(
+            "smart_dl_tasks_total{{dimension=\"state\",label=\"{label}\"}} {n}\n"
+        ));
+    }
+    // 引擎维度
+    for (label, n) in &st.by_engine {
+        out.push_str(&format!(
+            "smart_dl_tasks_total{{dimension=\"engine\",label=\"{label}\"}} {n}\n"
+        ));
+    }
+    // 聚合速率（bytes/s）
+    out.push_str("# HELP smart_dl_speed_bytes_per_second Aggregate transfer speed.\n");
+    out.push_str("# TYPE smart_dl_speed_bytes_per_second gauge\n");
+    out.push_str(&format!(
+        "smart_dl_speed_bytes_per_second{{direction=\"down\"}} {}\n",
+        st.down_bytes_s
+    ));
+    out.push_str(&format!(
+        "smart_dl_speed_bytes_per_second{{direction=\"up\"}} {}\n",
+        st.up_bytes_s
+    ));
+    // A4：任务级速率分布 histogram（按 engine 标签分 series；count = 传输中
+    // 任务数——全零速率任务不进样本，见 task_speed_samples 口径注释）
+    let samples = state.task_speed_samples();
+    render_speed_histogram(
+        &mut out,
+        "smart_dl_task_down_speed_bytes_per_second",
+        "Per-task download speed distribution (active transfers only).",
+        0,
+        &samples,
+    );
+    render_speed_histogram(
+        &mut out,
+        "smart_dl_task_up_speed_bytes_per_second",
+        "Per-task upload speed distribution (active transfers only).",
+        1,
+        &samples,
+    );
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4",
+        )],
+        out,
+    )
+        .into_response()
+}
+
+/// 任务速率 histogram 桶边界（bytes/s，累计口径；+Inf 由渲染器补齐）：
+/// 64KB / 256KB / 1MB / 4MB / 16MB / 64MB——覆盖拨号到万内网典型档位，
+/// 稀疏上段防桶爆炸（Prometheus 常规规模）。
+const SPEED_BUCKETS: &[u64] = &[
+    65_536, 262_144, 1_048_576, 4_194_304, 16_777_216, 67_108_864,
+];
+
+/// 渲染一条任务速率 histogram（纯函数，单测直测）。`dir_idx`：0=down 1=up。
+/// 每方向仅统计该方向速率 > 0 的样本；按 engine 标签分组出独立 series
+///（BTreeMap 保证输出序稳定），le 标签为累计口径，末尾补 +Inf/sum/count。
+fn render_speed_histogram(
+    out: &mut String,
+    name: &str,
+    help: &str,
+    dir_idx: usize,
+    samples: &[(&'static str, u64, u64)],
+) {
+    // (engine → (累计桶计数, sum, count))
+    let mut by_engine: std::collections::BTreeMap<
+        &'static str,
+        ([u64; SPEED_BUCKETS.len()], u64, u64),
+    > = Default::default();
+    for &(engine, down, up) in samples {
+        let v = if dir_idx == 0 { down } else { up };
+        if v == 0 {
+            continue;
+        }
+        let e = by_engine.entry(engine).or_default();
+        for (i, b) in SPEED_BUCKETS.iter().enumerate() {
+            if v <= *b {
+                e.0[i] += 1;
+            }
+        }
+        e.1 += v;
+        e.2 += 1;
+    }
+    out.push_str(&format!("# HELP {name} {help}\n"));
+    out.push_str(&format!("# TYPE {name} histogram\n"));
+    for (engine, (buckets, sum, count)) in &by_engine {
+        for (i, b) in SPEED_BUCKETS.iter().enumerate() {
+            out.push_str(&format!(
+                "{name}_bucket{{engine=\"{engine}\",le=\"{b}\"}} {}\n",
+                buckets[i]
+            ));
+        }
+        out.push_str(&format!(
+            "{name}_bucket{{engine=\"{engine}\",le=\"+Inf\"}} {count}\n"
+        ));
+        out.push_str(&format!("{name}_sum{{engine=\"{engine}\"}} {sum}\n"));
+        out.push_str(&format!("{name}_count{{engine=\"{engine}\"}} {count}\n"));
+    }
+}
+
+/// 版本与编译特性（对齐部署矩阵：二进制是哪个 feature 组合的构建）。
+async fn version_endpoint() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "name": "smart-dl-daemon",
+        "version": env!("CARGO_PKG_VERSION"),
+        "features": {
+            "bt": cfg!(feature = "bt"),
+            "ftp": cfg!(feature = "ftp"),
+            "sftp": cfg!(feature = "sftp"),
+            "nas": cfg!(feature = "nas"),
+            "xunlei": cfg!(feature = "xunlei"),
+        },
+    }))
+}
+
+/// 存活探针（liveness）：200 = 进程可达且路由栈就绪。引擎故障属任务级
+/// 状态（见 /tasks 与 /stats），不在此反映。与全端点一致受 auth_mw 保护
+/// —— 配置 token 时探针需携带 Bearer（V1/V13 fail-closed 姿态，不设例外）。
+async fn health_endpoint() -> impl IntoResponse {
+    Json(serde_json::json!({ "status": "ok" }))
+}
+
+/// 删除任务（引擎 remove + 目录记录移除；`?delete_data=true` 同步删除已下载
+/// 数据（E7：BT 删种子数据 / HTTP 删落盘文件），缺省 false 保留文件）。
+#[derive(Deserialize, Default)]
+struct RemoveTaskQuery {
+    #[serde(default)]
+    delete_data: bool,
+}
+
 async fn remove_task(
     Path(id): Path<String>,
+    Query(q): Query<RemoveTaskQuery>,
     State(state): State<Arc<DaemonState>>,
 ) -> impl IntoResponse {
-    match state.remove(&id).await {
+    match state.remove_with(&id, q.delete_data).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     }
 }
 
 /// WS 升级端点（D36 socket 端点，M7）：连接即推全量（重连重同步），随后
-/// 轮询增量 + 1s 快照节流（Progress/Speed 合并）。单消费者语义（D22 本机单
-/// 用户）；多连接时后来的连接会 drain 走队列，属可接受偏差。
+/// 轮询增量 + 1s 快照节流（Progress/Speed 合并）。E10：首推/轮询均改非破坏
+/// 读（read_after/snapshot_upto）——多连接不再互踩（原 drain 单消费者语义
+/// 升级）；事件缓冲非清空，历史可事后经 GET /events 查询。
 async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<Arc<DaemonState>>,
@@ -444,9 +1511,10 @@ async fn ws_handler(
 async fn ws_session(mut socket: WebSocket, state: Arc<DaemonState>) {
     let hub = state.hub();
 
-    // 1) 连接即推送全量（掉队客户端重连重同步入口）
+    // 1) 连接即推送全量（掉队客户端重连重同步入口；E10 非破坏读——
+    //    多连接各自拉到同一份历史，不再互踩）
     let mut last_seq = 0u64;
-    for env in hub.drain() {
+    for env in hub.read_after(0, usize::MAX) {
         if send_text(&mut socket, &env).await.is_none() {
             return;
         }
@@ -495,16 +1563,90 @@ async fn send_text(socket: &mut WebSocket, env: &crate::events::Envelope) -> Opt
     socket.send(Message::Text(text)).await.ok()
 }
 
+/// `.meta4`/`.metalink` 后缀识别（B1）：剥 query/fragment 后大小写无关。
+/// 仅按 URL 形态判定，不看 Content-Type（描述文件常由静态服务托管，CT 缺失
+/// 或非标准很常见；误判后果 = 把 XML 当下载目标，探测/哈希校验自然失败）。
+fn metalink_url_suffix(url: &str) -> bool {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let lower = path.to_lowercase();
+    lower.ends_with(".meta4") || lower.ends_with(".metalink")
+}
+
+/// url / metalink_b64 分支共享的任务级 opts 构造（B1 收口：conflict 解析
+/// 错误统一早退响应）。
+fn build_add_http_opts(
+    req: &AddTaskReq,
+    auto_retry: u32,
+) -> Result<crate::state::AddHttpOpts, (StatusCode, Json<serde_json::Value>)> {
+    Ok(crate::state::AddHttpOpts {
+        sequential: req.sequential,
+        proxy: req.proxy.clone(),
+        headers: req
+            .headers
+            .as_ref()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default(),
+        basic_auth: req
+            .username
+            .clone()
+            .map(|u| (u, req.password.clone().unwrap_or_default())),
+        sha256: req.sha256.clone(),
+        sha1: req.sha1.clone(),
+        md5: req.md5.clone(),
+        backup_url: req.backup_url.clone(),
+        backup_md5: req.backup_md5.clone(),
+        name: req.name.clone(),
+        conflict: match req.conflict_policy.as_deref() {
+            None => None,
+            Some(other) => match crate::state::ConflictPolicy::parse(other) {
+                Some(c) => Some(c),
+                None => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error":
+                            format!("未知 conflict_policy {other:?}（合法值: overwrite, rename, skip）") })),
+                    ));
+                }
+            },
+        },
+        start_at_unix: req.start_at_unix,
+        auto_retry,
+    })
+}
+
 async fn add_task(
     State(state): State<Arc<DaemonState>>,
     Json(req): Json<AddTaskReq>,
 ) -> impl IntoResponse {
-    let result = if let Some(b64) = req.torrent_b64 {
+    // E30：auto_retry 范围门（0..=10；防极端配置拖垮调度循环）。B1 起三选一
+    // 各分支共享（metalink 展开的 HTTP 任务同样消费 auto_retry）。
+    let auto_retry = req.auto_retry.unwrap_or(0);
+    if auto_retry > 10 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error":
+                format!("auto_retry 取值 0..=10，收到 {auto_retry}") })),
+        );
+    }
+
+    // 源三选一（优先级 torrent > metalink > url）；统一产出任务 id 列表
+    // （单源任务 = 单元素；metalink = 逐 <file> 展开，B1）。
+    let result: Result<Vec<String>, crate::state::DaemonError> = if let Some(b64) = req.torrent_b64
+    {
         match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
             Ok(bytes) => {
                 #[cfg(feature = "bt")]
                 {
-                    state.add_torrent_task(bytes, req.dest).await
+                    state
+                        .add_torrent_task_opts(
+                            bytes,
+                            req.dest,
+                            req.sequential,
+                            req.start_at_unix,
+                            req.auto_retry.unwrap_or(0),
+                        )
+                        .await
+                        .map(|id| vec![id])
                 }
                 #[cfg(not(feature = "bt"))]
                 {
@@ -518,20 +1660,88 @@ async fn add_task(
                 "torrent_b64 不是合法 base64".into(),
             )),
         }
+    } else if let Some(b64) = req.metalink_b64.clone() {
+        // B1：metalink 描述文件（本地内容，RFC 5854 XML，UTF-8）逐 <file>
+        // 展开。req 级哈希/名字/backup_url 与 XML 并存时以 XML 为准（逐
+        // 文件各异更权威）；headers/auth/proxy/sequential/conflict/
+        // start_at/auto_retry 逐文件继承。
+        match base64::engine::general_purpose::STANDARD.decode(b64.as_bytes()) {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(xml) => match build_add_http_opts(&req, auto_retry) {
+                    Ok(opts) => state.add_metalink_tasks(&xml, req.dest, opts).await,
+                    Err(resp) => return resp,
+                },
+                Err(_) => Err(crate::state::DaemonError::InvalidSource(
+                    "metalink_b64 不是合法 UTF-8（RFC 5854 XML 应为 UTF-8 编码）".into(),
+                )),
+            },
+            Err(_) => Err(crate::state::DaemonError::InvalidSource(
+                "metalink_b64 不是合法 base64".into(),
+            )),
+        }
     } else {
-        let Some(url) = req.url else {
+        let Some(url) = req.url.clone() else {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "需要 url 或 torrent_b64" })),
+                Json(serde_json::json!({ "error": "需要 url / torrent_b64 / metalink_b64 之一" })),
             );
         };
-        state.add_link_task(url, req.dest).await
+        let opts = match build_add_http_opts(&req, auto_retry) {
+            Ok(o) => o,
+            Err(resp) => return resp,
+        };
+        if metalink_url_suffix(&url) {
+            // B1：.meta4/.metalink URL → 引导 XML 拉取（bootstrap client
+            // 与引擎共享同源代理/cookie/超时口径）→ 展开为任务集。
+            match state.fetch_metalink_xml(&url).await {
+                Ok(xml) => state.add_metalink_tasks(&xml, req.dest, opts).await,
+                Err(e) => Err(e),
+            }
+        } else {
+            state
+                .add_link_task_opts(url, req.dest, opts)
+                .await
+                .map(|id| vec![id])
+        }
     };
     match result {
-        Ok(task_id) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({ "task_id": task_id })),
-        ),
+        Ok(ids) => {
+            // 建任务时可选任务级限速：复用 set_task_limits 全链（合并/持久化/重放）。
+            // metalink 任务集逐个应用（单个失败即止，后续任务未设限；已创建任务
+            // 不回滚，返回错误体提示单独重试 limit 调用）。
+            let limits_err = if req.down_kb_s.is_some() || req.up_kb_s.is_some() {
+                let mut first: Option<(String, crate::state::DaemonError)> = None;
+                for id in &ids {
+                    if let Err(e) = state.set_task_limits(id, req.down_kb_s, req.up_kb_s).await {
+                        first = Some((id.clone(), e));
+                        break;
+                    }
+                }
+                first
+            } else {
+                None
+            };
+            let count = ids.len();
+            let first_id = ids.first().cloned().unwrap_or_default();
+            match limits_err {
+                None => (
+                    StatusCode::CREATED,
+                    Json(serde_json::json!({
+                        "task_id": first_id,
+                        "task_ids": ids,
+                        "count": count,
+                    })),
+                ),
+                Some((id, e)) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "task_id": first_id,
+                        "task_ids": ids,
+                        "error": format!("任务已创建但限速设置失败（{id}）: {e}（可单独重试 POST /tasks/:id/limit）")
+                    })),
+                ),
+            }
+        }
         Err(e) => match e {
             crate::state::DaemonError::Duplicate(existing) => (
                 StatusCode::CONFLICT,
@@ -616,8 +1826,462 @@ async fn task_snapshot(
     }
 }
 
-async fn list_tasks(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
-    Json(state.list())
+/// `GET /tasks` 查询参数（E7，全部可选；无参数时行为/形状与 E7 之前一致）。
+/// `state`/`engine` 逗号分隔多值（大小写不敏感）；`limit`/`offset` 分页，
+/// 提供分页参数时响应附 `X-Total-Count`（过滤后总数）。
+#[derive(Deserialize, Default)]
+struct ListTasksQuery {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    engine: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    offset: Option<usize>,
+    /// E14：关键字子串搜索（匹配任务名/来源 URL，大小写不敏感；空白 = 不过滤）。
+    #[serde(default)]
+    search: Option<String>,
+    /// E18：标签 any-of 过滤（逗号分隔多值；大小写不敏感；空白段丢弃）。
+    #[serde(default)]
+    tag: Option<String>,
+}
+
+/// `limit` 上限（防一次性拉全表打爆内存；UI 每页 50 量级，500 留足余量）。
+const LIST_LIMIT_CAP: usize = 500;
+
+/// 逗号分隔标签解析 + 合法性校验（大小写不敏感；空段/空白段忽略）。
+/// 非法值 → Err(错误信息，含合法值全集)。
+fn parse_label_list(
+    raw: &Option<String>,
+    known: &[String],
+    dim: &str,
+) -> Result<Vec<String>, String> {
+    let Some(raw) = raw else {
+        return Ok(vec![]);
+    };
+    let labels: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    for l in &labels {
+        if !known.iter().any(|k| k.eq_ignore_ascii_case(l)) {
+            return Err(format!(
+                "未知 {dim} 值 {l:?}（合法值: {}）",
+                known.join(", ")
+            ));
+        }
+    }
+    Ok(labels)
+}
+
+/// 校验查询参数 → ListQuery（400 语义：state/engine 值非法或 limit 越界）。
+fn validate_list_query(q: &ListTasksQuery) -> Result<ListQuery, String> {
+    let states = parse_label_list(&q.state, &known_state_labels(), "state")?;
+    let engines = parse_label_list(&q.engine, &known_engine_labels(), "engine")?;
+    if let Some(l) = q.limit {
+        if l == 0 || l > LIST_LIMIT_CAP {
+            return Err(format!("limit 须在 1..={LIST_LIMIT_CAP}"));
+        }
+    }
+    Ok(ListQuery {
+        states,
+        engines,
+        limit: q.limit,
+        offset: q.offset.unwrap_or(0),
+        // E14：trim 后为空视为未提供（宽容处理，与“空 = 不过滤”语义一致）
+        search: q
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        // E18：逗号分隔 → trim → 丢空白段（标签为用户自定义任意串，
+        // 不走 known-label 校验；全空 = 不过滤）
+        tags: q
+            .tag
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+/// 任务列表（E7 过滤/分页；E14 增 `?search=` 关键字过滤）：无参数 → 全量数组
+/// （兼容不变）；有分页参数 → 附 `X-Total-Count`（过滤后总数，含 search 过滤）。
+/// 排序恒为创建序（task_id 数值后缀）。
+async fn list_tasks(
+    Query(q): Query<ListTasksQuery>,
+    State(state): State<Arc<DaemonState>>,
+) -> impl IntoResponse {
+    match validate_list_query(&q) {
+        Ok(lq) => {
+            let paged = q.limit.is_some() || q.offset.is_some();
+            let (items, total) = state.list_filtered(&lq);
+            let mut resp = Json(items).into_response();
+            if paged {
+                if let Ok(v) = HeaderValue::from_str(&total.to_string()) {
+                    resp.headers_mut().insert("x-total-count", v);
+                }
+            }
+            resp
+        }
+        Err(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+    }
+}
+
+/// 批量操作请求（E7）：action ∈ {pause, resume, remove}；`delete_data` 仅
+/// remove 生效；ids 上限 100、非空；逐项执行单项失败不短路（恒 200 + 逐项结果）。
+#[derive(Deserialize)]
+struct BatchTaskReq {
+    action: String,
+    #[serde(default)]
+    ids: Vec<String>,
+    #[serde(default)]
+    delete_data: bool,
+    /// E19：条件选择（与 `ids` 二选一：同时提供或均缺失 → 400）。命中集
+    /// 全量执行 action；仅支持 pause/resume（remove 走显式 ids，非破坏性原则）。
+    #[serde(default)]
+    select: Option<BatchSelect>,
+}
+
+/// 条件选择器（E19）：与 `GET /tasks` 过滤参数同口径——`state`/`engine`
+/// 走合法标签校验（逗号分隔多值，大小写不敏感）；`tag` 逗号分隔任意串；
+/// `search` 子串。至少提供一个条件（全空 → 400，防 `{}` 误匹配全量任务）。
+#[derive(Deserialize, Default)]
+struct BatchSelect {
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    engine: Option<String>,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    search: Option<String>,
+}
+
+fn parse_batch_select(s: &BatchSelect) -> Result<ListQuery, String> {
+    let empty = s.state.is_none() && s.engine.is_none() && s.tag.is_none() && s.search.is_none();
+    if empty {
+        return Err("选择条件不能全空（state/engine/tag/search 至少一项）".into());
+    }
+    Ok(ListQuery {
+        states: parse_label_list(&s.state, &known_state_labels(), "state")?,
+        engines: parse_label_list(&s.engine, &known_engine_labels(), "engine")?,
+        limit: None,
+        offset: 0,
+        search: s
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_string),
+        tags: s
+            .tag
+            .as_deref()
+            .map(|v| {
+                v.split(',')
+                    .map(str::trim)
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    })
+}
+
+/// 批量 id 上限（批量语义是便利入口不是全表操作入口；防误传全量 id 集合）。
+const BATCH_IDS_CAP: usize = 100;
+
+/// `GET /events` 查询参数（E10）：`after` seq 游标（默认 0 = 全量重同步）、
+/// `limit` 页长（默认 100）、`task_id`/`type` 可选过滤（`type` 逗号分隔多值，
+/// 大小写不敏感，对齐 E7 风格）。
+#[derive(Deserialize, Default)]
+struct ListEventsQuery {
+    #[serde(default)]
+    after: Option<u64>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default, rename = "type")]
+    event_type: Option<String>,
+}
+
+/// `GET /events` 页长上限（E10：UI 每页 50–100 量级；4096 全量可分页拉取）。
+const EVENTS_LIMIT_CAP: usize = 1000;
+/// `GET /events` 缺省页长（不传 limit 也限页，防一次性拉全缓冲）。
+const EVENTS_LIMIT_DEFAULT: usize = 100;
+
+/// 事件历史查询（E10）：非破坏读 WsHub 环形缓冲；seq 游标分页 + task_id/
+/// type 过滤 + `truncated` 缺口报警（缓冲已冲掉目标区间 → 客户端应放弃
+/// 增量补拉改走全量重同步）。过滤在分页前生效（limit = 过滤后条数）。
+async fn list_events(
+    Query(q): Query<ListEventsQuery>,
+    State(state): State<Arc<DaemonState>>,
+) -> Response {
+    let types = match parse_label_list(&q.event_type, &known_event_type_labels(), "type") {
+        Ok(t) => t,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    if let Some(l) = q.limit {
+        if l == 0 || l > EVENTS_LIMIT_CAP {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("limit 须在 1..={EVENTS_LIMIT_CAP}"),
+            )
+                .into_response();
+        }
+    }
+    let limit = q.limit.unwrap_or(EVENTS_LIMIT_DEFAULT);
+    let after = q.after.unwrap_or(0);
+    let hub = state.hub();
+    let pred = |env: &Envelope| {
+        let task_ok = q
+            .task_id
+            .as_deref()
+            .is_none_or(|want| env.event.task_id() == Some(want));
+        let type_ok = types.is_empty()
+            || types
+                .iter()
+                .any(|t| env.event.type_label().eq_ignore_ascii_case(t));
+        task_ok && type_ok
+    };
+    let (events, has_more) = hub.read_filtered(after, limit, pred);
+    let next_after = events.last().map(|e| e.seq).unwrap_or(after);
+    let truncated = hub.gap_after(after);
+    Json(serde_json::json!({
+        "events": events,
+        "next_after": next_after,
+        "has_more": has_more,
+        "oldest_seq": hub.oldest_seq(),
+        "truncated": truncated,
+    }))
+    .into_response()
+}
+
+/// `GET /events/stream` 查询参数：`after` 游标（显式覆盖 Last-Event-ID 头，
+/// 调试友好）/ `task_id` / `type` 过滤（语义同 GET /events）。无 after 时读
+/// `Last-Event-ID` 请求头（EventSource 断线重连自动携带），都无 = 0（全量
+/// 历史重放）；头解析失败视为未携带（EventSource 只发合法值）。
+#[derive(Deserialize, Default)]
+struct EventsStreamQuery {
+    #[serde(default)]
+    after: Option<u64>,
+    #[serde(default)]
+    task_id: Option<String>,
+    #[serde(default, rename = "type")]
+    event_type: Option<String>,
+}
+
+/// SSE 轮询周期（与 WS 会话同口径：200ms 增量轮询 + 1s 快照节流）。
+const SSE_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// SSE 每轮批量拉取上限（200ms × 256 = 1280 ev/s 稳态，远超背压丢弃口径）。
+const SSE_BATCH: usize = 256;
+
+/// Envelope → SSE 帧：`id: <seq>`（EventSource 断线自动回传 Last-Event-ID）、
+/// `event: <type_label>`（EventSource addEventListener 按类型路由）、
+/// `data: <envelope JSON>`（与 WS 帧、GET /events 条目同形——单套解析复用）。
+/// 序列化失败 → None（跳帧，不毒化流）。
+fn envelope_to_sse(env: &Envelope) -> Option<SseEvent> {
+    let data = serde_json::to_string(env).ok()?;
+    Some(
+        SseEvent::default()
+            .id(env.seq.to_string())
+            .event(env.event.type_label())
+            .data(data),
+    )
+}
+
+/// SSE 流状态机（unfold）：pending 先排空（重放/当前批），空则等下一轮
+/// 轮询增量；客户端断开 = 响应体 dropped → unfold future 被 poll 中止，
+/// 状态自然释放（无泄漏后台任务）。
+struct SseStreamState {
+    state: Arc<DaemonState>,
+    cursor: u64,
+    pred: Box<dyn Fn(&Envelope) -> bool + Send>,
+    pending: VecDeque<SseEvent>,
+    throttler: Throttler,
+    last_flush: Instant,
+    tick: tokio::time::Interval,
+}
+
+/// SSE 事件流端点（E12）：`text/event-stream` 长连接——连接即重放历史
+/// （非破坏读，与 WS 首推同口径），随后 200ms 轮询增量 + 1s 节流
+/// （Progress/Speed 合并，与 WS 同口径；重放不节流）。缺口（gap_after）→
+/// 注释行 `: gap` 报警 + 从缓冲最旧重放（客户端可按首帧 seq 回退或注释行
+/// 判定增量补拉失效，同 REST `truncated` 的判定输入）。与 WS 的差异：
+/// 单向推送（无上行）、HTTP/1.1 友好（代理穿透/浏览器 EventSource 原生）、
+/// keep-alive 注释保活。路由在 auth_mw 之下，与全端点同保护。
+async fn events_stream(
+    Query(q): Query<EventsStreamQuery>,
+    headers: HeaderMap,
+    State(state): State<Arc<DaemonState>>,
+) -> Response {
+    let types = match parse_label_list(&q.event_type, &known_event_type_labels(), "type") {
+        Ok(t) => t,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    let last_event_id = headers
+        .get(header::HeaderName::from_static("last-event-id"))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let requested = q.after.or(last_event_id).unwrap_or(0);
+    let hub = state.hub();
+    let pred = move |env: &Envelope| {
+        let task_ok = q
+            .task_id
+            .as_deref()
+            .is_none_or(|want| env.event.task_id() == Some(want));
+        let type_ok = types.is_empty()
+            || types
+                .iter()
+                .any(|t| env.event.type_label().eq_ignore_ascii_case(t));
+        task_ok && type_ok
+    };
+
+    // 缺口检测（连接时点快照口径）：目标区间已被冲掉 → 从缓冲最旧重放，
+    // 并以注释行报警（客户端亦可按首帧 seq 回退自行判定）。
+    let (cursor, gap) = if hub.gap_after(requested) {
+        (
+            hub.oldest_seq()
+                .unwrap_or_else(|| hub.last_seq() + 1)
+                .saturating_sub(1),
+            true,
+        )
+    } else {
+        (requested, false)
+    };
+
+    // 连接即重放历史（非破坏读；不节流，与 WS 首推同口径）。
+    let mut pending = VecDeque::new();
+    if gap {
+        pending.push_back(SseEvent::default().comment(format!(
+            "gap: events after {requested} were evicted, replaying from oldest buffered seq"
+        )));
+    }
+    let mut cursor = cursor;
+    let (replay, _) = hub.read_filtered(cursor, usize::MAX, &pred);
+    for env in replay {
+        cursor = env.seq;
+        if let Some(ev) = envelope_to_sse(&env) {
+            pending.push_back(ev);
+        }
+    }
+
+    let stream = futures::stream::unfold(
+        SseStreamState {
+            state,
+            cursor,
+            pred: Box::new(pred),
+            pending,
+            throttler: Throttler::new(),
+            last_flush: Instant::now(),
+            tick: tokio::time::interval(SSE_POLL_INTERVAL),
+        },
+        |mut st| async move {
+            loop {
+                if let Some(ev) = st.pending.pop_front() {
+                    return Some((Ok::<_, Infallible>(ev), st));
+                }
+                st.tick.tick().await;
+                let (batch, _) = st.state.hub().read_filtered(st.cursor, SSE_BATCH, &st.pred);
+                for env in batch {
+                    st.cursor = env.seq;
+                    if Throttler::is_throttlable(&env.event) {
+                        st.throttler.upsert(env); // 合并，等 1s flush（与 WS 同口径）
+                    } else if let Some(ev) = envelope_to_sse(&env) {
+                        st.pending.push_back(ev);
+                    }
+                }
+                if !st.throttler.is_empty() && st.last_flush.elapsed() >= Duration::from_secs(1) {
+                    for env in st.throttler.drain_pending() {
+                        if let Some(ev) = envelope_to_sse(&env) {
+                            st.pending.push_back(ev);
+                        }
+                    }
+                    st.last_flush = Instant::now();
+                }
+            }
+        },
+    );
+    Sse::new(stream)
+        .keep_alive(axum::response::sse::KeepAlive::default())
+        .into_response()
+}
+
+async fn batch_tasks(
+    State(state): State<Arc<DaemonState>>,
+    axum::Json(body): axum::Json<BatchTaskReq>,
+) -> impl IntoResponse {
+    let action = match body.action.to_ascii_lowercase().as_str() {
+        "pause" => BatchAction::Pause,
+        "resume" => BatchAction::Resume,
+        "remove" => BatchAction::Remove {
+            delete_data: body.delete_data,
+        },
+        _ => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("未知 action {:?}（合法值: pause, resume, remove）", body.action)
+            })),
+        )
+            .into_response(),
+    };
+    // E19：ids 与 select 二选一
+    if let Some(select) = body.select.as_ref() {
+        if !body.ids.is_empty() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "ids 与 select 只能二选一" })),
+            )
+                .into_response();
+        }
+        let q = match parse_batch_select(select) {
+            Ok(q) => q,
+            Err(msg) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": msg })),
+                )
+                    .into_response()
+            }
+        };
+        return match state.batch_select(&q, action).await {
+            Ok(outcome) => Json(outcome).into_response(),
+            Err(e) => {
+                let status = match e {
+                    DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                    _ => StatusCode::INTERNAL_SERVER_ERROR,
+                };
+                (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+            }
+        };
+    }
+    if body.ids.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "ids 不能为空" })),
+        )
+            .into_response();
+    }
+    if body.ids.len() > BATCH_IDS_CAP {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": format!("ids 数量超上限（{} > {BATCH_IDS_CAP}）", body.ids.len())
+            })),
+        )
+            .into_response();
+    }
+    Json(state.batch(&body.ids, action).await).into_response()
 }
 
 async fn pause_task(
@@ -667,18 +2331,287 @@ async fn providers(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     Json(rows)
 }
 
+// ===== RSS 订阅自动下载（qbit RSS 对标，v1）=====
+
+#[derive(serde::Deserialize)]
+struct AddRssFeedReq {
+    url: String,
+}
+
+#[derive(serde::Deserialize)]
+struct AddRssRuleReq {
+    name: String,
+    #[serde(default = "default_rule_enabled")]
+    enabled: bool,
+    #[serde(default)]
+    must_contain: Vec<String>,
+    #[serde(default)]
+    must_not_contain: Vec<String>,
+    #[serde(default)]
+    feed_id: Option<u64>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    dest: Option<String>,
+    /// batch5：关键词按正则解释（qB「使用正则表达式」对标）。
+    #[serde(default)]
+    use_regex: bool,
+    /// batch5：集数过滤（qB「集数过滤」对标），如 `1x02;1x04-1x06`。
+    #[serde(default)]
+    episode_filter: Option<String>,
+}
+
+fn default_rule_enabled() -> bool {
+    true
+}
+
+#[derive(serde::Deserialize)]
+struct RssItemsQuery {
+    #[serde(default)]
+    feed_id: Option<u64>,
+}
+
+async fn rss_feed_add(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<AddRssFeedReq>,
+) -> impl IntoResponse {
+    let url = req.url.trim().to_string();
+    if url.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "url 不可为空" })),
+        )
+            .into_response();
+    }
+    match state.rss_add_feed(url).await {
+        Ok((id, title, count)) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({ "id": id, "title": title, "item_count": count })),
+        )
+            .into_response(),
+        Err(e) => {
+            let status = match e {
+                DaemonError::Duplicate(_) => StatusCode::CONFLICT,
+                DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+        }
+    }
+}
+
+async fn rss_feeds_list(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let st = state.rss_state().lock();
+    let feeds: Vec<serde_json::Value> = st
+        .feeds
+        .iter()
+        .map(|f| {
+            serde_json::json!({
+                "id": f.id,
+                "url": f.url,
+                "title": f.title,
+                "added_at_unix": f.added_at_unix,
+                "last_refresh_unix": f.last_refresh_unix,
+                "item_count": f.items.len(),
+                "pending_count": f.items.iter().filter(|i| i.task_id.is_none()).count(),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "feeds": feeds })).into_response()
+}
+
+/// 订阅设置更新请求（batch5.1）：interval_override_secs（0 = 跟随全局）。
+#[derive(Deserialize)]
+pub struct RssFeedUpdateReq {
+    #[serde(default)]
+    pub interval_override_secs: u64,
+}
+
+/// 订阅设置更新（batch5.1）：`PATCH /rss/feeds/:id`。
+async fn rss_feed_update(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<u64>,
+    Json(req): Json<RssFeedUpdateReq>,
+) -> Response {
+    match state.rss_update_feed(id, req.interval_override_secs) {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => daemon_error_response(e, &id.to_string()),
+    }
+}
+
+async fn rss_feed_remove(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    if state.rss_remove_feed(id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("feed {id} 不存在") })),
+        )
+            .into_response()
+    }
+}
+
+async fn rss_items_list(
+    State(state): State<Arc<DaemonState>>,
+    Query(q): Query<RssItemsQuery>,
+) -> impl IntoResponse {
+    let st = state.rss_state().lock();
+    let items: Vec<serde_json::Value> = st
+        .feeds
+        .iter()
+        .filter(|f| q.feed_id.map(|id| f.id == id).unwrap_or(true))
+        .flat_map(|f| {
+            f.items.iter().map(move |i| {
+                serde_json::json!({
+                    "feed_id": f.id,
+                    "feed_title": f.title,
+                    "guid": i.guid,
+                    "title": i.title,
+                    "url": i.url,
+                    "pub_date": i.pub_date,
+                    "task_id": i.task_id,
+                })
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "items": items })).into_response()
+}
+
+async fn rss_rule_add(
+    State(state): State<Arc<DaemonState>>,
+    Json(req): Json<AddRssRuleReq>,
+) -> impl IntoResponse {
+    match state.rss_add_rule(
+        req.name,
+        req.enabled,
+        req.must_contain,
+        req.must_not_contain,
+        req.feed_id,
+        req.tags,
+        req.dest,
+        req.use_regex,
+        req.episode_filter,
+    ) {
+        Ok(id) => (StatusCode::CREATED, Json(serde_json::json!({ "id": id }))).into_response(),
+        Err(e) => {
+            let status = match e {
+                DaemonError::InvalidSource(_) => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(serde_json::json!({ "error": e.to_string() }))).into_response()
+        }
+    }
+}
+
+async fn rss_rules_list(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let st = state.rss_state().lock();
+    let rules: Vec<serde_json::Value> = st
+        .rules
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "name": r.name,
+                "enabled": r.enabled,
+                "must_contain": r.must_contain,
+                "must_not_contain": r.must_not_contain,
+                "feed_id": r.feed_id,
+                "tags": r.tags,
+                "dest": r.dest,
+                "use_regex": r.use_regex,
+                "episode_filter": r.episode_filter,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "rules": rules })).into_response()
+}
+
+async fn rss_rule_remove(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<u64>,
+) -> impl IntoResponse {
+    if state.rss_remove_rule(id) {
+        StatusCode::NO_CONTENT.into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("rule {id} 不存在") })),
+        )
+            .into_response()
+    }
+}
+
+async fn rss_refresh(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
+    let (new_items, matched, task_ids, errors) = state.rss_refresh_all().await;
+    Json(serde_json::json!({
+        "new_items": new_items,
+        "matched": matched,
+        "task_ids": task_ids,
+        "errors": errors,
+    }))
+    .into_response()
+}
+
 macro_rules! router_base {
     ($app:expr) => {
         $app.route("/tasks", get(list_tasks).post(add_task))
+            .route("/tasks/batch", post(batch_tasks))
+            .route("/probe", post(probe_endpoint))
             .route("/tasks/:id", get(task_snapshot).delete(remove_task))
             .route("/tasks/:id/pause", post(pause_task))
             .route("/tasks/:id/resume", post(resume_task))
             .route("/tasks/:id/logs", get(task_logs))
             .route("/tasks/:id/fallback", post(task_fallback))
+            .route("/tasks/:id/limit", post(task_limit))
+            .route("/tasks/:id/sequential", post(task_sequential))
+            .route("/tasks/:id/connections", post(task_connections))
+            .route("/tasks/:id/proxy", post(task_set_proxy))
+            .route("/tasks/:id/name", post(task_rename))
+            .route("/tasks/:id/tags", post(task_set_tags))
+            .route("/tasks/:id/files/priority", post(task_file_priority))
             .route("/tasks/:id/webseeds", post(task_webseeds))
+            .route("/tasks/:id/peers", post(task_add_peers))
+            .route("/tasks/:id/super-seeding", post(task_super_seeding))
+            .route("/tasks/:id/announce", post(task_announce))
+            .route("/tasks/:id/recheck", post(task_recheck))
+            .route("/tasks/:id/priority", post(task_priority))
+            .route("/tasks/:id/export", get(task_export))
+            .route("/tasks/:id/piece-priority", post(task_piece_first_last))
+            .route("/tasks/:id/magnet", get(task_magnet))
+            .route(
+                "/security/bans",
+                get(security_list_bans)
+                    .post(security_ban)
+                    .delete(security_unban),
+            )
+            // batch5：IP 段批量导入（DAT/P2P 文本；部分成功语义）
+            .route("/security/bans/import", post(security_ban_import))
+            .route("/tasks/:id/trackers", get(task_trackers_list))
+            .route("/tasks/:id/trackers", post(task_trackers_add))
+            .route("/tasks/:id/trackers", delete(task_trackers_remove))
             .route("/bt/metadata", post(bt_magnet_metadata))
             .route("/config", get(config_endpoint))
+            .route("/config/limit", post(config_set_limit))
+            .route("/settings", get(settings_endpoint).put(settings_put))
+            .route("/rss/feeds", get(rss_feeds_list).post(rss_feed_add))
+            .route(
+                "/rss/feeds/:id",
+                delete(rss_feed_remove).patch(rss_feed_update),
+            )
+            .route("/rss/items", get(rss_items_list))
+            .route("/rss/rules", get(rss_rules_list).post(rss_rule_add))
+            .route("/rss/rules/:id", delete(rss_rule_remove))
+            .route("/rss/refresh", post(rss_refresh))
+            .route("/stats", get(stats_endpoint))
+            .route("/metrics", get(metrics_endpoint))
+            .route("/version", get(version_endpoint))
+            .route("/health", get(health_endpoint))
             .route("/providers", get(providers))
+            .route("/events", get(list_events))
+            .route("/events/stream", get(events_stream))
             .route("/ws", get(ws_handler))
     };
 }
@@ -696,16 +2629,56 @@ async fn auth_mw(
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());
     if state.verify_http_token(authorization) {
-        next.run(req).await
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(
-                serde_json::json!({ "error": "unauthorized: 需要 Authorization: Bearer <token>" }),
-            ),
-        )
-            .into_response()
+        return next.run(req).await;
     }
+    // 审计修复（40-e P1-6）：SSE 鉴权回退——EventSource（浏览器规范限制）
+    // 无法自定义请求头，配置 token 后 UI 事件流 401 死循环（2s 重试永不
+    // 恢复，速率事件/完成 toast/日志视图全部失效）。仅对 /events/stream
+    // 精确路径接受 ?token=（UI 侧 encodeURIComponent；服务端原值/解码双
+    // 比较，常量时间与 Bearer 同口径）。其余端点仍严格 Bearer-only。
+    if req.uri().path() == "/events/stream" {
+        let from_query = req
+            .uri()
+            .query()
+            .and_then(|q| q.split('&').find_map(|kv| kv.strip_prefix("token=")));
+        if let Some(t) = from_query {
+            if state.verify_http_token_query(t) || state.verify_http_token_query(&pct_decode(t)) {
+                return next.run(req).await;
+            }
+        }
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({ "error": "unauthorized: 需要 Authorization: Bearer <token>" })),
+    )
+        .into_response()
+}
+
+/// 最小 percent-decode（SSE query token 回退专用：UI 侧 encodeURIComponent）。
+/// 非法序列原样保留；`+` 按查询串惯例解码为空格。
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
+            {
+                out.push(v);
+                i += 3;
+                continue;
+            }
+        }
+        if b[i] == b'+' {
+            out.push(b' ');
+            i += 1;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(feature = "nas")]
@@ -728,16 +2701,47 @@ macro_rules! router_nas {
 
 #[cfg(feature = "xunlei-import")]
 pub fn router(state: Arc<DaemonState>) -> Router {
-    router_nas!(router_base!(Router::new()))
-        .route("/tasks/xunlei-import", post(add_xunlei_import))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
-        .with_state(state)
+    router_with_ui(state, None)
 }
 
 #[cfg(not(feature = "xunlei-import"))]
 pub fn router(state: Arc<DaemonState>) -> Router {
-    router_nas!(router_base!(Router::new()))
-        .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
+    router_with_ui(state, None)
+}
+
+/// 带 UI 静态服务的路由（S2 内嵌）：`ui_dir` Some 时挂 ServeDir 作 fallback
+/// （SPA：目录自动 index.html）；API 优先级不变（路由表命中优先于 fallback）。
+pub fn router_with_ui(state: Arc<DaemonState>, ui_dir: Option<std::path::PathBuf>) -> Router {
+    inner_router(state, ui_dir)
+}
+
+#[cfg(feature = "xunlei-import")]
+fn inner_router(state: Arc<DaemonState>, ui_dir: Option<std::path::PathBuf>) -> Router {
+    let app = router_nas!(router_base!(Router::new()))
+        .route("/tasks/xunlei-import", post(add_xunlei_import));
+    finish_router(app, state, ui_dir)
+}
+
+#[cfg(not(feature = "xunlei-import"))]
+fn inner_router(state: Arc<DaemonState>, ui_dir: Option<std::path::PathBuf>) -> Router {
+    finish_router(router_nas!(router_base!(Router::new())), state, ui_dir)
+}
+
+fn finish_router(
+    app: axum::Router<Arc<DaemonState>>,
+    state: Arc<DaemonState>,
+    ui_dir: Option<std::path::PathBuf>,
+) -> Router {
+    let app = match ui_dir {
+        Some(dir) => {
+            tracing::info!("内嵌 UI 已启用: {:?}", dir);
+            app.fallback_service(
+                tower_http::services::ServeDir::new(&dir).append_index_html_on_directories(true),
+            )
+        }
+        None => app,
+    };
+    app.layer(middleware::from_fn_with_state(state.clone(), auth_mw))
         .with_state(state)
 }
 
@@ -841,5 +2845,64 @@ async fn nas_token(State(_): State<Arc<DaemonState>>, Json(req): Json<NasTokenRe
             Json(serde_json::json!({ "ok": false, "error": e })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod metrics_render_tests {
+    use super::*;
+
+    #[test]
+    fn histogram_down_direction_buckets_and_excludes_zero() {
+        // down 方向：仅统计 down>0 样本；bt（down=0）不出现在 down series
+        let samples = vec![
+            ("http", 65_536u64, 0u64),
+            ("http", 1_048_576, 0),
+            ("bt", 0, 999),
+        ];
+        let mut out = String::new();
+        render_speed_histogram(&mut out, "m_down", "help text", 0, &samples);
+        assert!(out.contains("# TYPE m_down histogram"));
+        // 累计口径：65_536 落首桶（le 相等含），1_048_576 落至第三桶
+        assert!(out.contains("m_down_bucket{engine=\"http\",le=\"65536\"} 1"));
+        assert!(out.contains("m_down_bucket{engine=\"http\",le=\"262144\"} 1"));
+        assert!(out.contains("m_down_bucket{engine=\"http\",le=\"1048576\"} 2"));
+        assert!(out.contains("m_down_bucket{engine=\"http\",le=\"+Inf\"} 2"));
+        assert!(out.contains("m_down_sum{engine=\"http\"} 1114112"));
+        assert!(out.contains("m_down_count{engine=\"http\"} 2"));
+        // down=0 的 bt 样本不得进入 down histogram
+        assert!(!out.contains("engine=\"bt\""), "down=0 样本泄漏: {out}");
+    }
+
+    #[test]
+    fn histogram_up_direction_selects_up_column() {
+        let samples = vec![("http", 100, 0), ("bt", 50, 4_194_304)];
+        let mut out = String::new();
+        render_speed_histogram(&mut out, "m_up", "help text", 1, &samples);
+        assert!(out.contains("m_up_bucket{engine=\"bt\",le=\"4194304\"} 1"));
+        assert!(out.contains("m_up_count{engine=\"bt\"} 1"));
+        // up=0 的 http 样本不进 up histogram
+        assert!(!out.contains("engine=\"http\""), "up=0 样本泄漏: {out}");
+    }
+
+    #[test]
+    fn histogram_all_zero_samples_emit_help_type_only() {
+        let samples = vec![("http", 0u64, 0u64)];
+        let mut out = String::new();
+        render_speed_histogram(&mut out, "m_empty", "help text", 0, &samples);
+        assert!(out.contains("# HELP m_empty help text"));
+        assert!(out.contains("# TYPE m_empty histogram"));
+        assert!(!out.contains("_bucket"), "空样本不得出 bucket 行: {out}");
+    }
+
+    #[test]
+    fn histogram_engine_series_sorted_stable() {
+        // BTreeMap：engine series 输出序稳定（bt < http 字典序）
+        let samples = vec![("http", 100, 0), ("bt", 100, 0)];
+        let mut out = String::new();
+        render_speed_histogram(&mut out, "m", "h", 0, &samples);
+        let bt_pos = out.find("engine=\"bt\"").unwrap();
+        let http_pos = out.find("engine=\"http\"").unwrap();
+        assert!(bt_pos < http_pos, "engine series 须按字典序稳定输出");
     }
 }

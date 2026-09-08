@@ -8,6 +8,7 @@
 #include <libtorrent/settings_pack.hpp>
 #include <libtorrent/add_torrent_params.hpp>
 #include <libtorrent/torrent_info.hpp>
+#include <libtorrent/version.hpp>
 #include <libtorrent/torrent_handle.hpp>
 #include <libtorrent/torrent_status.hpp>
 #include <libtorrent/create_torrent.hpp>
@@ -67,7 +68,12 @@ lt::torrent_info make_torrent_info(lt::create_torrent& t) {
     if (ec) throw std::runtime_error("bdecode failed: " + ec.message());
     lt::bdecode_node info_section = root.dict_find("info");
     if (!info_section) throw std::runtime_error("torrent has no info dict");
+#if LIBTORRENT_VERSION_NUM >= 20100
     lt::torrent_info ti(info_section, ec, lt::load_torrent_limits(), lt::from_info_section);
+#else
+    // 2.0.x 无 from_info_section：回退全文件 bdecode_node ctor（root 即完整 .torrent）
+    lt::torrent_info ti(root, ec);
+#endif
     if (ec) throw std::runtime_error("torrent_info failed: " + ec.message());
     return ti;
 }
@@ -80,9 +86,16 @@ int main(int argc, char** argv) {
     try {
         make_file(dir);
 
+#if LIBTORRENT_VERSION_NUM >= 20100
         // ABI=100: create_torrent(file_storage&) excluded; use create_file_entry vector
         lt::create_torrent t(std::vector<lt::create_file_entry>{
             lt::create_file_entry(kFileName, kFileSize)});
+#else
+        // 2.0.x：无 create_file_entry，create_torrent(file_storage&) 可用
+        lt::file_storage fs;
+        fs.add_file(kFileName, kFileSize);
+        lt::create_torrent t(fs);
+#endif
         lt::set_piece_hashes(t, dir); // hashes from disk (2-arg overload, throws)
         lt::torrent_info ti = make_torrent_info(t);
         const lt::sha1_hash v1 = ti.info_hashes().v1;

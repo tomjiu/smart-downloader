@@ -27,8 +27,22 @@ fn read_sample(name: &str) -> Vec<u8> {
 
 async fn serve(dest: std::path::PathBuf) -> (std::net::SocketAddr, Arc<DaemonState>) {
     let engine = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
-    let bt = smart_dl_daemon::bt::BtEngine::new(&dest, None, 0, 0, false, false, false)
-        .expect("bt engine");
+    let bt = smart_dl_daemon::bt::BtEngine::new(
+        &dest,
+        None,
+        0,
+        0,
+        false,
+        false,
+        false,
+        false,
+        false,
+        "allow",
+        &[],
+        0.0,
+        0,
+    )
+    .expect("bt engine");
     let state = Arc::new(
         DaemonState::new(Arc::new(engine), vec![])
             .with_dest_root(dest.clone())
@@ -50,6 +64,7 @@ fn b64(data: &[u8]) -> String {
 
 #[tokio::test]
 async fn xunlei_import_creates_bt_task() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let torrent = read_sample("test.torrent");
     let cfg = read_sample("test.xlbt.cfg");
     let xltd = read_sample("test.bt.xltd");
@@ -110,6 +125,7 @@ async fn xunlei_import_creates_bt_task() {
 
 #[tokio::test]
 async fn xunlei_import_rejects_bad_base64() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (addr, _state) = serve(dir.path().to_path_buf()).await;
     let base = format!("http://{addr}");
@@ -134,6 +150,7 @@ async fn xunlei_import_rejects_bad_base64() {
 
 #[tokio::test]
 async fn xunlei_import_rejects_xltd_count_mismatch() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     // 构造一个假 torrent（2 文件），但只传 1 个 xltd
     let mut torrent = Vec::new();
     torrent.extend_from_slice(b"d4:infod");

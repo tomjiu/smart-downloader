@@ -17,6 +17,8 @@ fn content_identity_single_file_serde_roundtrip() {
         size: 12345,
         etag: Some("\"abc\"".into()),
         sha256: None,
+        sha1: None,
+        md5: None,
         backup_md5: None,
     };
     let json = serde_json::to_string(&ci).unwrap();
@@ -65,4 +67,36 @@ fn canonical_id_distinguishes_kind_and_identity() {
         token_sensitive: false,
     };
     assert_ne!(bt, tf, "不同 kind 同 identity 不应相等");
+}
+
+// ==================== E25：主源 sha1/md5 字段（serde 非破坏兼容） ====================
+
+#[test]
+fn content_identity_single_file_e25_fields_roundtrip() {
+    let ci = ContentIdentity::SingleFile {
+        size: 1,
+        etag: None,
+        sha256: None,
+        sha1: Some("a".repeat(40)),
+        md5: None,
+        backup_md5: None,
+    };
+    let json = serde_json::to_string(&ci).unwrap();
+    assert!(json.contains("\"sha1\""), "sha1 应参与序列化: {json}");
+    let back: ContentIdentity = serde_json::from_str(&json).unwrap();
+    assert_eq!(ci, back);
+}
+
+#[test]
+fn content_identity_single_file_legacy_json_missing_e25_fields() {
+    // 旧持久化 JSON 无 sha1/md5 字段 → serde(default) 兜底 None，加载不破
+    let legacy = r#"{"SingleFile":{"size":8,"etag":"\"e\"","sha256":null,"backup_md5":null}}"#;
+    let back: ContentIdentity = serde_json::from_str(legacy).unwrap();
+    match back {
+        ContentIdentity::SingleFile { sha1, md5, .. } => {
+            assert_eq!(sha1, None);
+            assert_eq!(md5, None);
+        }
+        other => panic!("应为 SingleFile: {other:?}"),
+    }
 }

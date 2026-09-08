@@ -60,6 +60,7 @@ fn http_routes_to_http_engine() {
             headers: vec![],
             auth: None,
             backup_url: None,
+            proxy: None,
         },
         0,
         0,

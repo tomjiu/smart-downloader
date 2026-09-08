@@ -24,6 +24,11 @@ pub struct FtpServerConfig {
     pub reject_421: u32,
     /// RETR 总是回 550（文件不存在）。
     pub retr_550: bool,
+    /// REST 起点命中时 RETR 回 421（P1 缩小粒度重试注入；非终态，触发客户端拆分重试）。
+    pub fail_ranges: Vec<u64>,
+    /// fail_ranges 注入的最大命中次数（FTP 的 RETR 无请求长度语义，改用次数上限
+    /// 保证拆分收敛：耗尽后同起点请求放行；None = 无限注入）。
+    pub fail_ranges_max_hits: Option<usize>,
     /// 目录场景：`(远端绝对路径, 内容)`。SIZE/RETR 按路径匹配；LIST 列出直接子文件。
     pub files: Vec<(String, Vec<u8>)>,
     /// LIST 响应中额外插入的子目录行名（目录下载过滤测试用）。
@@ -37,6 +42,8 @@ impl Default for FtpServerConfig {
             content: None,
             reject_421: 0,
             retr_550: false,
+            fail_ranges: Vec::new(),
+            fail_ranges_max_hits: None,
             files: Vec::new(),
             list_subdirs: Vec::new(),
         }
@@ -58,21 +65,23 @@ impl FtpTestServer {
         let rest_offsets = Arc::new(Mutex::new(Vec::new()));
         let control_connections = Arc::new(AtomicUsize::new(0));
         let retr_count = Arc::new(AtomicUsize::new(0));
+        let fail_hits = Arc::new(AtomicUsize::new(0));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let (ro, cc, rc) = (
+        let (ro, cc, rc, fh) = (
             rest_offsets.clone(),
             control_connections.clone(),
             retr_count.clone(),
+            fail_hits.clone(),
         );
         tokio::spawn(async move {
             loop {
                 let (stream, _) = listener.accept().await.unwrap();
-                let (ro, cc, rc) = (ro.clone(), cc.clone(), rc.clone());
+                let (ro, cc, rc, fh) = (ro.clone(), cc.clone(), rc.clone(), fh.clone());
                 let cfg = cfg.clone();
                 tokio::spawn(async move {
-                    handle_control(stream, cfg, ro, cc, rc).await;
+                    handle_control(stream, cfg, ro, cc, rc, fh).await;
                 });
             }
         });
@@ -95,6 +104,7 @@ async fn handle_control(
     rest_offsets: Arc<Mutex<Vec<u64>>>,
     control_connections: Arc<AtomicUsize>,
     retr_count: Arc<AtomicUsize>,
+    fail_hits: Arc<AtomicUsize>,
 ) {
     let conn_no = control_connections.fetch_add(1, Ordering::SeqCst);
     if (conn_no as u32) < cfg.reject_421 {
@@ -197,6 +207,15 @@ async fn handle_control(
                 if cfg.retr_550 {
                     let _ = conn.write_all(b"550 file unavailable\r\n").await;
                     continue;
+                }
+                // P1 注入：起点命中 fail_ranges 且未耗尽命中上限 → 421
+                // （非终态；对应 HTTP 侧 fail_ranges 语义，触发缩小粒度重试）
+                if cfg.fail_ranges.contains(&rest) {
+                    let hits = fail_hits.fetch_add(1, Ordering::SeqCst);
+                    if hits < cfg.fail_ranges_max_hits.unwrap_or(usize::MAX) {
+                        let _ = conn.write_all(b"421 fail injection\r\n").await;
+                        continue;
+                    }
                 }
                 // 目录场景：按路径匹配 files；未命中 → 单文件场景（懒构建 body）
                 let data: Vec<u8> = match find_file(&cfg.files, arg) {

@@ -48,6 +48,10 @@ pub fn spawn_alert_loop(
     interval: Duration,
     guard: Option<Arc<crate::bt::BtEngine>>,
 ) -> tokio::task::JoinHandle<()> {
+    // batch3-P1：置位常驻消费者旗标 → save_fastresume 纯等分发不自行 pop
+    if let Some(g) = &guard {
+        g.mark_alert_loop_active();
+    }
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(interval).await;
@@ -70,9 +74,8 @@ pub fn spawn_alert_loop(
                 });
                 match &effect.to {
                     TaskState::Seeding => {
-                        hub.publish(SchedulerEvent::Completed {
-                            task_id: effect.task_id.clone(),
-                        });
+                        // E17：完成事件统一出口（广播 + Webhook；BT 下载完成 = 进做种）
+                        state.publish_task_completed(&effect.task_id);
                     }
                     TaskState::Failed => {
                         hub.publish(SchedulerEvent::Failed {
@@ -83,6 +86,21 @@ pub fn spawn_alert_loop(
                     _ => {}
                 }
             }
+        }
+    })
+}
+
+/// 子文件优先级重放循环：周期性收敛「恢复时 metadata 未就绪」挂起的优先级
+/// 任务（`DaemonState::replay_pending_file_priorities`）。pending 为空时为
+/// 纯空转检查（锁一次即返回），默认 2s 粒度对恢复场景足够。
+pub fn spawn_file_priority_replay_loop(
+    state: Arc<DaemonState>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            state.replay_pending_file_priorities().await;
         }
     })
 }

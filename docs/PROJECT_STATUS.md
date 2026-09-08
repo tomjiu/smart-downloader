@@ -1,6 +1,6 @@
 # 项目交接状态总报告
 
-> 生成时间：2026-08-29
+> 生成时间：2026-08-29（更新：2026-09-04 —— 补充通用下载器主线增强线 E1–E33 收官状态）
 > 仓库：https://github.com/tomjiu/smart-downloader
 > 用途：让云/其他人接手时，一眼看清四条主线的现状、卡点、下一步
 
@@ -23,6 +23,18 @@
 | CLI 客户端 | ✅ | `smart-dl add/pause/resume/remove/list/status/logs/fallback` |
 | 导入迅雷任务 | ✅ | `import-xunlei` 命令（xlbt.cfg + .bt.xltd + .torrent → fastresume） |
 
+### 增强线（2026-09-02 ~ 09-04，E1–E33 全部合并）
+
+常规能力增强批次 33 批全部合并（PR #22–#57，每批独立 PR + CI 三 job 全绿）。
+覆盖：任务管理面（过滤/分页/批量/标签/搜索/重命名/delete_data）、事件三通道
+（WS / REST 补拉 / SSE）、速率全链路真实化（stats + 快照实时速率 + BT 累计
+分享率）、限速体系（全局+任务级，运行中热改）、代理（任务级 + 运行中热改
+不断传）、重试体系（自动指数退避 + 终态手动重试）、定时启动 + 错峰、文件
+冲突策略、校验算法三选一 + 双指纹续传加固、多源并行、完成 Webhook + 完成后
+钩子 + 自动清扫、BT tracker 运行时管理、Prometheus `/metrics`、探测预览
+`/probe`。逐批行为契约与验证证据见 [`IMPLEMENTED.md`](IMPLEMENTED.md) #21。
+测试基线：非 bt workspace 624（09-02）→ **850**（E33 收官）。
+
 ### 未完成 / 待增强
 
 | 能力 | 状态 | 说明 |
@@ -30,7 +42,7 @@
 | ~~Magnet 直链解析~~ | ✅ 完成（2026-08-30） | B-1：`core/source_parse/magnet.rs`（URI 解析）+ `core/torrent_meta.rs`（摘要+infohash）+ `btcore::magnet::fetch_metadata`（DHT/tracker/bootstrap-peer 抓取）+ FFI `lt_metadata` + daemon `POST /bt/metadata`；e2e 走本地 seeder（btcore/tests/magnet_metadata.rs） |
 | BT 子文件选择 | 🔶 deferred | `XL_BtSelectSubTask` 在 Windows 绑定已暴露，但上层 UI 未接线（libtorrent 侧 file_priorities 可作降级路径） |
 | 速度精确查询 | 🔶 deferred | `XL_QueryTaskFlow` 字段 + `XLGetGlobalDownloadSpeed` 签名待补 |
-| 断点续传校验 | 🔶 partial | fastresume 有，但跨引擎统一续传协议待定（B 线下一项） |
+| 断点续传校验 | 🔶 partial | HTTP 侧已由 E26 双指纹加固（ETag + Last-Modified 失配作废账本重下）；跨引擎统一续传协议仍待定 |
 | 多源调度可视化 | 🔶 backlog | Provider fallback 有骨架，无 UI |
 
 ### 关键文件

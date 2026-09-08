@@ -1,6 +1,12 @@
 # 未实现清单（整体）— 迅雷 + 通用 + 未来愿景
 
+> 更新：2026-09-06（四）。**RSS 订阅自动下载落地（qbit RSS 对标）+ BT 任务 add 后 resume 补链**：RSS 2.0/Atom 解析（URL 三级兜底/逐条容错/guid 去重/标题锁定）+ 关键词规则引擎（must 全命中 & must_not 全不命中，无 regex 依赖）→ 命中自动建 HTTP 任务（名=条目标题 + tag 透传，去重不重建）；八端点 `/rss/*` + `[rss]` 配置 + serve 刷新 ticker（≥60s）+ rss.json 持久化。同批修复：BT 首次 add 后内核 handle 永久 paused（恢复重放有 resume 而首次 add 缺失）——磁链 x.pe 本地闭环实测暴露（seeder peers=0），补链后 2MB 下载 cmp 逐字节一致；沙盒 UDP 出站被封（DHT ping 超时实测），公网磁链发现层依赖真实网络验证（G1 既有口径）。
+> 更新：2026-09-06（三）。**桌面版 BT 引擎装配落地（S1-d）**：desktop CI 三平台原生 libtorrent 打包矩阵（Windows vcpkg x64-windows / Linux apt / macOS brew），sidecar 升级 `--features bt,ftp,sftp` 全引擎；运行期原生库随包分发（Linux RUNPATH `$ORIGIN/../lib/Smart Downloader/native/linux`（deb/AppImage 同构）/ macOS install_name `@executable_path/../Resources/…` + ad-hoc 重签 / Windows vcpkg DLL+CRT 落安装根），布局依据 v0.1.0 产物解剖实证。desktop-v0.2.0。
+> 更新：2026-09-06（二）。**DASH（MPD）下载支持落地（C-DASH）**：`.mpd` 分流 → MPD static VOD 解析（视频优先选流 + SegmentTemplate/SegmentList 定址 + BaseURL 链）→ init+媒体段顺序拼接 + 段账本续传 + pause/resume，全链路与 HLS 同构（`.dash-ledger`/`dash-aborted` 同语义）。遗留：桌面版 BT 引擎装配（下表 S1-d）。
+> 更新：2026-09-06。**S1 设置面 + S2 前端入仓 + 桌面端**三项落地（本提交批）：`GET/PUT /settings` 十域运行时生效 + 落盘持久化、备用限速调度（[limits] 跨零点窗口 + 星期过滤 + 30s ticker）、BT 会话热改链路（`BtSessionPatch` trait + 内核 `lt_apply_conn`：监听端口/全局连接数上限）、HTTP 全局代理热改（逐任务 client 构建合并）、`ui/` Next.js 静态导出 + qoder-ui `data-theme` 8 主题 + qbit 式设置视图、daemon `--ui-dir` 内嵌 UI、Tauri v2 桌面壳（sidecar + 托盘 + 三平台 CI）。**httpdl RFC 7233 容错**（200 全量响应 skip+截断写入）随 e2e 实测落地。遗留：S1-b 队列门控接线（下表 S1-b）、桌面版 BT 引擎装配、BT per-torrent 连接数上限。
 > 更新：2026-08-27。已完成主线（thunder 解码 / HTTP 断点续传 / BT / fastresume / 热重载 / 状态推进）+ C 类通用缺口中的**代理 + 引擎层限速**（3fac8e3）+ **M6 云兜底调度接线**（c19313a）+ 2026-08-25 四卡落地：**FTP 目录下载**（httpdl 引擎 + daemon 路由）、**BT DHT/LSD/UPnP 配置开关**（FFI `lt_apply_discovery` 全链路）、**.torrent 多文件空间预检**、**TaskSnapshot.files 透出** + 2026-08-27：**httpdl 动态分段（P0，方案A）**（109692c）。
+> 更新：2026-09-05（二）。**BT 传输/发现配置面补全**（PEX/uTP/MSE 加密三态，`lt_apply_transport` + `lt_apply_discovery` 扩参全链路，PEX 经 per-torrent disable_pex 落地——2.0.x 无会话级开关；daemon 默认 PEX 由内核默认开转为配置默认关，对齐 M0 全关语义）。
+> 更新：2026-09-04。**常规能力增强线 E1–E33 全部合并**（PR #22–#57，22 项愿望清单收官：任务管理面/事件三通道/速率全链路/重试/定时错峰/完成 Webhook 与钩子/冲突策略/多源并行/校验扩展/双指纹续传/BT tracker 运行时/Prometheus/探测预览/分享率统计），逐批档案见 [`IMPLEMENTED.md`](IMPLEMENTED.md) #21。
 > **迅雷云盘线现状一句话**：F2/F2.1 的「私有流格式」前提已被考古证伪推翻，F3/F5 PoC 均已通过，主线进入 **Rust 实装 + 活票验收**阶段。
 > **已完成事项的集中档案见 [`IMPLEMENTED.md`](IMPLEMENTED.md)**（行为契约/配置/API/验证证据）。
 > 本文档 = 一切**未实现**事项的总清单。排序：迅雷云盘线（当前主线）→ 研究尾巴 → 通用缺口 → 明确排除 → 未来愿景。
@@ -31,16 +37,24 @@
 
 | 缺口 | 说明 |
 |---|---|
-| ~代理支持~ | ~~无（HTTP/BT 均无代理配置项）~~ **已完成**：HTTP（reqwest Proxy）+ BT（lt_apply_network）双引擎接线，启动时生效（见 3fac8e3）|
+| ~S1-b 队列门控接线~ | **已完成（2026-09-06）**：`[queue] max_active_{bt,http,ftp}`（0 = 不限，默认禁用排队）daemon 运行时门控——add 四入口 `gate_or_enqueue` 配额满落 Queued（queue_wait 事件）；`activate_due_tasks` 统一激活泵扩容为 E23+E30+S1-b 三候选（queue_wait 随时到期），FIFO（created_at）+ 配额闸递补；槽位 = 有句柄且非 Paused/Seeding/终态（add 后轮询前窗口按句柄占位防超卖）；手动 resume = 强制开始；恢复重放不设闸。settings_api/queue_gate 6 测试 |
+| ~S1-c BT per-task 连接数上限~ | **已完成（2026-09-06）**：FFI `lt_torrent_set_max_connections`（>0 上限 / 0 复位会话级默认，metadata 未就绪可设）→ btcore ffi/engine → trait `set_max_connections`（default Unsupported）→ daemon BtEngine；`DownloadTask.max_connections`（serde default 向后兼容）+ `POST /tasks/:id/connections`（仅 BT，其余 409）+ 快照透出 + 恢复重放 ③b + TaskDetail BT 控件；内核级/status 真实 libtorrent 测试 |
+| ~S1-d 桌面版 BT 引擎装配~ | **已完成（2026-09-06，PR #90）**：desktop workflow 三平台 BT 矩阵（scripts/ci/desktop-bt-{linux,macos}.sh + desktop-bt-windows.ps1，setup/stage 两段式）；tauri.{linux,macos,windows}.conf.json 平台资源覆盖层；Linux stage 自检 = 安装布局模拟树 + 空 LD_LIBRARY_PATH ldd 全解析；本地 Linux 实证 env -i 实跑 serve/magnet 全通 |
+| ~RSS 订阅自动下载~ | **已完成（2026-09-06，PR #91）**：`/rss/feeds`（添加即拉取，重复 409，坏源 400 fail-closed）/`/rss/items`/`/rss/rules`/`/rss/refresh` 八端点；RSS 2.0 + Atom 解析（`crates/daemon/src/rss.rs`，quick-xml，按 local name，命名空间无关）；规则 = must_contain 全命中 + must_not_contain 全不命中（大小写不敏感子串）；`[rss]` auto_refresh/refresh_interval_secs/max_processed_items_per_feed + ticker；rss.json 持久化（tasks.json 同目录） |
+| ~代理支持~ | ~~无（HTTP/BT 均无代理配置项）~~ **已完成**：HTTP（reqwest Proxy）+ BT（lt_apply_network）双引擎接线，启动时生效（见 3fac8e3）；**S1 追加：运行时热改**（BT settings_pack 重放立即生效 / HTTP 逐任务 client 构建合并新任务生效，`PUT /settings`）|
 | ~引擎层限速~ | ~~无（BT 的 libtorrent 速率上限未接线；HTTP 无限速）~~ **已完成**：全局下载/上传限速（KiB/s；0=不限），HTTP 跨段共享 RateLimiter（见 3fac8e3）|
 | ~云兜底调度接线~ | ~~FallbackCoordinator（M2 设计）仅在 provider crate 测试里使用，daemon 无调度入口~~ **已完成（M6）**：`POST /tasks/:id/fallback` 手动兜底——BT 任务暂停且进度 <50% → 选 provider → 直链 → HttpEngine 传输 → 任务 Completed；`[provider]` 配置段（mock 占位，真实 provider 待迅雷线落地）|
 | ~Provider 探活失败自动降级~ | ~~Provider 探活失败会阻塞主链路 / 手动兜底失败后无自动切换~~ **已完成（2026-08-27）**：`XunleiProvider` 内部失败冷却（Auth 5 分钟 / Quota 1 小时 / 其他 1 分钟）；`FallbackCoordinator::begin_fallback` 支持多 provider 依次尝试；`RemoteProvider::probe()` 轻量探活（默认 `Ok(())`）|
 | FTP 目录下载 | ~~无（仅单文件）~~ **已完成（2026-08-25）**：httpdl 引擎目录递归展开 + daemon `add_ftp_task` 路由打通（`POST /tasks` 可达 `ftp://` 目录 URL），目录任务按多文件下发 |
+| ~FTPS（AUTH TLS）~ | **已完成（2026-09-05，B2，PR #77）**：RFC 4217 显式模式——`ftps://` 全链识别（core parse/normalize + daemon 校验）、控制连接 AUTH TLS→PBSZ→PROT P 升级、数据连接全程 TLS；webpki-roots 严格校验；传输流抽象复用既有段管理/账本/限速全链。v1 边界：隐式 990/自定义根集后续按需 |
 | ~快照 files 字段透出~ | ~~多文件任务快照只见总量不见明细~~ **已完成（2026-08-25）**：`TaskSnapshot.files` 透出每个子文件的路径/大小/进度 |
 | ~xunlei-import 端到端测试~ | ~~`POST /tasks/xunlei-import` 代码存在但无 e2e 测试~~ **已完成（2026-08-27）**：新增 `crates/daemon/tests/xunlei_import_api.rs`，覆盖合法样本导入、bad base64、xltd 数量不匹配 |
 | ed2k 协议 | ~~明确不支持~~ **链接解析已完成（2026-08-30，`core/src/source_parse/ed2k.rs`：name/size/md4 结构化 + 明确错误分类）**；完整 eMule/eDonkey 客户端协议仍列远期（数周级），并入"跨协议"远期专项（见 F 段）|
+| HLS/DASH 流媒体 | **HLS 已完成（2026-09-05，C-HLS，PR #78）**：RFC 8216 VOD 子集——`.m3u8` 分流、master 最高带宽变体、AES-128-CBC 解密（key 缓存/IV 缺省推导）、顺序段下载 + 段账本续传、pause/resume；live 流/BYTERANGE/MAP 明确拒绝。**DASH 已完成（2026-09-06，C-DASH）**：MPD static VOD 子集——`.mpd` 分流、视频优先/最高码率选流（纯音频回退）、SegmentTemplate（duration→$Number$ / SegmentTimeline→$Time$，含 `%0Nd`/`$$`）与 SegmentList、BaseURL 链逐级解析 + `..` 压平、init+媒体段顺序拼接 + `.dash-ledger` 续传、pause/resume；dynamic（live）/多 Period/DRM（ContentProtection）/SegmentBase/xlink/$SubNumber$/mediaRange 明确拒绝；音视频分轨 v1 仅取单轨（不混流） |
+| ~Metalink4 支持~ | **已完成（2026-09-05，B1，PR #76）**：RFC 5854 解析（quick-xml 事件流）→ 逐 `<file>` 展开为 HTTP 任务集（priority 主/备 URL + 内建哈希择强直通校验链 + failover 复用）；API 三选一 `metalink_b64` / `.meta4`-`.metalink` URL 引导拉取 / 常规 url；响应 task_ids/count。v1 边界：仅 http(s) URL、文件名取末段不做子目录展开 |
 
-已有（防重复列）：并发队列（BT≤3/HTTP·FTP≤8）、HTTP 多连接并行/镜像/换源、**HTTP 动态分段（SegmentManager 动态领取 + 流式写盘，`109692c`）**、**失败缩小粒度重试（`b70923e`）**、**backup_url/backup_md5 备用源兜底（`963f9dd`）**、sha256 可选校验、BT 校验/做种停止、事件队列背压、全局代理 + 双引擎限速（启动时生效）。
+已有（防重复列）：**cookie jar（2026-09-05 A5：reqwest cookies，探测/段请求/重定向自动会话，全局 client 同站共享 + 任务级代理 client 独立 jar）**、**BT PEX/uTP/MSE 加密配置面（2026-09-05，`[bt]` 三键 + FFI `lt_apply_transport`；PEX 经 per-torrent disable_pex 实现，内核 2.0.x 无会话级开关）**、并发队列（BT≤3/HTTP·FTP≤8）、HTTP 多连接并行/镜像/换源、**HTTP 动态分段（SegmentManager 动态领取 + 流式写盘，`109692c`）**、**任务级顺序下载（HTTP/FTP 在飞窗口 + BT sequential flag，2026-09-02 双引擎落地、2026-09-05 A3 扩 FTP 三引擎齐备，CAPABILITY_MAP N3）**
+**FTP 任务级限速 + 顺序下载补齐（2026-09-05 A3：set_limits/set_sequential 与 HTTP 同口径，limiters 表串联全局总阀门；sequential = 段在飞窗口收紧同语义）**、**失败缩小粒度重试（`b70923e`）**、**backup_url/backup_md5 备用源兜底（`963f9dd`）**、sha256 可选校验、BT 校验/做种停止、事件队列背压、全局代理 + 双引擎限速（启动时生效）。
 
 ### 手动验证待办（脚本已备，待人工在真实网络执行）
 
@@ -62,7 +76,7 @@
 > 当前主线不变：仍以迅雷（云盘处理）为主。
 
 - 夸克网盘转换
-- 百度网盘 112 链接转换
+- 百度网盘 112 链接转换 → **解析层已完成（2026-09-05，B3-a）**：分享链接（`/s/1xxx`/`/share/init?surl=`）→ 免登录 verify → BDCLND → share/list 文件清单（真实链接 e2e；协议证据 `docs/research/baidu/share_protocol.md`）。dlink 直链转换需登录态（实测 errno -6），**待用户提供 BDUSS 做 B3-b 真机校准**；「112 链接」格式定义仍无公开资料，拿到样本后在 `provider/src/baidu/share.rs` 单点增补
 - 多服务商节点发现 → 加速下载（架构预留扩展点）
 
 ### F0. 能力地图与客户端分析总纲
@@ -89,3 +103,39 @@
 - Kaspersky 锁 daemon lib 单测 exe → 只能用集成测试（`--test X`）
 - bt_api 并行偶发 flaky（libtorrent 多 session 并行）→ 重跑即绿
 - http_api 曾偶发 1 用例失败：重负载窗口（连续重建 + 杀软扫描新 exe）把轮询测试的 10s 等待击穿。**已修复**：三处等待护栏 10s→60s（快照/list/事件；语义不变，仅抗进程级停顿；已实测 6 轮强制 rebuild 首跑 + 50+ 次运行全绿）
+
+> 更新：2026-09-06（五）。**qBittorrent 对标补齐批次落地（Task 38）**：磁链端到端
+> 实测（本地 seeder + x.pe 直连 → 2MB 下载 cmp 一致）暴露 API 面缺口后四项补齐——
+> ① `POST /tasks/:id/peers`（qbit 添加 peer，部分成功逐条回执）② `bt.extra_trackers`
+> （新任务自动追加 tracker）③ `bt.max_share_ratio`（Seeding 达标自动暂停 + 事件）
+> ④ `POST /tasks/:id/super-seeding`（超级种子，内核 lt_set_seed_mode）。做种时长
+> 上限需 `completed_at` 时间戳（记录无此字段，待需求出现再加）；peer 封禁受限于
+> libtorrent 2.x 公开 API 无 per-endpoint ban（内核文档化存根，维持）。
+
+> 更新：2026-09-06（六）。**做种时长上限落地（Task 39）**：`bt.max_seeding_time_min`
+> （分钟，0=不启用）+ TaskRecord.seeding_since 计时（Finished→Seeding 登记/离开清空）
+> + 执法升级为 share_ratio ∪ seeding_time 双限制，达标走完整 pause 语义（修复 F3
+> 只停引擎不同步记录态的缺口）；UI 设置面板同步 extra_trackers / max_share_ratio /
+> max_seeding_time_min 三项。至此 qbit 做种限制对标补齐（时长口径=本次运行内，
+> 重启经重新 checking 重新计时——持久化口径待需求出现再议）。
+
+> 更新：2026-09-07（一）。**第六轮子智能体批量代码审查落地（batch6）**：三路并行
+> 审查（RSS+队列 / BT 运维+做种执法 / HLS+DASH+FTPS+FTP+Metalink），修复——
+> ① **P0 rss.rs**：CDATA 事件整体丢弃（quick-xml CData 独立变体，WordPress 等主流
+> feed 全挂）→ CData 分支 + 条目槽位累加语义；② **P0 httpdl**：HLS/DASH 流式循环
+> 缺 epoch 单写者闸门（pause→resume 双写者 append 同一 .part 静默损坏）→ is_aborted
+> 闭包（pause ∪ epoch 过期 ∪ 已移除）+ 落位前终检 + HTTP resume 运行态不重 spawn；
+> ③ P1：rss.json 唯一 tmp+0600+损坏留存（对齐 tasks.json V12 配方）、刷新互斥闸、
+> 规则首见命中去重、cap=0 无限重下防护、空白关键词拒绝、集数 captures_iter 全量提取、
+> DASH 单文件表示 120s 总超时+全量内存改流式、内核 piece priority 0 语义映射
+> （0=恢复默认而非 lt 的 skip）、fill_ih 幂等/errored 重建补齐 .torrent/fastresume
+> 路径（E30 重试死锁根治）、重启 Seeding 任务回登记（执法/统计不脱管 + 完成事件
+> 不重发）、resume 后引擎实况收敛（seeding_since 重登记）、downloaded==0 ratio∞
+> 口径、激活窗口暂停意图守卫、pause/resume 广播 from 态实值化；④ P2：FTPS 全局
+> 共享 connector（TLS 会话复用，vsftpd require_ssl_reuse 默认配置兼容）、HLS 段数
+> 上限/key 缓存上限/清单 16MB 限长（DASH 同步）、显式全零 IV 保留（Option 根治
+> 哨兵混淆）、SegmentTemplate Rep 级逐属性继承（ISO 23009-1）、封禁区间 v4-mapped
+> 归一、recheck/announce/super-seeding NotFound 语义（500→404）。**暂缓项**（下轮）：
+> 配额闸门 TOCTOU 预留槽位改造（add 在途窗口超卖，四入口统一）、完成动作全表快照
+> 竞态（同根因）、ban 重放失败脏标记重试、created_at 持久化（重启 FIFO 保序）、
+> FTP 续传 MDTM 指纹（G2 缺陷类 FTP 残留）。

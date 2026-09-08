@@ -100,12 +100,19 @@ pub fn classify_error(status: u16, body: &str) -> EngineError {
     EngineError::Other(format!("xunlei api {status}: {}", truncate(body, 160)))
 }
 
+/// 按字符边界截断（审计修复 P1-2：原 `&s[..n]` 按字节切片，n=160/120 落在
+/// 多字节 UTF-8（CJK）中间即 panic——NAS/迅雷错误体以中文为主，必然触发）。
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n])
+        return s.to_string();
     }
+    let cut = s
+        .char_indices()
+        .map(|(i, _)| i)
+        .take_while(|&i| i <= n)
+        .last()
+        .unwrap_or(0);
+    format!("{}…", &s[..cut])
 }
 
 /// `params.speed` 形如 `"1.23MB/s"` / `"456KB/s"` / `"789"`（B/s）→ B/s。
@@ -392,12 +399,17 @@ impl DownloadEngine for NasRemoteEngine {
             total: total as u64,
             down_rate: speed,
             up_rate: 0,
+            // E33：NAS 远端无全生命周期累计口径，恒 0（快照序列化省略）
+            total_downloaded: 0,
+            total_uploaded: 0,
             num_peers: 0,
             num_seeds: 0,
             error: params
                 .get("error")
                 .and_then(|e| e.as_str())
                 .map(|s| s.to_string()),
+            // E9：NAS 引擎不参与名字回填（daemon add 时已派生远端名）
+            name: None,
         })
     }
 

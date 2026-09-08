@@ -1,0 +1,140 @@
+name: desktop
+
+# 桌面端三平台打包（tag desktop-v* 触发；PR 手动验证用 workflow_dispatch）
+on:
+  workflow_dispatch:
+  push:
+    tags: ["desktop-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            triple-suffix: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            triple-suffix: x86_64-pc-windows-msvc.exe
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            triple-suffix: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: oven-sh/setup-bun@v2
+
+      - name: Install Linux webkit deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - name: Install tauri-cli
+        run: cargo install tauri-cli --version '^2' --locked
+
+      # ---- S1-d：BT 引擎（原生 libtorrent）三平台装配 ----
+      - name: Setup BT native env (Linux)
+        if: runner.os == 'Linux'
+        # apt 装 libtorrent-rasterbar-dev + 内核静态库 + fakevcpkg 契约 + GITHUB_ENV
+        # （与 bt integration job 同源 bt-linux-setup.sh，链接行为逐字一致）
+        run: bash scripts/ci/desktop-bt-linux.sh setup
+
+      - name: Restore vcpkg binaries (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache/restore@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-libtorrent-x64-windows-v1
+
+      - name: Setup BT native env (Windows)
+        if: runner.os == 'Windows'
+        # vcpkg 装 libtorrent（动态 triplet）+ cl 编内核静态库 → GITHUB_ENV
+        run: ./scripts/ci/desktop-bt-windows.ps1 -Cmd setup
+
+      # 失败也落袋：vcpkg 首建源码编译 ~30min，内容寻址缓存部分命中可续跑
+      - name: Save vcpkg binaries (Windows)
+        if: always() && runner.os == 'Windows'
+        uses: actions/cache/save@v4
+        with:
+          path: .vcpkg-cache
+          key: vcpkg-libtorrent-x64-windows-v1
+
+      - name: Setup BT native env (macOS)
+        if: runner.os == 'macOS'
+        # brew 装 libtorrent-rasterbar + clang++ 编内核 + fakevcpkg 别名 → GITHUB_ENV
+        run: bash scripts/ci/desktop-bt-macos.sh setup
+
+      - name: Build UI (static export)
+        working-directory: ui
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+
+      # bt,ftp,sftp 全引擎 profile：BT 依赖上方三平台 native libtorrent 环境
+      - name: Build daemon (release, full-engine profile)
+        run: cargo build --release -p smart-dl-daemon --features bt,ftp,sftp
+
+      - name: Place sidecar binary
+        shell: bash
+        # externalBin 相对 src-tauri/（tauri.conf.json 所在目录）解析：
+        # 期望 desktop/src-tauri/binaries/smart-dl-daemon-<triple>。
+        run: |
+          mkdir -p desktop/src-tauri/binaries
+          cp "target/release/smart-dl-daemon$( [ '${{ runner.os }}' = 'Windows' ] && echo '.exe' )" \
+             "desktop/src-tauri/binaries/smart-dl-daemon-${{ matrix.triple-suffix }}"
+
+      # ---- S1-d：运行期原生库随包分发 ----
+      - name: Stage native libs (Linux)
+        if: runner.os == 'Linux'
+        # .so 闭包 → src-tauri/native/linux/ + sidecar 注入 RUNPATH
+        # $ORIGIN/../lib/Smart Downloader/native/linux（deb 与 AppImage 同构）
+        run: bash scripts/ci/desktop-bt-linux.sh stage "desktop/src-tauri/binaries/smart-dl-daemon-${{ matrix.triple-suffix }}"
+
+      - name: Stage native libs (macOS)
+        if: runner.os == 'macOS'
+        # dylib 闭包 → src-tauri/native/macos/lib/ + install_name 改写 @executable_path + ad-hoc 重签
+        run: bash scripts/ci/desktop-bt-macos.sh stage "desktop/src-tauri/binaries/smart-dl-daemon-${{ matrix.triple-suffix }}"
+
+      - name: Stage native libs (Windows)
+        if: runner.os == 'Windows'
+        # vcpkg bin DLL 全量 + CRT 三件套 → src-tauri/native/win/（资源映射落安装根）
+        run: ./scripts/ci/desktop-bt-windows.ps1 -Cmd stage
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop
+          tauriScript: cargo tauri
+          args: --target ${{ matrix.target }}
+          # tag 触发时发布 Release 并附安装包（矩阵三平台同 Release 并发上传，
+          # tauri-action 幂等：已存在则仅追加资产）；__VERSION__ 取 tauri.conf.json
+          tagName: desktop-v__VERSION__
+          releaseName: Smart Downloader Desktop v__VERSION__
+          releaseBody: |
+            Smart Downloader 桌面端（内嵌 daemon + UI，全引擎：BT(libtorrent) / HTTP / FTP / SFTP）。
+            - Windows：.msi / .exe（WebView2）
+            - macOS（Apple Silicon）：.dmg / .app
+            - Linux：.deb / .AppImage
+            原生库已随包分发，无需另行安装 libtorrent/VC 运行时。
+            首次启动后数据目录：系统标准应用配置目录（任务/下载收纳于此）。
+          releaseDraft: false
+          prerelease: false
+
+      - name: Upload bundles (workflow artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: smart-dl-desktop-${{ matrix.target }}
+          path: |
+            desktop/src-tauri/target/*/release/bundle/**/*

@@ -149,6 +149,24 @@ pub fn parse_proxy(url: &str) -> Result<ProxyCfg> {
     })
 }
 
+/// MSE（Protocol Encryption）握手策略，对应 `lt_apply_transport` 的 enc_policy：
+/// `Disable` = 纯明文（拒绝 MSE 连接）/ `Allow` = 明文+加密皆收（内核默认行为）/
+/// `Require` = 仅加密（明文直接拒绝）。取值与内核 enc_policy 三态一一对应
+///（0=pe_disabled 1=pe_enabled 2=pe_forced），新增变体须同步 lt.h 契约注释。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum EncryptPolicy {
+    Disable = 0,
+    Allow = 1,
+    Require = 2,
+}
+
+impl EncryptPolicy {
+    pub fn as_c_int(self) -> c_int {
+        self as u32 as c_int
+    }
+}
+
 impl Session {
     pub fn new(save_path: &Path, session_id: &str) -> Result<Self> {
         let sp = cstr(&save_path.to_string_lossy())?;
@@ -202,13 +220,16 @@ impl Session {
         call(code, || Ok(()))
     }
 
-    /// 发现层开关：DHT / LSD / UPnP（enable_upnp 同时控制 NAT-PMP——端口映射族）。
-    /// 会话默认全关（M0 确定性语义）；本方法显式覆盖。
+    /// 发现层开关：DHT / LSD / UPnP / PEX（enable_upnp 同时控制 NAT-PMP——端口映射族）。
+    /// 内核默认 DHT/LSD/UPnP 关、PEX 开（M0 确定性语义）；本方法显式覆盖。
+    /// PEX 特殊：内核 2.0.x 无会话级 settings_pack 开关，置 false 经 per-torrent
+    /// disable_pex flag 落地（仅对其后新增任务生效，见 lt.h 契约注释）。
     pub fn apply_discovery(
         &self,
         enable_dht: bool,
         enable_lsd: bool,
         enable_upnp: bool,
+        enable_pex: bool,
     ) -> Result<()> {
         let code = unsafe {
             lt_apply_discovery(
@@ -216,8 +237,24 @@ impl Session {
                 enable_dht as c_int,
                 enable_lsd as c_int,
                 enable_upnp as c_int,
+                enable_pex as c_int,
             )
         };
+        call(code, || Ok(()))
+    }
+
+    /// 传输层开关：uTP（incoming/outgoing 同进退）+ MSE 加密三态。
+    /// 会话默认 uTP 关 + 加密允许（M0 确定性语义）；本方法显式覆盖。
+    pub fn apply_transport(&self, enable_utp: bool, enc_policy: EncryptPolicy) -> Result<()> {
+        let code =
+            unsafe { lt_apply_transport(self.raw, enable_utp as c_int, enc_policy.as_c_int()) };
+        call(code, || Ok(()))
+    }
+
+    /// 会话连接参数（S1）：监听端口 + 全局连接数上限。
+    /// port = 0 / max_connections = 0 → 该项不下发（内核默认/上次设置）。
+    pub fn apply_conn(&self, port: u16, max_connections: u32) -> Result<()> {
+        let code = unsafe { lt_apply_conn(self.raw, port as c_int, max_connections as c_int) };
         call(code, || Ok(()))
     }
 
@@ -309,6 +346,99 @@ impl Session {
         )
     }
 
+    /// 超级种子开关（seed_mode flag；下载中设置无效果，做种态生效）。
+    pub fn set_seed_mode(&self, ih: &str, on: bool) -> Result<()> {
+        let i = self.ih(ih)?;
+        call(
+            unsafe { lt_set_seed_mode(self.raw, i.as_ptr(), on as c_int) },
+            || Ok(()),
+        )
+    }
+
+    /// 强制向全部 tracker 立即宣告（qbit/BitComet 任务右键对标；Task 46）。
+    pub fn force_reannounce(&self, ih: &str) -> Result<()> {
+        let i = self.ih(ih)?;
+        call(unsafe { lt_force_reannounce(self.raw, i.as_ptr()) }, || {
+            Ok(())
+        })
+    }
+
+    /// 强制 DHT 宣告（DHT 未启用时内核 no-op，不报错）。
+    pub fn force_dht_announce(&self, ih: &str) -> Result<()> {
+        let i = self.ih(ih)?;
+        call(
+            unsafe { lt_force_dht_announce(self.raw, i.as_ptr()) },
+            || Ok(()),
+        )
+    }
+
+    /// 强制重新校验（任务转入 checking；校验期下载/做种挂起，完成后自动恢复）。
+    pub fn force_recheck(&self, ih: &str) -> Result<()> {
+        let i = self.ih(ih)?;
+        call(unsafe { lt_force_recheck(self.raw, i.as_ptr()) }, || Ok(()))
+    }
+
+    /// Session 级 IP 封禁（幂等；内核走 ip_filter，列表 C++ 侧镜像可查回）。
+    /// `ih` = Some 时内核先验证任务存在（NotFound 语义），None 直接全 session 生效。
+    pub fn ban_ip(&self, ih: Option<&str>, ip: &str) -> Result<()> {
+        let a = cstr(ip)?;
+        let i = match ih {
+            Some(s) => Some(self.ih(s)?),
+            None => None,
+        };
+        let ih_ptr = match &i {
+            Some(c) => c.as_ptr(),
+            None => ptr::null(),
+        };
+        call(
+            unsafe { lt_ban_peer(self.raw, ih_ptr, a.as_ptr(), 0) },
+            || Ok(()),
+        )
+    }
+
+    /// 解除封禁（幂等：未封禁的 IP 也返回 Ok）。
+    pub fn unban_ip(&self, ip: &str) -> Result<()> {
+        let a = cstr(ip)?;
+        call(unsafe { lt_unban_peer(self.raw, a.as_ptr()) }, || Ok(()))
+    }
+
+    /// IP 段封禁（batch5 对标）：[start, end] 闭区间加入 ip_filter。
+    pub fn ban_ip_range(&self, start: &str, end: &str) -> Result<()> {
+        let a = cstr(start)?;
+        let b = cstr(end)?;
+        call(
+            unsafe { lt_ban_range(self.raw, a.as_ptr(), b.as_ptr()) },
+            || Ok(()),
+        )
+    }
+
+    /// 首尾块优先（batch5 对标）：每文件首/末块优先级置为 prio（0..=7）。
+    /// 需要 metadata（否则 NotFound）。
+    pub fn set_piece_first_last(&self, ih: &str, prio: i32) -> Result<()> {
+        let i = self.ih(ih)?;
+        call(
+            unsafe { lt_set_piece_first_last(self.raw, i.as_ptr(), prio) },
+            || Ok(()),
+        )
+    }
+
+    /// 会话级存储模式（batch5 对标）：后续新增任务预分配开关。
+    pub fn set_storage_mode(&self, alloc: bool) -> Result<()> {
+        call(
+            unsafe { lt_set_storage_mode(self.raw, alloc as i32) },
+            || Ok(()),
+        )
+    }
+
+    /// 查询显式封禁状态（true = 已封禁）。仅反映本层显式封禁（不含内核
+    /// auto-ban 的临时封禁）。
+    pub fn is_banned(&self, ip: &str) -> Result<bool> {
+        let a = cstr(ip)?;
+        let mut out: c_int = 0;
+        let code = unsafe { lt_is_banned(self.raw, a.as_ptr(), &mut out) };
+        call(code, || Ok(out != 0))
+    }
+
     pub fn resume(&self, ih: &str) -> Result<()> {
         let i = self.ih(ih)?;
         call(unsafe { lt_resume(self.raw, i.as_ptr()) }, || Ok(()))
@@ -335,6 +465,9 @@ impl Session {
             num_seeds: 0,
             metadata_received: 0,
             paused: 0,
+            name: [0; 256],
+            all_time_download: 0,
+            all_time_upload: 0,
         };
         let code = unsafe { lt_status(self.raw, i.as_ptr(), &mut st) };
         call(code, || Ok(st))
@@ -395,6 +528,39 @@ impl Session {
             )
         };
         call(code, || Ok(done.into_iter().zip(size).collect()))
+    }
+
+    /// 子文件优先级批量设置（P1 任务级能力）。`prio` = (文件下标, 0..=7)，
+    /// 内核两段式（全量校验→应用）。需要 metadata（否则 NOT_FOUND）。
+    pub fn set_file_priorities(&self, ih: &str, prio: &[(i32, i32)]) -> Result<()> {
+        if prio.is_empty() {
+            return Ok(());
+        }
+        let i = self.ih(ih)?;
+        let idxs: Vec<i32> = prio.iter().map(|(idx, _)| *idx).collect();
+        let prios: Vec<i32> = prio.iter().map(|(_, p)| *p).collect();
+        let code = unsafe {
+            lt_set_file_priorities(
+                self.raw,
+                i.as_ptr(),
+                idxs.as_ptr(),
+                prios.as_ptr(),
+                idxs.len() as c_int,
+            )
+        };
+        call(code, || Ok(()))
+    }
+
+    /// 读取当前各文件优先级（下标即文件序）。需要 metadata。
+    pub fn file_priorities(&self, ih: &str) -> Result<Vec<i32>> {
+        let n = self.file_count(ih)?;
+        if n <= 0 {
+            return Ok(Vec::new());
+        }
+        let i = self.ih(ih)?;
+        let mut out = vec![0 as c_int; n as usize];
+        let code = unsafe { lt_get_file_priorities(self.raw, i.as_ptr(), out.as_mut_ptr(), n) };
+        call(code, || Ok(out))
     }
 
     /// 富 peer 列表；尺寸查询 → 分配 → 填充（查询阶段恒传 null/0，避免 !buf 恒真空转）
@@ -494,10 +660,59 @@ impl Session {
         )
     }
 
+    /// tracker 表列举（E29）：两段式（cap=0 探测 → BUFFER_TOO_SMALL → 扩容重试），
+    /// 与 peers() 同构。空表 → Ok(vec![])。
+    pub fn list_trackers(&self, ih: &str) -> Result<Vec<lt_tracker_info>> {
+        let i = self.ih(ih)?;
+        let mut need: c_int = 0;
+        let code = unsafe { lt_list_trackers(self.raw, i.as_ptr(), ptr::null_mut(), 0, &mut need) };
+        match code {
+            lt_err_LT_OK => return Ok(Vec::new()), // 空表
+            lt_err_LT_ERR_BUFFER_TOO_SMALL => {}   // need 已为所需数
+            c => return Err(Error::from(c)),
+        }
+        let cap = need as usize;
+        let mut buf: Vec<lt_tracker_info> = Vec::with_capacity(cap);
+        buf.resize_with(cap, || lt_tracker_info {
+            url: [0; 256],
+            tier: 0,
+        });
+        let mut n: c_int = 0;
+        let code2 = unsafe {
+            lt_list_trackers(self.raw, i.as_ptr(), buf.as_mut_ptr(), cap as c_int, &mut n)
+        };
+        if code2 != lt_err_LT_OK {
+            return Err(Error::from(code2));
+        }
+        buf.truncate(n.max(0) as usize);
+        Ok(buf)
+    }
+
+    /// 删 tracker（E29）：内核按 URL 精确匹配，无匹配 → Error（NotFound 定性）。
+    pub fn remove_tracker(&self, ih: &str, url: &str) -> Result<()> {
+        let i = self.ih(ih)?;
+        let u = cstr(url)?;
+        call(
+            unsafe { lt_remove_tracker(self.raw, i.as_ptr(), u.as_ptr()) },
+            || Ok(()),
+        )
+    }
+
     pub fn set_sequential(&self, ih: &str, on: bool) -> Result<()> {
         let i = self.ih(ih)?;
         call(
             unsafe { lt_set_sequential(self.raw, i.as_ptr(), on as c_int) },
+            || Ok(()),
+        )
+    }
+
+    /// 任务级连接数上限（S1-c）：>0 = 上限；0 = 复位会话级默认。
+    pub fn set_max_connections(&self, ih: &str, max_connections: u32) -> Result<()> {
+        let i = self.ih(ih)?;
+        call(
+            unsafe {
+                lt_torrent_set_max_connections(self.raw, i.as_ptr(), max_connections as c_int)
+            },
             || Ok(()),
         )
     }

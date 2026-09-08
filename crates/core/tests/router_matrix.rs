@@ -50,6 +50,7 @@ fn http_routes_to_http() {
             headers: vec![],
             auth: None,
             backup_url: None,
+            proxy: None,
         })
         .unwrap(),
         "http"
@@ -129,6 +130,7 @@ fn no_engine_at_all_is_no_engine_error() {
         headers: vec![],
         auth: None,
         backup_url: None,
+        proxy: None,
     });
     assert!(matches!(r, Err(RoutingError::NoEngineForSource)));
 }

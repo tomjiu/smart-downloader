@@ -1,5 +1,5 @@
 //! smart-dl-daemon 二进制入口：
-//! - `smart-dl-daemon serve [--config <path>]`：daemon 服务
+//! - `smart-dl-daemon serve [--config <path>] [--ui-dir <dir>] [--addr <addr>]`：daemon 服务
 //! - 其他命令（add/list/status/...）：客户端模式，连接 serve 的 HTTP API
 //!   （`--server <url>`，默认 http://127.0.0.1:8787）
 
@@ -17,23 +17,33 @@ fn main() {
 
     // —— serve 子命令 ——
     if args.get(1).map(|s| s.as_str()) == Some("serve") {
-        let cfg_path = match serve::parse_args(&args[2..]) {
+        let serve_args = match serve::parse_args(&args[2..]) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("参数错误: {e}");
-                eprintln!("用法: smart-dl-daemon serve [--config <path>]");
+                eprintln!("用法: smart-dl-daemon serve [--config <path>] [--ui-dir <dir>] [--addr <addr>]");
                 std::process::exit(2);
             }
         };
-        let cfg = match smart_dl_daemon::config::Config::load(cfg_path.as_deref()) {
+        let cfg = match smart_dl_daemon::config::Config::load(serve_args.config.as_deref()) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("配置错误: {e}");
                 std::process::exit(2);
             }
         };
+        // CLI `--addr` 覆盖配置文件监听地址（桌面壳 sidecar 契约：壳与 daemon
+        // 同端口约定）。非回环 + 无 token 的 fail-closed 校验在 serve::run 内。
+        let cfg = match &serve_args.addr {
+            Some(addr) => {
+                let mut c = cfg;
+                c.server.addr = addr.clone();
+                c
+            }
+            None => cfg,
+        };
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime 创建失败");
-        if let Err(e) = rt.block_on(serve::run(cfg, cfg_path)) {
+        if let Err(e) = rt.block_on(serve::run(cfg, serve_args)) {
             eprintln!("daemon 退出: {e}");
             std::process::exit(1);
         }
@@ -99,6 +109,21 @@ fn main() {
             tier.clone(),
         )) {
             eprintln!("xunlei-login 失败: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    // —— baidu-resolve：本地执行（无需 daemon 进程），分发前拦截 ——
+    if let smart_dl_daemon::cli::CliCommand::BaiduResolve { url, pwd, dir } = &cli.command {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime 创建失败");
+        if let Err(e) = rt.block_on(smart_dl_daemon::baidu_resolve::run(
+            url.clone(),
+            pwd.clone(),
+            dir.clone(),
+            cli.json,
+        )) {
+            eprintln!("baidu-resolve 失败: {e}");
             std::process::exit(1);
         }
         return;

@@ -222,7 +222,7 @@ fn extract_binary_entries(
                     .or_else(|| {
                         before.map(|&(po, ref s)| (po, s, (i as i64 - (po + s.len()) as i64).abs()))
                     });
-                if let Some((_, s, gap)) = pick {
+                if let Some((_po, s, gap)) = pick {
                     let tag_ok = !tlv_mode
                         || i >= 2 && bytes[i - 2..i].iter().any(|&b| (0x01..0x40).contains(&b));
                     if tag_ok {
@@ -313,10 +313,12 @@ fn utf16le_strings(bytes: &[u8]) -> Vec<(usize, String)> {
             buf.push(u);
             i += 2;
         } else {
-            if let Some(st) = start.filter(|_| buf.len() >= 6) {
-                let s: String = String::from_utf16_lossy(&buf);
-                if s.contains('/') || s.contains('\\') || s.contains('.') {
-                    out.push((st, s));
+            if let Some(off) = start {
+                if buf.len() >= 6 {
+                    let s: String = String::from_utf16_lossy(&buf);
+                    if s.contains('/') || s.contains('\\') || s.contains('.') {
+                        out.push((off, s));
+                    }
                 }
             }
             start = None;
@@ -324,10 +326,12 @@ fn utf16le_strings(bytes: &[u8]) -> Vec<(usize, String)> {
             i += 2;
         }
     }
-    if let Some(st) = start.filter(|_| buf.len() >= 6) {
-        let s = String::from_utf16_lossy(&buf);
-        if s.contains('/') || s.contains('\\') || s.contains('.') {
-            out.push((st, s));
+    if let Some(off) = start {
+        if buf.len() >= 6 {
+            let s = String::from_utf16_lossy(&buf);
+            if s.contains('/') || s.contains('\\') || s.contains('.') {
+                out.push((off, s));
+            }
         }
     }
     out
@@ -371,7 +375,7 @@ mod tests {
         v.extend_from_slice(&[0x00, 0x00]);
         let (report, entries) = analyze_cid_store(&v);
         assert!(report.xdlctx_family);
-        assert!(entries.len() >= 1, "notes={:?}", report.notes);
+        assert!(!entries.is_empty(), "notes={:?}", report.notes);
         assert_eq!(entries[0].path, "D:/dl/video.mkv");
         assert_eq!(entries[0].hash_len, 16);
         assert_eq!(entries[0].hash_hex, hex::encode(hash));

@@ -177,7 +177,11 @@ pub struct Sharer {
 impl Sharer {
     pub fn new() -> Self {
         Sharer {
-            http: reqwest::Client::new(),
+            http: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
             captcha: Mutex::new(None),
             pass_token: Mutex::new(None),
         }
@@ -186,15 +190,15 @@ impl Sharer {
     /// 构造 share API 的三要素请求头（参考 client.rs::auth_headers，但 x-device-id 用 32 位匿名设备号）。
     fn share_headers(&self, device_id: &str, captcha_token: &str) -> HeaderMap {
         let mut h = HeaderMap::new();
-        h.insert("x-device-id", HeaderValue::from_str(device_id).unwrap());
+        h.insert("x-device-id", super::client::safe_header_value(device_id));
         h.insert(
             "x-captcha-token",
-            HeaderValue::from_str(captcha_token).unwrap(),
+            super::client::safe_header_value(captcha_token),
         );
         // 部分接口同时读大写的 X-Captcha-Token（脚本实测里两种都带过）。
         h.insert(
             "X-Captcha-Token",
-            HeaderValue::from_str(captcha_token).unwrap(),
+            super::client::safe_header_value(captcha_token),
         );
         h.insert("x-client-id", HeaderValue::from_static(CLIENT_ID));
         h.insert(

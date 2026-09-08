@@ -71,7 +71,20 @@ const APPKEY: &str = "34a062aaa22f906fca4fefe9fb3a3021";
 ///       → `adb1a76709f6584a13b58baaf6e1d871`
 pub fn device_id_32(device_id: &str) -> &str {
     let s = device_id.strip_prefix("wdi10.").unwrap_or(device_id);
-    &s[..s.len().min(32)]
+    // 审查修复（P2）：按字节切片在多字节 UTF-8 边界 panic（auth.json 手编/
+    // 异常档位注入非 hex id 时可达）。ASCII 快路径保持原语义；非 ASCII 按
+    // char boundary 截断到 ≤32 字节，签名路径不 panic。
+    if s.is_ascii() {
+        return &s[..s.len().min(32)];
+    }
+    let mut end = 0;
+    for (i, c) in s.char_indices() {
+        if i + c.len_utf8() > 32 {
+            break;
+        }
+        end = i + c.len_utf8();
+    }
+    &s[..end]
 }
 
 /// 计算 Web 端 captcha_sign：
@@ -133,6 +146,28 @@ pub fn device_sign(device_id: &str) -> String {
         to_hex(&h.finalize())
     };
     format!("div101.{}{}", device_id, md5_hex)
+}
+
+/// 本地随机生成完整 device_id（`wdi10.` + 64 位 hex）。
+///
+/// 服务端不校验来源（README_captcha_sign §1.5 实测），本地随机即可。
+/// device_id_32() 会自动剥前缀取前 32 位供 captcha_sign 使用。
+pub fn random_device_id() -> String {
+    use md5::{Digest as Md5Digest, Md5};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let pid = std::process::id();
+    let mut h = Md5::new();
+    h.update(format!("{nanos}-{pid}-{n}-a").as_bytes());
+    let a: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let mut h2 = Md5::new();
+    h2.update(format!("{nanos}-{pid}-{n}-b").as_bytes());
+    let b: String = h2.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    format!("wdi10.{a}{b}")
 }
 
 #[cfg(test)]
@@ -211,26 +246,4 @@ mod tests {
     fn device_sign_differs_by_device() {
         assert_ne!(device_sign("a"), device_sign("b"));
     }
-}
-
-/// 本地随机生成完整 device_id（`wdi10.` + 64 位 hex）。
-///
-/// 服务端不校验来源（README_captcha_sign §1.5 实测），本地随机即可。
-/// device_id_32() 会自动剥前缀取前 32 位供 captcha_sign 使用。
-pub fn random_device_id() -> String {
-    use md5::{Digest as Md5Digest, Md5};
-    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let pid = std::process::id();
-    let mut h = Md5::new();
-    h.update(format!("{nanos}-{pid}-{n}-a").as_bytes());
-    let a: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    let mut h2 = Md5::new();
-    h2.update(format!("{nanos}-{pid}-{n}-b").as_bytes());
-    let b: String = h2.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    format!("wdi10.{a}{b}")
 }

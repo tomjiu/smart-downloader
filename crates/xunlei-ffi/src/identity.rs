@@ -252,7 +252,7 @@ mod bgrade_tests {
 
     #[test]
     fn cstring_helper_rejects_nul() {
-        assert!(matches!(cstring_or_err("ok", "x"), Ok(_)));
+        assert!(cstring_or_err("ok", "x").is_ok());
         let err = cstring_or_err("bad\0string", "x").unwrap_err();
         assert!(matches!(err, XunleiError::InvalidParam(m) if m.contains("null byte")));
     }

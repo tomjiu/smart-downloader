@@ -119,8 +119,14 @@ use std::sync::Arc;
 
 #[tokio::test]
 async fn cli_add_list_status_roundtrip() {
+    // dest 垃圾治理：default_dest_root 缺省 = "."（进程工作目录 = crates/daemon/），
+    // dest: None 的 add 会把下载文件留在仓库内（crates/daemon/file）。注入独立
+    // tempdir 为白名单根 + 默认落盘目录，TempDir 守卫在测试结束时自动清理。
+    let dir = tempfile::tempdir().unwrap();
     let engine = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
-    let state = Arc::new(DaemonState::new(Arc::new(engine), vec![]));
+    let state = Arc::new(
+        DaemonState::new(Arc::new(engine), vec![]).with_dest_root(dir.path().to_path_buf()),
+    );
     let app = http::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

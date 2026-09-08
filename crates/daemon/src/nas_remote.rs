@@ -7,6 +7,7 @@
 //!   - 任务列表：GET  /device/v1/tasks
 //!   - 暂停/恢复：POST /device/v1/tasks/{id}/pause|resume（未验证）
 //!   - try_speed：GET /device/v1/try_speed/get_info（端点字符串已实证，参数未验证）
+//!
 //! 已实证事实（附录 E）：DriveListen 为 gin HTTP（默认 127.0.0.1:5050）；
 //! 登录门前 web 不监听；token 预置路径 `HOME/auth_token.json`（#8）。
 //!

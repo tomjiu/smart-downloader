@@ -148,6 +148,28 @@ fn control_ops_and_read_piece() {
 }
 
 #[test]
+fn task_max_connections_set_and_reset() {
+    let (c, _save) = core("maxconn");
+    let seeder = seed::TestSeeder::start();
+    let ih = c.add_magnet(seeder.magnet(), &[]).expect("add_magnet");
+
+    // 元数据未就绪也可设（handle 级参数，S1-c 契约）
+    c.set_max_connections(&ih, 64).expect("set 64");
+    // 0 = 复位会话级 connections_limit 默认
+    c.set_max_connections(&ih, 0).expect("reset");
+
+    // 未知 infohash → NotFound 定性
+    let err = c
+        .set_max_connections("0000000000000000000000000000000000000000", 10)
+        .expect_err("未知 ih 必须失败");
+    assert!(
+        matches!(err, smart_dl_btcore::Error::NotFound(_)),
+        "实际 {:?}",
+        err
+    );
+}
+
+#[test]
 fn pause_resume_flow() {
     // pause → torrent_paused alert；resume 后状态可查（ABI100：状态停在暂停前值，§10.1）
     let (c, _save) = core("pr");
@@ -186,4 +208,41 @@ fn pause_resume_flow() {
     let st = c.status(&ih).expect("status_resumed");
     assert_eq!(st.progress, 1.0);
     assert!(!st.paused, "resume 后 status.paused 应为 false");
+}
+
+/// E33：全生命周期累计上/下行透出（lt_torrent_status::all_time_*）。
+/// 注意冲账时机：libtorrent 的 all_time 计数器（m_total_downloaded +=
+/// m_stat.last_payload_downloaded()）只在 session second_tick（≈1s 节拍）
+/// 落账——progress 到 1.0 后立即读可能仍是 0（本次 2MB 环回下载实测如
+/// 此）。累计统计的展示语义本就是秒级（qBittorrent 同款轮询口径），
+/// 快照读数容忍一个 tick 的滞后属可接受设计，此处轮询等待冲账。
+#[test]
+fn all_time_totals_exposed() {
+    let (c, _save) = core("totals");
+    let seeder = seed::TestSeeder::start();
+    let ih = c.add_magnet(seeder.magnet(), &[]).expect("add_magnet");
+    let (ip, port) = seeder.addr();
+    c.resume(&ih).expect("resume");
+    c.add_peer(&ih, &ip, port).expect("add_peer");
+    download_to_complete(&c, &ih);
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let st = loop {
+        let st = c.status(&ih).expect("status");
+        if st.all_time_download > 0 {
+            break st;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "15s 内 all_time_download 未冲账为非零（tick 未落账）: {st:?}"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    assert!(
+        st.all_time_download >= st.downloaded,
+        "累计下行应 >= 本次 done（含 hashfail/重复收块历史口径）: {} < {}",
+        st.all_time_download,
+        st.downloaded
+    );
+    assert!(st.all_time_upload >= 0);
 }

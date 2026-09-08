@@ -1,0 +1,452 @@
+/* smart-dl UI 自定义层（S2 内嵌版）：
+   - 全部颜色取自 qoder-ui 主题变量（data-theme 8 主题自适应）
+   - dl-* 前缀为应用组件层；.qoder-* 为 vendored qoder-ui 库层
+   - 动效尊重 prefers-reduced-motion */
+
+.dl-root {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-page);
+  color: var(--text-primary);
+  background-image: radial-gradient(
+      color-mix(in srgb, var(--accent) 7%, transparent) 1px,
+      transparent 1px
+    ),
+    radial-gradient(
+      color-mix(in srgb, var(--accent) 4%, transparent) 1px,
+      transparent 1px
+    );
+  background-size: 28px 28px, 28px 28px;
+  background-position: 0 0, 14px 14px;
+}
+
+/* —— 顶栏：玻璃拟态 —— */
+.dl-header {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 20px;
+  background: color-mix(in srgb, var(--bg-card) 78%, transparent);
+  backdrop-filter: blur(14px) saturate(1.2);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  border-bottom: 1px solid var(--border-subtle);
+}
+.dl-logo {
+  width: 34px;
+  height: 34px;
+  border-radius: var(--qoder-radius-md);
+  background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 55%, #000));
+  display: grid;
+  place-items: center;
+  color: var(--bg-card);
+  box-shadow: 0 2px 10px color-mix(in srgb, var(--accent) 45%, transparent);
+  flex: none;
+}
+.dl-title {
+  font-size: var(--qoder-font-lg);
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  position: relative;
+  padding-left: 12px;
+}
+.dl-title::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 3px;
+  bottom: 3px;
+  width: 3px;
+  border-radius: 2px;
+  background: linear-gradient(180deg, var(--accent), transparent);
+}
+.dl-header .dl-spacer { flex: 1; }
+
+/* —— 布局 —— */
+.dl-body {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+}
+.dl-sidebar {
+  width: 208px;
+  flex: none;
+  padding: 16px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-right: 1px solid var(--border-subtle);
+}
+.dl-nav-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: var(--qoder-radius-md);
+  color: var(--text-secondary);
+  cursor: pointer;
+  border: 1px solid transparent;
+  background: transparent;
+  font: inherit;
+  width: 100%;
+  text-align: left;
+  transition: all var(--qoder-transition-fast);
+}
+.dl-nav-item:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  transform: translateX(2px);
+}
+.dl-nav-item--active {
+  background: color-mix(in srgb, var(--accent) 12%, var(--bg-card));
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+  font-weight: 600;
+}
+.dl-nav-item--active .qoder-icon { animation: dl-pop 0.3s ease; }
+@keyframes dl-pop {
+  0% { transform: scale(0.7); }
+  60% { transform: scale(1.18); }
+  100% { transform: scale(1); }
+}
+.dl-main {
+  flex: 1;
+  min-width: 0;
+  padding: 22px 26px 40px;
+  overflow-x: hidden;
+}
+@media (max-width: 760px) {
+  .dl-sidebar {
+    position: fixed;
+    left: 0; right: 0; bottom: 0;
+    top: auto;
+    z-index: 50;
+    width: auto;
+    flex-direction: row;
+    justify-content: space-around;
+    padding: 6px;
+    background: color-mix(in srgb, var(--bg-card) 92%, transparent);
+    backdrop-filter: blur(12px);
+    border-right: none;
+    border-top: 1px solid var(--border-subtle);
+  }
+  .dl-nav-item { flex-direction: column; gap: 2px; padding: 6px 10px; }
+  .dl-nav-item span { font-size: 10px; }
+  .dl-main { padding: 16px 14px 84px; }
+}
+
+/* —— 卡片 —— */
+.dl-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--qoder-radius-lg);
+  padding: 16px;
+  transition: transform var(--qoder-transition-base), box-shadow var(--qoder-transition-base),
+    border-color var(--qoder-transition-base);
+}
+.dl-card--hover:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--qoder-shadow-lg);
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border-subtle));
+}
+.dl-grid { display: grid; gap: 14px; }
+.dl-grid--stats { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.dl-grid--tasks { grid-template-columns: 1fr; gap: 10px; }
+
+/* —— 入场动画（错峰） —— */
+.dl-enter {
+  animation: dl-enter 0.42s cubic-bezier(0.22, 1, 0.36, 1) both;
+  animation-delay: calc(min(var(--i, 0), 12) * 42ms);
+}
+@keyframes dl-enter {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+
+/* —— 进度条 v2：五态语义 —— */
+.dl-progress {
+  position: relative;
+  height: 8px;
+  border-radius: 99px;
+  background: color-mix(in srgb, var(--text-tertiary) 18%, transparent);
+  overflow: hidden;
+}
+.dl-progress--thin { height: 5px; }
+.dl-bar {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  width: 0;
+  background: var(--accent);
+  transition: width 0.5s cubic-bezier(0.22, 1, 0.36, 1);
+  position: relative;
+}
+.dl-bar--run {
+  background: linear-gradient(90deg, var(--accent), color-mix(in srgb, var(--accent) 60%, #fff));
+}
+.dl-bar--run::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: repeating-linear-gradient(
+    -55deg,
+    transparent 0 8px,
+    color-mix(in srgb, #fff 25%, transparent) 8px 12px
+  );
+  animation: dl-flow 0.8s linear infinite;
+}
+.dl-bar--run::before {
+  content: "";
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 36px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.45), transparent);
+  animation: dl-sweep 1.6s ease-in-out infinite;
+}
+@keyframes dl-flow { to { background-position: 24px 0; } }
+@keyframes dl-sweep { 0% { left: -40px; } 60%, 100% { left: 105%; } }
+.dl-bar--done { background: var(--success); }
+.dl-bar--error { background: var(--error); }
+.dl-bar--paused { background: var(--warning); }
+.dl-bar--queued {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--text-tertiary) 0 6px,
+    transparent 6px 12px
+  );
+  opacity: 0.5;
+}
+
+/* —— 速率胶囊 / 百分比 —— */
+.dl-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 99px;
+  font-size: var(--qoder-font-sm);
+  font-variant-numeric: tabular-nums;
+  background: var(--bg-surface);
+  color: var(--text-secondary);
+}
+.dl-pill--down { color: var(--accent); background: color-mix(in srgb, var(--accent) 12%, transparent); }
+.dl-pill--up { color: var(--info); background: color-mix(in srgb, var(--info) 12%, transparent); }
+.dl-pct {
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+.dl-live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 99px;
+  background: currentColor;
+  animation: dl-breathe 1.2s ease-in-out infinite;
+}
+@keyframes dl-breathe {
+  0%, 100% { opacity: 0.35; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+
+/* —— 统计卡 —— */
+.dl-stat-ico {
+  width: 38px;
+  height: 38px;
+  flex: none;
+  border-radius: var(--qoder-radius-md);
+  display: grid;
+  place-items: center;
+  font-size: 19px;
+  background: color-mix(in srgb, var(--tone, var(--accent)) 13%, transparent);
+  color: var(--tone, var(--accent));
+}
+.dl-stat-num {
+  font-size: var(--qoder-font-xl);
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.15;
+}
+.dl-bar-track {
+  height: 6px;
+  border-radius: 99px;
+  background: color-mix(in srgb, var(--text-tertiary) 16%, transparent);
+  overflow: hidden;
+}
+.dl-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--tone, var(--accent)), color-mix(in srgb, var(--tone, var(--accent)) 55%, #fff));
+  transition: width 0.6s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* —— 表单（设置页） —— */
+.dl-form-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 220px;
+  gap: 10px 18px;
+  align-items: center;
+}
+@media (max-width: 860px) {
+  .dl-form-grid { grid-template-columns: 1fr; }
+}
+.dl-field-label { font-weight: 600; font-size: var(--qoder-font-md); }
+.dl-field-help {
+  grid-column: 1 / -1;
+  margin-top: -6px;
+  font-size: var(--qoder-font-sm);
+  color: var(--text-tertiary);
+}
+.dl-badge-row { display: inline-flex; gap: 6px; align-items: center; margin-left: 8px; }
+.dl-effective {
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 99px;
+  border: 1px solid var(--border-subtle);
+  color: var(--text-tertiary);
+  vertical-align: middle;
+}
+.dl-effective--now { color: var(--success); border-color: color-mix(in srgb, var(--success) 40%, transparent); }
+.dl-effective--restart { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 40%, transparent); }
+.dl-actions {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  justify-content: flex-end;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border-subtle);
+  margin-top: 14px;
+}
+
+/* —— 主题预览卡（data-theme 与 qoder-ui 完全对齐） —— */
+.dl-theme-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 12px;
+}
+.dl-theme-card {
+  cursor: pointer;
+  border: 2px solid var(--border-subtle);
+  border-radius: var(--qoder-radius-lg);
+  overflow: hidden;
+  background: var(--bg-card);
+  transition: all var(--qoder-transition-fast);
+  padding: 0;
+  font: inherit;
+  text-align: left;
+}
+.dl-theme-card:hover { transform: translateY(-2px); box-shadow: var(--qoder-shadow-md); }
+.dl-theme-card--active { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
+.dl-theme-swatch {
+  height: 64px;
+  position: relative;
+  display: flex;
+  align-items: stretch;
+}
+.dl-theme-swatch i { flex: 1; }
+.dl-theme-name {
+  padding: 8px 10px;
+  font-size: var(--qoder-font-sm);
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+/* —— 抽屉 —— */
+.dl-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  background: rgba(0, 0, 0, 0.42);
+  backdrop-filter: blur(3px);
+  animation: dl-fade 0.2s ease both;
+}
+@keyframes dl-fade { from { opacity: 0; } }
+.dl-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 91;
+  width: min(560px, 94vw);
+  overflow-y: auto;
+  background: var(--bg-popup, var(--bg-card));
+  border-left: 1px solid var(--border-subtle);
+  box-shadow: var(--qoder-shadow-xl);
+  padding: 20px;
+  animation: dl-slide 0.28s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+@keyframes dl-slide {
+  from { transform: translateX(60px); opacity: 0; }
+}
+
+/* —— 空态 —— */
+.dl-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 46px 20px;
+  color: var(--text-tertiary);
+}
+.dl-orb {
+  width: 54px;
+  height: 54px;
+  border-radius: 99px;
+  border: 2px dashed color-mix(in srgb, var(--accent) 55%, transparent);
+  display: grid;
+  place-items: center;
+  color: var(--accent);
+  animation: dl-orbit 6s linear infinite;
+}
+@keyframes dl-orbit {
+  to { transform: rotate(360deg); }
+}
+
+/* —— 主按钮辉光 —— */
+.qoder-btn--primary {
+  box-shadow: 0 1px 8px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.qoder-btn--primary:hover {
+  box-shadow: 0 3px 14px color-mix(in srgb, var(--accent) 55%, transparent);
+}
+
+/* —— tabs 微交互 —— */
+.qoder-tab:hover { color: var(--text-primary); }
+
+/* —— toast —— */
+.dl-toasts {
+  position: fixed;
+  right: 16px;
+  bottom: 16px;
+  z-index: 120;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.dl-toast {
+  background: var(--bg-popup, var(--bg-card));
+  border: 1px solid var(--border-subtle);
+  border-left: 3px solid var(--accent);
+  border-radius: var(--qoder-radius-md);
+  padding: 10px 14px;
+  min-width: 220px;
+  max-width: 380px;
+  box-shadow: var(--qoder-shadow-lg);
+  font-size: var(--qoder-font-md);
+  animation: dl-enter 0.25s ease both;
+}
+.dl-toast--error { border-left-color: var(--error); }
+.dl-toast--success { border-left-color: var(--success); }
+
+@media (prefers-reduced-motion: reduce) {
+  .dl-enter, .dl-toast, .dl-drawer, .dl-overlay { animation: none !important; }
+  .dl-bar--run::after, .dl-bar--run::before, .dl-live-dot,
+  .dl-orb, .dl-nav-item--active .qoder-icon { animation: none !important; }
+  .dl-nav-item:hover, .dl-card--hover:hover, .dl-theme-card:hover { transform: none !important; }
+}

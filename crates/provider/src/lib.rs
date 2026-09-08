@@ -4,12 +4,17 @@
 //! 直链过期：update_sources(≤3) → resubmit(≤2) → 超限 Failed（计划 M5 link_expiry）。
 //! 默认关（不自动烧配额）：只有显式传入已启用 Provider 才可选。
 
+pub mod baidu;
 pub mod coordinator;
 pub mod mock;
 pub mod quark;
 pub mod types;
 pub mod xunlei;
 
+// B3-a：百度网盘分享免登录解析（dlink 直链待 B3-b 登录态）
+// 命名说明：顶层 parse_share_link 已被 quark 占用，百度版别名导出
+pub use baidu::share::parse_share_link as parse_baidu_share;
+pub use baidu::{BaiduClient, BaiduError, BaiduShareFile, BaiduShareLink};
 pub use coordinator::{FallbackCoordinator, FallbackOutcome, HttpSink, SinkError};
 pub use mock::MockProvider;
 // Task 5-d/T2：夸克网盘 Provider（分享链接 → 转存 → 直链）

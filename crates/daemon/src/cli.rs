@@ -53,6 +53,16 @@ pub enum CliCommand {
         xltds: Vec<String>,
         dest: Option<String>,
     },
+    /// 百度分享免登录解析（B3-a）：verify → BDCLND → 分享页 meta →
+    /// share/list 文件清单。本地执行，不需要 daemon 在跑；dlink 直链
+    /// 转换待 B3-b（需登录态 BDUSS）。
+    BaiduResolve {
+        url: String,
+        /// 提取码（URL 未带 ?pwd= 时显式提供）。
+        pwd: Option<String>,
+        /// 列子目录（缺省列根目录）。
+        dir: Option<String>,
+    },
 }
 
 /// 迅雷登录模式（Task 5-b）。
@@ -188,6 +198,38 @@ fn parse_command(args: &[String]) -> Result<CliCommand, CliError> {
         )),
         "list" => Ok(CliCommand::List),
         "config" => Ok(CliCommand::Config),
+        "baidu-resolve" => {
+            let url = args
+                .get(1)
+                .ok_or_else(|| CliError::MissingArg("baidu-resolve <url>".to_string()))?
+                .clone();
+            let mut pwd = None;
+            let mut dir = None;
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--pwd" => {
+                        pwd = Some(
+                            args.get(i + 1)
+                                .ok_or_else(|| CliError::MissingArg("--pwd <提取码>".to_string()))?
+                                .clone(),
+                        );
+                        i += 1;
+                    }
+                    "--dir" => {
+                        dir = Some(
+                            args.get(i + 1)
+                                .ok_or_else(|| CliError::MissingArg("--dir <路径>".to_string()))?
+                                .clone(),
+                        );
+                        i += 1;
+                    }
+                    other => return Err(CliError::Unknown(format!("baidu-resolve {other}"))),
+                }
+                i += 1;
+            }
+            Ok(CliCommand::BaiduResolve { url, pwd, dir })
+        }
         "xunlei-login" => {
             let mut mode = XunleiLoginMode::Page;
             let mut token_path = None;

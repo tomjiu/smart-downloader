@@ -14,7 +14,7 @@ from pathlib import Path
 
 # 沿用 v1 的常量
 CLIENT_ID = "Xp6vsxz_7IYVw2BB"
-CLIENT_SECRET = "Xp6vsy4tN9toTVdMSpomVdXpRmES"
+CLIENT_SECRET = "<redacted>"
 CLIENT_VERSION = "8.31.0.9726"
 PACKAGE_NAME = "com.xunlei.downloadprovider"
 APPID = "40"

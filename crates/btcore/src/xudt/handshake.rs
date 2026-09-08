@@ -1,103 +1,27 @@
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn hex_decode(s: &str) -> Vec<u8> {
-        (0..s.len())
-            .step_by(2)
-            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
-            .collect()
-    }
-
-    #[test]
-    fn handshake_roundtrip() {
-        let h = build_handshake(LOCAL_PORT, 128);
-        assert_eq!(h[0], 0x14);
-        assert_eq!(h[1], 0x00);
-        let (port, reqq, version) = parse_handshake(&h).unwrap();
-        assert_eq!(port, LOCAL_PORT);
-        assert_eq!(reqq, 128);
-        assert_eq!(version, CLIENT_VERSION);
-    }
-
-    #[test]
-    fn handshake_matches_known_bytes() {
-        let h = build_handshake(15000, 128);
-        let known = hex_decode("140064313a65693065313a6d6431323a75745f686f6c6570756e636869346531313a75745f6d65746164617461693265363a75745f70657869316565313a7069313530303065343a726571716931323865313a7631313a58756e4c6569203030313965");
-        assert_eq!(h, known);
-    }
-}
-
 pub const CLIENT_VERSION: &[u8] = b"XunLei 0019";
 pub const LOCAL_PORT: u16 = 15000;
 
 pub fn build_handshake(port: u16, reqq: u32) -> Vec<u8> {
-    // 0x14 协议扩展位 + 0x00 保留位 + bencode 字典 'd'
-    let mut buf = vec![0x14, 0x00, b'd'];
-
-    // 1:e i0 e
-    buf.push(b'1');
-    buf.push(b':');
-    buf.push(b'e');
-    buf.push(b'i');
-    buf.push(b'0');
-    buf.push(b'e');
-
-    // 1:m d ... e e
-    buf.push(b'1');
-    buf.push(b':');
-    buf.push(b'm');
-    buf.push(b'd');
-    // 12:ut_holepunch i4 e
-    buf.push(b'1');
-    buf.push(b'2');
-    buf.push(b':');
-    buf.extend_from_slice(b"ut_holepunch");
-    buf.push(b'i');
-    buf.extend_from_slice(b"4");
-    buf.push(b'e');
-    // 11:ut_metadata i2 e
-    buf.push(b'1');
-    buf.push(b'1');
-    buf.push(b':');
-    buf.extend_from_slice(b"ut_metadata");
-    buf.push(b'i');
-    buf.extend_from_slice(b"2");
-    buf.push(b'e');
-    // 6:ut_pex i1 e
-    buf.push(b'6');
-    buf.push(b':');
-    buf.extend_from_slice(b"ut_pex");
-    buf.push(b'i');
-    buf.extend_from_slice(b"1");
-    buf.push(b'e');
-    // close m dict
-    buf.push(b'e');
+    // 常量前缀：msg id 0x14 + 0x00 + bencode 字典开段 + 能力表（ut_holepunch/ut_metadata/ut_pex），
+    // 动态项仅 1:p / 4:reqq / 1:v 三个字段；字节布局由 handshake_matches_known_bytes 金样锁定。
+    const PREFIX: &[u8] = b"\x14\x00d1:ei0e1:md12:ut_holepunchi4e11:ut_metadatai2e6:ut_pexi1ee";
+    let mut buf = PREFIX.to_vec();
 
     // 1:p i<port> e
-    buf.push(b'1');
-    buf.push(b':');
-    buf.push(b'p');
-    buf.push(b'i');
+    buf.extend_from_slice(b"1:pi");
     buf.extend_from_slice(port.to_string().as_bytes());
     buf.push(b'e');
 
     // 4:reqq i<reqq> e
-    buf.push(b'4');
-    buf.push(b':');
-    buf.extend_from_slice(b"reqq");
-    buf.push(b'i');
+    buf.extend_from_slice(b"4:reqqi");
     buf.extend_from_slice(reqq.to_string().as_bytes());
     buf.push(b'e');
 
     // 1:v <len>:<version>
-    buf.push(b'1');
+    buf.extend_from_slice(b"1:v");
+    buf.extend_from_slice(CLIENT_VERSION.len().to_string().as_bytes());
     buf.push(b':');
-    buf.push(b'v');
-    let version_bytes = CLIENT_VERSION;
-    buf.extend_from_slice(version_bytes.len().to_string().as_bytes());
-    buf.push(b':');
-    buf.extend_from_slice(version_bytes);
+    buf.extend_from_slice(CLIENT_VERSION);
 
     // close top dict
     buf.push(b'e');
@@ -152,10 +76,43 @@ pub fn parse_handshake(payload: &[u8]) -> Option<(u16, u32, Vec<u8>)> {
         .ok()?
         .parse::<usize>()
         .ok()?;
-    if v_rest.len() < colon + 1 + len {
+    // 安全修复（H-3 同型）：colon+1+len 裸加法在 release 下可回绕绕过检查 →
+    // 切片 panic（恶意 xudt 握手 peer）。
+    let end = colon.checked_add(1)?.checked_add(len)?;
+    if v_rest.len() < end {
         return None;
     }
-    let version = v_rest[colon + 1..colon + 1 + len].to_vec();
+    let version = v_rest[colon + 1..end].to_vec();
 
     Some((port, reqq, version))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex_decode(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn handshake_roundtrip() {
+        let h = build_handshake(LOCAL_PORT, 128);
+        assert_eq!(h[0], 0x14);
+        assert_eq!(h[1], 0x00);
+        let (port, reqq, version) = parse_handshake(&h).unwrap();
+        assert_eq!(port, LOCAL_PORT);
+        assert_eq!(reqq, 128);
+        assert_eq!(version, CLIENT_VERSION);
+    }
+
+    #[test]
+    fn handshake_matches_known_bytes() {
+        let h = build_handshake(15000, 128);
+        let known = hex_decode("140064313a65693065313a6d6431323a75745f686f6c6570756e636869346531313a75745f6d65746164617461693265363a75745f70657869316565313a7069313530303065343a726571716931323865313a7631313a58756e4c6569203030313965");
+        assert_eq!(h, known);
+    }
 }

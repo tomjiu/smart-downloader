@@ -158,6 +158,21 @@ pub fn save(path: &std::path::Path, state: &AuthState) -> std::io::Result<()> {
         }
     }
     let tmp = path.with_extension("tmp");
+    // 审查修复（P2）：先以 0600 建空文件再写，消除「写入(0644 可读)→chmod」
+    // 窗口内凭据短暂可读（安全修复 V7 的补强）。
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?
+            .write_all(serialized.as_bytes())?;
+    }
+    #[cfg(not(unix))]
     std::fs::write(&tmp, &serialized)?;
     // 安全修复（V7，CWE-312/732）：token 含 access/refresh 凭据，落盘必须 0600
     // （rename 保留权限位）；存量宽松权限文件在写入时顺带收紧。

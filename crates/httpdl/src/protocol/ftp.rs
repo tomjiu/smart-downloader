@@ -2,8 +2,14 @@
 //! 被动模式（PASV）、REST 断点续传（.part）、421 退避重试、目录下载（LIST 单层）；
 //! 不支持 SFTP/FTPS 隐式/目录递归/FXP。
 
+use crate::download::SEQUENTIAL_WINDOW;
+use crate::ledger;
+use crate::rate::{RateLimiter, RateSample};
 use crate::retry::Backoff;
-use crate::static_split::plan_segments;
+use crate::segment_manager::{
+    Segment as DynSegment, SegmentManager, DEFAULT_MIN_SPLIT, MIN_RETRY_GRANULARITY,
+};
+use crate::static_split::segment_count;
 use parking_lot::Mutex;
 use smart_dl_core::session::output::OutputManager;
 use smart_dl_core::task::DownloadTask;
@@ -14,12 +20,96 @@ use smart_dl_core::types::{
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::task::JoinSet;
+
+/// FTP 传输流抽象（B2 FTPS）：控制/数据连接统一为 trait object，
+/// 明文 TcpStream 与 AUTH TLS 升级后的 TlsStream 同一读写口径。
+trait FtpIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> FtpIo for T {}
+
+type BoxFtpIo = Box<dyn FtpIo>;
+
+/// FTPS 客户端 TLS 配置（B2，生产路径）：webpki-roots 固定根集 + ring
+/// provider（与 reqwest rustls-tls 同源，P1-3 安卓交叉兼容）。证书校验
+/// 严格开启（v1 不暴露 insecure 口子；自签名/私有 CA 场景后续按需加
+/// 配置面注入自定义根集）。rustls 栈经 tokio-rustls re-export 使用
+///（不引入直接依赖，与 reqwest 共享同一 rustls 0.23 编译单元）。
+fn ftps_connector() -> Result<tokio_rustls::TlsConnector, String> {
+    use tokio_rustls::rustls::crypto::ring as ring_backend;
+    // batch6-P2：全局共享 connector——rustls 的 TLS 会话缓存属于单个
+    // ClientConfig 实例，每次现建则控制/数据连接之间无会话可复用；
+    // vsftpd 自 2.3.5 起 require_ssl_reuse=YES 是默认值，数据连接握手
+    // 未复用控制会话会被服务端直接掐断（主流 Linux FTP 服务器默认配置
+    // 下 FTPS 必挂）。共享实例后 TLS 会话跨连接复用；附带收益：
+    // webpki-roots 根集只解析一次。
+    static SHARED: std::sync::OnceLock<tokio_rustls::TlsConnector> = std::sync::OnceLock::new();
+    if let Some(c) = SHARED.get() {
+        return Ok(c.clone());
+    }
+    let config = tokio_rustls::rustls::ClientConfig::builder_with_provider(
+        ring_backend::default_provider().into(),
+    )
+    .with_safe_default_protocol_versions()
+    .map_err(|e| format!("FTPS 协议版本配置失败: {e}"))?
+    .with_root_certificates(ftps_roots())
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+    Ok(SHARED.get_or_init(|| connector).clone())
+}
+
+fn ftps_roots() -> tokio_rustls::rustls::RootCertStore {
+    tokio_rustls::rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    }
+}
+
+/// 控制连接 AUTH TLS 升级 / 数据连接 PROT P 握手共用：TcpStream → TlsStream。
+/// connector 经 active_connector() 获取（测试可注入自签信任链）。
+async fn ftps_upgrade(
+    host: &str,
+    tcp: TcpStream,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    let connector = active_connector()?;
+    let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(host.to_string())
+        .map_err(|e| format!("FTPS SNI 非法 {host:?}: {e}"))?;
+    connector
+        .connect(server_name, tcp)
+        .await
+        .map_err(|e| format!("FTPS 握手失败: {e}"))
+}
+
+/// 测试专用 connector 注入点（#[cfg(test)]）：自签证书 e2e 用，生产恒空。
+#[cfg(test)]
+static TEST_CONNECTOR: std::sync::OnceLock<tokio_rustls::TlsConnector> = std::sync::OnceLock::new();
+
+/// 当前生效 connector：测试注入优先，生产回退 webpki-roots。
+fn active_connector() -> Result<tokio_rustls::TlsConnector, String> {
+    #[cfg(test)]
+    {
+        if let Some(c) = TEST_CONNECTOR.get() {
+            return Ok(c.clone());
+        }
+    }
+    ftps_connector()
+}
 
 /// 421/连接失败重试次数（连接层退避）。
 const CONNECT_ATTEMPTS: u32 = 4;
+
+/// 审计修复（P1-6）：控制连接建立超时——原零超时，PASV 黑洞地址/半开连接
+/// 时 worker 永久阻塞（任务永停 Downloading，且旧实现 pause/remove 都救不了）。
+const FTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// 审计修复（P1-6）：控制响应/数据读取 IO 超时（对齐 HTTP 侧 H-9 口径）。
+const FTP_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// FTP 段下载流式写入块大小：固定 64KB 缓冲（与 HTTP 侧 resp.chunk() 同级），
+/// 避免整段驻留内存（8 worker × 16MB 段 = 峰值 128MB+）。部分写入无害：
+/// 失败段不入账本，重试/恢复路径 seek 回 seg.start 全量重写。
+const FTP_CHUNK: usize = 64 * 1024;
 
 /// FTP URL 目标：单文件或目录。
 #[derive(Debug, PartialEq, Eq)]
@@ -47,21 +137,53 @@ struct FtpTask {
     user: String,
     pass: String,
     path: String,
+    /// B2 FTPS：ftps:// = 显式 AUTH TLS + PROT P（控制/数据连接全加密）。
+    use_tls: bool,
     /// 单文件任务：目标文件路径；目录任务：目标目录路径。
     dest: PathBuf,
     total: u64,
     state: EngineState,
     done: u64,
+    /// 速率采样器（E11）：status() 读取时增量采样（B/s），daemon /stats 聚合消费。
+    rate: RateSample,
     error: Option<String>,
     /// 目录任务的文件级进度（单文件任务为空）。
     files: Vec<FtpFile>,
+    /// 任务级下载限速（KiB/s 配置回显；None = 走全局）。实际生效速在
+    /// limiters 表的 RateLimiter 上（set_limits 运行中即时改率）。
+    limit_kb_s: Option<u32>,
+    /// 顺序下载（边下边播）：true = download_file 在飞段窗口收紧
+    /// （SEQUENTIAL_WINDOW，与 HTTP 同值同语义：前缀尽快完整，FIFO 领取
+    /// 不变）。set_sequential 运行中改写 → 下一次重下轮拾取；新建任务
+    /// add() 直接读 task.sequential → 立即生效。
+    sequential: bool,
+    /// 审计修复（P1-4）：真暂停闸门（与 HTTP EngineTask.pause 同构）——
+    /// pause() 置位后 worker 循环在段边界退出（在飞段收尾记账），不再
+    /// 「假暂停」（旧实现仅改状态字段，worker 继续跑完全程且 finish 会把
+    /// Paused 覆写成 Completed）；remove() 同旗标复用 → 退出后不落位。
+    pause: Arc<AtomicBool>,
+    /// batch3-P0 epoch 单写者闸门：resume/remove 置位旗标前先自增；下载循环
+    /// 开头快照 epoch0，worker 段边界与 join 判定均校验 epoch 未变——
+    /// 旧循环在任何新循环 spawn 后即「过期」，绝不 finalize、绝不继续领段，
+    /// 根治 pause→resume 竞态（空洞文件落位 + 双循环并发写 .part）。
+    epoch: Arc<AtomicU64>,
 }
 
 struct EngineInner {
     tasks: Mutex<HashMap<EngineTaskId, FtpTask>>,
+    /// 引擎全局限速器（E16 总阀门）：0 = 不限（wait 早退零开销）；
+    /// set_global_limits 运行中热调。任务级限速经 limiters 表串联本
+    /// limiter（上游），所有 FTP 任务的合计带宽仍受总阀门约束。
+    limiter: Arc<RateLimiter>,
+    /// 任务级限速登记表（E16）：set_limits 登记 → 下载循环 spawn 时取用；
+    /// Arc 共享使已登记任务运行中热调（set_rate_kb_s）即时生效。
+    limiters: Mutex<HashMap<EngineTaskId, Arc<RateLimiter>>>,
+    /// 动态分段粒度（字节，0 = 默认 16MB；与 HTTP 直链同粒度同源）。
+    /// 测试注入小粒度以覆盖多段/账本路径。
+    min_split: u64,
 }
 
-/// FTP 引擎（串行段下载：PASV + REST + RETR）。
+/// FTP 引擎（动态分段并行下载：PASV + REST + RETR，分段策略与 HTTP 对齐）。
 #[derive(Clone)]
 pub struct FtpEngine {
     backoff: Backoff,
@@ -75,16 +197,40 @@ impl FtpEngine {
 
     /// 可注入退避（421 测试用短退避）。
     pub fn with_backoff(backoff: Backoff) -> Self {
+        FtpEngine::with_backoff_limited(backoff, 0)
+    }
+
+    /// `download_kb_s` = 全局下载限速 KiB/s（0 = 不限；E16 总阀门，
+    /// 所有 FTP 任务合计不超速，运行中可经 set_global_limits 热改）。
+    pub fn new_limited(download_kb_s: u32) -> Self {
+        FtpEngine::with_backoff_limited(Backoff::default(), download_kb_s)
+    }
+
+    /// 可注入退避 + 全局限速（E16）。
+    pub fn with_backoff_limited(backoff: Backoff, download_kb_s: u32) -> Self {
         FtpEngine {
             backoff,
             inner: Arc::new(EngineInner {
                 tasks: Mutex::new(HashMap::new()),
+                limiter: Arc::new(RateLimiter::new(download_kb_s)),
+                limiters: Mutex::new(HashMap::new()),
+                min_split: 0,
             }),
         }
     }
 
+    /// 注入动态分段粒度（字节，0 = 默认 16MB）。测试用小粒度覆盖
+    /// 多段/账本续传路径；生产路径恒走默认（与 HTTP 直链同一粒度语义）。
+    pub fn with_min_split(mut self, min_split: u64) -> Self {
+        if let Some(inner) = Arc::get_mut(&mut self.inner) {
+            inner.min_split = min_split;
+        }
+        self
+    }
+
     /// 目录分支：LIST 探测（421 → 退避重试）→ 解析文件列表 → 建任务 → spawn 目录循环。
     /// 落位 `dest_root/<目录名>/<文件名>`；目录名取 URL 路径最后一段非空名称（根目录 → host）。
+    #[allow(clippy::too_many_arguments)] // 参数即协议会话要素，拆 struct 反而模糊调用点语义
     async fn add_directory(
         &self,
         task: &DownloadTask,
@@ -93,13 +239,14 @@ impl FtpEngine {
         user: String,
         pass: String,
         path: String,
+        use_tls: bool,
     ) -> Result<EngineTaskId, EngineError> {
         // LIST 探测：连接 + 登录 + PASV + LIST（421 → 退避重试）
         let listing = {
             let mut last = String::new();
             let mut listing: Option<String> = None;
             for attempt in 1..=CONNECT_ATTEMPTS {
-                match probe_list(&host, port, &user, &pass, &path).await {
+                match probe_list(&host, port, &user, &pass, &path, use_tls).await {
                     Ok(text) => {
                         listing = Some(text);
                         break;
@@ -139,15 +286,29 @@ impl FtpEngine {
         let mut total = 0u64;
         let mut done = 0u64;
         for e in entries {
+            // batch3-P1：条目名净化（sanitize_rel）——旧实现只滤 '/'\\'.'..'
+            // 四字符，恶意/被入侵服务器 LIST 输出形如 `C:evil.txt`（Windows
+            // 带盘符前缀）经 Path::join 直接替换 base 逃出 dest_root；与
+            // 单文件路径 sanitize_rel 口径对齐，非法条目跳过（拒杀整任务）。
+            let safe_name = match smart_dl_core::session::output::sanitize_rel(&e.name) {
+                Ok(pb) => pb,
+                Err(_) => {
+                    println!("ftp] 目录条目名非法，跳过: {:?}", e.name);
+                    continue;
+                }
+            };
             let fpath = format!("{}/{}", dir_prefix, e.name);
-            let dest = dest_dir.join(&e.name);
+            let dest = dest_dir.join(&safe_name);
             let part = part_path_of(&dest);
             if let Ok(md) = std::fs::metadata(&part) {
                 if md.len() > e.size {
                     let _ = std::fs::remove_file(&part);
                 }
             }
-            let d = part_done(&part);
+            // batch3-P1：初始进度由账本折算（download_file 同口径）——
+            // .part 已预分配 set_len(total)，part_done()==total 会让
+            // 重启/重加任务进度恒 100%（G1 明令禁止「预分配长度当进度」）
+            let d = ledger_done_bytes(&part);
             total += e.size;
             done += d;
             files.push(FtpFile {
@@ -170,12 +331,18 @@ impl FtpEngine {
                     user,
                     pass,
                     path,
+                    use_tls,
                     dest: dest_dir,
                     total,
                     state: EngineState::Downloading,
                     done,
+                    rate: RateSample::default(),
                     error: None,
                     files,
+                    limit_kb_s: None,
+                    sequential: task.sequential,
+                    pause: Arc::new(AtomicBool::new(false)),
+                    epoch: Arc::new(AtomicU64::new(0)),
                 },
             );
         }
@@ -223,10 +390,16 @@ fn spawn_ftp_loop<F, Fut>(
     });
 }
 
-/// 解析 `ftp://[user:pass@]host[:port]/path`。
+/// 解析 `ftp(s)://[user:pass@]host[:port]/path`。
 /// 目录（空路径或以 `/` 结尾）→ `FtpTarget::Dir`；否则 `FtpTarget::File`。
-fn parse_ftp_url(url: &str) -> Option<(String, u16, FtpTarget)> {
-    let rest = url.strip_prefix("ftp://")?;
+/// 返回 `(host, port, target, use_tls)`：ftps:// = 显式 AUTH TLS（默认端口
+/// 仍 21，与 FileZilla/wget 惯例一致；隐式 990 后续按需）。
+fn parse_ftp_url(url: &str) -> Option<(String, u16, FtpTarget, bool)> {
+    let rest = url
+        .strip_prefix("ftps://")
+        .map(|r| (r, true))
+        .or_else(|| url.strip_prefix("ftp://").map(|r| (r, false)))?;
+    let (rest, use_tls) = rest;
     // 无 `/` → 空路径（根目录）
     let (auth_host, raw_path) = match rest.split_once('/') {
         Some((ah, p)) => (ah, p),
@@ -243,13 +416,22 @@ fn parse_ftp_url(url: &str) -> Option<(String, u16, FtpTarget)> {
     if host.is_empty() {
         return None;
     }
+    // 审查修复 P0（CWE-147）：host/path 拒绝 CR/LF/NUL —— 恶意 URL
+    // （API/metalink/RSS 均可携带）不得经 RETR/NLST/CWD 命令注入。
+    // user/pass 侧防线见 core parse_ftp_auth 与 login() 终检。
+    if [host.as_str(), raw_path]
+        .iter()
+        .any(|s| s.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0))
+    {
+        return None;
+    }
     let path = format!("/{raw_path}");
     let target = if path.ends_with('/') {
         FtpTarget::Dir(path)
     } else {
         FtpTarget::File(path)
     };
-    Some((host, port, target))
+    Some((host, port, target, use_tls))
 }
 
 /// 目录条目（LIST 解析结果：普通文件）。
@@ -326,28 +508,75 @@ fn dir_name_of(dir_path: &str, host: &str) -> String {
     }
 }
 
-/// 控制连接会话（单命令/响应流）。
+/// 控制连接会话（单命令/响应流；B2：明文或 AUTH TLS 升级后同一口径）。
 struct FtpSession {
-    reader: BufReader<TcpStream>,
+    reader: BufReader<BoxFtpIo>,
 }
 
 impl FtpSession {
-    async fn connect(host: &str, port: u16) -> Result<Self, String> {
-        let stream = TcpStream::connect((host, port))
+    /// 建立控制连接。`use_tls` = 显式 FTPS（RFC 4217）：明文 banner →
+    /// AUTH TLS（234）→ TLS 握手（服务器证书严格校验）→ PBSZ 0 → PROT P
+    /// （后续控制流与全部数据连接均加密）。
+    async fn connect(host: &str, port: u16, use_tls: bool) -> Result<Self, String> {
+        let tcp = tokio::time::timeout(FTP_CONNECT_TIMEOUT, TcpStream::connect((host, port)))
             .await
+            .map_err(|_| "connect timeout".to_string())?
             .map_err(|e| e.to_string())?;
-        let mut reader = BufReader::new(stream);
+        // 升级前以裸 TcpStream 交互（banner + AUTH TLS 响应），升级后再装箱
+        let mut reader = BufReader::new(tcp);
         let banner = read_response(&mut reader).await?;
         if banner.starts_with("421") {
             return Err(format!("421 {banner}"));
         }
-        Ok(FtpSession { reader })
+        if use_tls {
+            let resp = write_cmd(&mut reader, "AUTH TLS").await?;
+            if !resp.starts_with("234") {
+                return Err(format!("AUTH TLS 被拒绝: {resp}"));
+            }
+            let tls = ftps_upgrade(host, reader.into_inner()).await?;
+            let mut reader = BufReader::new(Box::new(tls) as BoxFtpIo);
+            // RFC 4217：PBSZ 必须先于 PROT；PBSZ 0 = 流式传输无缓冲协商
+            let pbsz = write_cmd(&mut reader, "PBSZ 0").await?;
+            if !pbsz.starts_with("200") {
+                return Err(format!("PBSZ 被拒绝: {pbsz}"));
+            }
+            let prot = write_cmd(&mut reader, "PROT P").await?;
+            if !prot.starts_with("200") {
+                return Err(format!("PROT P 被拒绝（仅支持私有数据连接）: {prot}"));
+            }
+            Ok(FtpSession { reader })
+        } else {
+            Ok(FtpSession {
+                reader: BufReader::new(Box::new(reader.into_inner()) as BoxFtpIo),
+            })
+        }
     }
 
+    /// 登录（审计修复：USER/PASS/TYPE 响应码校验）。原实现丢弃全部响应码，
+    /// 密码错误要到 RETR 才以 550 暴露；多行 banner 下的失步另由
+    /// read_response 的多行支持处理（RFC 959）。USER 2xx = 免密已登录，
+    /// 跳过 PASS（部分服务器对多余 PASS 回 503）；3xx = 需要 PASS；其余 = 终态。
     async fn login(&mut self, user: &str, pass: &str) -> Result<(), String> {
-        self.cmd(&format!("USER {user}")).await?;
-        self.cmd(&format!("PASS {pass}")).await?;
-        self.cmd("TYPE I").await?;
+        // 审查修复 P0（CWE-147）终防线：凭据含 CR/LF/NUL → 拒绝登录。
+        // core parse_ftp_auth 哨兵 + parse_ftp_url 拒绝之外的第三层。
+        if user.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+            || pass.bytes().any(|b| b == b'\r' || b == b'\n' || b == 0)
+        {
+            return Err("credentials contain control characters".to_string());
+        }
+        let user_resp = self.cmd(&format!("USER {user}")).await?;
+        if user_resp.starts_with('3') {
+            let pass_resp = self.cmd(&format!("PASS {pass}")).await?;
+            if !pass_resp.starts_with('2') {
+                return Err(pass_resp);
+            }
+        } else if !user_resp.starts_with('2') {
+            return Err(user_resp);
+        }
+        let type_resp = self.cmd("TYPE I").await?;
+        if !type_resp.starts_with('2') {
+            return Err(type_resp);
+        }
         Ok(())
     }
 
@@ -381,16 +610,58 @@ impl FtpSession {
     }
 }
 
-async fn read_response(reader: &mut BufReader<TcpStream>) -> Result<String, String> {
+/// 读 FTP 响应（审计修复：支持 RFC 959 多行响应）。原实现只读一行——
+/// 多行 banner/331/150（proftpd/pure-ftpd 常见）会把后续行错配给下一条
+/// 命令，轻则登录/FTPS 握手失步失败，重则响应对错位。
+/// 多行格式：首行 `xyz-text`，以 `xyz text`（同 xyz + 空格）为终止行。
+async fn read_response<T: AsyncRead + Unpin>(reader: &mut BufReader<T>) -> Result<String, String> {
     let mut line = String::new();
-    let n = reader
-        .read_line(&mut line)
+    let n = tokio::time::timeout(FTP_IO_TIMEOUT, reader.read_line(&mut line))
         .await
+        .map_err(|_| "response timeout".to_string())?
         .map_err(|e| e.to_string())?;
     if n == 0 {
         return Err("connection closed by server".to_string());
     }
-    Ok(line.trim_end().to_string())
+    let first = line.trim_end().to_string();
+    let bytes = first.as_bytes();
+    let is_multiline =
+        bytes.len() >= 4 && bytes[3] == b'-' && bytes[..3].iter().all(|b| b.is_ascii_digit());
+    if !is_multiline {
+        return Ok(first);
+    }
+    let code = &first[..3]; // 纯 ASCII 数字（上方已校验），切片安全
+    loop {
+        let mut cont = String::new();
+        let n = tokio::time::timeout(FTP_IO_TIMEOUT, reader.read_line(&mut cont))
+            .await
+            .map_err(|_| "response timeout".to_string())?
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err("connection closed in multiline response".to_string());
+        }
+        let cont = cont.trim_end().to_string();
+        let cb = cont.as_bytes();
+        if cb.len() >= 4 && cont.starts_with(code) && cb[3] == b' ' {
+            return Ok(cont); // 终止行作为权威响应
+        }
+    }
+}
+
+/// 发送命令行并读单行响应（AUTH TLS 升级前后共用——升级需在 session
+/// 成型前以裸 TcpStream 交互，故与 FtpSession::cmd 分立）。
+async fn write_cmd<T: AsyncRead + AsyncWrite + Unpin>(
+    reader: &mut BufReader<T>,
+    line: &str,
+) -> Result<String, String> {
+    let mut buf = line.to_string();
+    buf.push_str("\r\n");
+    reader
+        .get_mut()
+        .write_all(buf.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    read_response(reader).await
 }
 
 /// 解析 `227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)`。
@@ -411,62 +682,200 @@ fn parse_pasv(resp: &str) -> Result<SocketAddr, String> {
 }
 
 /// 下载一个段（独立连接：连接+登录+PASV+REST+RETR），写入 .part 段位置。
+#[allow(clippy::too_many_arguments)] // 参数即协议会话要素（E16 增 limiter），拆 struct 反而模糊
 async fn download_segment(
     host: &str,
     port: u16,
     user: &str,
     pass: &str,
     path: &str,
-    seg: crate::static_split::Segment,
+    seg: DynSegment,
     part: &Path,
+    limiter: &RateLimiter,
+    use_tls: bool,
 ) -> Result<(), String> {
-    let mut s = FtpSession::connect(host, port).await?;
+    let mut s = FtpSession::connect(host, port, use_tls).await?;
     s.login(user, pass).await?;
     let data_addr = s.pasv().await?;
-    s.cmd(&format!("REST {}", seg.start)).await?;
+    // 审计修复（P0）：REST 响应码必须校验。原实现丢弃响应——服务器拒绝 REST
+    // （5xx，不支持断点）时 RETR 仍从字节 0 全量传输，客户端却把读到的
+    // seg.len 字节写在 .part 的 seg.start 偏移处 → 段数据错位写盘（静默损坏）。
+    // REST 成功 = 350；4xx/5xx 一律失败（5xx 由 is_terminal 判终态不再二分重试）。
+    let rest = s.cmd(&format!("REST {}", seg.start)).await?;
+    if !rest.starts_with("350") {
+        return Err(format!("{rest} (REST {} rejected)", seg.start));
+    }
     // RETR 必须是 1xx 中间响应（150）；550 等错误直接终态失败
     let retr = s.cmd(&format!("RETR {path}")).await?;
     if !retr.starts_with('1') {
         return Err(retr);
     }
-    let mut data = TcpStream::connect(data_addr)
+    let data_tcp = tokio::time::timeout(FTP_CONNECT_TIMEOUT, TcpStream::connect(data_addr))
         .await
+        .map_err(|_| "data connect timeout".to_string())?
         .map_err(|e| e.to_string())?;
-    let need = seg.len() as usize;
-    let mut buf = vec![0u8; need];
-    let mut got = 0usize;
-    while got < need {
-        let n = data
-            .read(&mut buf[got..])
-            .await
-            .map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Err(format!("data connection closed early: {got}/{need}"));
-        }
-        got += n;
-    }
-    let _ = read_response(&mut s.reader).await; // 226
-    s.quit().await;
-
-    // 写 .part 段位置（段不相交 → 无锁）
+    // PROT P：数据连接全程 TLS（B2）；PROT C（明文数据）不支持——connect
+    // 阶段 PROT P 被拒即整体失败，此处无需分支。
+    let mut data: BoxFtpIo = if use_tls {
+        Box::new(ftps_upgrade(host, data_tcp).await?)
+    } else {
+        Box::new(data_tcp)
+    };
+    // 流式直写 .part 段位置（与 HTTP 侧流式语义对齐；段不相交 → 无锁）。
+    // 固定 64KB 块缓冲，段长不再驻内存；失败时部分写入由重试/恢复路径
+    // seek 回 seg.start 全量重写（段未入账本前不构成有效凭据）。
+    use std::io::{Seek, SeekFrom, Write};
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
         .open(part)
         .map_err(|e| e.to_string())?;
-    use std::io::{Seek, SeekFrom, Write};
     f.seek(SeekFrom::Start(seg.start))
         .map_err(|e| e.to_string())?;
-    f.write_all(&buf).map_err(|e| e.to_string())?;
+    let need = seg.len() as usize;
+    let mut chunk = vec![0u8; FTP_CHUNK];
+    let mut got = 0usize;
+    while got < need {
+        // 审计修复（P1-6）：数据读取超时——服务器停发数据时不再永久阻塞
+        let n = tokio::time::timeout(FTP_IO_TIMEOUT, data.read(&mut chunk))
+            .await
+            .map_err(|_| "data read timeout".to_string())?
+            .map_err(|e| e.to_string())?;
+        if n == 0 {
+            return Err(format!("data connection closed early: {got}/{need}"));
+        }
+        // E16 全局限速：逐块消费全局预算（限速器内部计数，速率 0 早退零开销）
+        limiter.wait(n as u64).await;
+        f.write_all(&chunk[..n]).map_err(|e| e.to_string())?;
+        got += n;
+    }
+    // 关键：读满子段配额后立即断开数据连接。RETR 无结束偏移语义，服务器从
+    // REST 偏移一直发到 EOF——非末段场景客户端停止读取后，服务器 write_all
+    // 会因流控阻塞（过量发送远超内核缓冲 ~1MB），226 永远不到达，双边死锁。
+    // 主动断开 → 服务器 EPIPE 收尾（真实服务器回 426/226 或直接关闭，均
+    // 无关紧要：数据完整性由 got==need 校验与账本语义保证）。
+    drop(data);
+    let _ = read_response(&mut s.reader).await; // 226（或 426/关闭，忽略）
+    s.quit().await;
     Ok(())
 }
 
-/// 单文件下载核心（单文件/目录任务共用）：串行段下载 + 退避重试 + .part 落位。
-/// 续传：.part 存在（>0 且 < total）→ 单段 REST 从 part 大小续到文件尾；
-/// 无 .part（或已满）→ 正常分块下载。每段完成经 `on_progress(len)` 上报增量。
-#[allow(clippy::too_many_arguments)] // 私有 F 风格 API（host/port/user/pass/path/dest/total/backoff/on_progress）
-async fn download_file<F: Fn(u64)>(
+/// 段下载 + 失败缩小粒度重试（P1，与 HTTP download.rs 同构）：失败段可拆
+/// （len/2 >= MIN_RETRY_GRANULARITY，两侧共用同一常量口径）则二分重试栈继续，
+/// 否则上抛；终态错误（5xx，协议级永久失败）不拆直接上抛。子段区间恒落在
+/// 原段内 → 部分写入由后续成功尝试全量重写；账本仍按原段边界记账
+/// （拆分仅是重试内部细节，不影响进度真源）。迭代式拆分栈（避免 async 递归装箱）。
+// 参数即协议会话要素（主机/凭据/路径/段/目标/限速/退避），拆 struct 反而模糊调用点语义。
+#[allow(clippy::too_many_arguments)]
+async fn download_segment_with_retry(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+    path: &str,
+    seg: DynSegment,
+    part: &Path,
+    limiter: &RateLimiter,
+    backoff: &Backoff,
+    use_tls: bool,
+) -> Result<(), String> {
+    let mut stack: Vec<DynSegment> = vec![seg];
+    while let Some(cur) = stack.pop() {
+        match download_segment_attempts(
+            host, port, user, pass, path, cur, part, limiter, backoff, use_tls,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(e) if is_terminal(&e) => {
+                return Err(format!("segment [{}, {}]: {e}", cur.start, cur.end))
+            }
+            Err(_) if cur.len() / 2 >= MIN_RETRY_GRANULARITY => {
+                let mid = cur.start + cur.len() / 2;
+                // 先压 right 再压 left → 先处理 left，与 HTTP 侧拆分顺序一致
+                stack.push(DynSegment {
+                    start: mid,
+                    end: cur.end,
+                });
+                stack.push(DynSegment {
+                    start: cur.start,
+                    end: mid - 1,
+                });
+            }
+            Err(e) => return Err(format!("segment [{}, {}]: {e}", cur.start, cur.end)),
+        }
+    }
+    Ok(())
+}
+
+/// 单个子段的连接层退避重试（421/IO；5xx 终态直接失败）——原 worker 内联
+/// 逻辑提为函数，供二分重试栈逐子段调用（每次栈内尝试都保有完整退避预算，
+/// 最坏尝试次数 = 拆分深度 × CONNECT_ATTEMPTS，有界）。
+// 参数即协议会话要素（主机/凭据/路径/段/目标/限速/退避），拆 struct 反而模糊调用点语义。
+#[allow(clippy::too_many_arguments)]
+async fn download_segment_attempts(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+    path: &str,
+    seg: DynSegment,
+    part: &Path,
+    limiter: &RateLimiter,
+    backoff: &Backoff,
+    use_tls: bool,
+) -> Result<(), String> {
+    let mut last = String::new();
+    for attempt in 1..=CONNECT_ATTEMPTS {
+        match download_segment(host, port, user, pass, path, seg, part, limiter, use_tls).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                if attempt < CONNECT_ATTEMPTS && !is_terminal(&e) {
+                    tokio::time::sleep(backoff.next_delay(attempt)).await;
+                    continue;
+                }
+                last = e;
+                break;
+            }
+        }
+    }
+    Err(last)
+}
+
+/// download_file 结局：Completed（全部段完成，可落位）/ Paused（段边界
+/// 发现暂停旗标，在飞段已收尾记账，不得 finalize）。
+enum FtpOutcome {
+    Completed,
+    Paused,
+}
+
+/// 审计修复（batch3-P0）：暂停退出原因锁存——worker 因旗标退出时置位本槽，
+/// join 后判槽而非活读旗标。旧实现 join 后重新读旗标，pause→resume 竞态
+/// 下（resume 清旗标 + spawn 新循环先于旧循环检查点）旧循环误判 Completed
+/// → 把预分配 .part（含 0 填充空洞）rename 成 dest，新循环下载的完整数据
+/// 再被 finalize_to 幂等短路丢弃 → 空洞文件永久交付为 Completed。
+/// 锁存后无论旗标何时被 resume 清除，本次循环的真实退出原因不可回退。
+type PausedSeen = Arc<AtomicBool>;
+
+/// 段边界暂停检查：旗标置位 → 锁存退出原因 + 退出（在飞段已收尾记账）。
+fn pause_hit(pause: &Option<Arc<AtomicBool>>, paused_seen: &PausedSeen) -> bool {
+    if pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst)) {
+        paused_seen.store(true, Ordering::SeqCst);
+        return true;
+    }
+    false
+}
+
+/// 单文件下载核心（单文件/目录任务共用）：动态分段 + worker 池并行 + 账本续传。
+/// 分段策略与 HTTP 直链对齐（P0 方案A + P4 账本统一进度真源）：
+/// - 段粒度 `min_split`（0 = 默认 16MB）FIFO 队列（<16MB 单段）；
+/// - 并行 worker 数 = `segment_count(total)`（与 HTTP 同一公式，2-8）；
+/// - 续传：`<part>.progress` 段账本为唯一凭据（缺失/损坏/失配 → 作废重下），
+///   每段完成原子落盘，finalize 后清理；旧 .part 长度前缀续传语义废弃（G1/G2）。
+// 参数即协议会话要素（主机/凭据/路径/目标/退避/进度回调），拆 struct 反而模糊调用点语义。
+#[allow(clippy::too_many_arguments)]
+async fn download_file(
     host: &str,
     port: u16,
     user: &str,
@@ -475,21 +884,35 @@ async fn download_file<F: Fn(u64)>(
     dest: &Path,
     total: u64,
     backoff: Backoff,
-    on_progress: F,
-) -> Result<(), String> {
+    limiter: &RateLimiter,
+    min_split: u64,
+    sequential: bool,
+    on_progress: Arc<dyn Fn(u64) + Send + Sync>,
+    use_tls: bool,
+    pause: Option<Arc<AtomicBool>>,
+    epoch: Arc<AtomicU64>,
+) -> Result<FtpOutcome, String> {
+    let epoch0 = epoch.load(Ordering::SeqCst);
     let part = part_path_of(dest);
-    let part_done = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
-    let segments = if part_done > 0 && part_done < total {
-        // .part 续传：从偏移续到文件尾（单段）
-        vec![crate::static_split::Segment {
-            start: part_done,
-            end: total - 1,
-        }]
-    } else {
-        plan_segments(total)
-    };
+    let ledger_path = ledger::ledger_path(&part);
+    // 段账本加载（P4 唯一进度真源，与 HTTP engine.rs 同口径）：合法账本 →
+    // 恢复已完成段并沿用其粒度；缺失/损坏/total 失配 → 全新计划 + .part 作废。
+    // 旧「.part 长度前缀续传」语义废弃（G1/G2：预分配后长度恒为 total，不可信）。
+    let loaded = ledger::load(&ledger_path).filter(|l| l.total == total && l.validate_segments());
+    if loaded.is_none() {
+        let _ = std::fs::remove_file(&part);
+    }
+    // 生效粒度：账本恢复沿用其粒度，否则用调用方注入（0 = 默认 16MB）
+    let eff_min_split = loaded
+        .as_ref()
+        .map(|l| l.min_split)
+        .unwrap_or(if min_split == 0 {
+            DEFAULT_MIN_SPLIT
+        } else {
+            min_split
+        });
 
-    // 预分配 .part
+    // 预分配 .part（续传场景：旧 .part 保留只写缺失段，不截断）
     std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -499,31 +922,147 @@ async fn download_file<F: Fn(u64)>(
         .set_len(total)
         .map_err(|e| format!("part open: {e}"))?;
 
-    for seg in segments {
-        for attempt in 1..=CONNECT_ATTEMPTS {
-            match download_segment(host, port, user, pass, path, seg, &part).await {
-                Ok(()) => break,
-                Err(e) => {
-                    // 连接层失败（421/IO）→ 退避重试；550 等终态 → 直接失败
-                    if attempt < CONNECT_ATTEMPTS && !is_terminal(&e) {
-                        tokio::time::sleep(backoff.next_delay(attempt)).await;
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-        // 进度：段完成
-        on_progress(seg.len());
+    // 段管理器：账本恢复（跳过已完成段，折算 done_bytes）或全新计划
+    let manager = Arc::new(Mutex::new(match &loaded {
+        Some(l) => SegmentManager::new_with_done(total, l.min_split, &l.done),
+        None => SegmentManager::new(total, 0, eff_min_split),
+    }));
+    // 恢复进度立即可见（账本折算字节，daemon 轮询无需等首段）
+    let done0 = manager.lock().done_bytes();
+    if done0 > 0 {
+        on_progress(done0);
     }
 
-    // 全部段完成 → 落位
-    finalize_part(&part, dest, total)
+    // 顺序模式在飞闸门（与 HTTP download_dynamic 同构）：permit 从领取前
+    // 持有到 complete 后释放（RAII），失败/panic 退出路径同样随作用域释放，
+    // 无泄漏。在飞段数 ≤ SEQUENTIAL_WINDOW → 前缀尽快完整（边下边播）。
+    let seq_gate: Option<Arc<tokio::sync::Semaphore>> = if sequential {
+        Some(Arc::new(tokio::sync::Semaphore::new(SEQUENTIAL_WINDOW)))
+    } else {
+        None
+    };
+    let paused_seen: PausedSeen = Arc::new(AtomicBool::new(false));
+
+    // worker 数：与 HTTP 同一公式（静态 2-8）。<16MB 单段时多出的 worker
+    // 领不到段（Drained）即退，零开销。
+    let n_workers = segment_count(total);
+    let mut workers = JoinSet::new();
+    for _ in 0..n_workers {
+        let host = host.to_string();
+        let user = user.to_string();
+        let pass = pass.to_string();
+        let path = path.to_string();
+        let part = part.clone();
+        let limiter = limiter.clone();
+        let manager = manager.clone();
+        let seq_gate = seq_gate.clone();
+        let ledger_path = ledger_path.clone();
+        let on_progress = on_progress.clone();
+        let pause = pause.clone();
+        let paused_seen = paused_seen.clone();
+        let epoch = epoch.clone();
+        workers.spawn(async move {
+            loop {
+                // 审计修复（P1-4）：段边界检查暂停旗标——置位即退出（在飞段
+                // 已完成收尾记账，账本保留），不再领取新段。
+                // batch3-P0：退出原因锁存到 paused_seen，join 后判槽不判旗标；
+                // epoch 已变 → 本循环已被 resume/remove 取代（过期），立即退出，
+                // 防双循环并发写 .part / 互踩账本。
+                if epoch.load(Ordering::SeqCst) != epoch0 {
+                    return Ok::<(), String>(());
+                }
+                if pause_hit(&pause, &paused_seen) {
+                    return Ok::<(), String>(());
+                }
+                // 顺序模式：先拿 permit 再领取段，保证「在飞段数 ≤ 窗口」
+                //（先领后等会导致窗口外表内的段已占用 FIFO 游标）。
+                let _permit = match &seq_gate {
+                    Some(g) => Some(
+                        g.clone()
+                            .acquire_owned()
+                            .await
+                            .map_err(|_| "sequential gate closed".to_string())?,
+                    ),
+                    None => None,
+                };
+                // FIFO 领取：段天然无重叠 → .part 分区写无需文件锁
+                let seg: DynSegment = {
+                    let mut m = manager.lock();
+                    match m.take_segment() {
+                        Some(s) => s,
+                        None => return Ok::<(), String>(()),
+                    }
+                };
+                // 失败缩小粒度重试（P1，与 HTTP download.rs 同构）+ 连接层退避：
+                // 二分重试栈收敛瞬时故障，5xx 终态直接上抛
+                download_segment_with_retry(
+                    &host, port, &user, &pass, &path, seg, &part, &limiter, &backoff, use_tls,
+                )
+                .await?;
+                // 段完成：记账 + 账本原子落盘 + 进度回报（锁内一并，
+                // 保证账本视图与计数一致——与 HTTP download.rs 同模式）
+                {
+                    let mut m = manager.lock();
+                    m.complete(seg);
+                    let snapshot = ledger::Ledger {
+                        version: ledger::LEDGER_VERSION,
+                        total,
+                        min_split: eff_min_split,
+                        etag: None,
+                        last_modified: None,
+                        done: m.done_ranges().to_vec(),
+                    };
+                    ledger::save(&ledger_path, &snapshot);
+                    on_progress(m.done_bytes());
+                }
+            }
+        });
+    }
+    // 任一 worker 失败 → 整体失败，取消其余；账本保留已成功段 → 下次续传
+    let mut first_err: Option<String> = None;
+    while let Some(res) = workers.join_next().await {
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                workers.abort_all();
+                first_err = Some(e);
+                break;
+            }
+            Err(e) => {
+                workers.abort_all();
+                first_err = Some(format!("worker panicked: {e}"));
+                break;
+            }
+        }
+    }
+    drop(workers);
+    // 暂停优先于错误：退出原因以锁存槽为准（batch3-P0），旗标活读仅兜底
+    // 「worker 因 err 退出未过检查点」场景（保持原「暂停优先于错误」语义）；
+    // 置位后任何 worker 错误/panic 都视为暂停退出（账本已记账）。
+    // 不再依赖 join 后的旗标现状：resume 清旗标不会把暂停循环改成 Completed。
+    if epoch0 != epoch.load(Ordering::SeqCst)
+        || paused_seen.load(Ordering::SeqCst)
+        || pause.as_ref().is_some_and(|p| p.load(Ordering::SeqCst))
+    {
+        return Ok(FtpOutcome::Paused);
+    }
+    if let Some(e) = first_err {
+        return Err(e);
+    }
+
+    // 审计修复（P1-4）：暂停/移除退出 → 不清账本、不落位（resume 后账本续传）；
+    // remove 复用同一旗标 → 同样不落位（旧实现会继续 finalize_part 把
+    // 已 remove 任务的文件 rename 到 dest）。
+
+    // 全部段完成 → 清续传凭据 + 落位
+    let _ = std::fs::remove_file(&ledger_path);
+    finalize_part(&part, dest, total)?;
+    Ok(FtpOutcome::Completed)
 }
 
 /// 单文件任务的下载循环：download_file 包装 + 任务状态落定。
 async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Backoff) {
-    let (host, port, user, pass, path, dest, total) = {
+    let (host, port, user, pass, path, dest, total, use_tls) = {
         let tasks = inner.tasks.lock();
         let t = tasks.get(&tid).unwrap();
         (
@@ -534,29 +1073,50 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
             t.path.clone(),
             t.dest.clone(),
             t.total,
+            t.use_tls,
         )
     };
     let inner2 = inner.clone();
     let tid2 = tid.clone();
+    // 任务级限速优先，未登记回退全局（与 HTTP engine 同口径）；登记条目
+    // 已在 set_limits 时串联全局上游（E16），此处直接取用即可。
+    let limiter = inner
+        .limiters
+        .lock()
+        .get(&tid)
+        .cloned()
+        .unwrap_or_else(|| inner.limiter.clone());
+    let sequential = {
+        let tasks = inner.tasks.lock();
+        tasks.get(&tid).map(|t| t.sequential).unwrap_or(false)
+    };
+    let min_split = inner.min_split;
+    let (pause_flag, epoch_flag) = {
+        let tasks = inner.tasks.lock();
+        tasks
+            .get(&tid)
+            .map(|t| (Some(t.pause.clone()), t.epoch.clone()))
+            .unwrap_or((None, Arc::new(AtomicU64::new(0))))
+    };
+    // 审计修复（P1-3）：进度改绝对赋值（HTTP 同款 max 语义）——download_file
+    // 回传的是文件内绝对完成字节（账本折算），旧实现按增量 += 累加 →
+    // 4 段 64MB 新下载最终 done 虚报至 4 倍，resume 场景再叠加。
+    let progress: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |n| {
+        let mut tasks = inner2.tasks.lock();
+        if let Some(t) = tasks.get_mut(&tid2) {
+            t.done = t.done.max(n.min(t.total));
+        }
+    });
     let r = download_file(
-        &host,
-        port,
-        &user,
-        &pass,
-        &path,
-        &dest,
-        total,
-        backoff,
-        move |n| {
-            let mut tasks = inner2.tasks.lock();
-            if let Some(t) = tasks.get_mut(&tid2) {
-                t.done += n;
-            }
-        },
+        &host, port, &user, &pass, &path, &dest, total, backoff, &limiter, min_split, sequential,
+        progress, use_tls, pause_flag, epoch_flag,
     )
     .await;
     match r {
-        Ok(()) => finish(&inner, &tid, EngineState::Completed, None),
+        Ok(FtpOutcome::Completed) => finish(&inner, &tid, EngineState::Completed, None),
+        // 审计修复（P1-4）：暂停退出不落定状态（pause() 已置 Paused；
+        // resume 重新 spawn 循环）。旧实现会 finish(Completed) 覆写 Paused。
+        Ok(FtpOutcome::Paused) => {}
         Err(e) => finish(&inner, &tid, EngineState::Error, Some(e)),
     }
 }
@@ -564,7 +1124,7 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
 /// 目录任务下载循环：逐文件串行 download_file，落位 `<dest>/<文件名>`；
 /// 任一文件终态失败 → 整任务 Error（错误消息带文件名）。
 async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Backoff) {
-    let (host, port, user, pass, dir_dest, files) = {
+    let (host, port, user, pass, dir_dest, files, use_tls, pause_flag, epoch_flag) = {
         let tasks = inner.tasks.lock();
         let t = tasks.get(&tid).unwrap();
         (
@@ -575,10 +1135,14 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
             t.dest.clone(),
             t.files
                 .iter()
-                .map(|f| (f.name.clone(), f.path.clone(), f.size))
+                .map(|f| (f.name.clone(), f.path.clone(), f.size, f.state))
                 .collect::<Vec<_>>(),
+            t.use_tls,
+            t.pause.clone(),
+            t.epoch.clone(),
         )
     };
+    let epoch0 = epoch_flag.load(Ordering::SeqCst);
     // add 时已建目录；此处幂等兜底（目录被外部删除的场景）
     if let Err(e) = std::fs::create_dir_all(&dir_dest) {
         finish(
@@ -589,12 +1153,61 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
         );
         return;
     }
-    for (name, fpath, size) in files {
+    // 目录任务按文件串行（既有语义），sequential 语义 = 文件内段在飞窗口收紧
+    let sequential = {
+        let tasks = inner.tasks.lock();
+        tasks.get(&tid).map(|t| t.sequential).unwrap_or(false)
+    };
+    for (name, fpath, size, fstate) in files {
+        // 审计修复（P1-4）：resume 重新 spawn 后跳过已完成文件（旧循环暂停前
+        // 已完成落位的文件，重跑会全量重下覆盖）。
+        if fstate == EngineState::Completed {
+            continue;
+        }
+        // 段边界暂停：不 finish（pause() 已置 Paused，resume 重入本循环）；
+        // batch3-P0：epoch 已变 → 本循环过期（新循环已 spawn），立即退出防双循环。
+        if pause_flag.load(Ordering::SeqCst) || epoch_flag.load(Ordering::SeqCst) != epoch0 {
+            return;
+        }
         let dest = dir_dest.join(&name);
         set_file_state(&inner, &tid, &name, EngineState::Downloading);
         let inner2 = inner.clone();
         let tid2 = tid.clone();
         let name2 = name.clone();
+        // 任务级限速优先，未登记回退全局（与单文件循环同口径）
+        let limiter = inner
+            .limiters
+            .lock()
+            .get(&tid)
+            .cloned()
+            .unwrap_or_else(|| inner.limiter.clone());
+        let min_split = inner.min_split;
+        // 审计修复（P1-3）：目录任务进度 = base（进入本文件前累计）+
+        // 文件内绝对进度，max 语义（resume 重入不回退不重复累计）。
+        let (base, fbase) = {
+            let tasks = inner.tasks.lock();
+            let t = tasks.get(&tid);
+            (
+                t.map(|t| t.done).unwrap_or(0),
+                t.map(|t| {
+                    t.files
+                        .iter()
+                        .find(|f| f.name == name)
+                        .map(|f| f.done)
+                        .unwrap_or(0)
+                })
+                .unwrap_or(0),
+            )
+        };
+        let progress: Arc<dyn Fn(u64) + Send + Sync> = Arc::new(move |n| {
+            let mut tasks = inner2.tasks.lock();
+            if let Some(t) = tasks.get_mut(&tid2) {
+                t.done = t.done.max(base + n);
+                if let Some(f) = t.files.iter_mut().find(|f| f.name == name2) {
+                    f.done = f.done.max(fbase + n);
+                }
+            }
+        });
         let r = download_file(
             &host,
             port,
@@ -604,19 +1217,21 @@ async fn download_dir_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: 
             &dest,
             size,
             backoff,
-            move |n| {
-                let mut tasks = inner2.tasks.lock();
-                if let Some(t) = tasks.get_mut(&tid2) {
-                    t.done += n;
-                    if let Some(f) = t.files.iter_mut().find(|f| f.name == name2) {
-                        f.done += n;
-                    }
-                }
-            },
+            &limiter,
+            min_split,
+            sequential,
+            progress,
+            use_tls,
+            Some(pause_flag.clone()),
+            epoch_flag.clone(),
         )
         .await;
         match r {
-            Ok(()) => set_file_state(&inner, &tid, &name, EngineState::Completed),
+            Ok(FtpOutcome::Completed) => {
+                set_file_state(&inner, &tid, &name, EngineState::Completed)
+            }
+            // 暂停退出：不 finish，文件保持 Downloading（resume 续传）
+            Ok(FtpOutcome::Paused) => return,
             Err(e) => {
                 set_file_state(&inner, &tid, &name, EngineState::Error);
                 finish(
@@ -654,6 +1269,14 @@ fn part_path_of(dest: &Path) -> PathBuf {
 }
 
 fn finalize_part(part: &Path, dest: &Path, total: u64) -> Result<(), String> {
+    // 审查修复（P1）：同 HTTP 引擎 finalize_part——换源/重下场景 dest 可能
+    // 已有旧内容且大小相同（finalize_to 幂等短路直接 Ok 不覆盖），远端同
+    // 尺寸内容变更后重下 → 旧内容被静默保留、新数据丢弃。先删 dest 强制落位。
+    if let Err(e) = std::fs::remove_file(dest) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("finalize_part: 删除目标文件失败 {dest:?}: {e}");
+        }
+    }
     let om = OutputManager::new(PathBuf::from("."));
     om.finalize_to(part, dest, total).map_err(|e| e.to_string())
 }
@@ -688,24 +1311,96 @@ impl DownloadEngine for FtpEngine {
         vec![Capability::Ftp, Capability::FtpResume]
     }
 
+    /// 引擎全局限速热改（E16 trait 扩展）：热调引擎全局 limiter，所有 FTP
+    /// 任务合计带宽立即按新速率节流。仅 down 方向：up 请求被显式拒绝。
+    async fn set_global_limits(
+        &self,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<(), EngineError> {
+        if up_kb_s.is_some() {
+            return Err(EngineError::Other(
+                "HTTP/FTP 引擎无上传方向，up_kb_s 不适用".to_string(),
+            ));
+        }
+        if let Some(kb) = down_kb_s {
+            self.inner.limiter.set_rate_kb_s(kb);
+        }
+        Ok(())
+    }
+
+    /// 任务级下载限速（trait 扩展，与 HTTP 引擎同口径）：任务专属 limiter
+    /// 登记进 limiters 表（串联全局上游，总阀门对任务级限速任务同样生效）；
+    /// 已登记 → 原地热调（运行中任务经 Arc 共享即时生效）；未登记（含
+    /// 运行中走全局的任务）→ 新登记，下一次重下轮拾取。仅 down 方向。
+    async fn set_limits(
+        &self,
+        id: &EngineTaskId,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<(), EngineError> {
+        if up_kb_s.is_some() {
+            return Err(EngineError::Other(
+                "HTTP/FTP 引擎无上传方向，up_kb_s 不适用".to_string(),
+            ));
+        }
+        let Some(kb) = down_kb_s else { return Ok(()) }; // 双 None = no-op
+        {
+            let mut tasks = self.inner.tasks.lock();
+            let Some(t) = tasks.get_mut(id) else {
+                return Err(EngineError::NotFound);
+            };
+            // 配置回显记到任务快照上（审计/透出口径）
+            t.limit_kb_s = Some(kb);
+        }
+        let mut limiters = self.inner.limiters.lock();
+        match limiters.get(id) {
+            Some(lim) => lim.set_rate_kb_s(kb), // 已有限速器 → 原地热调
+            None => {
+                limiters.insert(
+                    id.clone(),
+                    Arc::new(RateLimiter::new_chained(kb, &self.inner.limiter)),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// 任务级顺序下载开关（trait 扩展）：字段改写，下一次重下轮拾取；
+    /// 运行中的当前轮不变（收尾在飞段）。新建任务在 add() 直接读
+    /// task.sequential → 立即生效（FTP 单轮下载，无 resume 重入路径）。
+    async fn set_sequential(&self, id: &EngineTaskId, on: bool) -> Result<(), EngineError> {
+        let mut tasks = self.inner.tasks.lock();
+        match tasks.get_mut(id) {
+            Some(t) => {
+                t.sequential = on;
+                Ok(())
+            }
+            None => Err(EngineError::NotFound),
+        }
+    }
+
     async fn add(&self, task: &DownloadTask) -> Result<EngineTaskId, EngineError> {
         let (url, user, pass) = match &task.source {
             DownloadSource::Ftp { url, user, pass } => (url.clone(), user.clone(), pass.clone()),
             _ => return Err(EngineError::Other("source is not ftp".to_string())),
         };
-        let (host, port, target) =
+        let (host, port, target, use_tls) =
             parse_ftp_url(&url).ok_or_else(|| EngineError::Other("invalid ftp url".to_string()))?;
 
         match target {
             // 目录分支：LIST 探测 → 逐文件条目 → 目录下载循环
-            FtpTarget::Dir(path) => self.add_directory(task, host, port, user, pass, path).await,
+            FtpTarget::Dir(path) => {
+                self.add_directory(task, host, port, user, pass, path, use_tls)
+                    .await
+            }
             FtpTarget::File(path) => {
                 // 探测：连接 + 登录 + SIZE（421 → 退避重试）
                 let total = {
                     let mut last = String::new();
                     let mut size: Option<u64> = None;
                     for attempt in 1..=CONNECT_ATTEMPTS {
-                        match probe_size(&host, port, &user, &pass, &path).await {
+                        match probe_size(&host, port, &user, &pass, &path, use_tls).await {
                             Ok(t) => {
                                 size = Some(t);
                                 break;
@@ -756,12 +1451,20 @@ impl DownloadEngine for FtpEngine {
                             user,
                             pass,
                             path,
+                            use_tls,
                             dest,
                             total,
                             state: EngineState::Downloading,
-                            done: part_done(&part),
+                            // batch3-P1：账本折算（.part 预分配长度恒 total，
+                            // 旧值会让重启后进度恒 100% 且 max 语义不可回退）
+                            done: ledger_done_bytes(&part),
+                            rate: RateSample::default(),
                             error: None,
                             files: vec![],
+                            limit_kb_s: None,
+                            sequential: task.sequential,
+                            pause: Arc::new(AtomicBool::new(false)),
+                            epoch: Arc::new(AtomicU64::new(0)),
                         },
                     );
                 }
@@ -774,23 +1477,53 @@ impl DownloadEngine for FtpEngine {
         }
     }
 
+    /// 审计修复（P1-4）：真暂停——置位闸门 + 状态 Paused；在飞段收尾记账
+    /// 后 worker 在段边界退出，download_loop 识别 Paused 结局不 finish
+    /// （旧实现仅改状态字段，worker 继续跑完整个下载且 finish 把 Paused
+    /// 覆写成 Completed）。
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError> {
         let mut tasks = self.inner.tasks.lock();
         let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
+        t.pause.store(true, Ordering::SeqCst);
         t.state = EngineState::Paused;
         Ok(())
     }
 
+    /// 审计修复（P1-4）：恢复 = 清闸门 + 重新 spawn 下载循环（账本续传，
+    /// 单文件进度回调为 max 绝对赋值不重复累计；目录循环跳过已完成文件）。
+    /// 旧实现只改状态字段，暂停后传输并未停止，resume 也无循环可恢复。
     async fn resume(&self, id: &EngineTaskId) -> Result<(), EngineError> {
-        let mut tasks = self.inner.tasks.lock();
-        let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
-        t.state = EngineState::Downloading;
+        let (is_dir, is_paused) = {
+            let mut tasks = self.inner.tasks.lock();
+            let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
+            let dir = !t.files.is_empty();
+            let was_paused = t.state == EngineState::Paused;
+            // batch3-P0：先自增 epoch 再清旗标——旧循环在下一个检查点即过期
+            // 退出（即使旗标已 false 也不会误判 Completed/继续领段），
+            // 新循环以新 epoch 成为唯一写者。
+            t.epoch.fetch_add(1, Ordering::SeqCst);
+            t.pause.store(false, Ordering::SeqCst);
+            t.state = EngineState::Downloading;
+            (dir, was_paused)
+        };
+        // 非暂停态的 resume（Queued 手动启动等）维持既有无操作语义，不重复 spawn
+        if !is_paused {
+            return Ok(());
+        }
+        let inner = self.inner.clone();
+        let backoff = self.backoff;
+        let spawn_tid = id.clone();
+        if is_dir {
+            spawn_ftp_loop(download_dir_loop, inner, spawn_tid, backoff);
+        } else {
+            spawn_ftp_loop(download_loop, inner, spawn_tid, backoff);
+        }
         Ok(())
     }
 
     async fn status(&self, id: &EngineTaskId) -> Result<EngineStatus, EngineError> {
-        let tasks = self.inner.tasks.lock();
-        let t = tasks.get(id).ok_or(EngineError::NotFound)?;
+        let mut tasks = self.inner.tasks.lock();
+        let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
         // 目录任务 → 文件级进度（FileProgress）；单文件任务 → 空（保持既有行为）
         let files = t
             .files
@@ -801,23 +1534,55 @@ impl DownloadEngine for FtpEngine {
                 size: f.size,
             })
             .collect();
+        let down_rate = t.rate.sample(t.done);
         Ok(EngineStatus {
             state: t.state,
             metadata_received: true,
             files,
             total_done: t.done,
             total: t.total,
-            down_rate: 0,
+            down_rate,
             up_rate: 0,
+            // E33：FTP 单向引擎无累计统计口径，恒 0（快照序列化省略）
+            total_downloaded: 0,
+            total_uploaded: 0,
             num_peers: 0,
             num_seeds: 0,
             error: t.error.clone(),
+            // FTP 不参与 E9 名字回填：daemon add 时已派生 URL 末段名
+            name: None,
         })
     }
 
-    async fn remove(&self, id: &EngineTaskId, _delete_data: bool) -> Result<(), EngineError> {
-        let mut tasks = self.inner.tasks.lock();
-        tasks.remove(id).ok_or(EngineError::NotFound)?;
+    async fn remove(&self, id: &EngineTaskId, delete_data: bool) -> Result<(), EngineError> {
+        // 审计修复（P1-4）：置位暂停闸门再移除表项——运行中循环在段边界
+        // 退出，不再继续占用带宽/写 .part/把文件 rename 落位。
+        {
+            let tasks = self.inner.tasks.lock();
+            if let Some(t) = tasks.get(id) {
+                t.epoch.fetch_add(1, Ordering::SeqCst);
+                t.pause.store(true, Ordering::SeqCst);
+            }
+        }
+        let (dest, is_dir) = {
+            let mut tasks = self.inner.tasks.lock();
+            let t = tasks.remove(id).ok_or(EngineError::NotFound)?;
+            (delete_data.then(|| t.dest.clone()), !t.files.is_empty())
+        };
+        // 任务级限速登记一并回收（防表无限增长；与 HTTP engine 同口径）
+        self.inner.limiters.lock().remove(id);
+        // 审查修复（P1）：delete_data=true 端到端生效。目录任务 dest 为任务
+        // 专属目录（dest_root/dir_name），整目录回收；单文件任务删文件 + part。
+        if let Some(dest) = dest {
+            if is_dir {
+                let _ = std::fs::remove_dir_all(&dest);
+            } else {
+                let _ = std::fs::remove_file(&dest);
+                let part = part_path_of(&dest);
+                let _ = std::fs::remove_file(&part);
+                let _ = std::fs::remove_file(ledger::ledger_path(&part));
+            }
+        }
         Ok(())
     }
 
@@ -853,8 +1618,9 @@ async fn probe_size(
     user: &str,
     pass: &str,
     path: &str,
+    use_tls: bool,
 ) -> Result<u64, String> {
-    let mut s = FtpSession::connect(host, port).await?;
+    let mut s = FtpSession::connect(host, port, use_tls).await?;
     s.login(user, pass).await?;
     let size = s.size(path).await;
     s.quit().await;
@@ -862,8 +1628,14 @@ async fn probe_size(
 }
 
 /// 现有 .part 已下载字节数（续传起点）。
-fn part_done(part: &Path) -> u64 {
-    std::fs::metadata(part).map(|m| m.len()).unwrap_or(0)
+/// batch3-P1：段账本折算已完成字节（P4 唯一进度真源）；无账本 → 0。
+/// .part 因预分配 set_len(total) 长度恒等于 total，不可作为进度证据。
+fn ledger_done_bytes(part: &Path) -> u64 {
+    let lp = ledger::ledger_path(part);
+    ledger::load(&lp)
+        .filter(|l| l.validate_segments())
+        .map(|l| l.done.iter().map(|(s, e)| e - s + 1).sum::<u64>())
+        .unwrap_or(0)
 }
 
 /// 探测目录列表：连接 + 登录 + PASV + LIST → 目录文本（数据连接读到 EOF）。
@@ -873,8 +1645,9 @@ async fn probe_list(
     user: &str,
     pass: &str,
     path: &str,
+    use_tls: bool,
 ) -> Result<String, String> {
-    let mut s = FtpSession::connect(host, port).await?;
+    let mut s = FtpSession::connect(host, port, use_tls).await?;
     s.login(user, pass).await?;
     let data_addr = s.pasv().await?;
     // LIST 必须是 1xx 中间响应（150/125）；550 等错误直接终态失败
@@ -882,12 +1655,19 @@ async fn probe_list(
     if !resp.starts_with('1') {
         return Err(resp);
     }
-    let mut data = TcpStream::connect(data_addr)
+    let data_tcp = tokio::time::timeout(FTP_CONNECT_TIMEOUT, TcpStream::connect(data_addr))
         .await
+        .map_err(|_| "data connect timeout".to_string())?
         .map_err(|e| e.to_string())?;
+    let mut data: BoxFtpIo = if use_tls {
+        Box::new(ftps_upgrade(host, data_tcp).await?)
+    } else {
+        Box::new(data_tcp)
+    };
     let mut bytes = Vec::new();
-    data.read_to_end(&mut bytes)
+    tokio::time::timeout(FTP_IO_TIMEOUT, data.read_to_end(&mut bytes))
         .await
+        .map_err(|_| "list read timeout".to_string())?
         .map_err(|e| e.to_string())?;
     let _ = read_response(&mut s.reader).await; // 226
     s.quit().await;
@@ -897,6 +1677,188 @@ async fn probe_list(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// FTPS e2e（B2）：内嵌显式 FTPS 服务器（自签证书 + tokio-rustls），
+    /// 走 download_segment 全路径——控制连接 AUTH TLS 升级 + PBSZ/PROT P +
+    /// 数据连接 TLS + REST/RETR 断点偏移，落盘内容逐字节断言。
+    ///
+    /// 服务器协议循环（RFC 4217/959 最小子集）：banner 220 → AUTH TLS 234
+    /// → [TLS] PBSZ 200 / PROT 200 / USER 331 / PASS 230 / TYPE 200 /
+    /// PASV 227（同步起数据监听）→ REST 350 / RETR 150 → 数据连接 TLS
+    /// accept 后发送内容 → 226 → QUIT 221。
+    #[tokio::test]
+    async fn ftps_end_to_end_download_via_download_segment() {
+        // —— 自签证书（SAN 含 127.0.0.1，SNI/校验均走 IP）——
+        let ck = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let cert_der =
+            tokio_rustls::rustls::pki_types::CertificateDer::from(ck.cert.der().to_vec());
+        let key_der =
+            tokio_rustls::rustls::pki_types::PrivatePkcs8KeyDer::from(ck.key_pair.serialize_der());
+        // 客户端 connector：直接信任自签证书（注入 TEST_CONNECTOR）
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(cert_der.clone()).unwrap();
+        let client_config = tokio_rustls::rustls::ClientConfig::builder_with_provider(
+            tokio_rustls::rustls::crypto::ring::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        TEST_CONNECTOR
+            .set(tokio_rustls::TlsConnector::from(Arc::new(client_config)))
+            .ok();
+
+        // —— server TLS（rustls 同一构建单元；builder 显式 ring provider）——
+        let server_config = tokio_rustls::rustls::ServerConfig::builder_with_provider(
+            tokio_rustls::rustls::crypto::ring::default_provider().into(),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert_der], key_der.into())
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let content: Arc<Vec<u8>> = Arc::new((0..1024u32).map(|i| (i % 251) as u8).collect());
+
+        // 数据监听先行（PASV 响应需要端口）
+        let data_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let data_port = data_listener.local_addr().unwrap().port();
+        let ctrl_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ctrl_port = ctrl_listener.local_addr().unwrap().port();
+
+        let content2 = content.clone();
+        let server = tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let (sock, _) = ctrl_listener.accept().await.unwrap();
+            let mut reader = BufReader::new(sock);
+            let mut line = String::new();
+            // FTP 服务器先发 banner，客户端 connect 才能读到
+            reader
+                .get_mut()
+                .write_all(b"220 ftps-e2e ready\r\n")
+                .await
+                .unwrap();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                let cmd = line.trim_end().to_string();
+                match cmd.as_str() {
+                    "AUTH TLS" => {
+                        reader
+                            .get_mut()
+                            .write_all(b"234 proceeding\r\n")
+                            .await
+                            .unwrap();
+                        let tls = acceptor.accept(reader.into_inner()).await.unwrap();
+                        let mut reader = BufReader::new(tls);
+                        // 加密段协议循环
+                        loop {
+                            line.clear();
+                            reader.read_line(&mut line).await.unwrap();
+                            let cmd = line.trim_end().to_string();
+                            match cmd.as_str() {
+                                "PBSZ 0" => {
+                                    reader.get_mut().write_all(b"200 ok\r\n").await.unwrap()
+                                }
+                                "PROT P" => {
+                                    reader.get_mut().write_all(b"200 ok\r\n").await.unwrap()
+                                }
+                                "USER anonymous" => reader
+                                    .get_mut()
+                                    .write_all(b"331 need pass\r\n")
+                                    .await
+                                    .unwrap(),
+                                // 客户端 "PASS " + 空密码，trim_end 后为 "PASS"
+                                "PASS" | "PASS " => reader
+                                    .get_mut()
+                                    .write_all(b"230 logged in\r\n")
+                                    .await
+                                    .unwrap(),
+                                "TYPE I" => {
+                                    reader.get_mut().write_all(b"200 ok\r\n").await.unwrap()
+                                }
+                                "PASV" => {
+                                    let p1 = data_port / 256;
+                                    let p2 = data_port % 256;
+                                    reader
+                                        .get_mut()
+                                        .write_all(
+                                            format!(
+                                                "227 Entering Passive Mode (127,0,0,1,{p1},{p2})\r\n"
+                                            )
+                                            .as_bytes(),
+                                        )
+                                        .await
+                                        .unwrap();
+                                }
+                                "REST 0" => reader
+                                    .get_mut()
+                                    .write_all(b"350 restart ok\r\n")
+                                    .await
+                                    .unwrap(),
+                                "RETR /f.bin" => {
+                                    reader
+                                        .get_mut()
+                                        .write_all(b"150 opening data\r\n")
+                                        .await
+                                        .unwrap();
+                                    // 数据连接：客户端连上后立即 TLS（PROT P）
+                                    let (dsock, _) = data_listener.accept().await.unwrap();
+                                    let mut dtls = acceptor.accept(dsock).await.unwrap();
+                                    dtls.write_all(&content2).await.unwrap();
+                                    dtls.shutdown().await.unwrap();
+                                    reader
+                                        .get_mut()
+                                        .write_all(b"226 transfer done\r\n")
+                                        .await
+                                        .unwrap();
+                                }
+                                "QUIT" => {
+                                    reader.get_mut().write_all(b"221 bye\r\n").await.unwrap();
+                                    return;
+                                }
+                                _ => reader
+                                    .get_mut()
+                                    .write_all(b"502 not impl\r\n")
+                                    .await
+                                    .unwrap(),
+                            }
+                        }
+                    }
+                    _ => reader
+                        .get_mut()
+                        .write_all(b"502 need AUTH TLS\r\n")
+                        .await
+                        .unwrap(),
+                }
+            }
+        });
+
+        // —— 客户端全路径：connect(true) → login → pasv/REST/RETR → 数据 TLS ——
+        let dir = tempfile::tempdir().unwrap();
+        let part = dir.path().join("f.bin.part");
+        let seg = DynSegment {
+            start: 0,
+            end: content.len() as u64 - 1,
+        };
+        download_segment(
+            "127.0.0.1",
+            ctrl_port,
+            "anonymous",
+            "",
+            "/f.bin",
+            seg,
+            &part,
+            &RateLimiter::new(0),
+            true,
+        )
+        .await
+        .unwrap();
+        let got = std::fs::read(&part).unwrap();
+        assert_eq!(got, *content, "FTPS 数据连接内容逐字节一致（TLS 解密正确）");
+        server.abort();
+    }
 
     /// LIST 解析：两个文件行 + `total` 头 + 子目录被过滤 + 多空格分隔。
     #[test]
@@ -939,23 +1901,48 @@ mod tests {
     /// 目录识别：以 `/` 结尾或空路径 → Dir；否则 File；非法 URL → None。
     #[test]
     fn parse_ftp_url_distinguishes_file_and_dir() {
-        let (h, p, t) = parse_ftp_url("ftp://u:p@host:2121/pub/dir/").unwrap();
+        let (h, p, t, tls) = parse_ftp_url("ftp://u:p@host:2121/pub/dir/").unwrap();
         assert_eq!((h.as_str(), p), ("host", 2121));
         assert_eq!(t, FtpTarget::Dir("/pub/dir/".to_string()));
+        assert!(!tls);
 
-        let (_, _, t) = parse_ftp_url("ftp://host/").unwrap();
+        let (_, _, t, _) = parse_ftp_url("ftp://host/").unwrap();
         assert_eq!(t, FtpTarget::Dir("/".to_string()));
 
         // 无路径（空路径）→ 根目录
-        let (_, _, t) = parse_ftp_url("ftp://host").unwrap();
+        let (_, _, t, _) = parse_ftp_url("ftp://host").unwrap();
         assert_eq!(t, FtpTarget::Dir("/".to_string()));
 
-        let (h, p, t) = parse_ftp_url("ftp://host/file.bin").unwrap();
-        assert_eq!((h.as_str(), p), ("host", 21));
+        let (_h, _p, _t, tls) = parse_ftp_url("ftp://host/file.bin").unwrap();
+        assert!(!tls);
+    }
+
+    #[test]
+    fn parse_ftp_url_ftps_flag() {
+        let (h, p, t, tls) = parse_ftp_url("ftps://u:p@host:990/file.bin").unwrap();
+        assert_eq!((h.as_str(), p), ("host", 990));
         assert_eq!(t, FtpTarget::File("/file.bin".to_string()));
+        assert!(tls);
+
+        // 默认端口仍 21（显式 AUTH TLS 惯例）
+        let (h, p, t2, tls) = parse_ftp_url("ftps://host/dir/").unwrap();
+        assert_eq!((h.as_str(), p), ("host", 21));
+        assert!(tls);
+        assert_eq!(t2, FtpTarget::Dir("/dir/".to_string()));
 
         assert!(parse_ftp_url("http://host/x").is_none());
         assert!(parse_ftp_url("ftp://").is_none());
+    }
+
+    /// 审查修复 P0（CWE-147）：host/path 含 CR/LF/NUL 的 URL 一律拒绝。
+    #[test]
+    fn parse_ftp_url_rejects_injection() {
+        assert!(parse_ftp_url("ftp://host/a\r\nDELE /data").is_none());
+        assert!(parse_ftp_url("ftp://host/\nDELE /data").is_none());
+        assert!(parse_ftp_url("ftp://ho\rst/file").is_none());
+        assert!(parse_ftp_url("ftp://host/a\x00b").is_none());
+        // 合法 URL 不受影响
+        assert!(parse_ftp_url("ftp://host/file.bin").is_some());
     }
 
     /// 目录落位名：最后一段非空名称；根目录 → host（含端口净化）。

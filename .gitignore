@@ -12,6 +12,8 @@
 *.profraw
 *.profdata
 download.bin.part
+download.bin.part.progress
+download.bin.part.etag
 crates/daemon/download.bin
 scripts/research/captures/
 scripts/research/cloud_delivery/
@@ -62,3 +64,13 @@ docs/nas/evidence/
 
 # 本地调试运行产物（bugb 复现环境：日志/配置/二进制/任务快照，含本机路径）
 /out/
+daemon.log
+ui/node_modules/
+ui/.next/
+ui/out/
+node_modules/
+
+# S1-d 桌面 BT 装配：native 运行库为 CI stage 产物（.so/.dylib/DLL 闭包），
+# vcpkg 二进制缓存同理——均不入库（tauri 资源映射在 CI 构建期读取）
+desktop/src-tauri/native/
+.vcpkg-cache/
