@@ -4,6 +4,48 @@
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本号语义：`0.x` 阶段以能力批次为单位推进，不承诺字段级兼容。
 
+## [0.2.1] - 2026-09-07
+
+第六轮子智能体批量代码审查修复（batch6）+ 桌面端三平台打包矩阵首跑验证。
+
+### 审查修复（安全与正确性）
+- **RSS 解析器 CDATA 事件丢弃**（P0）：quick-xml 将 `<![CDATA[...]]>` 投递为
+  独立事件（非 Text），旧实现静默吞掉 → WordPress 等主流 CMS feed 条目全丢；
+  现已接取（原始文本不转义）+ 混合内容累加语义 + 回归锚测试
+- **HLS/DASH 流式循环缺 epoch 单写者闸门**（P0）：暂停→恢复可产生双写者并发
+  append 同一 `.part` → 静默交付损坏文件；现已引入 is_aborted 闭包
+  （暂停 ∪ epoch 过期 ∪ 任务已移除）段间检查 + 落位前终检 + HTTP resume
+  运行态不重 spawn（与 FTP 同口径）
+- **BT 内核首尾块优先级 0 语义颠倒**（P1）：契约 0=恢复默认，内核透传为
+  libtorrent 的「不下载」→ 首末块（及小于一块的小文件）永不完成；
+  现映射 `lt::default_priority`
+- **内核 fill_ih 补幂等/errored 句柄重建**（P1）：`.torrent`/fastresume 路径
+  重试全程 duplicate 死锁（磁链路径已有修复，此为补齐）
+- **重启后 Seeding 任务脱管**（P1）：记录强置 Queued 退出轮询管道（速率/
+  名称回填/做种限制执法失效）+ 完成事件可能重发；现已恢复后回登记做种态
+- **做种任务 pause→resume 后计时失效**（P1）：内核不重发 finished alert，
+  `max_seeding_time` 永久失效；resume 后按引擎实况收敛记录态并重起计时
+- rss.json 唯一 tmp+0600+损坏留存（对齐 tasks.json 加固配方）；RSS 刷新
+  互斥（并发重复建任务）；规则首见命中去重；DASH 单文件表示改流式下载
+  （120s 总超时+全量内存 → 大文件必挂）；FTPS 全局共享 TLS connector
+  （vsftpd `require_ssl_reuse` 默认配置兼容）
+
+### 其他修复
+- 激活窗口暂停意图守卫；pause/resume 广播 from 态实值化
+- downloaded==0 视作分享率 ∞（qbit 口径）；空白 RSS 关键词 add 即拒；
+  RSS 已处理条目上限 0 值防护；集数过滤全量提取（多集标题漏检）
+- recheck/announce/超级种子句柄缺失 404（原 500）；封禁区间 v4-mapped 归一
+- HLS 段数/key 缓存/清单体积上限；显式全零 IV 保留（Option 根治哨兵混淆）；
+  SegmentTemplate Rep 级逐属性继承（ISO 23009-1）
+- 暂缓项（配额闸门预留槽位改造等 5 项）记入 BACKLOG
+
+### 桌面端
+- desktop CI 三平台打包矩阵首跑验证：Linux/macOS 构建链修复（brew
+  libtorrent 2.1.0 RTC 构建态宏一致性探测兜底），Windows vcpkg 缓存复跑
+- 桌面安装包以 `desktop-v0.2.1` 标签发布（含本批全部修复）
+
+版本号语义：`0.x` 阶段以能力批次为单位推进，不承诺字段级兼容。
+
 ## [0.2.0] - 2026-09-07
 
 第五轮全库审查修复（12 项）+ qBittorrent/BitComet 对标补齐 + RSS 订阅 UI。
