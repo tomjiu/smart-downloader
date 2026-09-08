@@ -2267,12 +2267,15 @@ async fn stats_aggregates_live_down_rate_e2e() {
 async fn task_snapshot_exposes_live_rates_e2e() {
     let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let total = 1024 * 1024; // 1MiB < DEFAULT_MIN_SPLIT → 单连接整流
-    let srv = SlowTestServer::start(patterned(total), 20, 200).await; // ≈4s
+    // 40×200ms ≈ 8s 传输（Windows CI 二跑实证：重负载下 daemon 侧 300ms
+    // 轮询器被饿死到 4s 传输结束后才恢复采样，60s 护栏内全零）——传输
+    // 拉长 + 轮询加密把暴露窗口扩 3 倍（PR #107 实证用例）。
+    let srv = SlowTestServer::start(patterned(total), 40, 200).await; // ≈8s
     let (addr, state) = serve().await;
-    // 测试装配：300ms 轮询（状态机推进 + 缓存刷新；慢于默认 2s 缩短捕获时延）
+    // 测试装配：200ms 轮询（状态机推进 + 缓存刷新；慢于默认 2s 缩短捕获时延）
     let _h = smart_dl_daemon::http_events::spawn_http_events(
         state.clone(),
-        std::time::Duration::from_millis(300),
+        std::time::Duration::from_millis(200),
     );
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
@@ -2283,7 +2286,7 @@ async fn task_snapshot_exposes_live_rates_e2e() {
     // 用 list（记录态）等下载推进——不触发引擎 status()，保首个采样窗口干净
     wait_list_state(&client, &base, &tid, "Downloading").await;
 
-    // 快照轮询等待非零下行速率（下载持续 ≈4s；60s 护栏对齐同文件先例
+    // 快照轮询等待非零下行速率（下载持续 ≈8s；60s 护栏对齐同文件先例
     //——Windows CI 重负载窗口实测击穿 15s：PR #106 首跑 rate e2e 超时）
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut seen = 0u64;
