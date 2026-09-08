@@ -120,6 +120,9 @@ pub fn parse_metalink4(xml: &str) -> Result<Vec<MetalinkFile>, String> {
     let mut files: Vec<MetalinkFile> = Vec::new();
     let mut cur: Option<MetalinkFile> = None;
     let mut target: Option<TextTarget> = None;
+    // 文本累积缓冲：0.38+ 实体引用拆为独立 GeneralRef 事件，文本可能分段到达，
+    // 在目标元素 End 时统一落位（旧版单事件覆盖语义的等价升级）。
+    let mut text_buf = String::new();
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) => match e.name().local_name().as_ref() {
@@ -181,39 +184,54 @@ pub fn parse_metalink4(xml: &str) -> Result<Vec<MetalinkFile>, String> {
             },
             Ok(Event::Text(t)) => {
                 // target=None → 非收集目标（文档级元数据 <publisher> 等）直接忽略
-                let Some(tgt) = &target else { continue };
+                let Some(_) = &target else { continue };
                 let text = t
-                    .unescape()
-                    .map(|c| c.into_owned())
+                    .xml10_content()
                     .map_err(|e| format!("metalink 文本转义非法: {e}"))?;
-                let f = cur.as_mut().ok_or("metalink 叶子元素出现在 <file> 之外")?;
-                match tgt {
-                    TextTarget::Size => {
-                        f.size = Some(text.trim().parse::<u64>().map_err(|_| {
-                            format!("metalink <size> 非法非负整数: {:?}", text.trim())
-                        })?);
+                text_buf.push_str(&text);
+            }
+            Ok(Event::GeneralRef(r)) => {
+                // `&amp;` 等实体引用自 0.38 起拆为独立事件，解析回值并累积
+                let Some(_) = &target else { continue };
+                let text = resolve_ref(&r)?;
+                text_buf.push_str(&text);
+            }
+            Ok(Event::End(e)) => {
+                let local = e.name().local_name();
+                if matches!(local.as_ref(), b"size" | b"hash" | b"url") {
+                    // target/cur 双守卫：<size> 等出现在 <file> 之外时静默忽略（旧行为）
+                    if let (Some(tgt), Some(f)) = (&target, cur.as_mut()) {
+                        let text = std::mem::take(&mut text_buf);
+                        match tgt {
+                            TextTarget::Size => {
+                                f.size = Some(text.trim().parse::<u64>().map_err(|_| {
+                                    format!("metalink <size> 非法非负整数: {:?}", text.trim())
+                                })?);
+                            }
+                            TextTarget::Url => {
+                                let u = f.urls.last_mut().expect("url 文本前必有 url 起始事件");
+                                u.url = text.trim().to_string();
+                            }
+                            TextTarget::Hash(ty) => match ty.as_str() {
+                                "sha256" => f.sha256 = Some(text.trim().to_lowercase()),
+                                "sha1" => f.sha1 = Some(text.trim().to_lowercase()),
+                                _ => f.md5 = Some(text.trim().to_lowercase()),
+                            },
+                        }
                     }
-                    TextTarget::Url => {
-                        let u = f.urls.last_mut().expect("url 文本前必有 url 起始事件");
-                        u.url = text.trim().to_string();
+                    text_buf.clear();
+                }
+                match local.as_ref() {
+                    b"file" => {
+                        if let Some(f) = cur.take() {
+                            files.push(f);
+                        }
+                        target = None;
                     }
-                    TextTarget::Hash(ty) => match ty.as_str() {
-                        "sha256" => f.sha256 = Some(text.trim().to_lowercase()),
-                        "sha1" => f.sha1 = Some(text.trim().to_lowercase()),
-                        _ => f.md5 = Some(text.trim().to_lowercase()),
-                    },
+                    b"size" | b"hash" | b"url" => target = None,
+                    _ => {}
                 }
             }
-            Ok(Event::End(e)) => match e.name().local_name().as_ref() {
-                b"file" => {
-                    if let Some(f) = cur.take() {
-                        files.push(f);
-                    }
-                    target = None;
-                }
-                b"size" | b"hash" | b"url" => target = None,
-                _ => {}
-            },
             Ok(Event::Eof) => break,
             Err(e) => return Err(format!("metalink XML 解析失败: {e}")),
             _ => {}
@@ -230,9 +248,28 @@ fn decode_attr(
     a: &quick_xml::events::attributes::Attribute,
     reader: &Reader<&[u8]>,
 ) -> Result<String, String> {
-    a.decode_and_unescape_value(reader.decoder())
+    a.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder())
         .map(|c| c.into_owned())
         .map_err(|e| format!("metalink 属性值解码失败: {e}"))
+}
+
+/// 实体引用事件（0.38+ `Event::GeneralRef`）解析回原值：
+/// 数字字符引用（`&#38;`/`&#x26;`）与预定义 XML 实体（`&amp;` 等）；
+/// 未知命名实体与旧版 unescape 行为一致地报错。
+fn resolve_ref(r: &quick_xml::events::BytesRef<'_>) -> Result<String, String> {
+    if r.is_char_ref() {
+        return r
+            .resolve_char_ref()
+            .map_err(|e| format!("metalink 数字字符引用非法: {e}"))?
+            .map(|c| c.to_string())
+            .ok_or_else(|| "metalink 数字字符引用非法".to_string());
+    }
+    let name = r
+        .xml10_content()
+        .map_err(|e| format!("metalink 实体引用解码失败: {e}"))?;
+    quick_xml::escape::resolve_xml_entity(&name)
+        .map(str::to_string)
+        .ok_or_else(|| format!("metalink 未知实体引用: &{name};"))
 }
 
 #[cfg(test)]
@@ -322,6 +359,17 @@ mod tests {
         let f = &parse_metalink4(xml).unwrap()[0];
         assert_eq!(f.name, "a&b.bin");
         assert_eq!(f.urls[0].url, "http://h/x?a=1&b=2");
+    }
+
+    #[test]
+    fn unescapes_numeric_char_refs_and_fragmented_text() {
+        // 0.38+ 事件模型：文本被实体引用切分为 Text+GeneralRef+Text 三事件，
+        // 数字字符引用 &#38; 与命名实体 &amp; 均须还原。
+        let xml = r#"<metalink><file name="x.bin">
+            <url>http://h/x?a=1&#38;b=2&amp;c=3</url>
+        </file></metalink>"#;
+        let f = &parse_metalink4(xml).unwrap()[0];
+        assert_eq!(f.urls[0].url, "http://h/x?a=1&b=2&c=3");
     }
 
     #[test]

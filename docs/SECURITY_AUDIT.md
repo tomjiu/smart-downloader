@@ -92,3 +92,66 @@
 2. hyper header-read timeout（等 axum/hyper-util 层暴露或切手动 serve）。
 3. SFTP known_hosts 换钥的 UI 呈现（当前为 error 日志 + 人工删文件）。
 4. `extra_allowed_hosts` 热重载支持（当前启动注入）。
+
+## 七、工具化安全审计（batch9，2026-09-08）
+
+> 方法升级：人工双路审计（§一–§五）之后，引入三件行业标准审计工具做
+> 全量机器扫描，并把结论固化为可复跑的仓库门禁。
+
+### 工具与覆盖面
+
+| 工具 | 版本 | 覆盖面 | 结果 |
+|------|------|--------|------|
+| cargo-audit | 0.22.2 | Cargo.lock × RustSec advisory DB（1242 条） | 初扫 3 漏洞 → 修复后 **0** |
+| cargo-deny | 0.20.2 | advisories / bans / licenses / sources | 初扫多组失败 → 配置后 **全绿** |
+| gitleaks | 8.30.1 | git 全历史（317 commits，21.6MB）+ 工作树 | 初扫 36 命中 → 取证豁免后 **双绿** |
+
+### 发现与修复
+
+1. **RustSec 漏洞 3 项（全修）**：均为网络面 DoS 类，与下载器场景强相关——
+   - `h2` 0.4.15 unbounded empty DATA frames（RUSTSEC-2026-0258）→ **0.4.19**
+     （axum/hyper HTTP/2 服务器与客户端路径）；
+   - `quick-xml` 0.37.5 两项（RUSTSEC-2026-0194 二次方复杂度 / 2026-0195
+     命名空间声明无界分配，内存耗尽 DoS）→ **0.41.0**（DASH/Metalink4/RSS
+     清单解析入口，直接依赖升级）。
+2. **quick-xml 0.37→0.41 API 迁移（三解析器全量适配）**：`BytesText::unescape`
+   移除、`decode_and_unescape_value` 弃用、**实体引用拆分为独立
+   `Event::GeneralRef` 事件**。`dash.rs` / `metalink.rs` / `rss.rs` 补
+   GeneralRef 分支（数字字符引用 + 预定义实体解析），metalink 由"逐事件
+   覆盖"升级为"累积 + End 落位"（等价语义超集）；新增实体切分回归测试
+   `unescapes_numeric_char_refs_and_fragmented_text` 钉死行为。
+3. **自身 crate 许可元数据缺失**：5 个主 crate 无 `license` 字段（cargo-deny
+   licenses 初扫全拒）→ workspace 统一 `license = "MIT OR Apache-2.0"` +
+   `publish = false`（与 xunlei-* 既有声明一致；应用型 workspace 不发布
+   crates.io）。仓库根 LICENSE 文件属维护者决策，另行建议。
+4. **gitleaks 36 处历史命中分类取证**：
+   - 31 处为**厂商公开常量**（迅雷客户端 device/签名常量 28 字节 ×25、
+     NAS 设备流 client 常量 22 字节 ×5、厂商前端 bundle 内嵌 key ×2 中的
+     公开部分）——public-by-construction，非用户凭证；
+   - `login_page.rs` 2 处为 **alg=none 测试样例 JWT**（fixture，非真实 token）；
+   - 1 处为历史取证产物中的**会话级 JWT**（HEAD 已删、早已过期）——记录
+     在案并建议吊销对应 NAS 会话；不做公开仓库历史重写（破坏性操作）；
+   - 现行代码核实：`scripts/nas/*.py` 已改 `SD_XL_CLIENT_ID/SECRET`
+     环境变量注入（修复在前，命中仅存历史版本）。
+5. **构建产物误报**：`target/` 下加密库 `.rmeta` 元数据的 private-key 命中
+   22 处——路径豁免。
+
+### 门禁固化（新增文件）
+
+- `deny.toml`：advisories 全阻断 + yanked=deny；外部通配符版本 deny
+  （workspace 内 path 依赖经 `publish=false` 合规放行）；license 白名单
+  （MIT/Apache-2.0/BSD/ISC/Unicode-3.0/Zlib/MPL-2.0/CC0/BSL-1.0 等）+
+  ring 许可澄清；sources 锁定 crates.io。
+- `.gitleaks.toml`：默认规则 + 精准 allowlist（逐条理由：两条厂商公开
+  常量正则、alg=none fixture 前缀、取证产物与构建产物路径）——不做无理由
+  目录级宽免，未来真实泄漏仍会浮出。
+- `.github/workflows/ci.yml`：新增 **security job**（cargo-deny-action
+  四组检查 + gitleaks-action 全历史扫描），与 rust/bt-integration 并列。
+
+### 验证终态
+
+- cargo-audit 复扫 **0 漏洞**；cargo-deny 四组 **全绿**；gitleaks 历史 +
+  工作树 **双绿**。
+- 门禁回归：fmt 绿；clippy（ftp / sftp 口径，-D warnings）绿；core 264 /
+  provider 162 / httpdl-ftp 全绿 / httpdl-sftp 205 / daemon 默认 **330**（+1
+  实体切分回归）/ daemon ftp+nas / sftp 全绿 / btcore / daemon bt 全绿。
