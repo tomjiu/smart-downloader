@@ -1071,7 +1071,7 @@ lt_err lt_set_piece_first_last(lt_session* s, const char* ih, int prio) {
         //（vcpkg 构建 deprecated-functions=off 时成员整体移除，brew 2.1.0 仅告警）
         // ——版本宏分流：2.1+ 公开面取整份 file_storage 的唯一途径是
         // files_impl()（"internal" 注释但 public，2.0.11 无此成员）；2.0 走 files()。
-#if LIBTORRENT_VERSION_NUM >= 0x020100
+#if LIBTORRENT_VERSION_NUM >= 20100 // 2.1.0（版本宏=十进制编码 major*10000+minor*100+tiny）
         const lt::file_storage& fs = tf->files_impl();
 #else
         const lt::file_storage& fs = tf->files();
