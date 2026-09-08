@@ -25,7 +25,7 @@ pub enum DownloadSource {
     Thunder(String), // 解码为 Http（§7.1）
     /// 迅雷网盘分享链接（pan.xunlei.com/s/xxx?pwd=yyy）。
     XunleiShare(String),
-    Ed2k(String),    // v1 不支持 → Failed
+    Ed2k(String), // v1 不支持 → Failed
 }
 
 /// HTTP(S) 认证（Digest 属 v2）。
@@ -37,7 +37,16 @@ pub enum Auth {
 
 /// 安全修复（V6，CWE-532）：敏感 query 参数名（值替换为 `***`）。
 const SENSITIVE_QUERY_KEYS: &[&str] = &[
-    "token", "key", "sign", "sig", "signature", "auth", "pwd", "password", "passwd", "secret",
+    "token",
+    "key",
+    "sign",
+    "sig",
+    "signature",
+    "auth",
+    "pwd",
+    "password",
+    "passwd",
+    "secret",
 ];
 
 /// 剥 URL userinfo（`scheme://user:pass@host` → `scheme://***@host`）并把敏感
@@ -98,7 +107,11 @@ impl DownloadSource {
                 "Http {{ url: {:?}, headers: {:?}, auth: {}, backup_url: {} }}",
                 redact_url(url),
                 headers.iter().map(|(k, _)| k.clone()).collect::<Vec<_>>(),
-                if auth.is_some() { "Some([REDACTED])" } else { "None" },
+                if auth.is_some() {
+                    "Some([REDACTED])"
+                } else {
+                    "None"
+                },
                 backup_url
                     .as_deref()
                     .map(|u| format!("Some({:?})", redact_url(u)))
@@ -232,7 +245,11 @@ pub trait DownloadEngine: Send + Sync {
     async fn update_sources(&self, id: &EngineTaskId, urls: Vec<String>)
         -> Result<(), EngineError>;
     async fn add_url_seed(&self, id: &EngineTaskId, url: &str) -> Result<(), EngineError>;
-    async fn add_peer(&self, _id: &EngineTaskId, _peer: std::net::SocketAddr) -> Result<(), EngineError> {
+    async fn add_peer(
+        &self,
+        _id: &EngineTaskId,
+        _peer: std::net::SocketAddr,
+    ) -> Result<(), EngineError> {
         Ok(()) // 默认：不支持直连 peer 注入
     }
     async fn ban_peer(&self, id: &EngineTaskId, peer: SocketAddr) -> Result<(), EngineError>;
@@ -240,10 +257,7 @@ pub trait DownloadEngine: Send + Sync {
 
     /// 迅雷任务导入（M9）：接受 xunlei-convert 生成的 fastresume bencode。
     /// 默认实现返回 `not supported`；BT 引擎（libtorrent）应Override为 `add_torrent_resume`。
-    async fn add_xunlei_resume(
-        &self,
-        _data: Vec<u8>,
-    ) -> Result<EngineTaskId, EngineError> {
+    async fn add_xunlei_resume(&self, _data: Vec<u8>) -> Result<EngineTaskId, EngineError> {
         Err(EngineError::Other(
             "add_xunlei_resume not supported by this engine".into(),
         ))

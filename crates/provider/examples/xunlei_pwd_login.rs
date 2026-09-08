@@ -10,7 +10,7 @@
 //! username 规则：`+86...` 手机号 / 邮箱 / 用户名均可（服务端按格式识别）。
 //! 落盘后的登录态可直接被 `XunleiProvider::new(token_path)` 加载。
 
-use smart_dl_provider::xunlei::auth::{save as save_auth};
+use smart_dl_provider::xunlei::auth::save as save_auth;
 use smart_dl_provider::xunlei::client::Client;
 
 #[tokio::main]
@@ -71,7 +71,14 @@ async fn main() {
     }
     println!();
     println!("✅ 登录成功，登录态已写入: {token_path}");
-    println!("  user_id: {}", if state.user_id.is_empty() { "(未知)" } else { &state.user_id });
+    println!(
+        "  user_id: {}",
+        if state.user_id.is_empty() {
+            "(未知)"
+        } else {
+            &state.user_id
+        }
+    );
     println!("后续可启动 daemon 或运行 resolve 取链验证。");
 }
 

@@ -20,6 +20,8 @@ pub mod xltd;
 pub mod integration_tests;
 
 pub use cid_store::{analyze_cid_store, CidStoreEntry, CidStoreReport};
-pub use fastresume::{build_bitfield, build_bitfield_lenient, FastresumeConverter, PartialPieceInfo};
+pub use fastresume::{
+    build_bitfield, build_bitfield_lenient, FastresumeConverter, PartialPieceInfo,
+};
 pub use xlbt_cfg::{XlbtCfg, XlbtCfgError};
 pub use xltd::{XltdAnalysis, XltdError};

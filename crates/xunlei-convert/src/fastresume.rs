@@ -114,7 +114,13 @@ impl FastresumeConverter {
         let mut xltd_analysis = XltdAnalysis::analyze(xltd_path)?;
 
         // 4. 验证 piece 哈希
-        xltd_analysis.verify_piece_hashes(xltd_path, piece_length, pieces_hash, file_offset, file_size)?;
+        xltd_analysis.verify_piece_hashes(
+            xltd_path,
+            piece_length,
+            pieces_hash,
+            file_offset,
+            file_size,
+        )?;
 
         let report = FastresumeReport {
             infohash_match: true, // 由外部校验后传入
@@ -167,7 +173,11 @@ impl FastresumeConverter {
     }
 
     /// 将 fastresume 写入 bencode 文件（libtorrent 标准格式）。
-    pub fn write_fastresume(&self, fastresume: &Fastresume, path: &Path) -> Result<(), anyhow::Error> {
+    pub fn write_fastresume(
+        &self,
+        fastresume: &Fastresume,
+        path: &Path,
+    ) -> Result<(), anyhow::Error> {
         let data = bencode_fastresume(fastresume)?;
         std::fs::write(path, data)?;
         Ok(())
@@ -349,16 +359,16 @@ fn bdecode_at(
         }
         b'i' => {
             let start = pos + 1;
-            let end_rel = data[start..].iter().position(|&b| b == b'e').ok_or_else(|| {
-                BencodeError::InvalidData("unterminated int".into())
-            })?;
+            let end_rel = data[start..]
+                .iter()
+                .position(|&b| b == b'e')
+                .ok_or_else(|| BencodeError::InvalidData("unterminated int".into()))?;
             let end = start + end_rel;
-            let s = std::str::from_utf8(&data[start..end]).map_err(|e| {
-                BencodeError::InvalidData(format!("invalid int utf8: {}", e))
-            })?;
-            let n: i64 = s.parse().map_err(|e| {
-                BencodeError::InvalidData(format!("invalid int: {}", e))
-            })?;
+            let s = std::str::from_utf8(&data[start..end])
+                .map_err(|e| BencodeError::InvalidData(format!("invalid int utf8: {}", e)))?;
+            let n: i64 = s
+                .parse()
+                .map_err(|e| BencodeError::InvalidData(format!("invalid int: {}", e)))?;
             Ok((BencodeValue::Int(n), end + 1))
         }
         _ => {
@@ -369,15 +379,17 @@ fn bdecode_at(
 }
 
 fn bdecode_bytes(data: &[u8], pos: usize) -> Result<(Vec<u8>, usize), BencodeError> {
-    let colon = data[pos..].iter().position(|&b| b == b':').ok_or_else(|| {
-        BencodeError::InvalidData("missing colon in bytes".into())
-    })? + pos;
+    let colon = data[pos..]
+        .iter()
+        .position(|&b| b == b':')
+        .ok_or_else(|| BencodeError::InvalidData("missing colon in bytes".into()))?
+        + pos;
     let len_str = std::str::from_utf8(&data[pos..colon]).map_err(|e| {
         BencodeError::InvalidData(format!("invalid len utf8 at pos {}: {}", pos, e))
     })?;
-    let len: usize = len_str.parse().map_err(|e| {
-        BencodeError::InvalidData(format!("invalid len at pos {}: {}", pos, e))
-    })?;
+    let len: usize = len_str
+        .parse()
+        .map_err(|e| BencodeError::InvalidData(format!("invalid len at pos {}: {}", pos, e)))?;
     let end = colon + 1 + len;
     if end > data.len() {
         return Err(BencodeError::InvalidData("bytes truncated".into()));
@@ -439,11 +451,23 @@ mod bencode_tests {
         };
         let encoded = bencode_fastresume(&fr).unwrap();
         let decoded = bdecode(&encoded).unwrap();
-        assert_eq!(decoded.dict_get(b"file-format").unwrap().as_bytes(), Some(b"libtorrent resume file".as_slice()));
+        assert_eq!(
+            decoded.dict_get(b"file-format").unwrap().as_bytes(),
+            Some(b"libtorrent resume file".as_slice())
+        );
         assert_eq!(decoded.dict_get(b"file-version").unwrap().as_int(), Some(1));
-        assert_eq!(decoded.dict_get(b"pieces").unwrap().as_bytes(), Some(fr.pieces.as_slice()));
-        assert_eq!(decoded.dict_get(b"name").unwrap().as_bytes(), Some(b"test.torrent".as_slice()));
-        assert_eq!(decoded.dict_get(b"save_path").unwrap().as_bytes(), Some(b"/tmp/data".as_slice()));
+        assert_eq!(
+            decoded.dict_get(b"pieces").unwrap().as_bytes(),
+            Some(fr.pieces.as_slice())
+        );
+        assert_eq!(
+            decoded.dict_get(b"name").unwrap().as_bytes(),
+            Some(b"test.torrent".as_slice())
+        );
+        assert_eq!(
+            decoded.dict_get(b"save_path").unwrap().as_bytes(),
+            Some(b"/tmp/data".as_slice())
+        );
         let file_sizes = decoded.dict_get(b"file sizes").unwrap().as_list().unwrap();
         assert_eq!(file_sizes.len(), 2);
         let f0 = file_sizes[0].as_list().unwrap();

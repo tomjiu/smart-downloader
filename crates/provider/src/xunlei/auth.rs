@@ -141,8 +141,8 @@ pub fn from_web_credentials_str(s: &str) -> Option<AuthState> {
         access_token_expires_at: 0,
         captcha_token_expires_at: 0,
     };
-    state.access_token_expires_at = jwt_exp(&state.access_token)
-        .unwrap_or_else(|| crate::xunlei::client::now_unix() + 3600);
+    state.access_token_expires_at =
+        jwt_exp(&state.access_token).unwrap_or_else(|| crate::xunlei::client::now_unix() + 3600);
     state.fill_user_id_from_token();
     Some(state)
 }
@@ -186,10 +186,13 @@ mod tests {
     use super::*;
     fn state() -> AuthState {
         AuthState {
-            access_token: "at".into(), refresh_token: "rt".into(),
-            device_id: "dev".into(), captcha_token: "ck".into(),
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            device_id: "dev".into(),
+            captcha_token: "ck".into(),
             user_id: "123".into(),
-            access_token_expires_at: 1000, captcha_token_expires_at: 500,
+            access_token_expires_at: 1000,
+            captcha_token_expires_at: 500,
         }
     }
     #[test]

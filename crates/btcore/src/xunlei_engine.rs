@@ -13,10 +13,10 @@ use tokio::sync::Mutex;
 
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
-    Capability, DownloadEngine, DownloadSource, EngineError, EngineKind,
-    EngineState, EngineStatus, EngineTaskId, FileProgress, PeerInfo,
+    Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
+    EngineTaskId, FileProgress, PeerInfo,
 };
-use xunlei_ffi::{XunleiHandle, query::TaskState as XlTaskState, task::TaskId as XlTaskId};
+use xunlei_ffi::{query::TaskState as XlTaskState, task::TaskId as XlTaskId, XunleiHandle};
 
 /// 迅雷 BT 引擎（匿名 + 可选带身份模式）。
 #[derive(Clone)]
@@ -78,14 +78,10 @@ impl<'a> XunleiBtEngineBuilder<'a> {
 
     /// 执行 Init + 身份注入。
     pub async fn build(self) -> Result<XunleiBtEngine, EngineError> {
-        let handle = XunleiHandle::new(
-            self.sdk_dir,
-            self.save_path,
-            self.save_path,
-            &self.app_guid,
-        )
-        .await
-        .map_err(|e| EngineError::Other(format!("xunlei init failed: {e}")))?;
+        let handle =
+            XunleiHandle::new(self.sdk_dir, self.save_path, self.save_path, &self.app_guid)
+                .await
+                .map_err(|e| EngineError::Other(format!("xunlei init failed: {e}")))?;
 
         // identity.rs 三 setter（对齐 sdk_export_inventory.md §5）。
         if let Some(mode) = self.token_mode {
@@ -102,7 +98,9 @@ impl<'a> XunleiBtEngineBuilder<'a> {
             handle
                 .set_accelerate_certification(&cert)
                 .await
-                .map_err(|e| EngineError::Other(format!("xunlei set_accelerate_certification failed: {e}")))?;
+                .map_err(|e| {
+                    EngineError::Other(format!("xunlei set_accelerate_certification failed: {e}"))
+                })?;
         }
 
         // handle.rs set_user_info（ABI 已修正为字符串参数；参数语义待真机澄清）。
@@ -132,10 +130,7 @@ impl XunleiBtEngine {
 
     async fn get_xl_task_id(&self, id: &EngineTaskId) -> Result<XlTaskId, EngineError> {
         let tasks = self.tasks.lock().await;
-        tasks
-            .get(id)
-            .copied()
-            .ok_or_else(|| EngineError::NotFound)
+        tasks.get(id).copied().ok_or_else(|| EngineError::NotFound)
     }
 
     async fn remove_task(&self, id: &EngineTaskId) -> Option<XlTaskId> {
@@ -208,7 +203,11 @@ impl DownloadEngine for XunleiBtEngine {
                         .to_string(),
                 ));
             }
-            _ => return Err(EngineError::Other("unsupported source for xunlei engine".to_string())),
+            _ => {
+                return Err(EngineError::Other(
+                    "unsupported source for xunlei engine".to_string(),
+                ))
+            }
         };
 
         let engine_id = Self::engine_task_id(xl_id.0);

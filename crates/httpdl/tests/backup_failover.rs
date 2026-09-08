@@ -206,7 +206,9 @@ async fn backup_unused_when_main_ok() {
     assert_eq!(got, good);
     // 备用服务器零请求
     assert_eq!(
-        srv_backup.request_count.load(std::sync::atomic::Ordering::SeqCst),
+        srv_backup
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
         0,
         "主源正常时不得触碰备用源"
     );
@@ -253,7 +255,9 @@ async fn backup_without_sha256_still_fails_over_on_content_mismatch() {
     let got = std::fs::read(dir.path().join("bk6.bin")).unwrap();
     assert_eq!(got, bad, "主源内容原样落位");
     assert_eq!(
-        srv_backup.request_count.load(std::sync::atomic::Ordering::SeqCst),
+        srv_backup
+            .request_count
+            .load(std::sync::atomic::Ordering::SeqCst),
         0,
         "无校验目标 → 不触发备用源"
     );

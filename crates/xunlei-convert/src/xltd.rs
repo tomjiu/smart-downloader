@@ -51,8 +51,16 @@ impl std::fmt::Display for XltdError {
         match self {
             Self::NotPageAligned => write!(f, "xltd size is not 4096-byte aligned"),
             Self::IoError => write!(f, "I/O error reading xltd"),
-            Self::PieceHashMismatch { piece_index, expected, actual } => {
-                write!(f, "piece {} hash mismatch: expected {:x?}, actual {:x?}", piece_index, expected, actual)
+            Self::PieceHashMismatch {
+                piece_index,
+                expected,
+                actual,
+            } => {
+                write!(
+                    f,
+                    "piece {} hash mismatch: expected {:x?}, actual {:x?}",
+                    piece_index, expected, actual
+                )
             }
             Self::InsufficientTorrentInfo => {
                 write!(f, "torrent info missing piece_length or pieces_hash")
@@ -147,8 +155,8 @@ impl XltdAnalysis {
             }
 
             let mut buf = vec![0u8; valid_len];
-            use std::io::Seek;
             use std::io::Read;
+            use std::io::Seek;
             if f.seek(std::io::SeekFrom::Start(xltd_offset)).is_err()
                 || f.read_exact(&mut buf).is_err()
             {

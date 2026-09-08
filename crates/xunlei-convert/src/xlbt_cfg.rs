@@ -139,7 +139,8 @@ impl XlbtCfg {
         for off in [0x18u32, 0x1C, 0x24, 0x2C, 0x30, 0x34, 0x38] {
             let off = off as usize;
             if off + 4 <= size {
-                let val = u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+                let val =
+                    u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
                 header_u32s.push((off as u32, val));
             }
         }
@@ -157,7 +158,10 @@ impl XlbtCfg {
         }
         let ih_offset = 0x3C;
         let ih_bytes = &data[ih_offset..ih_offset + 40];
-        if !ih_bytes.iter().all(|&b| b.is_ascii() && (b.is_ascii_hexdigit() || b == 0)) {
+        if !ih_bytes
+            .iter()
+            .all(|&b| b.is_ascii() && (b.is_ascii_hexdigit() || b == 0))
+        {
             return Err(XlbtCfgError::BadInfoHash);
         }
         let info_hash = String::from_utf8_lossy(ih_bytes).to_uppercase();
@@ -167,12 +171,7 @@ impl XlbtCfg {
         let mut i = 0x64usize;
         while i + 8 <= size && data[i..i + 2] == [0x02, 0x00] {
             let key = u16::from_le_bytes([data[i + 2], data[i + 3]]);
-            let val = u32::from_le_bytes([
-                data[i + 4],
-                data[i + 5],
-                data[i + 6],
-                data[i + 7],
-            ]);
+            let val = u32::from_le_bytes([data[i + 4], data[i + 5], data[i + 6], data[i + 7]]);
             int_records.push((key, val));
             i += 8;
         }
@@ -181,12 +180,8 @@ impl XlbtCfg {
         let mut blob_lengths = Vec::new();
         let mut j = 0usize;
         while j + 6 <= size && data[j..j + 2] == [0x04, 0x00] {
-            let len = u32::from_le_bytes([
-                data[j + 2],
-                data[j + 3],
-                data[j + 4],
-                data[j + 5],
-            ]) as usize;
+            let len =
+                u32::from_le_bytes([data[j + 2], data[j + 3], data[j + 4], data[j + 5]]) as usize;
             blob_lengths.push(len as u32);
             j += 6 + len;
         }
@@ -222,11 +217,16 @@ fn find_peer_strings(data: &[u8]) -> Vec<String> {
     let mut peers = Vec::new();
     let prefix = b"bt://";
     let mut start = 0usize;
-    while let Some(pos) = data[start..].windows(prefix.len()).position(|w| w == prefix) {
+    while let Some(pos) = data[start..]
+        .windows(prefix.len())
+        .position(|w| w == prefix)
+    {
         let abs_pos = start + pos;
         let rest = &data[abs_pos + prefix.len()..];
         let mut end = 0usize;
-        while end < rest.len() && (rest[end].is_ascii_digit() || rest[end] == b'.' || rest[end] == b':') {
+        while end < rest.len()
+            && (rest[end].is_ascii_digit() || rest[end] == b'.' || rest[end] == b':')
+        {
             end += 1;
         }
         if end > 0 {
@@ -250,18 +250,18 @@ mod tests {
         // 构造最小合法 .xlbt.cfg（仅头部 + 1 个 tag-02）
         let mut data = Vec::new();
         data.extend_from_slice(b"XDLCTX\x00\x00"); // magic
-        data.extend_from_slice(&[0u8; 16]);         // 随机区
+        data.extend_from_slice(&[0u8; 16]); // 随机区
         data.extend_from_slice(&30025u32.to_le_bytes()); // 0x18
-        data.extend_from_slice(&7u32.to_le_bytes());     // 0x1C
-        data.extend_from_slice(&0u32.to_le_bytes());     // 0x20
-        data.extend_from_slice(&4u32.to_le_bytes());     // 0x24
-        data.extend_from_slice(&0u32.to_le_bytes());     // 0x28
+        data.extend_from_slice(&7u32.to_le_bytes()); // 0x1C
+        data.extend_from_slice(&0u32.to_le_bytes()); // 0x20
+        data.extend_from_slice(&4u32.to_le_bytes()); // 0x24
+        data.extend_from_slice(&0u32.to_le_bytes()); // 0x28
         data.extend_from_slice(&28584u32.to_le_bytes()); // 0x2C
-        data.extend_from_slice(&4u32.to_le_bytes());     // 0x30
+        data.extend_from_slice(&4u32.to_le_bytes()); // 0x30
         data.extend_from_slice(&262145u32.to_le_bytes()); // 0x34
-        data.extend_from_slice(&40u32.to_le_bytes());    // 0x38 infohash len
+        data.extend_from_slice(&40u32.to_le_bytes()); // 0x38 infohash len
         data.extend_from_slice(b"ABCDEF0123456789abcdef0123456789ABCDEF01"); // 0x3C infohash
-        // tag-02: key=1, val=1868
+                                                                             // tag-02: key=1, val=1868
         data.extend_from_slice(&[0x02, 0x00]);
         data.extend_from_slice(&1u16.to_le_bytes());
         data.extend_from_slice(&1868u32.to_le_bytes());
@@ -281,7 +281,10 @@ mod tests {
 
     #[test]
     fn reject_too_small() {
-        assert!(matches!(XlbtCfg::parse(&[0u8; 10]), Err(XlbtCfgError::TooSmall)));
+        assert!(matches!(
+            XlbtCfg::parse(&[0u8; 10]),
+            Err(XlbtCfgError::TooSmall)
+        ));
     }
 
     #[test]

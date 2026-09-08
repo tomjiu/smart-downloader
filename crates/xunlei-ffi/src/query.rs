@@ -5,7 +5,7 @@
 use tokio::task;
 
 use crate::bindings::{XLTaskFlow, XLTaskInfo};
-use crate::error::{XunleiError, Result};
+use crate::error::{Result, XunleiError};
 use crate::handle::XunleiHandle;
 use crate::task::TaskId;
 
@@ -123,10 +123,7 @@ impl XunleiHandle {
             unsafe {
                 let r = (inner.symbols.XL_QueryTaskFlow)(tid, flow_type, &mut flow);
                 if r != 0 {
-                    return Err(XunleiError::with_context(
-                        r,
-                        "XL_QueryTaskFlow failed",
-                    ));
+                    return Err(XunleiError::with_context(r, "XL_QueryTaskFlow failed"));
                 }
             }
 

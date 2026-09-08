@@ -35,7 +35,10 @@ async fn main() {
                 eprintln!("用法: xunlei_sms_login send <手机号> [session.json]");
                 std::process::exit(2);
             });
-            let session_path = args.get(3).cloned().unwrap_or_else(|| DEFAULT_SESSION.into());
+            let session_path = args
+                .get(3)
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_SESSION.into());
             send_phase(&phone, Path::new(&session_path)).await;
         }
         "verify" => {
@@ -43,7 +46,10 @@ async fn main() {
                 eprintln!("用法: xunlei_sms_login verify <验证码> [session.json] [auth.json]");
                 std::process::exit(2);
             });
-            let session_path = args.get(3).cloned().unwrap_or_else(|| DEFAULT_SESSION.into());
+            let session_path = args
+                .get(3)
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_SESSION.into());
             let auth_path = args.get(4).cloned().unwrap_or_else(|| DEFAULT_AUTH.into());
             verify_phase(&code, Path::new(&session_path), PathBuf::from(auth_path)).await;
         }
@@ -69,7 +75,10 @@ async fn send_phase(phone: &str, session_path: &Path) {
     let verification_id = client
         .send_sms_code(phone, &device_id)
         .await
-        .unwrap_or_else(|e| { eprintln!("发送失败: {e}"); std::process::exit(1); });
+        .unwrap_or_else(|e| {
+            eprintln!("发送失败: {e}");
+            std::process::exit(1);
+        });
     println!("    ✅ 已下发（verification_id={verification_id}）");
 
     let session = SmsSession {
@@ -77,8 +86,11 @@ async fn send_phase(phone: &str, session_path: &Path) {
         device_id,
         verification_id,
     };
-    std::fs::write(session_path, serde_json::to_string_pretty(&session).unwrap())
-        .expect("写会话文件失败");
+    std::fs::write(
+        session_path,
+        serde_json::to_string_pretty(&session).unwrap(),
+    )
+    .expect("写会话文件失败");
     println!("    会话已存: {}", session_path.display());
     println!();
     println!("下一步：收到短信后执行");
@@ -94,9 +106,17 @@ async fn verify_phase(code: &str, session_path: &Path, auth_path: PathBuf) {
     let client = Client::new();
     println!("[1] 校验验证码 {code} …");
     let mut state = client
-        .verify_sms_code(&session.phone, code, &session.verification_id, &session.device_id)
+        .verify_sms_code(
+            &session.phone,
+            code,
+            &session.verification_id,
+            &session.device_id,
+        )
         .await
-        .unwrap_or_else(|e| { eprintln!("校验失败: {e}"); std::process::exit(1); });
+        .unwrap_or_else(|e| {
+            eprintln!("校验失败: {e}");
+            std::process::exit(1);
+        });
 
     // 补齐 pan API 三要素：device_id + user_id + drive 场景 captcha
     if state.device_id.is_empty() {
@@ -104,16 +124,26 @@ async fn verify_phase(code: &str, session_path: &Path, auth_path: PathBuf) {
     }
     state.fill_user_id_from_token();
     println!("[2] 拉取 drive 场景 captcha_token …");
-    client.refresh_captcha(&mut state).await.unwrap_or_else(|e| {
-        eprintln!("刷新 captcha 失败: {e}");
-        std::process::exit(1);
-    });
+    client
+        .refresh_captcha(&mut state)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("刷新 captcha 失败: {e}");
+            std::process::exit(1);
+        });
 
     save_auth(&auth_path, &state).expect("写登录态失败");
     let left = state.access_token_expires_at.saturating_sub(now_unix());
     println!();
     println!("✅ 短信登录成功！");
-    println!("  user_id: {}", if state.user_id.is_empty() { "(未知)" } else { &state.user_id });
+    println!(
+        "  user_id: {}",
+        if state.user_id.is_empty() {
+            "(未知)"
+        } else {
+            &state.user_id
+        }
+    );
     println!("  access_token 剩余 ~{left} 秒");
     println!("  登录态已写入: {}", auth_path.display());
 }

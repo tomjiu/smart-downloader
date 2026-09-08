@@ -19,6 +19,6 @@ pub mod client;
 pub mod share;
 pub mod types;
 
-pub use client::{DownloadLink, SaveTaskState, QuarkClient};
+pub use client::{DownloadLink, QuarkClient, SaveTaskState};
 pub use share::{parse_share_link, QuarkProvider, QuarkShareLink};
-pub use types::{load_auth, save_auth, QuarkAuth, QuarkError, REFERER, USER_AGENT, BASE};
+pub use types::{load_auth, save_auth, QuarkAuth, QuarkError, BASE, REFERER, USER_AGENT};

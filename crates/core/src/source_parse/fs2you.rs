@@ -93,7 +93,10 @@ mod tests {
     fn decodes_with_cachefile_prefix() {
         let link = format!(
             "fs2you://{}",
-            enc(&format!("cachefile://cache13.zhowta.com/file/a.rar|{size}|{MD5}", size = 1048576))
+            enc(&format!(
+                "cachefile://cache13.zhowta.com/file/a.rar|{size}|{MD5}",
+                size = 1048576
+            ))
         );
         let f = parse_fs2you(&link).unwrap();
         assert_eq!(f.url, "http://cache13.zhowta.com/file/a.rar");
@@ -114,10 +117,7 @@ mod tests {
 
     #[test]
     fn scheme_case_insensitive() {
-        let link = format!(
-            "FS2YOU://{}",
-            enc(&format!("cache.x.com/f|1|{MD5}"))
-        );
+        let link = format!("FS2YOU://{}", enc(&format!("cache.x.com/f|1|{MD5}")));
         assert!(parse_fs2you(&link).is_ok());
     }
 

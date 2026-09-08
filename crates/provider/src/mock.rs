@@ -237,17 +237,17 @@ impl crate::RemoteProvider for MockProvider {
         if let Some(ra) = t.ready_at {
             if std::time::Instant::now() < ra {
                 t.status = ProviderStatus::Downloading;
-                return Ok(t.status.clone());
+                return Ok(t.status);
             }
             t.status = ProviderStatus::Ready;
-            return Ok(t.status.clone());
+            return Ok(t.status);
         }
         t.status = match t.status_calls {
             1 => ProviderStatus::Queued,
             2 => ProviderStatus::Downloading,
             _ => ProviderStatus::Ready,
         };
-        Ok(t.status.clone())
+        Ok(t.status)
     }
 
     async fn resolve(&self, id: &ProviderTaskId) -> Result<Vec<ResolvedRemoteFile>, ProviderError> {

@@ -158,7 +158,11 @@ async fn fallback_skips_disabled_provider_and_uses_next() {
         expires_at: None,
     }]);
     let dir = tempfile::tempdir().unwrap();
-    let (addr, _state) = serve(dir.path().to_path_buf(), vec![Arc::new(disabled), Arc::new(ok)]).await;
+    let (addr, _state) = serve(
+        dir.path().to_path_buf(),
+        vec![Arc::new(disabled), Arc::new(ok)],
+    )
+    .await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
     let tid = add_magnet(&base, &client).await;
@@ -204,7 +208,11 @@ async fn fallback_skips_quota_exhausted_provider_and_uses_next() {
         expires_at: None,
     }]);
     let dir = tempfile::tempdir().unwrap();
-    let (addr, _state) = serve(dir.path().to_path_buf(), vec![Arc::new(quota_exhausted), Arc::new(ok)]).await;
+    let (addr, _state) = serve(
+        dir.path().to_path_buf(),
+        vec![Arc::new(quota_exhausted), Arc::new(ok)],
+    )
+    .await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
     let tid = add_magnet(&base, &client).await;
@@ -250,7 +258,11 @@ async fn fallback_skips_auth_failed_provider_and_uses_next() {
         expires_at: None,
     }]);
     let dir = tempfile::tempdir().unwrap();
-    let (addr, _state) = serve(dir.path().to_path_buf(), vec![Arc::new(auth_failed), Arc::new(ok)]).await;
+    let (addr, _state) = serve(
+        dir.path().to_path_buf(),
+        vec![Arc::new(auth_failed), Arc::new(ok)],
+    )
+    .await;
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
     let tid = add_magnet(&base, &client).await;

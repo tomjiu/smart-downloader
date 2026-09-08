@@ -1,7 +1,7 @@
 //! HttpEngine（§14，impl DownloadEngine）：M4a 骨架 + M4b 多连接并行下载/镜像/换源/校验。
 //! add = 探测 → 规划 → 登记 → 后台下载循环；段失败 → 镜像轮换；校验失败 → 重下 1 次 → 降级接受。
 
-use crate::download::download_dynamic;
+use crate::download::{download_dynamic, download_full_stream};
 use crate::range::probe_range;
 use crate::rate::RateLimiter;
 use crate::resume;
@@ -51,6 +51,9 @@ struct HttpTask {
     /// 换源代次：etag 变化 → gen+1 → 旧下载循环退出、新循环启动。
     /// .part 路径随 gen 隔离（`dest.<gen>.part`），避免新旧循环并发写同一文件。
     gen: u64,
+    /// 源站 Range 能力（probe 结论）：false → 整流下载路径（服务器忽略 Range，
+    /// 分段器的 206 硬要求必败）。B-accept 补（Linux 实弹验收发现）。
+    range_supported: bool,
 }
 
 struct EngineInner {
@@ -128,7 +131,7 @@ async fn download_loop(
 ) {
     loop {
         // 快照任务参数（不跨 await 持锁）
-        let (part, offset, mirrors_raw, total, sha256, md5) = {
+        let (part, offset, mirrors_raw, total, sha256, md5, range_supported) = {
             let tasks = inner.tasks.lock();
             let t = match tasks.get(&tid) {
                 Some(t) if t.gen == gen => t,
@@ -141,6 +144,7 @@ async fn download_loop(
                 t.total,
                 t.sha256.clone(),
                 t.md5.clone(),
+                t.range_supported,
             )
         };
 
@@ -151,18 +155,24 @@ async fn download_loop(
             mirrors.sort_by_key(|u| -scores.get(u).copied().unwrap_or(0));
         }
 
-        match download_dynamic(
-            client,
-            &part,
-            total,
-            offset,
-            DEFAULT_MIN_SPLIT,
-            &mirrors,
-            limiter.clone(),
-            Some(inner.mirror_scores.clone()),
-        )
-        .await
-        {
+        // Range 能力分流：有 Range → 动态分段；无（服务器忽略 Range → 200 全文件）
+        // → 整流单流（分段器 206 硬要求对非 Range 源必败，B-accept 补）。
+        let download_result = if range_supported {
+            download_dynamic(
+                client,
+                &part,
+                total,
+                offset,
+                DEFAULT_MIN_SPLIT,
+                &mirrors,
+                limiter.clone(),
+                Some(inner.mirror_scores.clone()),
+            )
+            .await
+        } else {
+            download_full_stream(client, &part, total, offset, &mirrors, limiter.clone()).await
+        };
+        match download_result {
             Ok(()) => {
                 // finalize 前检查代次：换源已发生 → 本循环结果作废（gen1 会重下）
                 let still_current = inner
@@ -173,6 +183,14 @@ async fn download_loop(
                     .unwrap_or(false);
                 if !still_current {
                     return;
+                }
+                // 整流路径：长度未知（probe 无 content-length）→ 以下载实际大小为准
+                let mut total = total;
+                if !range_supported && total == 0 {
+                    total = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+                    if let Some(t) = inner.tasks.lock().get_mut(&tid) {
+                        t.total = total;
+                    }
                 }
                 // 段全部落位 → 校验（sha256 或备用源 md5；均未提供 → 不校验直接落位）
                 let dest = dest_of(&inner, &tid);
@@ -431,6 +449,7 @@ impl DownloadEngine for HttpEngine {
                     backup_md5,
                     backup_used: false,
                     gen: 0,
+                    range_supported: probe.range_supported,
                 },
             );
         }

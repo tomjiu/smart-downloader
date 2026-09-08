@@ -20,7 +20,7 @@ use std::ffi::CString;
 
 use tokio::task;
 
-use crate::error::{XunleiError, Result};
+use crate::error::{Result, XunleiError};
 use crate::handle::XunleiHandle;
 
 impl XunleiHandle {
@@ -108,7 +108,9 @@ impl XunleiHandle {
         let extra = extra.map(str::to_string);
         task::spawn_blocking(move || unsafe {
             let sym = sym.XL_EnableDcdnWithToken.ok_or_else(|| {
-                XunleiError::DllLoad("XL_EnableDcdnWithToken not resolved (DLL missing export)".into())
+                XunleiError::DllLoad(
+                    "XL_EnableDcdnWithToken not resolved (DLL missing export)".into(),
+                )
             })?;
             let token_c = cstring_or_err(&token, "token")?;
             // CString 必须绑定存活到 FFI 调用点（临时值 .as_ptr() 会在语句末析构 → 悬垂 UB）
@@ -123,7 +125,10 @@ impl XunleiHandle {
                 extra_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             );
             if r != 0 {
-                return Err(XunleiError::with_context(r, "XL_EnableDcdnWithToken failed"));
+                return Err(XunleiError::with_context(
+                    r,
+                    "XL_EnableDcdnWithToken failed",
+                ));
             }
             Ok(())
         })
@@ -171,7 +176,10 @@ impl XunleiHandle {
                 k2_c.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
             );
             if r != 0 {
-                return Err(XunleiError::with_context(r, "XL_EnableDcdnWithSession failed"));
+                return Err(XunleiError::with_context(
+                    r,
+                    "XL_EnableDcdnWithSession failed",
+                ));
             }
             Ok(())
         })
@@ -197,7 +205,10 @@ impl XunleiHandle {
             let cert_c = cstring_or_err(&cert, "cert")?;
             let r = sym(channel, flags, cert_c.as_ptr());
             if r != 0 {
-                return Err(XunleiError::with_context(r, "XL_EnableDcdnWithVipCert failed"));
+                return Err(XunleiError::with_context(
+                    r,
+                    "XL_EnableDcdnWithVipCert failed",
+                ));
             }
             Ok(())
         })
@@ -241,10 +252,7 @@ mod bgrade_tests {
 
     #[test]
     fn cstring_helper_rejects_nul() {
-        assert!(matches!(
-            cstring_or_err("ok", "x"),
-            Ok(_)
-        ));
+        assert!(matches!(cstring_or_err("ok", "x"), Ok(_)));
         let err = cstring_or_err("bad\0string", "x").unwrap_err();
         assert!(matches!(err, XunleiError::InvalidParam(m) if m.contains("null byte")));
     }

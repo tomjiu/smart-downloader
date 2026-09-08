@@ -25,20 +25,24 @@ async fn main() {
         refresh_token: String,
         device_id: String,
     }
-    let path = std::env::args().nth(1).unwrap_or_else(|| "xunlei_auth.json".into());
-    let mut auth: Auth = serde_json::from_str(
-        &std::fs::read_to_string(Path::new(&path)).expect("读登录态失败"),
-    )
-    .expect("解析登录态失败");
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "xunlei_auth.json".into());
+    let mut auth: Auth =
+        serde_json::from_str(&std::fs::read_to_string(Path::new(&path)).expect("读登录态失败"))
+            .expect("解析登录态失败");
     let http = reqwest::Client::new();
 
     // 0) 用同 client（XW5Sk）刷新过期 token —— OAuth 正确姿势
     println!("[0] refresh_token 续期（client_id=XW5Sk）…");
     #[derive(Deserialize)]
     struct TokenResp {
-        #[serde(default)] access_token: String,
-        #[serde(default)] refresh_token: String,
-        #[serde(default)] expires_in: u64,
+        #[serde(default)]
+        access_token: String,
+        #[serde(default)]
+        refresh_token: String,
+        #[serde(default)]
+        expires_in: u64,
     }
     let tr = http
         .post(format!("{XLUSER}/v1/auth/token"))
@@ -49,11 +53,17 @@ async fn main() {
         }))
         .send()
         .await
-        .unwrap_or_else(|e| { eprintln!("网络错误: {e}"); std::process::exit(1); });
+        .unwrap_or_else(|e| {
+            eprintln!("网络错误: {e}");
+            std::process::exit(1);
+        });
     let t_status = tr.status();
     let t_body = tr.text().await.unwrap_or_default();
     if !t_status.is_success() {
-        eprintln!("❌ refresh {t_status}: {}", &t_body[..t_body.len().min(300)]);
+        eprintln!(
+            "❌ refresh {t_status}: {}",
+            &t_body[..t_body.len().min(300)]
+        );
         std::process::exit(1);
     }
     let tok: TokenResp = serde_json::from_str(&t_body).expect("解析 token 响应失败");
@@ -66,8 +76,14 @@ async fn main() {
         auth.refresh_token = tok.refresh_token.clone();
     }
     // 回写登录态（续期成果不丢）
-    let _ = std::fs::write(Path::new(&path), serde_json::to_string_pretty(&auth).unwrap());
-    println!("    ✅ 已续期并回写 {}（expires_in={}s）", path, tok.expires_in);
+    let _ = std::fs::write(
+        Path::new(&path),
+        serde_json::to_string_pretty(&auth).unwrap(),
+    );
+    println!(
+        "    ✅ 已续期并回写 {}（expires_in={}s）",
+        path, tok.expires_in
+    );
 
     // 1) 用与 token 同源的 client 拿 captcha（App 式空 meta，无需 captcha_sign）
     println!("[1] captcha/init（client_id={DEVICE_CLIENT_ID}, 空 meta）…");
@@ -89,7 +105,10 @@ async fn main() {
         }))
         .send()
         .await
-        .unwrap_or_else(|e| { eprintln!("网络错误: {e}"); std::process::exit(1); });
+        .unwrap_or_else(|e| {
+            eprintln!("网络错误: {e}");
+            std::process::exit(1);
+        });
     let cap_status = cap_resp.status();
     let cap_body = cap_resp.text().await.unwrap_or_default();
     if !cap_status.is_success() {
@@ -101,19 +120,27 @@ async fn main() {
         eprintln!("❌ captcha_token 为空: {cap_body}");
         std::process::exit(1);
     }
-    println!("    ✅ 拿到 captcha_token（{} 字符）", cap.captcha_token.len());
+    println!(
+        "    ✅ 拿到 captcha_token（{} 字符）",
+        cap.captcha_token.len()
+    );
 
     // 2) 三件套同源调 pan 列目录
     println!("[2] GET /drive/v1/files（x-client-id=XW5Sk）…");
     let resp = http
-        .get(format!("{PAN}/drive/v1/files?parent_id=&usage=DISPLAY&with_audit=true&limit=10"))
+        .get(format!(
+            "{PAN}/drive/v1/files?parent_id=&usage=DISPLAY&with_audit=true&limit=10"
+        ))
         .header("Authorization", format!("Bearer {}", auth.access_token))
         .header("x-device-id", &auth.device_id)
         .header("x-captcha-token", &cap.captcha_token)
         .header("x-client-id", DEVICE_CLIENT_ID)
         .send()
         .await
-        .map_err(|e| { eprintln!("网络错误: {e}"); std::process::exit(1); })
+        .map_err(|e| {
+            eprintln!("网络错误: {e}");
+            std::process::exit(1);
+        })
         .unwrap();
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();

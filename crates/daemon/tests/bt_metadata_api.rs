@@ -95,8 +95,7 @@ fn validate_save_dest_blocks_symlink_escape() {
 async fn serve_with_token() -> std::net::SocketAddr {
     let http = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
     let state = Arc::new(
-        DaemonState::new(Arc::new(http), vec![])
-            .with_http_token(Some("s3cret-token".to_string())),
+        DaemonState::new(Arc::new(http), vec![]).with_http_token(Some("s3cret-token".to_string())),
     );
     let app = http::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -261,7 +260,11 @@ mod bt_enabled {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "缺 xt → 400");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "缺 xt → 400"
+        );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body["error"].as_str().unwrap().contains("xt"));
     }
@@ -279,7 +282,11 @@ mod bt_enabled {
             .send()
             .await
             .unwrap();
-        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "peer 解析失败 → 400");
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "peer 解析失败 → 400"
+        );
         let body: serde_json::Value = resp.json().await.unwrap();
         assert!(body["error"].as_str().unwrap().contains("peers"));
     }
@@ -322,10 +329,18 @@ mod bt_enabled {
             .send()
             .await
             .unwrap();
-        assert_eq!(second.status(), reqwest::StatusCode::CONFLICT, "占用中 → 409");
+        assert_eq!(
+            second.status(),
+            reqwest::StatusCode::CONFLICT,
+            "占用中 → 409"
+        );
         // 第一个请求完成：超时 → 408（permit 随 handler 结束归还）
         let first = first.await.unwrap();
-        assert_eq!(first.status(), reqwest::StatusCode::REQUEST_TIMEOUT, "超时 → 408");
+        assert_eq!(
+            first.status(),
+            reqwest::StatusCode::REQUEST_TIMEOUT,
+            "超时 → 408"
+        );
         let body: serde_json::Value = first.json().await.unwrap();
         assert!(body["error"].as_str().unwrap().contains("超时"));
         // 门禁已释放：坏 magnet 走到 parse 段 400（先过门禁）→ 证明端点可再用
@@ -335,7 +350,11 @@ mod bt_enabled {
             .send()
             .await
             .unwrap();
-        assert_eq!(third.status(), reqwest::StatusCode::BAD_REQUEST, "门禁释放后可再用");
+        assert_eq!(
+            third.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "门禁释放后可再用"
+        );
     }
 
     /// —— V15 e2e：save_to 越界拒绝（bt 构建；校验在抓取前快速失败）——

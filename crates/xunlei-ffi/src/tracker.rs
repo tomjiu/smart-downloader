@@ -5,7 +5,7 @@
 use std::os::raw::c_char;
 use tokio::task;
 
-use crate::error::{XunleiError, Result};
+use crate::error::{Result, XunleiError};
 use crate::handle::XunleiHandle;
 use crate::task::TaskId;
 
@@ -33,19 +33,11 @@ impl XunleiHandle {
                 c_strings.push(c);
             }
 
-            let ptrs: Vec<*const c_char> =
-                c_strings.iter().map(|s| s.as_ptr()).collect();
+            let ptrs: Vec<*const c_char> = c_strings.iter().map(|s| s.as_ptr()).collect();
 
-            let r = (sym.XL_BatchAddBTTracker)(
-                task_id_u32,
-                ptrs.as_ptr(),
-                ptrs.len() as u32,
-            );
+            let r = (sym.XL_BatchAddBTTracker)(task_id_u32, ptrs.as_ptr(), ptrs.len() as u32);
             if r != 0 {
-                return Err(XunleiError::with_context(
-                    r,
-                    "XL_BatchAddBTTracker failed",
-                ));
+                return Err(XunleiError::with_context(r, "XL_BatchAddBTTracker failed"));
             }
             Ok(())
         })

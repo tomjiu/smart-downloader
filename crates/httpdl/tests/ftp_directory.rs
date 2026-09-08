@@ -36,8 +36,16 @@ async fn directory_download_lands_files_under_dir_name() {
 
     // 落位：dest_root/files/<文件名>，内容一致
     let root = dir.path().join("files");
-    assert_eq!(std::fs::read(root.join("a.bin")).unwrap(), a, "a.bin 内容必须一致");
-    assert_eq!(std::fs::read(root.join("b.bin")).unwrap(), b, "b.bin 内容必须一致");
+    assert_eq!(
+        std::fs::read(root.join("a.bin")).unwrap(),
+        a,
+        "a.bin 内容必须一致"
+    );
+    assert_eq!(
+        std::fs::read(root.join("b.bin")).unwrap(),
+        b,
+        "b.bin 内容必须一致"
+    );
     // 子目录被过滤 → 不落盘；.part 完成后清理
     assert!(!root.join("subdir").exists(), "子目录不得落盘");
     assert!(!root.join("a.bin.part").exists(), "完成后 .part 应清理");

@@ -25,9 +25,7 @@ pub fn transition_for(now: &TaskState, a: &Alert) -> Option<(TaskState, TaskStat
         (AlertKind::State, StateSubKind::Finished)
             if matches!(
                 now,
-                TaskState::Downloading(EngineKind::Bt)
-                    | TaskState::Queued
-                    | TaskState::Paused
+                TaskState::Downloading(EngineKind::Bt) | TaskState::Queued | TaskState::Paused
             ) =>
         {
             Some((now.clone(), TaskState::Seeding))

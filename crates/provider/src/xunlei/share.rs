@@ -312,6 +312,7 @@ impl Sharer {
     ///    登录态正是该错误的对症解；
     /// 2. device_id 用会话的（`device_id_32(&state.device_id)`），与 captcha/init 口径一致；
     /// 3. 提取码校验走 `verify_pass_code_authed`（带登录态重试同端点）。
+    ///
     /// 网络验证待登录态会话（同 VIP 通道 UNTESTED 模式）。
     pub async fn list_with_auth(
         &self,

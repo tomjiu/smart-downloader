@@ -166,10 +166,7 @@ impl Config {
     pub fn is_loopback_addr(addr: &str) -> bool {
         let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
         let host = host.trim_start_matches('[').trim_end_matches(']');
-        host == "localhost"
-            || host.starts_with("127.")
-            || host == "::1"
-            || host == "[::1]"
+        host == "localhost" || host.starts_with("127.") || host == "::1" || host == "[::1]"
     }
 
     /// BT 实际落盘目录（save_path 或默认 dest_root）。
@@ -386,7 +383,10 @@ path = "/tmp/sd.lock"
         assert_eq!(snap["provider_xunlei_enabled"], false);
         assert_eq!(snap["provider_xunlei_token_exists"], false);
         assert!(
-            !snap.as_object().unwrap().contains_key("provider_xunlei_token_path"),
+            !snap
+                .as_object()
+                .unwrap()
+                .contains_key("provider_xunlei_token_path"),
             "快照不得含 token 路径"
         );
     }

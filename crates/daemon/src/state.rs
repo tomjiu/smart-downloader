@@ -274,11 +274,7 @@ impl TorrentMeta {
                             "pieces 长度不是 20 的倍数".into(),
                         ));
                     }
-                    pieces_hash = pieces_data
-                        .0
-                        .chunks_exact(20)
-                        .map(|ch| <[u8; 20]>::try_from(ch).unwrap())
-                        .collect();
+                    pieces_hash = pieces_data.0.as_chunks::<20>().0.to_vec();
                     i = value_skip(b, i, 0).ok_or_else(|| {
                         DaemonError::InvalidSource(".torrent info dict 解析失败".into())
                     })?;
@@ -414,7 +410,7 @@ fn parse_file_list(data: &[u8], piece_length: u32) -> Result<Vec<FileMeta>, Daem
             // 计算 piece 偏移和数量（按文件在 torrent 中的累计字节偏移）
             let total_size: u64 = files.iter().map(|f: &FileMeta| f.size).sum();
             let piece_offset = (total_size / plen) as usize;
-            let piece_count = ((length + plen - 1) / plen) as usize;
+            let piece_count = length.div_ceil(plen) as usize;
             files.push(FileMeta {
                 path,
                 size: length,
@@ -519,6 +515,7 @@ impl DaemonState {
     /// - 未配置 token（None）→ 放行（serve 已保证该模式仅回环监听可达）；
     /// - 已配置 → `Authorization: Bearer <token>` 必须精确匹配，否则 false
     ///   （比较走 `ct_eq` 常量时间路径，第六轮 9.3.4）。
+    ///
     /// 覆盖全部路由含 /ws 升级握手（同一 Router layer）。
     pub fn verify_http_token(&self, authorization: Option<&str>) -> bool {
         match self.http_token.as_deref() {
@@ -1156,7 +1153,9 @@ impl DaemonState {
             retry: Default::default(),
             created_at: std::time::Instant::now(),
             metadata: TaskMetadata {
-                name: None,
+                // qBittorrent 语义：从 URL 路径末段推导文件名（空段 → None，
+                // engine 侧 fallback download.bin + sanitize_rel 兼底）
+                name: http_name_from_url(&url),
                 added_at_unix: 0,
             },
         };
@@ -1991,6 +1990,28 @@ fn is_token_param(name: &str) -> bool {
         || name.starts_with("X-QiNiu-")
 }
 
+/// qBittorrent 语义：从 URL 路径末段推导默认落盘文件名（Linux 实弹验收补）。
+/// 以 / 结尾（空段）→ None；解码后为空/`.`/`..`/含路径分隔符 → None。
+/// name 只是默认落盘名，不承担安全边界（engine 侧 sanitize_rel 仍兜底）。
+fn http_name_from_url(url: &str) -> Option<String> {
+    let u = url::Url::parse(url).ok()?;
+    let last = u.path().rsplit('/').next()?;
+    if last.is_empty() {
+        return None;
+    }
+    use percent_encoding::percent_decode_str;
+    let decoded = percent_decode_str(last).decode_utf8_lossy().into_owned();
+    if decoded.is_empty()
+        || decoded == "."
+        || decoded == ".."
+        || decoded.contains('/')
+        || decoded.contains('\\')
+    {
+        return None;
+    }
+    Some(decoded)
+}
+
 /// 从 magnet 提取 btih（40 hex，v1 规范 xt=urn:btih:）。无 → None（canonical 回落全文）。
 #[cfg(feature = "bt")]
 pub(crate) fn btih_of(magnet: &str) -> Option<String> {
@@ -2806,14 +2827,14 @@ mod b10_tests {
         // 白名单内的子目录 → 放行
         assert!(ensure_dest_root(
             Some(root.join("sub").to_string_lossy().into_owned()),
-            &[root.clone()]
+            std::slice::from_ref(&root)
         )
         .is_ok());
         // 白名单外的目录 → 拒绝
         let outside = dir.path().join("elsewhere");
         let r = ensure_dest_root(
             Some(outside.to_string_lossy().into_owned()),
-            &[root.clone()],
+            std::slice::from_ref(&root),
         );
         assert!(matches!(r, Err(DaemonError::InvalidSource(m)) if m.contains("越界")));
         // 绝对路径穿越到白名单外 → 拒绝
@@ -2941,9 +2962,10 @@ impl DownloadEngine for FakeEngine {
         &self,
         _id: &EngineTaskId,
     ) -> Result<EngineStatus, smart_dl_core::types::EngineError> {
-        let mut es = EngineStatus::default();
-        es.files = self.status_files.lock().clone();
-        Ok(es)
+        Ok(EngineStatus {
+            files: self.status_files.lock().clone(),
+            ..Default::default()
+        })
     }
     async fn remove(
         &self,

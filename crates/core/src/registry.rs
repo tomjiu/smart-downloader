@@ -91,9 +91,7 @@ impl EngineRegistry {
                     size: l.size,
                     md4: l.md4,
                 }),
-                Err(e) => Err(RoutingError::Unsupported(format!(
-                    "ed2k 链接解析失败: {e}"
-                ))),
+                Err(e) => Err(RoutingError::Unsupported(format!("ed2k 链接解析失败: {e}"))),
             },
             DownloadSource::XunleiShare(_) => self
                 .first_with(Capability::OfflineCache)

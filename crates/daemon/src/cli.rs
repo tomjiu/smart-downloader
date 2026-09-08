@@ -202,7 +202,9 @@ fn parse_command(args: &[String]) -> Result<CliCommand, CliError> {
                     "--tier" => {
                         tier = Some(
                             args.get(i + 1)
-                                .ok_or_else(|| CliError::MissingArg("--tier <web|nas>".to_string()))?
+                                .ok_or_else(|| {
+                                    CliError::MissingArg("--tier <web|nas>".to_string())
+                                })?
                                 .clone(),
                         );
                         i += 1;
@@ -219,16 +221,21 @@ fn parse_command(args: &[String]) -> Result<CliCommand, CliError> {
                         let v = args
                             .get(i + 1)
                             .ok_or_else(|| CliError::MissingArg("--port <n>".to_string()))?;
-                        port = v.parse().map_err(|_| {
-                            CliError::Unknown(format!("--port 非法端口号: {v}"))
-                        })?;
+                        port = v
+                            .parse()
+                            .map_err(|_| CliError::Unknown(format!("--port 非法端口号: {v}")))?;
                         i += 1;
                     }
                     other => return Err(CliError::Unknown(format!("xunlei-login {other}"))),
                 }
                 i += 1;
             }
-            Ok(CliCommand::XunleiLogin { mode, token_path, port, tier })
+            Ok(CliCommand::XunleiLogin {
+                mode,
+                token_path,
+                port,
+                tier,
+            })
         }
         other => Err(CliError::Unknown(other.to_string())),
     }

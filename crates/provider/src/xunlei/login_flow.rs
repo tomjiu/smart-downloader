@@ -61,7 +61,10 @@ pub struct DeviceSession {
 /// 发起设备码会话：请求 device/code → 本地构造 QR URL。
 /// `client` 可用 [`Client::with_bases`] 注入 mock 地址（测试）。
 /// 授权页 URL 的 client_id 随 `client` 的身份档位（P1-1；web 档与旧版逐字节一致）。
-pub async fn start_device_session(client: &Client, scope: &str) -> Result<DeviceSession, ClientError> {
+pub async fn start_device_session(
+    client: &Client,
+    scope: &str,
+) -> Result<DeviceSession, ClientError> {
     let code = client.request_device_code(scope).await?;
     let qr_url = crate::xunlei::client::device_code_qr_url_for(client.tier(), &code.user_code);
     let web_url = web_auth_url_for(client.tier(), &code.user_code, scope);
@@ -211,7 +214,10 @@ mod tests {
     fn login_mode_from_flag() {
         assert_eq!(LoginMode::from_flag(None), Some(LoginMode::Page));
         assert_eq!(LoginMode::from_flag(Some("--qr")), Some(LoginMode::Qr));
-        assert_eq!(LoginMode::from_flag(Some("--browser")), Some(LoginMode::Browser));
+        assert_eq!(
+            LoginMode::from_flag(Some("--browser")),
+            Some(LoginMode::Browser)
+        );
         assert_eq!(LoginMode::from_flag(Some("--page")), Some(LoginMode::Page));
         assert_eq!(LoginMode::from_flag(Some("--wat")), None);
     }
@@ -228,11 +234,17 @@ mod tests {
             expires_at: now_unix() + 300,
             interval: 3,
         };
-        assert!(s.qr_url.starts_with("https://pan.xunlei.com/yc/?client_id="));
+        assert!(s
+            .qr_url
+            .starts_with("https://pan.xunlei.com/yc/?client_id="));
         assert!(s.qr_url.contains("user_code=UC1234"));
         // web_auth_url 必须显式带 scope（空格转 %20），与 Python daemon 同构。
-        assert!(s.web_auth_url.starts_with("https://pan.xunlei.com/yc/?client_id="));
+        assert!(s
+            .web_auth_url
+            .starts_with("https://pan.xunlei.com/yc/?client_id="));
         assert!(s.web_auth_url.contains("user_code=UC1234"));
-        assert!(s.web_auth_url.contains("&scope=profile%20offline%20pan%20sso%20user"));
+        assert!(s
+            .web_auth_url
+            .contains("&scope=profile%20offline%20pan%20sso%20user"));
     }
 }

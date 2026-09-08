@@ -72,9 +72,7 @@ fn ed2k_routes_to_failed() {
     let r = router();
     // 合法 ed2k（Task 5-a T3）：已识别 → Failed(Ed2kNotSupported，携带 md4/size 元数据)
     let d = r.route(
-        &DownloadSource::Ed2k(
-            "ed2k://|file|x|1|0123456789abcdef0123456789abcdef|/".into(),
-        ),
+        &DownloadSource::Ed2k("ed2k://|file|x|1|0123456789abcdef0123456789abcdef|/".into()),
         0,
         0,
     );

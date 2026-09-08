@@ -133,8 +133,14 @@ impl BtCore {
 
     /// 发现层开关：DHT / LSD / UPnP（enable_upnp 同时控制 NAT-PMP——端口映射族）。
     /// 会话默认全关（M0 确定性语义）；本方法显式覆盖。
-    pub fn apply_discovery(&self, enable_dht: bool, enable_lsd: bool, enable_upnp: bool) -> ffi::Result<()> {
-        self.sess.apply_discovery(enable_dht, enable_lsd, enable_upnp)
+    pub fn apply_discovery(
+        &self,
+        enable_dht: bool,
+        enable_lsd: bool,
+        enable_upnp: bool,
+    ) -> ffi::Result<()> {
+        self.sess
+            .apply_discovery(enable_dht, enable_lsd, enable_upnp)
     }
 
     // —— 添加 / 移除 ——
@@ -277,6 +283,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let core = BtCore::new(&dir, "test-discovery").expect("session init");
         core.apply_discovery(true, true, true).expect("全开应 Ok");
-        core.apply_discovery(false, false, false).expect("全关应 Ok");
+        core.apply_discovery(false, false, false)
+            .expect("全关应 Ok");
     }
 }

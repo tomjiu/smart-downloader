@@ -199,10 +199,7 @@ impl NasManager {
             )));
         }
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let dangerous: Vec<&str> = stdout
-            .lines()
-            .filter(|m| tar_member_dangerous(m))
-            .collect();
+        let dangerous: Vec<&str> = stdout.lines().filter(|m| tar_member_dangerous(m)).collect();
         if !dangerous.is_empty() {
             return Err(NasError::Install(format!(
                 "SPK 含危险 tar 成员（绝对路径/..），拒绝安装: {}",

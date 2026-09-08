@@ -11,21 +11,21 @@ pub mod bare;
 pub mod engine;
 pub mod ffi;
 pub mod magnet;
+#[cfg(feature = "nas")]
+pub mod nas_remote;
 pub mod resume;
 pub mod strategy;
 pub mod xudt;
 #[cfg(feature = "xunlei")]
 pub mod xunlei_engine;
-#[cfg(feature = "nas")]
-pub mod nas_remote;
 
 pub use alerts::{Alert, AlertKind, StateSubKind};
 pub use bare::Bare;
 pub use engine::{peer_flags, BtCore, PeerInfo, TorrentStatus};
 pub use ffi::{Error, Result};
 pub use magnet::{fetch_metadata, FetchError, FetchOpts, FetchedTorrent};
+#[cfg(feature = "nas")]
+pub use nas_remote::{NasRemoteConfig, NasRemoteEngine};
 pub use resume::ResumeBytes;
 #[cfg(feature = "xunlei")]
 pub use xunlei_engine::XunleiBtEngine;
-#[cfg(feature = "nas")]
-pub use nas_remote::{NasRemoteConfig, NasRemoteEngine};

@@ -80,7 +80,11 @@ async fn main() {
                 };
                 println!(
                     "    t={:2}s: state={:?}, file_size={}, download_size={} {}",
-                    3 * i, info.state, info.file_size, info.download_size, growing
+                    3 * i,
+                    info.state,
+                    info.file_size,
+                    info.download_size,
+                    growing
                 );
                 last_download = info.download_size;
             }
