@@ -1,6 +1,6 @@
 [package]
 name = "xunlei-convert"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["smart-downloader"]
 description = "Thunder BT task migration tools (xlbt.cfg + xltd -> libtorrent fastresume) - UNVERIFIED"

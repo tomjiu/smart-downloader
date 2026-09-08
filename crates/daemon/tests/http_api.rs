@@ -2215,8 +2215,9 @@ async fn stats_aggregates_live_down_rate_e2e() {
     // 用 list（记录态）等下载推进——不触发引擎 status()，保采样窗口干净
     wait_list_state(&client, &base, &tid, "Downloading").await;
 
-    // /stats 轮询等待非零下行速率（下载持续 ≈4s，窗口余量充足）
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    // /stats 轮询等待非零下行速率（下载持续 ≈4s；60s 护栏对齐同文件先例
+    //——重负载窗口（runner 慢/杀软扫 exe）会击穿短窗口，见 BACKLOG 环境限制）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut seen = 0u64;
     while std::time::Instant::now() < deadline {
         let stats: serde_json::Value = client
@@ -2282,8 +2283,9 @@ async fn task_snapshot_exposes_live_rates_e2e() {
     // 用 list（记录态）等下载推进——不触发引擎 status()，保首个采样窗口干净
     wait_list_state(&client, &base, &tid, "Downloading").await;
 
-    // 快照轮询等待非零下行速率（下载持续 ≈4s，窗口余量充足）
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    // 快照轮询等待非零下行速率（下载持续 ≈4s；60s 护栏对齐同文件先例
+    //——Windows CI 重负载窗口实测击穿 15s：PR #106 首跑 rate e2e 超时）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut seen = 0u64;
     while std::time::Instant::now() < deadline {
         let snap: serde_json::Value = client
