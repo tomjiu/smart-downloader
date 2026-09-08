@@ -37,6 +37,7 @@ fn insert_bt_downloading(state: &DaemonState, id: &str, ih: &str) {
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
+                added_at_ms: 0,
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: 0,

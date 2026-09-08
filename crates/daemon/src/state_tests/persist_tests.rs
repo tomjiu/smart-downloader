@@ -149,6 +149,7 @@ fn bt_prio_task(id: &str, prios: Option<Vec<u32>>) -> DownloadTask {
         metadata: TaskMetadata {
             name: None,
             added_at_unix: 0,
+            added_at_ms: 0,
             tags: Vec::new(),
             finished_at_unix: 0,
             start_at_unix: 0,
@@ -414,4 +415,90 @@ async fn http_poll_transition_with_storage_autosave_no_deadlock() {
         .expect("poll_engine_states 死锁（Bug B 重入回归）");
     assert_eq!(effects.len(), 1, "应推进一条任务状态");
     assert!(store.exists(), "状态推进应触发持久化落盘");
+}
+
+// ==================== batch7：added_at_ms 持久化（重启 FIFO 保序） ====================
+
+/// 定时任务（恢复后为 Queued 无句柄）跨重启按 added_at_ms 保序递补：
+/// 重启前 t1 先于 t2 入队 → 恢复后配额 1 下递补顺序仍 t1 → t2。
+/// 旧实现排序键 created_at 是单调时钟（serde skip），恢复后全部取同一
+/// Instant → FIFO 退化 + HashMap 无序，递补顺序随机。
+#[tokio::test]
+async fn added_at_ms_persisted_fifo_order_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("tasks.json");
+    let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+    let start_at = now_unix() + 3; // 未来 3 秒：走 E23 调度等待（不入引擎）
+    let state = Arc::new(
+        DaemonState::new(fake.clone(), vec![])
+            .with_storage(store.clone())
+            .with_queue_cfg(crate::config::QueueCfg {
+                max_active_bt: 0,
+                max_active_http: 1,
+                max_active_ftp: 0,
+            }),
+    );
+
+    let t1 = state
+        .add_http_task_opts(
+            "https://example.com/fifo1.bin".into(),
+            None,
+            AddHttpOpts {
+                start_at_unix: Some(start_at),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    // 保证毫秒时间戳可分辨（同毫秒并列时 created_at 兜底，但持久化后兜底失效）
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let t2 = state
+        .add_http_task_opts(
+            "https://example.com/fifo2.bin".into(),
+            None,
+            AddHttpOpts {
+                start_at_unix: Some(start_at),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let (ms1, ms2) = {
+        let tasks = state.tasks.lock();
+        (
+            tasks.get(&t1).unwrap().task.metadata.added_at_ms,
+            tasks.get(&t2).unwrap().task.metadata.added_at_ms,
+        )
+    };
+    assert!(ms1 > 0 && ms2 > 0, "add 路径必须写 added_at_ms");
+    assert!(ms1 < ms2, "先入队者毫秒更小");
+    wait_file(&store, 2000);
+
+    // 重启：新 state（新引擎）恢复——两任务均为 Queued 无句柄（E23 未到期）
+    let fake2 = Arc::new(FakeEngine::new(EngineKind::Http));
+    let state2 = DaemonState::new(fake2.clone(), vec![])
+        .with_storage(store.clone())
+        .with_queue_cfg(crate::config::QueueCfg {
+            max_active_bt: 0,
+            max_active_http: 1,
+            max_active_ftp: 0,
+        });
+    let n = state2.restore_from(&store).await.unwrap();
+    assert_eq!(n, 2, "两个定时任务必须恢复");
+    {
+        let tasks = state2.tasks.lock();
+        let r1 = tasks.get(&t1).unwrap();
+        let r2 = tasks.get(&t2).unwrap();
+        assert_eq!(r1.task.metadata.added_at_ms, ms1, "恢复必须保有原入队毫秒");
+        assert_eq!(r2.task.metadata.added_at_ms, ms2);
+        assert!(r1.engine_tid.is_none() && r2.engine_tid.is_none());
+    }
+
+    // 到期后递补：配额 1 → 先 t1（added_at_ms 小者）；释放槽位后 t2
+    tokio::time::sleep(std::time::Duration::from_millis(3100)).await;
+    let act = state2.activate_due_tasks().await;
+    assert_eq!(act, vec![t1.clone()], "递补必须按持久化入队序（t1 先）");
+    state2.pause(&t1).await.unwrap();
+    let act = state2.activate_due_tasks().await;
+    assert_eq!(act, vec![t2.clone()], "第二递补必须是 t2");
 }

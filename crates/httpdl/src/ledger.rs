@@ -172,7 +172,7 @@ pub enum ResumeDecision {
 ///   宁枉勿纵 —— 错误续传产出旧前缀+新尾部的静默损坏，代价远高于重下）
 /// - (None, _) → 放行（账本本就无此指纹，无从核对；其余指纹字段、
 ///   总长核对、段对齐校验仍把关）
-fn fingerprint_ok(saved: &Option<String>, fresh: &Option<String>) -> bool {
+pub(crate) fn fingerprint_ok(saved: &Option<String>, fresh: &Option<String>) -> bool {
     match (saved, fresh) {
         (Some(s), Some(f)) => s == f,
         (Some(_), None) => false,

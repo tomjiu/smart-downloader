@@ -1268,6 +1268,7 @@ mod tests {
             metadata: smart_dl_core::task::TaskMetadata {
                 name: Some("data.bin".to_string()),
                 added_at_unix: 0,
+                added_at_ms: 0,
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: 0,
@@ -1340,6 +1341,7 @@ mod tests {
             metadata: smart_dl_core::task::TaskMetadata {
                 name: Some("f.bin".to_string()),
                 added_at_unix: 0,
+                added_at_ms: 0,
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: 0,
@@ -1393,6 +1395,7 @@ mod tests {
             metadata: smart_dl_core::task::TaskMetadata {
                 name: Some("missing.bin".to_string()),
                 added_at_unix: 0,
+                added_at_ms: 0,
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: 0,

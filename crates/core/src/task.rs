@@ -128,6 +128,15 @@ pub struct RetryState {
 pub struct TaskMetadata {
     pub name: Option<String>,
     pub added_at_unix: u64,
+    /// 入队时刻（batch7，unix 毫秒；0 = 旧档缺失/未知）：created_at 是单调
+    /// 时钟不可持久化——重启后全部恢复任务取同一 Instant，排队递补 FIFO
+    /// （activate_due_tasks 排序键）并列退化 + HashMap 无序。本字段为可
+    /// 持久化的 FIFO 排序键：add 路径写墙钟毫秒，恢复路径对旧档（0 值）
+    /// 按加载序回填 1..n（恒小于真实墙钟毫秒 = 恢复任务排在新任务前，语义
+    /// 正确）。运行期排序键 (queue_priority, added_at_ms, created_at)，
+    /// created_at 仅作同毫秒并列的运行期 tie-break。
+    #[serde(default)]
+    pub added_at_ms: u64,
     /// 用户标签（E18）：显示/分组元数据，引擎无关；空 = 无标签。
     /// 序列化缺省兼容旧 tasks.json（恢复时缺字段 → 空集）。
     #[serde(default)]
