@@ -2267,9 +2267,9 @@ async fn stats_aggregates_live_down_rate_e2e() {
 async fn task_snapshot_exposes_live_rates_e2e() {
     let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
     let total = 1024 * 1024; // 1MiB < DEFAULT_MIN_SPLIT → 单连接整流
-    // 40×200ms ≈ 8s 传输（Windows CI 二跑实证：重负载下 daemon 侧 300ms
-    // 轮询器被饿死到 4s 传输结束后才恢复采样，60s 护栏内全零）——传输
-    // 拉长 + 轮询加密把暴露窗口扩 3 倍（PR #107 实证用例）。
+                             // 40×200ms ≈ 8s 传输（Windows CI 二跑实证：重负载下 daemon 侧 300ms
+                             // 轮询器被饿死到 4s 传输结束后才恢复采样，60s 护栏内全零）——传输
+                             // 拉长 + 轮询加密把暴露窗口扩 3 倍（PR #107 实证用例）。
     let srv = SlowTestServer::start(patterned(total), 40, 200).await; // ≈8s
     let (addr, state) = serve().await;
     // 测试装配：200ms 轮询（状态机推进 + 缓存刷新；慢于默认 2s 缩短捕获时延）
