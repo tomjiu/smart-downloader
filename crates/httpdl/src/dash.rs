@@ -131,9 +131,16 @@ fn build_tree(xml: &str) -> Result<Vec<Elt>, String> {
             }
             Ok(Event::Text(t)) => {
                 let s = t
-                    .unescape()
+                    .xml10_content()
                     .map(|c| c.into_owned())
                     .map_err(|e| format!("DASH 清单文本转义非法: {e}"))?;
+                if let Some(top) = stack.last_mut() {
+                    top.text.push_str(&s);
+                }
+            }
+            Ok(Event::GeneralRef(r)) => {
+                // `&amp;` 等实体引用自 0.38 起拆为独立事件，解析回值继续拼接
+                let s = resolve_ref(&r).map_err(|e| format!("DASH 清单实体引用非法: {e}"))?;
                 if let Some(top) = stack.last_mut() {
                     top.text.push_str(&s);
                 }
@@ -163,11 +170,29 @@ fn elt_of(
         let a = a.map_err(|er| format!("DASH 清单 <{}> 属性解析失败: {er}", elt.name))?;
         let k = String::from_utf8_lossy(a.key.local_name().as_ref()).into_owned();
         let v = a
-            .decode_and_unescape_value(reader.decoder())
+            .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder())
             .map_err(|er| format!("DASH 清单 <{}> 属性值非法: {er}", elt.name))?;
         elt.attrs.push((k, v.into_owned()));
     }
     Ok(elt)
+}
+
+/// 实体引用事件（0.38+ `Event::GeneralRef`）解析回原值：
+/// 数字字符引用与预定义 XML 实体；未知命名实体与旧版 unescape 一致地报错。
+fn resolve_ref(r: &quick_xml::events::BytesRef<'_>) -> Result<String, String> {
+    if r.is_char_ref() {
+        return r
+            .resolve_char_ref()
+            .map_err(|e| format!("DASH 数字字符引用非法: {e}"))?
+            .map(|c| c.to_string())
+            .ok_or_else(|| "DASH 数字字符引用非法".to_string());
+    }
+    let name = r
+        .xml10_content()
+        .map_err(|e| format!("DASH 实体引用解码失败: {e}"))?;
+    quick_xml::escape::resolve_xml_entity(&name)
+        .map(str::to_string)
+        .ok_or_else(|| format!("DASH 未知实体引用: &{name};"))
 }
 
 // ---------------------------------------------------------------------------
