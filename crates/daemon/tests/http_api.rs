@@ -2275,7 +2275,7 @@ async fn task_snapshot_exposes_live_rates_e2e() {
     // 测试装配：200ms 轮询（状态机推进 + 缓存刷新；慢于默认 2s 缩短捕获时延）
     let _h = smart_dl_daemon::http_events::spawn_http_events(
         state.clone(),
-        std::time::Duration::from_millis(200),
+        std::time::Duration::from_millis(300),
     );
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
