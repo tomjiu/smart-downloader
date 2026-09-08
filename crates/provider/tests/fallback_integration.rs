@@ -27,6 +27,8 @@ fn bt_partial_task(dest_root: std::path::PathBuf) -> smart_dl_core::task::Downlo
             size: 0,
             etag: None,
             sha256: None,
+            sha1: None,
+            md5: None,
             backup_md5: None,
         },
         dest_root,
@@ -36,10 +38,19 @@ fn bt_partial_task(dest_root: std::path::PathBuf) -> smart_dl_core::task::Downlo
         state: TaskState::Queued,
         retry: Default::default(),
         created_at: std::time::Instant::now(),
+        file_priorities: None,
+        sequential: false,
         metadata: smart_dl_core::task::TaskMetadata {
             name: None,
             added_at_unix: 0,
+            tags: Vec::new(),
+            finished_at_unix: 0,
+            start_at_unix: 0,
+            next_retry_at_unix: 0,
         },
+        limits: None,
+        max_connections: None,
+        queue_priority: 0,
     }
 }
 

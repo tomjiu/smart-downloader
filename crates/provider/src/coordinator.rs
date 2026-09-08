@@ -183,7 +183,13 @@ impl FallbackCoordinator {
                         )
                         .await
                     {
-                        Ok(()) => transferred.push(f.rel_path.clone()),
+                        Ok(()) => {
+                            // 审查修复（P2）：Expired 恢复流重新遍历全部 files，
+                            // 已传输项必须跳过，否则重复传输 + transferred 重复条目。
+                            if !transferred.contains(&f.rel_path) {
+                                transferred.push(f.rel_path.clone());
+                            }
+                        }
                         // 传输中直链过期 → 进入恢复流
                         Err(SinkError::Expired) => {
                             all_ok = false;

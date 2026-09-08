@@ -16,6 +16,7 @@
 use super::types::{classify_envelope, QuarkAuth, QuarkError, BASE, PR_FR, REFERER, USER_AGENT};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 /// 夸克 HTTP 客户端（轻量：无状态，登录态由调用方显式传入）。
 #[derive(Clone)]
@@ -82,6 +83,9 @@ impl QuarkClient {
     pub fn with_base(base: String) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(USER_AGENT)
+            // 安全修复（H-9）：网关 API 调用必须有总超时（挂死会拖死轮询调用方）。
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .build()
             .expect("reqwest client build");
         QuarkClient {

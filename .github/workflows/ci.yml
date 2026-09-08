@@ -1,5 +1,9 @@
-# 最小 CI（D35）：纯 Rust crates 的 fmt/clippy/test。
-# BT 集成测试（btcore）依赖 vcpkg libtorrent 构建，见 bt-integration job（后置独立）。
+# CI（D35 扩展）：
+#  - rust: 纯 Rust crates 的 fmt/clippy/test，windows + ubuntu 双平台；
+#    daemon 增补 feature 矩阵（ftp / nas / ftp,nas；nas 语义属 Linux，测试仅在 ubuntu 跑）。
+#  - bt-integration: libtorrent native 集成 —— scripts/ci/bt-linux-setup.sh 就位
+#    2.0.x 系统包环境（ffi 源内 2.1/2.0 版本守卫 + fakevcpkg 契约仿真），
+#    btcore + daemon(bt) 的 clippy/test（btcore clippy 由此 job 覆盖）。
 name: ci
 
 on:
@@ -9,8 +13,12 @@ on:
 
 jobs:
   rust:
-    name: fmt + clippy + test (pure rust)
-    runs-on: windows-latest
+    name: fmt + clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -27,11 +35,30 @@ jobs:
           cargo clippy --workspace --exclude smart-dl-btcore
           --features smart-dl-httpdl/ftp -- -D warnings
 
+      - name: clippy workspace (sftp)
+        run: >
+          cargo clippy --workspace --exclude smart-dl-btcore
+          --features smart-dl-httpdl/sftp -- -D warnings
+
+      # daemon feature 矩阵：ftp 全平台编译检查；nas 仅 ubuntu（tar/kill 语义属 Linux）。
+      - name: clippy daemon features (ftp)
+        run: cargo clippy -p smart-dl-daemon --features ftp -- -D warnings
+
+      - name: clippy daemon features (nas + ftp,nas + sftp)
+        if: runner.os == 'Linux'
+        run: |
+          cargo clippy -p smart-dl-daemon --features nas -- -D warnings
+          cargo clippy -p smart-dl-daemon --features "ftp,nas" -- -D warnings
+          cargo clippy -p smart-dl-daemon --features sftp -- -D warnings
+
       - name: test core
         run: cargo test -p smart-dl-core
 
       - name: test httpdl (with ftp feature)
         run: cargo test -p smart-dl-httpdl --features ftp
+
+      - name: test httpdl (with sftp feature)
+        run: cargo test -p smart-dl-httpdl --features sftp
 
       - name: test provider
         run: cargo test -p smart-dl-provider
@@ -39,15 +66,47 @@ jobs:
       - name: test daemon
         run: cargo test -p smart-dl-daemon
 
+      - name: test daemon (ftp + nas)
+        if: runner.os == 'Linux'
+        run: cargo test -p smart-dl-daemon --features "ftp,nas"
+
+      - name: test daemon (sftp)
+        run: cargo test -p smart-dl-daemon --features sftp
+
   bt-integration:
-    # 后置独立：需 vcpkg libtorrent（见 scripts/m0/01_vcpkg.ps1）+ PATH 含
-    # ffi/vcpkg_installed/x64-windows/bin。本地验证命令：
-    #   $env:PATH = "<repo>\ffi\vcpkg_installed\x64-windows\bin;" + $env:PATH
-    #   cargo test -p smart-dl-btcore
-    name: bt integration (local, libtorrent)
-    runs-on: windows-latest
-    if: false
+    # libtorrent native 集成测试（此前 if:false 占位，配方已脚本化并本地实测）：
+    # scripts/ci/bt-linux-setup.sh [rootful] → 系统包 libtorrent 2.0.x + fakevcpkg 契约
+    # 仿真 + lt_kernel/seed_main 编译；ffi 源内版本守卫兼容 2.1 API。
+    # 本地 Debian 13 (2.0.11) 全绿基准：btcore 33 + daemon(bt) 162。
+    name: bt integration (ubuntu, libtorrent)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: placeholder (see scripts/m0/01_vcpkg.ps1 for local run)
-        run: echo "BT integration tests run locally with vcpkg libtorrent"
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Setup libtorrent native env
+        run: bash scripts/ci/bt-linux-setup.sh "$HOME/bt-native"
+
+      - name: clippy btcore (deny warnings)
+        run: |
+          source "$HOME/bt-native/env.sh"
+          cargo clippy -p smart-dl-btcore --all-targets -- -D warnings
+
+      - name: clippy daemon (bt)
+        run: |
+          source "$HOME/bt-native/env.sh"
+          cargo clippy -p smart-dl-daemon --features bt --all-targets -- -D warnings
+
+      - name: test btcore
+        run: |
+          source "$HOME/bt-native/env.sh"
+          cargo test -p smart-dl-btcore
+
+      - name: test daemon (bt)
+        run: |
+          source "$HOME/bt-native/env.sh"
+          cargo test -p smart-dl-daemon --features bt

@@ -4,6 +4,8 @@ use crate::config::Config;
 use crate::http;
 use crate::lockfile::InstanceLock;
 use crate::state::DaemonState;
+#[cfg(feature = "bt")]
+use smart_dl_core::types::DownloadEngine as _; // batch5：set_session_storage_allocate（trait 方法需在作用域）
 use smart_dl_provider::RemoteProvider;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,7 +25,7 @@ pub enum ServeError {
 
 /// 运行 daemon（阻塞至 Ctrl+C / 服务错误）。`cfg_path` 为配置文件源路径（Some 时启用
 /// #6 TOML 热重载：5s 轮询变更 → 刷新可热更字段）。
-pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeError> {
+pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     // 1. 单实例锁（重复启动立即退出）
     let _lock = InstanceLock::acquire(&cfg.lock.path)?;
     tracing::info!("单实例锁已持有: {:?}", cfg.lock.path);
@@ -60,11 +62,28 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
 
     // 3. 引擎组装：HTTP（必需）+ BT（feature bt 且配置开启）
     // 全局代理（config `[download] proxy`，启动时生效）：http/socks5/socks4，可带凭据
-    let mut client_builder = reqwest::Client::builder();
+    // 安全修复（H-9）：connect/read 超时兜底——connect_timeout 防黑洞地址挂死，
+    // read_timeout 防对端断流挂死（idle 语义，单次读超时即断）；刻意不设总超时，
+    // 避免误杀正常的长耗时大文件下载。
+    let mut client_builder = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .read_timeout(Duration::from_secs(30))
+        // batch5（重定向深度可配，qB 对标）：全局 client 策略 limited(n)，
+        // 合法域 1..=100（越界钳到边界，0 视作 1）。任务级代理 client
+        // （httpdl build_proxied_client）保持 reqwest 默认 10 跳。
+        .redirect(reqwest::redirect::Policy::limited(
+            cfg.download.max_redirects.clamp(1, 100) as usize,
+        ))
+        // A5（cookie jar）：引擎共享 client 启用内存 cookie 存储——探测/段请求/
+        // 重定向自动携带与更新（浏览器会话语义，登录型源一次会话全通）；
+        // 同站跨任务共享 jar（同一 client）。任务级代理 client 同口径（见
+        // httpdl build_proxied_client）；Cookie 任务头仍可显式覆盖。
+        .cookie_store(true);
     if !cfg.download.proxy.is_empty() {
         let proxy = reqwest::Proxy::all(&cfg.download.proxy)
             .map_err(|e| ServeError::Engine(format!("代理解析失败: {e}")))?;
-        if let Some(auth) = proxy_auth_of(&cfg.download.proxy) {
+        // E5：proxy_auth_of 提升至 httpdl（任务级代理同源同实现），此处复用
+        if let Some(auth) = smart_dl_httpdl::engine::proxy_auth_of(&cfg.download.proxy) {
             client_builder = client_builder.proxy(proxy.basic_auth(&auth.0, &auth.1));
         } else {
             client_builder = client_builder.proxy(proxy);
@@ -74,7 +93,9 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         .build()
         .map_err(|e| ServeError::Engine(format!("HTTP client 构建失败: {e}")))?;
     let http_engine: Arc<dyn smart_dl_core::types::DownloadEngine> = Arc::new(
-        smart_dl_httpdl::HttpEngine::new_limited(client, cfg.download.max_download_kb_s),
+        // B1：clone 一份给 DaemonState（metalink 引导 XML 拉取同源口径），
+        // 原件移交 HTTP 引擎（探测/段下载）。
+        smart_dl_httpdl::HttpEngine::new_limited(client.clone(), cfg.download.max_download_kb_s),
     );
     // 3b. 云兜底 provider 列表（`[provider]` 配置；仅 MockProvider 现成实现——
     // 开发/演示占位，真实 provider（迅雷云盘等）落地后按类型构造）
@@ -121,12 +142,40 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     let mut state = DaemonState::new(http_engine, providers)
         .with_dest_root(cfg.download.dest_root.clone())
         .with_http_token(http_token.clone())
-        .with_disk_precheck_strict(cfg.download.disk_precheck_strict);
+        .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
+        .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s)
+        .with_bootstrap_client(client.clone())
+        .with_webhook_url((!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone()))
+        .with_post_download(
+            (!cfg.post_download.move_to.is_empty()).then(|| cfg.post_download.move_to.clone()),
+            (!cfg.post_download.hook.is_empty()).then(|| cfg.post_download.hook.clone()),
+        )
+        .with_cleanup(cfg.cleanup.clone())
+        .with_start_jitter(cfg.scheduler.start_jitter_seconds)
+        .with_completion_action(&cfg.scheduler.completion_action)
+        .with_limits_cfg(cfg.limits.clone())
+        .with_queue_cfg(cfg.queue.clone())
+        .with_config_path(args.config.clone())
+        .with_live_config(cfg.clone());
     #[cfg(not(feature = "bt"))]
     let mut state = DaemonState::new(http_engine, providers)
         .with_dest_root(cfg.download.dest_root.clone())
         .with_http_token(http_token.clone())
-        .with_disk_precheck_strict(cfg.download.disk_precheck_strict);
+        .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
+        .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s)
+        .with_bootstrap_client(client)
+        .with_webhook_url((!cfg.webhook.url.is_empty()).then(|| cfg.webhook.url.clone()))
+        .with_post_download(
+            (!cfg.post_download.move_to.is_empty()).then(|| cfg.post_download.move_to.clone()),
+            (!cfg.post_download.hook.is_empty()).then(|| cfg.post_download.hook.clone()),
+        )
+        .with_cleanup(cfg.cleanup.clone())
+        .with_start_jitter(cfg.scheduler.start_jitter_seconds)
+        .with_completion_action(&cfg.scheduler.completion_action)
+        .with_limits_cfg(cfg.limits.clone())
+        .with_queue_cfg(cfg.queue.clone())
+        .with_config_path(args.config.clone())
+        .with_live_config(cfg.clone());
 
     // 4. BT 引擎（先取 core 句柄，供 alert 事件流）
     #[cfg(feature = "bt")]
@@ -146,10 +195,24 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
                     cfg.bt.enable_dht,
                     cfg.bt.enable_lsd,
                     cfg.bt.enable_upnp,
+                    cfg.bt.enable_pex,
+                    cfg.bt.enable_utp,
+                    &cfg.bt.encrypt,
+                    &cfg.bt.extra_trackers,
+                    cfg.bt.max_share_ratio,
+                    cfg.bt.max_seeding_time_min,
                 )
                 .map_err(ServeError::Engine)?,
             );
             let core = bt.core(); // Arc<BtCore>：alert 轮询句柄（trait 化前保存）
+                                  // S1：启动期会话连接参数（监听端口/全局连接数上限；0 = 不下发）
+            bt.apply_startup_conn(cfg.bt.listen_port, cfg.bt.max_connections)
+                .map_err(ServeError::Engine)?;
+            // batch5（存储模式）：会话级预分配开关，任务装配前注入（后续
+            // 全部新增生效；fastresume 回灌保留原模式）。
+            bt.set_session_storage_allocate(cfg.bt.storage_allocate)
+                .await
+                .map_err(|e| ServeError::Engine(e.to_string()))?;
             bt_typed = Some(bt.clone()); // Bug A：alert 循环的暂停意图压制句柄
             let bt_arc: Arc<dyn smart_dl_core::types::DownloadEngine> = bt.clone();
             state = state.with_bt(bt_arc);
@@ -167,6 +230,15 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     // 4c. 迅雷 SDK 引擎（Windows-only，免登录匿名 + 可选带身份模式；与 BT 共用 EngineKind::Bt）
     #[cfg(feature = "xunlei")]
     if cfg.xunlei.enabled {
+        // batch5-P2：与 BT 引擎互斥（共用 EngineKind::Bt 引擎槽）——原实现
+        // xunlei 后装配静默覆盖 bt，Task 46 全部 BT 右键能力（封禁/导出/
+        // 强制操作等）对 XunleiBtEngine 返回 Unsupported → 409，用户无从知晓。
+        if cfg.bt.enabled {
+            return Err(ServeError::Engine(
+                "配置 [bt].enabled 与 [xunlei].enabled 互斥（两引擎共用 BT 槽位）：请仅启用其一"
+                    .into(),
+            ));
+        }
         let save = cfg.xunlei_save_path();
         std::fs::create_dir_all(&save)
             .map_err(|e| ServeError::Engine(format!("Xunlei 落盘目录创建失败 {save:?}: {e}")))?;
@@ -206,13 +278,24 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         tracing::warn!("配置启用了 xunlei 但编译未带 --features xunlei，Xunlei 不可用");
     }
 
-    // 4d. FTP 引擎（feature `ftp`；与 HTTP 共用默认 dest_root）
+    // 4d. FTP 引擎（feature `ftp`；与 HTTP 共用默认 dest_root + 全局限速总阀门）
     #[cfg(feature = "ftp")]
     {
-        let ftp_engine: Arc<dyn smart_dl_core::types::DownloadEngine> =
-            Arc::new(smart_dl_httpdl::FtpEngine::new());
+        let ftp_engine: Arc<dyn smart_dl_core::types::DownloadEngine> = Arc::new(
+            smart_dl_httpdl::FtpEngine::new_limited(cfg.download.max_download_kb_s),
+        );
         state = state.with_ftp(ftp_engine);
         tracing::info!("FTP 引擎已启用");
+    }
+
+    // 4d-2. SFTP 引擎（feature `sftp`，C-S1；同用全局限速总阀门）
+    #[cfg(feature = "sftp")]
+    {
+        let sftp_engine: Arc<dyn smart_dl_core::types::DownloadEngine> = Arc::new(
+            smart_dl_httpdl::SftpEngine::new_limited(cfg.download.max_download_kb_s),
+        );
+        state = state.with_sftp(sftp_engine);
+        tracing::info!("SFTP 引擎已启用");
     }
 
     // 4e. NAS 引擎身份桥（feature `nas`，B-3 统一身份层）：L1 登录态存在时
@@ -248,9 +331,34 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     if tasks_path.exists() {
         match state.restore_from(&tasks_path).await {
             Ok(n) => tracing::info!("已从 {tasks_path:?} 恢复 {n} 个任务"),
-            Err(e) => tracing::warn!("任务恢复失败（继续空启动）: {e}"),
+            Err(e) => {
+                // 审计修复（P1-1 放大链收尾）：解析/读取失败时把坏文件改名留档。
+                // 原实现只 warn 继续空启动——下一次任务变更 autosave 会用空/新
+                // 状态**原位覆盖**坏文件，历史任务记录永久丢失（含 source 凭据，
+                // 用户无法手工修复重放）。留档后本次启动零任务，用户可事后恢复。
+                let bad = tasks_path.with_extension(format!(
+                    "json.bad-{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                ));
+                match std::fs::rename(&tasks_path, &bad) {
+                    Ok(()) => tracing::error!(
+                        "任务恢复失败，坏文件已留档 {bad:?}（继续空启动，可手工修复后重放）: {e}"
+                    ),
+                    Err(re) => {
+                        tracing::error!("任务恢复失败且留档失败（{re}）——下次落盘将覆盖坏文件: {e}")
+                    }
+                }
+            }
         }
     }
+
+    // 4b-2. 显式 IP 封禁重放（Task 46；须在 with_storage 回读 bans.json 之后——
+    // 原在 §4 BT 装配处调用早于回读，bt_bans 恒为空，重放从未生效。
+    // best-effort：单条失败仅 warn；无 BT 引擎时内部自行 warn 跳过）
+    state.replay_bans().await;
 
     // 4c. BT alert 事件流（feature bt 且 BT 启用时）
     #[cfg(feature = "bt")]
@@ -274,9 +382,61 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
     let _http_events_handle =
         crate::http_events::spawn_http_events(state_arc.clone(), Duration::from_secs(2));
 
+    // 4c++. 子文件优先级重放循环（P1-3）：magnet 恢复任务 metadata 就绪后
+    // 延迟下发持久化的 file_priorities（pending 集合收敛；非 bt 构建无 BT 任务
+    // 挂起，空转无害——但仍按 feature 门控避免无谓任务）
+    #[cfg(feature = "bt")]
+    let _prio_replay_handle = crate::bt_events::spawn_file_priority_replay_loop(
+        state_arc.clone(),
+        Duration::from_secs(2),
+    );
+
+    // 4c+++ 周期 fastresume 保存（P4 G4）：crash/断电时进度凭据最多丢一个
+    // 间隔（5min），不再依赖 pause/remove 两个显式时机。逐任务 spawn_blocking
+    //（save_resume_now 同步轮询 alert ≤3s），顺序保存避免 alert 消费竞态放大。
+    #[cfg(feature = "bt")]
+    if let Some(bt) = bt_typed.clone() {
+        let st = state_arc.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                for tid in st.active_bt_tids() {
+                    let b = bt.clone();
+                    let t = tid.clone();
+                    let _ = tokio::task::spawn_blocking(move || b.save_resume_now(&t)).await;
+                }
+            }
+        });
+    }
+
+    // 4d-. 已完成任务自动清扫循环（E20）：10min 周期扫描（配置 0 = 空转
+    // no-op）；配置随 TOML 热重载生效，循环每轮读取当前生效值。
+    {
+        let st = state_arc.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(600)).await;
+                let _ = st.sweep_completed_cleanup().await;
+            }
+        });
+    }
+
+    // 4d--. 定时任务调度循环（E23）：1s 周期把到期任务接入引擎
+    //（start_at 未来不入引擎，Queued 等待；jitter 错峰同样由本循环到点激活）。
+    // 无定时任务时空转（filter 后空集，无引擎调用）。
+    {
+        let st = state_arc.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let _ = st.activate_due_tasks().await;
+            }
+        });
+    }
+
     // 4d. #6 TOML 热重载：5s 轮询配置文件内容变更 → 解析 → refresh_config
     // （默认落盘目录 + /config 快照刷新；解析失败保留旧配置并告警）。
-    if let Some(path) = cfg_path {
+    if let Some(path) = args.config.clone() {
         let st = state_arc.clone();
         let tasks = tasks_path.clone();
         let mut last = std::fs::read_to_string(&path).ok();
@@ -292,6 +452,17 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
                 match toml::from_str::<Config>(&text) {
                     Ok(new_cfg) => {
                         st.refresh_config(&new_cfg, &tasks);
+                        // E16：限速总阀门随热重载生效（文件为准——与 dest_root
+                        // 同口径）；值无变化时 apply 内部 no-op，无事件噪声。
+                        if let Err(e) = st
+                            .apply_global_limits(
+                                Some(new_cfg.download.max_download_kb_s),
+                                Some(new_cfg.bt.max_upload_kb_s),
+                            )
+                            .await
+                        {
+                            tracing::warn!("配置热重载限速下发失败（保留引擎侧旧值）: {e}");
+                        }
                         tracing::info!("配置热重载生效: {}", path.display());
                         last = Some(text);
                     }
@@ -304,11 +475,54 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         });
     }
 
+    // S1：备用限速窗口 ticker（30s）——`[limits] alt_enabled` 开启时按
+    // HH:MM 窗口/星期自动切换基准/备用限速（跨零点回卷支持）。幂等：
+    // 无差异零副作用；窗口边界抖动由 [from, to) 半开区间消除。
+    {
+        let st = state_arc.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                if let Err(e) = st.tick_alt_limits().await {
+                    tracing::warn!("备用限速评估失败（保留引擎侧旧值）: {e}");
+                }
+            }
+        });
+    }
+
+    // RSS 订阅自动刷新 ticker（qbit RSS 对标）：`[rss] auto_refresh=true` 且
+    // refresh_interval_secs>0 时按周期 rss_refresh_all（拉取+规则匹配+自动建
+    // 任务）。间隔下限 60s 防误配风暴；单 feed 失败已在 refresh 内部降级为
+    // errors 列表，ticker 层仅告警。
+    if cfg.rss.auto_refresh && cfg.rss.refresh_interval_secs > 0 {
+        let st = state_arc.clone();
+        let period = Duration::from_secs(cfg.rss.refresh_interval_secs.max(60));
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(period);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick.tick().await; // 首拍立即返回——启动时不抢跑，等第一个整周期
+            loop {
+                tick.tick().await;
+                // batch5（RSS 每 feed 独立间隔）：仅刷新到期 feed（feed 自带
+                // interval_override_secs>0 且未到期 → 跳过）；手动刷新仍全量。
+                let (_, matched, _, errors) = st.rss_refresh_due().await;
+                if matched > 0 {
+                    tracing::info!("RSS 自动刷新命中 {matched} 条并建任务");
+                }
+                for e in &errors {
+                    tracing::warn!("RSS 自动刷新错误: {e}");
+                }
+            }
+        });
+    }
+
     // 5. 路由 + 监听
     // S2：清扫上次运行遗留的 magnet 抓取 scratch（kill -9/断电残骸，best-effort；
     // PID+mtime 双重保护，活跃抓取与并发实例不受影响）。
     http::cleanup_stale_magnet_scratch();
-    let app = http::router(state_arc.clone());
+    let app = http::router_with_ui(state_arc.clone(), args.ui_dir.clone());
     let listener = tokio::net::TcpListener::bind(&cfg.server.addr)
         .await
         .map_err(|e| ServeError::Bind(cfg.server.addr.clone(), e))?;
@@ -329,6 +543,19 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
         .await
         .map_err(ServeError::Io)?;
 
+    // G4：优雅退出前保存活跃 BT 任务 fastresume（crash 时凭据尽可能新）。
+    // 审查修复（P1）：保存必须放在 abort **之前**。原实现先 abort 再保存，
+    // 而 save_fastresume_impl 在 alert_loop_active=true 时纯等 mpsc 分发，
+    // 分发者恰是唯一被 abort 的 pop_alerts 消费者 → 每任务空转 3s 超时，
+    // fastresume 全部不落盘，重启后 BT 任务全量 re-check。先保存后 abort
+    // 保证分发链路存活；同步直调阻塞主线程 ≤3s/任务——进程正在退出，可接受。
+    #[cfg(feature = "bt")]
+    if let Some(bt) = &bt_typed {
+        for tid in state_arc.active_bt_tids() {
+            let _ = bt.save_resume_now(&tid);
+        }
+    }
+
     #[cfg(feature = "bt")]
     if let Some(h) = alert_handle {
         h.abort(); // 进程退出前停止 alert 轮询（锁随 _lock drop 释放）
@@ -338,8 +565,8 @@ pub async fn run(cfg: Config, cfg_path: Option<PathBuf>) -> Result<(), ServeErro
 }
 
 /// 解析生效 HTTP token（第六轮 9.3.5）：env `SMART_DL_HTTP_TOKEN`（空串视为未设）
-/// 优先于 config `[server] http_token`；值为 `auto` → 生成强随机临时 token
-/// （uuid v4，122 位随机，getrandom 支撑），`generated=true` 由调用方负责打印。
+/// > config `[server] http_token`；值为 `auto` → 生成强随机临时 token
+/// > （uuid v4，122 位随机，getrandom 支撑），`generated=true` 由调用方负责打印。
 fn resolve_http_token(env_val: Option<String>, cfg_val: Option<String>) -> (Option<String>, bool) {
     let raw = env_val.filter(|t| !t.is_empty()).or(cfg_val);
     match raw.as_deref() {
@@ -348,18 +575,21 @@ fn resolve_http_token(env_val: Option<String>, cfg_val: Option<String>) -> (Opti
     }
 }
 
-/// 从代理 URL 提取 `user:pass@`（HTTP 引擎 reqwest basic_auth 用；BT 引擎由
-/// btcore::parse_proxy 解析同一格式）。无凭据 → None。
-fn proxy_auth_of(url: &str) -> Option<(String, String)> {
-    let rest = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let (auth, _) = rest.rsplit_once('@')?;
-    let (u, p) = auth.split_once(':').unwrap_or((auth, ""));
-    Some((u.to_string(), p.to_string()))
+/// 进程参数：`serve [--config <path>] [--ui-dir <dir>] [--addr <addr>]`。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ServeArgs {
+    pub config: Option<std::path::PathBuf>,
+    /// 内嵌 UI 静态资源目录（S2）：Some 时 daemon 直接服务前端（SPA fallback
+    /// 到 index.html）；桌面壳/内嵌部署传 `ui/out`；None = 纯 API。
+    pub ui_dir: Option<std::path::PathBuf>,
+    /// 监听地址覆盖（S2 桌面端）：优先级 CLI `--addr` > 配置文件 > 默认值。
+    /// 桌面壳用它与 sidecar 约定同一端口（壳轮询就绪 + 开窗同址）。
+    /// 非回环地址仍走 serve::run 的 fail-closed 校验（无 token 拒绝启动）。
+    pub addr: Option<String>,
 }
 
-/// 进程参数：`serve [--config <path>]`。
-pub fn parse_args(args: &[String]) -> Result<Option<std::path::PathBuf>, String> {
-    let mut cfg_path = None;
+pub fn parse_args(args: &[String]) -> Result<ServeArgs, String> {
+    let mut out = ServeArgs::default();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -367,14 +597,28 @@ pub fn parse_args(args: &[String]) -> Result<Option<std::path::PathBuf>, String>
                 let v = args
                     .get(i + 1)
                     .ok_or_else(|| "--config 缺少路径".to_string())?;
-                cfg_path = Some(std::path::PathBuf::from(v));
+                out.config = Some(std::path::PathBuf::from(v));
+                i += 2;
+            }
+            "--ui-dir" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--ui-dir 缺少路径".to_string())?;
+                out.ui_dir = Some(std::path::PathBuf::from(v));
+                i += 2;
+            }
+            "--addr" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--addr 缺少监听地址".to_string())?;
+                out.addr = Some(v.to_string());
                 i += 2;
             }
             a if a.starts_with('-') => return Err(format!("未知参数: {a}")),
             _ => i += 1,
         }
     }
-    Ok(cfg_path)
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -411,18 +655,46 @@ mod tests {
     #[test]
     fn parse_config_flag() {
         let p = parse_args(&["serve".into(), "--config".into(), "x.toml".into()]).unwrap();
-        assert_eq!(p, Some(std::path::PathBuf::from("x.toml")));
+        assert_eq!(p.config, Some(std::path::PathBuf::from("x.toml")));
+        assert_eq!(p.ui_dir, None);
+    }
+
+    #[test]
+    fn parse_ui_dir_flag() {
+        let p = parse_args(&["serve".into(), "--ui-dir".into(), "ui/out".into()]).unwrap();
+        assert_eq!(p.ui_dir, Some(std::path::PathBuf::from("ui/out")));
+        assert_eq!(p.config, None);
+    }
+
+    #[test]
+    fn parse_addr_flag() {
+        let p = parse_args(&["serve".into(), "--addr".into(), "127.0.0.1:8788".into()]).unwrap();
+        assert_eq!(p.addr.as_deref(), Some("127.0.0.1:8788"));
+        assert_eq!(p.config, None);
+        // 与其余旗标组合互不干扰
+        let p = parse_args(&[
+            "--addr".into(),
+            "127.0.0.1:9000".into(),
+            "--ui-dir".into(),
+            "ui/out".into(),
+            "-c".into(),
+            "z.toml".into(),
+        ])
+        .unwrap();
+        assert_eq!(p.addr.as_deref(), Some("127.0.0.1:9000"));
+        assert_eq!(p.ui_dir, Some(std::path::PathBuf::from("ui/out")));
+        assert_eq!(p.config, Some(std::path::PathBuf::from("z.toml")));
     }
 
     #[test]
     fn parse_short_flag() {
         let p = parse_args(&["-c".into(), "y.toml".into()]).unwrap();
-        assert_eq!(p, Some(std::path::PathBuf::from("y.toml")));
+        assert_eq!(p.config, Some(std::path::PathBuf::from("y.toml")));
     }
 
     #[test]
     fn parse_default_no_flag() {
-        assert_eq!(parse_args(&["serve".into()]).unwrap(), None);
+        assert_eq!(parse_args(&["serve".into()]).unwrap().config, None);
     }
 
     #[test]
@@ -433,5 +705,6 @@ mod tests {
     #[test]
     fn parse_missing_value_errors() {
         assert!(parse_args(&["--config".into()]).is_err());
+        assert!(parse_args(&["--addr".into()]).is_err());
     }
 }

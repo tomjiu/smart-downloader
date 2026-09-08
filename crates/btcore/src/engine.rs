@@ -3,6 +3,8 @@
 
 use std::path::Path;
 
+use smart_dl_core::types::TrackerEntry;
+
 use crate::alerts::Alert;
 use crate::ffi::{self, lt_peer, lt_torrent_status, Session};
 use crate::resume::ResumeBytes;
@@ -21,10 +23,32 @@ pub struct TorrentStatus {
     pub num_seeds: i32,
     pub metadata_received: bool,
     pub paused: bool,
+    /// torrent 名（E28，torrent metadata；就绪前 None/空）。任务名回填链路
+    /// 的数据源——daemon 轮询消费（E9 幂等语义）。
+    pub name: Option<String>,
+    /// 全生命周期累计下行（E33；libtorrent all_time_download，随 resume data
+    /// 跨会话持久）。含 hashfail/断点重复收字节等历史口径，恒 >= 本次 done。
+    pub all_time_download: i64,
+    /// 全生命周期累计上行（E33；做种贡献，暂停不清零）。
+    pub all_time_upload: i64,
 }
 
 impl From<lt_torrent_status> for TorrentStatus {
     fn from(st: lt_torrent_status) -> Self {
+        // E28：C 定长 NUL 结尾缓冲 → Option<String>（空串归一 None）
+        let name: Option<String> = {
+            let bytes: Vec<u8> = st
+                .name
+                .iter()
+                .take_while(|&&c| c != 0)
+                .map(|&c| c as u8)
+                .collect();
+            if bytes.is_empty() {
+                None
+            } else {
+                Some(String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
         TorrentStatus {
             state: st.state,
             progress: st.progress,
@@ -36,6 +60,9 @@ impl From<lt_torrent_status> for TorrentStatus {
             num_seeds: st.num_seeds,
             metadata_received: st.metadata_received != 0,
             paused: st.paused != 0,
+            name,
+            all_time_download: st.all_time_download.max(0),
+            all_time_upload: st.all_time_upload.max(0),
         }
     }
 }
@@ -96,6 +123,17 @@ impl From<lt_peer> for PeerInfo {
     }
 }
 
+/// 加密策略字符串 → `EncryptPolicy`（daemon `bt.encrypt` 配置面同口径）：
+/// `disable` / `allow` / `require`（前后空白容忍），其余（含空串）返回 None。
+pub fn parse_encrypt_policy(s: &str) -> Option<ffi::EncryptPolicy> {
+    match s.trim() {
+        "disable" => Some(ffi::EncryptPolicy::Disable),
+        "allow" => Some(ffi::EncryptPolicy::Allow),
+        "require" => Some(ffi::EncryptPolicy::Require),
+        _ => None,
+    }
+}
+
 fn field_str<const N: usize>(arr: &[std::os::raw::c_char; N]) -> String {
     let bytes: Vec<u8> = arr
         .iter()
@@ -131,16 +169,36 @@ impl BtCore {
         self.sess.apply_network(proxy, down_kb_s, up_kb_s)
     }
 
-    /// 发现层开关：DHT / LSD / UPnP（enable_upnp 同时控制 NAT-PMP——端口映射族）。
-    /// 会话默认全关（M0 确定性语义）；本方法显式覆盖。
+    /// 发现层开关：DHT / LSD / UPnP / PEX（enable_upnp 同时控制 NAT-PMP——端口映射族）。
+    /// 内核默认 DHT/LSD/UPnP 关、PEX 开（M0 确定性语义）；本方法显式覆盖。
+    /// PEX 特殊：内核 2.0.x 无会话级开关，置 false 经 per-torrent disable_pex
+    /// flag 落地（仅对其后新增任务生效，见 lt.h 契约注释）。
     pub fn apply_discovery(
         &self,
         enable_dht: bool,
         enable_lsd: bool,
         enable_upnp: bool,
+        enable_pex: bool,
     ) -> ffi::Result<()> {
         self.sess
-            .apply_discovery(enable_dht, enable_lsd, enable_upnp)
+            .apply_discovery(enable_dht, enable_lsd, enable_upnp, enable_pex)
+    }
+
+    /// 传输层开关：uTP（incoming/outgoing 同进退）+ MSE 加密三态。
+    /// 会话默认 uTP 关 + 加密允许（M0 确定性语义）；本方法显式覆盖。
+    pub fn apply_transport(
+        &self,
+        enable_utp: bool,
+        enc_policy: ffi::EncryptPolicy,
+    ) -> ffi::Result<()> {
+        self.sess.apply_transport(enable_utp, enc_policy)
+    }
+
+    /// 会话连接参数（S1 设置面）：监听端口（0 = 不下发，内核默认 6881 系）+
+    /// 全局连接数上限（0 = 不下发，内核默认 200）。apply_settings 后内核对
+    /// 端口变更自动 re-listen，运行中调用安全。
+    pub fn apply_conn(&self, port: u16, max_connections: u32) -> ffi::Result<()> {
+        self.sess.apply_conn(port, max_connections)
     }
 
     // —— 添加 / 移除 ——
@@ -152,6 +210,11 @@ impl BtCore {
     /// 本地 seeder 直连注入（测试/评估用，无需 tracker）
     pub fn add_peer(&self, ih: &str, ip: &str, port: u16) -> ffi::Result<()> {
         self.sess.add_peer(ih, ip, port)
+    }
+
+    /// 超级种子开关（qBittorrent 同名能力；做种态生效，下载中无效果）
+    pub fn set_super_seeding(&self, ih: &str, on: bool) -> ffi::Result<()> {
+        self.sess.set_seed_mode(ih, on)
     }
 
     pub fn add_torrent_file(&self, meta: &[u8], web_seeds: &[String]) -> ffi::Result<String> {
@@ -248,12 +311,52 @@ impl BtCore {
         self.sess.add_tracker(ih, url)
     }
 
+    /// tracker 表列举（E29）：C 缓冲 → `TrackerEntry`（NUL 截断安全）。
+    pub fn list_trackers(&self, ih: &str) -> ffi::Result<Vec<TrackerEntry>> {
+        let raw = self.sess.list_trackers(ih)?;
+        Ok(raw
+            .into_iter()
+            .map(|t| {
+                let bytes: Vec<u8> = t
+                    .url
+                    .iter()
+                    .take_while(|&&c| c != 0)
+                    .map(|&c| c as u8)
+                    .collect();
+                TrackerEntry {
+                    url: String::from_utf8_lossy(&bytes).into_owned(),
+                    tier: t.tier,
+                }
+            })
+            .collect())
+    }
+
+    /// 删 tracker（E29）：URL 精确匹配，无匹配 → NotFound 定性错误。
+    pub fn remove_tracker(&self, ih: &str, url: &str) -> ffi::Result<()> {
+        self.sess.remove_tracker(ih, url)
+    }
+
     pub fn set_sequential(&self, ih: &str, on: bool) -> ffi::Result<()> {
         self.sess.set_sequential(ih, on)
     }
 
+    /// 任务级连接数上限（S1-c）：>0 = 上限；0 = 复位会话级默认。
+    pub fn set_max_connections(&self, ih: &str, max_connections: u32) -> ffi::Result<()> {
+        self.sess.set_max_connections(ih, max_connections)
+    }
+
     pub fn set_limits(&self, ih: &str, down: i64, up: i64) -> ffi::Result<()> {
         self.sess.set_limits(ih, down, up)
+    }
+
+    /// 子文件优先级批量设置（(文件下标, 0..=7)，P1 任务级能力；需 metadata）。
+    pub fn set_file_priorities(&self, ih: &str, prio: &[(i32, i32)]) -> ffi::Result<()> {
+        self.sess.set_file_priorities(ih, prio)
+    }
+
+    /// 读取当前各文件优先级（下标即文件序；需 metadata）。
+    pub fn file_priorities(&self, ih: &str) -> ffi::Result<Vec<i32>> {
+        self.sess.file_priorities(ih)
     }
 
     // —— 块读取（v2 轮询） ——
@@ -269,6 +372,53 @@ impl BtCore {
     pub fn metadata(&self, ih: &str) -> ffi::Result<Option<Vec<u8>>> {
         self.sess.metadata(ih)
     }
+
+    // —— 强制操作三件套 + IP 封禁（Task 46） ——
+
+    /// 强制向全部 tracker 立即宣告（qbit/BitComet 任务右键对标）。
+    pub fn force_reannounce(&self, ih: &str) -> ffi::Result<()> {
+        self.sess.force_reannounce(ih)
+    }
+
+    /// 强制 DHT 宣告（DHT 未启用时内核 no-op，不报错）。
+    pub fn force_dht_announce(&self, ih: &str) -> ffi::Result<()> {
+        self.sess.force_dht_announce(ih)
+    }
+
+    /// 强制重新校验：任务转入 checking（校验期下载/做种挂起，完成后自动恢复）。
+    pub fn force_recheck(&self, ih: &str) -> ffi::Result<()> {
+        self.sess.force_recheck(ih)
+    }
+
+    /// Session 级 IP 封禁（幂等；ih = Some 时先验证任务存在）。
+    pub fn ban_ip(&self, ih: Option<&str>, ip: &str) -> ffi::Result<()> {
+        self.sess.ban_ip(ih, ip)
+    }
+
+    /// 解除封禁（幂等）。
+    pub fn unban_ip(&self, ip: &str) -> ffi::Result<()> {
+        self.sess.unban_ip(ip)
+    }
+
+    /// IP 段封禁（batch5 对标）：[start, end] 闭区间加入 ip_filter。
+    pub fn ban_ip_range(&self, start: &str, end: &str) -> ffi::Result<()> {
+        self.sess.ban_ip_range(start, end)
+    }
+
+    /// 首尾块优先（batch5 对标）：每文件首/末块优先级置为 prio（0..=7）。
+    pub fn set_piece_first_last(&self, ih: &str, prio: i32) -> ffi::Result<()> {
+        self.sess.set_piece_first_last(ih, prio)
+    }
+
+    /// 会话级存储模式（batch5 对标）：后续新增任务预分配开关。
+    pub fn set_storage_mode(&self, alloc: bool) -> ffi::Result<()> {
+        self.sess.set_storage_mode(alloc)
+    }
+
+    /// 查询显式封禁状态（true = 已封禁；不含内核 auto-ban 临时封禁）。
+    pub fn is_banned(&self, ip: &str) -> ffi::Result<bool> {
+        self.sess.is_banned(ip)
+    }
 }
 
 #[cfg(test)]
@@ -282,8 +432,50 @@ mod tests {
         // 真实 DHT 冷启动拉 peer 属手动验证项。
         let dir = std::env::temp_dir();
         let core = BtCore::new(&dir, "test-discovery").expect("session init");
-        core.apply_discovery(true, true, true).expect("全开应 Ok");
-        core.apply_discovery(false, false, false)
+        core.apply_discovery(true, true, true, true)
+            .expect("全开应 Ok");
+        core.apply_discovery(false, false, false, false)
             .expect("全关应 Ok");
+    }
+
+    #[test]
+    fn apply_transport_smoke_roundtrip() {
+        // 传输层冒烟：uTP 两态 × 加密三态全组合（参数封送 + 内核
+        // apply_settings 不抛异常；加密策略值映射见 lt.h 契约注释）。
+        let dir = std::env::temp_dir();
+        let core = BtCore::new(&dir, "test-transport").expect("session init");
+        for utp in [true, false] {
+            for pol in [
+                ffi::EncryptPolicy::Disable,
+                ffi::EncryptPolicy::Allow,
+                ffi::EncryptPolicy::Require,
+            ] {
+                core.apply_transport(utp, pol).expect("uTP/加密组合应 Ok");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_encrypt_policy_variants() {
+        // 字符串 → 策略解析：合法三态 + 非法拒绝（daemon 配置面同口径）
+        assert_eq!(
+            parse_encrypt_policy("disable"),
+            Some(ffi::EncryptPolicy::Disable)
+        );
+        assert_eq!(
+            parse_encrypt_policy("allow"),
+            Some(ffi::EncryptPolicy::Allow)
+        );
+        assert_eq!(
+            parse_encrypt_policy("require"),
+            Some(ffi::EncryptPolicy::Require)
+        );
+        assert_eq!(
+            parse_encrypt_policy(" require "),
+            Some(ffi::EncryptPolicy::Require)
+        );
+        assert_eq!(parse_encrypt_policy(""), None);
+        assert_eq!(parse_encrypt_policy("forced"), None);
+        assert_eq!(parse_encrypt_policy("ALLOWED"), None);
     }
 }

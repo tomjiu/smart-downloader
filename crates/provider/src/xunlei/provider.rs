@@ -155,7 +155,11 @@ impl XunleiProvider {
             device_id,
             captcha_token: String::new(),
             user_id: String::new(),
-            access_token_expires_at: now_unix() + 43200, // 12h，实际以 token 响应为准
+            // batch3-P1：TTL 以 JWT exp 为准（auth::jwt_exp 现成），仅解析失败
+            // 回退 12h——旧实现硬编码 43200 且 device 流丢弃服务端 expires_in，
+            // 实际 TTL 更短时到期后 drive 请求 401 循环（无 401 驱动刷新）。
+            access_token_expires_at: crate::xunlei::auth::jwt_exp(&access_token)
+                .unwrap_or_else(|| now_unix() + 43200),
             captcha_token_expires_at: 0,
         };
         // 从 access_token（JWT sub）解析 user_id，captcha/init 需要。
@@ -228,6 +232,7 @@ impl crate::RemoteProvider for XunleiProvider {
                 | DownloadSource::Thunder(_)
                 | DownloadSource::XunleiShare(_)
                 | DownloadSource::Ftp { .. }
+                | DownloadSource::Sftp { .. }
                 | DownloadSource::Ed2k(_) => {
                     return Err(ProviderError::Other(
                         "v1 离线提交仅支持磁力/HTTP 链接（torrent 字节上传留后续）".into(),
@@ -306,7 +311,7 @@ impl crate::RemoteProvider for XunleiProvider {
             Ok(verdict)
         })
         .await
-        .inspect(|v| {
+        .inspect(|&v| {
             if matches!(v, ProviderStatus::Ready | ProviderStatus::Failed) {
                 self.clear_backoff();
             }
@@ -613,6 +618,7 @@ mod tests {
             headers: vec![],
             auth: None,
             backup_url: None,
+            proxy: None,
         };
         let res = p.submit(&source).await;
         assert!(res.is_err());

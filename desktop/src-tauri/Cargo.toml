@@ -1,0 +1,28 @@
+# 独立 workspace：本 crate 在仓库根 workspace 目录树内但不属于其 members，
+# 若无此空声明，tauri/cargo 独立构建会因「believes it's in a workspace」报错。
+[workspace]
+
+[package]
+name = "smart-dl-desktop"
+version = "0.2.0"
+description = "Smart Downloader 桌面端"
+authors = ["mmqz"]
+edition = "2021"
+rust-version = "1.77"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# wait_daemon 端口轮询（timeout/sleep + TcpStream::connect）；tauri 自带
+# runtime，此处仅取 API 所需 feature
+tokio = { version = "1", features = ["time", "net"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

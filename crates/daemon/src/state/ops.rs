@@ -1,0 +1,4432 @@
+//! 任务操作面：添加（HTTP/FTP/BT/迅雷/链接）、查询与列表、批量、控制（pause/resume/限速/优先级/顺序/代理/改名/标签）、tracker/webseed、移除、provider 兜底、完成回调与清理、HTTP/FTP 状态轮询。
+
+use super::lifecycle::execute_completion_action;
+use super::*;
+
+impl DaemonState {
+    /// 任务完成事件统一出口（E17）：广播 `SchedulerEvent::Completed` +
+    /// 触发完成 Webhook。三个完成转移点（HTTP/FTP 轮询循环、BT alert 流
+    /// Seeding 转移、Provider 兜底成功）一律经此，保证事件与通知不脱钩。
+    pub fn publish_task_completed(&self, task_id: &str) {
+        // E20：完成时刻入档（自动清理判龄依据；记录不存在则跳过写点）
+        {
+            if let Some(rec) = self.tasks.lock().get_mut(task_id) {
+                rec.task.metadata.finished_at_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+            }
+        }
+        self.hub.publish(SchedulerEvent::Completed {
+            task_id: task_id.to_string(),
+        });
+        self.fire_completion_webhook(task_id);
+        self.run_post_download_actions(task_id);
+        // Task 46：全部任务终态后的全局动作（qbit「下载完成后关机」对标）
+        self.maybe_run_completion_action();
+    }
+
+    /// 完成动作判定（Task 46）：action != none 且未触发过 → 全任务终态检查。
+    /// 空任务表不触发（无意义）；非终态任务存在（含 Paused/Queued/Seeding）
+    /// 阻塞触发——qbit 同语义（暂停/做种中均算未完成）。触发后置位 fired。
+    /// pub(crate)：lifecycle 的 set_completion_action 热更后补判（batch5-P2）。
+    pub(crate) fn maybe_run_completion_action(&self) {
+        let action = self.completion_action.lock().clone();
+        if action == "none" || action.is_empty() {
+            return;
+        }
+        if self
+            .completion_fired
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_err()
+        {
+            return; // 本会话已触发过
+        }
+        let all_terminal = {
+            let tasks = self.tasks.lock();
+            !tasks.is_empty()
+                && tasks.values().all(|r| {
+                    matches!(
+                        r.task.state,
+                        TaskState::Completed | TaskState::Failed | TaskState::Stopped
+                    )
+                })
+        };
+        if !all_terminal {
+            // 尚有活跃/暂停/排队任务 → 复位旗标，下次完成事件再判
+            self.completion_fired
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        execute_completion_action(&action);
+    }
+
+    /// 完成自动处理（E27，清单 #15）：`[post_download] move_to` 移动 +
+    /// `hook` 外部程序。fire-and-forget——失败仅记日志/事件，不反压链路；
+    /// 未配置两者时零开销直返。锁内快照、锁外行动（同 webhook 纪律）。
+    pub(super) fn run_post_download_actions(&self, task_id: &str) {
+        let move_to = self.post_move_to.lock().clone();
+        let hook = self.post_hook.lock().clone();
+        if move_to.is_none() && hook.is_none() {
+            return;
+        }
+        // 锁内快照：任务名/引擎/落盘路径/conflict-skip 标记
+        let snap = {
+            let tasks = self.tasks.lock();
+            let Some(rec) = tasks.get(task_id) else {
+                return; // 任务已移除 → 无处理主体
+            };
+            let conflict_skip = rec
+                .events
+                .iter()
+                .any(|e| e.op == "add" && e.detail.as_deref() == Some("conflict_skip"));
+            Some((
+                rec.task.metadata.name.clone(),
+                kind_label(&rec.engine_kind),
+                rec.task.dest_root.clone(),
+                conflict_skip,
+            ))
+        };
+        let Some((Some(name), engine, dest_root, conflict_skip)) = snap else {
+            return; // 无名任务（BT metadata 未回填等）→ 无落盘文件可定位
+        };
+        let src = dest_root.join(&name);
+        // batch5：单文件（move_completed_file）与目录（BT 多文件任务，
+        // move_completed_dir）都支持；不存在 → 跳过；hook 仍照发
+        //（webhook 同口径：通知尽力而为）
+        let is_file = src.is_file();
+        let is_dir = src.is_dir();
+        let mut final_path = src.clone();
+
+        // 1) 移动（conflict-skip 任务不动既有文件——尊重 skip 语义）
+        if let Some(dst_dir) = &move_to {
+            if conflict_skip {
+                tracing::info!("post_download: 任务 {task_id} 为 conflict-skip，既有文件不移动");
+            } else if !is_file && !is_dir {
+                tracing::info!(
+                    "post_download: 任务 {task_id} 落盘路径不存在（{:?}），移动跳过",
+                    src
+                );
+            } else if is_dir {
+                match Self::move_completed_dir(&src, dst_dir, &name) {
+                    Ok(target) => {
+                        tracing::info!("post_download: 任务 {task_id} 目录已移动 → {target:?}");
+                        final_path = target.clone();
+                        let mut tasks = self.tasks.lock();
+                        if let Some(rec) = tasks.get_mut(task_id) {
+                            rec.push_event(
+                                "post_move",
+                                Some(target.to_string_lossy().into_owned()),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("post_download: 任务 {task_id} 目录移动失败: {e}");
+                        let mut tasks = self.tasks.lock();
+                        if let Some(rec) = tasks.get_mut(task_id) {
+                            rec.push_event("post_move", Some(format!("failed: {e}")));
+                        }
+                    }
+                }
+            } else if is_file {
+                match Self::move_completed_file(&src, dst_dir, &name) {
+                    Ok(target) => {
+                        tracing::info!("post_download: 任务 {task_id} 文件已移动 → {target:?}");
+                        final_path = target.clone();
+                        let mut tasks = self.tasks.lock();
+                        if let Some(rec) = tasks.get_mut(task_id) {
+                            rec.push_event(
+                                "post_move",
+                                Some(target.to_string_lossy().into_owned()),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("post_download: 任务 {task_id} 移动失败: {e}");
+                        let mut tasks = self.tasks.lock();
+                        if let Some(rec) = tasks.get_mut(task_id) {
+                            rec.push_event("post_move", Some(format!("failed: {e}")));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2) 外部钩子（移动后终路径经 SD_FILE_PATH 传递；后台线程收尾）
+        if let Some(prog) = &hook {
+            let prog = prog.clone();
+            let envs = vec![
+                ("SD_TASK_ID".to_string(), task_id.to_string()),
+                ("SD_TASK_NAME".to_string(), name),
+                (
+                    "SD_FILE_PATH".to_string(),
+                    final_path.to_string_lossy().into_owned(),
+                ),
+                ("SD_ENGINE".to_string(), engine.to_string()),
+            ];
+            let hook_task_id = task_id.to_string();
+            let hook_prog = prog.clone();
+            std::thread::spawn(move || {
+                match std::process::Command::new(&hook_prog)
+                    .envs(envs)
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                {
+                    Ok(out) if out.status.success() => {
+                        tracing::info!("post_download: 任务 {hook_task_id} 钩子执行成功");
+                    }
+                    Ok(out) => {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        let stdout = String::from_utf8_lossy(&out.stdout);
+                        tracing::warn!(
+                            "post_download: 任务 {hook_task_id} 钩子非零退出 status={:?} stdout={stdout} stderr={stderr}",
+                            out.status.code()
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "post_download: 任务 {hook_task_id} 钩子启动失败 {hook_prog:?}: {e}"
+                        );
+                    }
+                }
+            });
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(task_id) {
+                rec.push_event("post_hook", Some(prog));
+            }
+        }
+    }
+
+    /// 完成通知投递（E17）：fire-and-forget——单次 POST、5s 超时、失败仅记
+    /// 警告日志（不重试不排队；通知属尽力而为，不得反压下载主链路）。
+    /// 未配置 URL 时零开销直返。payload 从任务记录快照构建（锁内取值锁外投递）。
+    pub(super) fn fire_completion_webhook(&self, task_id: &str) {
+        let Some(url) = self.webhook_url.lock().clone() else {
+            return;
+        };
+        let payload = {
+            let tasks = self.tasks.lock();
+            match tasks.get(task_id) {
+                None => return, // 任务已移除（完成通知失去主体）→ 静默
+                Some(rec) => {
+                    // 总字节：优先 add 探测 identity，缺省回退 E11 引擎快照缓存
+                    //（HTTP 探测失败/信息聚合型源 identity.size=0 时仍有值）
+                    let total_bytes = match &rec.task.identity {
+                        ContentIdentity::SingleFile { size, .. } if *size > 0 => Some(*size),
+                        _ => rec
+                            .engine_status
+                            .as_ref()
+                            .map(|s| s.total)
+                            .filter(|t| *t > 0),
+                    };
+                    serde_json::json!({
+                        "event": "task_completed",
+                        "task_id": rec.task.id,
+                        "name": rec.task.metadata.name,
+                        "engine": kind_label(&rec.engine_kind),
+                        "total_bytes": total_bytes,
+                        "finished_at_unix": std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0),
+                    })
+                }
+            }
+        };
+        let client = self.webhook_client.clone();
+        tokio::spawn(async move {
+            let result = client
+                .post(&url)
+                .timeout(std::time::Duration::from_secs(5))
+                .json(&payload)
+                .send()
+                .await;
+            match result {
+                Ok(resp) if resp.status().is_success() => {}
+                Ok(resp) => {
+                    tracing::warn!("完成 Webhook 非成功响应: {url} status={}", resp.status())
+                }
+                Err(e) => tracing::warn!("完成 Webhook 投递失败: {url} {e}"),
+            }
+        });
+    }
+
+    /// 添加任务入口：支持 http/https/thunder:///qqdl:// 链接（归一化后走 HTTP 引擎）；
+    /// magnet（feature `bt` 时走 libtorrent 引擎）；ed2k/无法识别 → InvalidSource。
+    pub async fn add_link_task(
+        &self,
+        link: String,
+        dest_root: Option<String>,
+    ) -> Result<TaskId, DaemonError> {
+        self.add_link_task_opts(link, dest_root, AddHttpOpts::default())
+            .await
+    }
+
+    // ===== 定时/错峰下载（E23）=====
+    //
+    // 语义：start_at 在未来的任务**不接入引擎**（engine_tid 空、停留 Queued），
+    // 到点由调度循环 `activate_due_tasks` 调引擎 add 激活（与普通 add 同链路，
+    // 查重/预检/目录创建已在 add 路径完成）。两个入口：
+    // - 显式定时：`AddTaskReq.start_at_unix`（unix 秒；过去时刻 = 立即，宽容不 400）
+    // - 错峰：`[scheduler] start_jitter_seconds` > 0 时，未显式指定的任务在
+    //   0..=N 秒内随机延迟启动（批量入队不被同时压向引擎/带宽）。
+
+    /// 解析任务定时启动时刻（E23）：显式值直传（0/过去 = 立即）；未显式且
+    /// 配置了错峰抖动 → now + 0..=jitter 秒（亚秒纳秒 ^ next_id 混熵，错峰
+    /// 无需密码学随机）；否则 0（立即）。
+    pub(super) fn resolve_start_at(&self, explicit: Option<u64>) -> u64 {
+        if let Some(t) = explicit {
+            return t;
+        }
+        let jitter = self
+            .start_jitter_secs
+            .load(std::sync::atomic::Ordering::Relaxed) as u64;
+        if jitter == 0 {
+            return 0;
+        }
+        let nano = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        let mix = nano
+            ^ self
+                .next_id
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        now_unix() + (mix % (jitter + 1))
+    }
+
+    /// 落一条调度等待任务记录（E23）：不入引擎（engine_tid 空），到点由
+    /// 调度循环激活。与 E21 conflict_skip 同款「有记录无句柄」形态。
+    pub(super) fn insert_scheduled_task(&self, task: DownloadTask, kind: EngineKind) -> String {
+        let task_id = task.id.clone();
+        let start_at = task.metadata.start_at_unix;
+        let mut rec = TaskRecord {
+            seeding_since: None,
+            task,
+            engine_tid: None,
+            engine_kind: kind,
+            engine_status: None,
+            events: vec![],
+        };
+        rec.push_event("add", Some(format!("scheduled_start@{start_at}")));
+        self.tasks.lock().insert(task_id.clone(), rec);
+        self.autosave();
+        self.hub.publish(SchedulerEvent::TaskCreated {
+            task_id: task_id.clone(),
+        });
+        task_id
+    }
+
+    // ==================== S1-b 并发队列门控 ====================
+    // [queue] max_active_{bt,http,ftp}（0 = 不限）：add 入口配额满 → 任务落
+    // Queued 排队（无句柄），由 activate_due_tasks（serve 1s tick）在槽位空闲
+    // 后按 FIFO（created_at 升序）递补激活。槽位释放 = 任务进入非传输态
+    // （Completed/Failed/Stopped/Paused/Seeding/移除）。手动 resume = 强制
+    // 开始（无视配额，对齐 qbit「强制继续」语义）；恢复路径重放不设闸
+    // （保持停机前在飞集合，仅新增激活受闸）。
+
+    /// 引擎槽位下标（[bt, http, ftp]；Provider/XunleiNas/Sftp 无独立配额，
+    /// 归 ftp 桶但 Provider/XunleiNas 实际不会走到——门控仅在 add 路径调用，
+    /// kind 恒为 Bt/Http/Ftp/Sftp；Sftp 复用 ftp 桶（同为文件传输协议，
+    /// 独立配额键后续按需拆分））。
+    fn slot_index(kind: EngineKind) -> usize {
+        match kind {
+            EngineKind::Bt => 0,
+            EngineKind::Http => 1,
+            EngineKind::Ftp | EngineKind::Sftp | EngineKind::Provider | EngineKind::XunleiNas => 2,
+        }
+    }
+
+    /// 引擎并发配额（S1-b）：None = 不限（配置 0 或引擎无独立配额）。
+    /// 读 live queue_cfg（设置热改跟随）。
+    pub(super) fn queue_limit_of(&self, kind: EngineKind) -> Option<u32> {
+        let q = self.queue_cfg.lock().clone();
+        let v = match kind {
+            EngineKind::Bt => q.max_active_bt,
+            EngineKind::Http => q.max_active_http,
+            _ => q.max_active_ftp,
+        };
+        (v > 0).then_some(v)
+    }
+
+    /// 当前占用引擎槽位的任务数（S1-b）：有句柄且不在释放态（Paused = 用户
+    /// 挂起 / Seeding = 做种不占下载槽 / 终态）。add 后记录态短暂停留 Queued
+    /// （首轮引擎状态同步前）——有句柄即占位，防同 tick 连发超卖。
+    pub(super) fn active_slot_counts(&self) -> [u32; 3] {
+        let tasks = self.tasks.lock();
+        let mut counts = [0u32; 3];
+        for rec in tasks.values() {
+            if rec.engine_tid.is_none() {
+                continue;
+            }
+            if matches!(
+                rec.task.state,
+                TaskState::Paused
+                    | TaskState::Seeding
+                    | TaskState::Completed
+                    | TaskState::Stopped
+                    | TaskState::Failed
+            ) {
+                continue;
+            }
+            counts[Self::slot_index(rec.engine_kind)] += 1;
+        }
+        counts
+    }
+
+    /// add 路径配额闸门（S1-b）：返回 true = 有槽位，调用方继续 engine.add；
+    /// false = 配额已满，任务已落排队记录（Queued + 无句柄 + queue_wait 事件
+    /// + TaskCreated 发布），调用方直接返回 task_id。
+    ///
+    /// 调用时机：定时判定之后（定时任务不受此闸——到点由调度循环按当时配额激活）。
+    pub(super) fn gate_or_enqueue(&self, task: DownloadTask, kind: EngineKind) -> bool {
+        let Some(limit) = self.queue_limit_of(kind) else {
+            return true;
+        };
+        if self.active_slot_counts()[Self::slot_index(kind)] < limit {
+            return true;
+        }
+        let task_id = task.id.clone();
+        let mut rec = TaskRecord {
+            seeding_since: None,
+            task,
+            engine_tid: None,
+            engine_kind: kind,
+            engine_status: None,
+            events: vec![],
+        };
+        rec.push_event(
+            "add",
+            Some(format!(
+                "queue_wait: {kind:?} 并发配额已满（{limit}），槽位空闲后自动递补"
+            )),
+        );
+        self.tasks.lock().insert(task_id.clone(), rec);
+        self.autosave();
+        self.hub.publish(SchedulerEvent::TaskCreated {
+            task_id: task_id.clone(),
+        });
+        false
+    }
+
+    /// 激活单个定时任务（E23）：调引擎 add 接入 + 记录句柄 + 事件。
+    /// add 失败/引擎不可用 → E30 重试拦截（预算未用尽安排退避重试）否则置
+    /// Failed（对齐 restore add 失败语义）。激活成功时消费重试安排
+    /// （next_retry_at 清零，快照不再显示过期时间）。
+    /// 返回是否激活成功。调用方需保证任务处于 Queued（调度等待态）。
+    pub(super) async fn activate_one(
+        &self,
+        id: &str,
+        task: DownloadTask,
+        kind: EngineKind,
+    ) -> bool {
+        let engine = match self.engine_for(kind) {
+            Ok(e) => e,
+            Err(e) => {
+                let retrying = {
+                    let mut tasks = self.tasks.lock();
+                    match tasks.get_mut(id) {
+                        Some(rec) => {
+                            rec.push_event("scheduled_start", Some(format!("引擎不可用: {e}")));
+                            let to = rec.fail_or_schedule_retry(Some(&format!("引擎不可用: {e}")));
+                            to == TaskState::Queued
+                        }
+                        None => false,
+                    }
+                };
+                self.autosave();
+                if !retrying {
+                    self.hub.publish(SchedulerEvent::Failed {
+                        task_id: id.to_string(),
+                        reason: format!("定时激活引擎不可用: {e}"),
+                    });
+                }
+                return false;
+            }
+        };
+        match engine.add(&task).await {
+            Ok(tid) => {
+                {
+                    let mut tasks = self.tasks.lock();
+                    match tasks.get_mut(id) {
+                        // 双检：激活间隙任务可能已被 resume 路径抢先激活/被移除/
+                        // 被用户暂停（batch6-P2：候选快照后用户 pause →
+                        // Queued→Paused，engine_tid 仍 None——不校验状态会把
+                        // 任务覆盖回 Downloading，违背用户暂停意图）。比对
+                        // 调用方快照态：resume 激活的快照态本来就是
+                        // Paused/Failed（合法），调度激活为 Queued；快照后
+                        // 状态被改写 = 间隙有并发意图 → 放弃本次激活。激活
+                        // 成功即消费重试安排（E30：next_retry_at 清零）。
+                        Some(rec) if rec.engine_tid.is_none() && rec.task.state == task.state => {
+                            rec.engine_tid = Some(tid);
+                            rec.task.metadata.next_retry_at_unix = 0;
+                            // batch3-P1：激活即 Downloading（BT 任务无轮询纠偏，
+                            // 与 add 路径同口径；HTTP 任务轮询稍后幂等确认）
+                            rec.task.state = TaskState::Downloading(kind);
+                            rec.push_event("scheduled_start", None);
+                        }
+                        _ => return false,
+                    }
+                }
+                self.autosave();
+                self.hub.publish(SchedulerEvent::TaskActivated {
+                    task_id: id.to_string(),
+                });
+                true
+            }
+            Err(e) => {
+                let retrying = {
+                    let mut tasks = self.tasks.lock();
+                    match tasks.get_mut(id) {
+                        Some(rec) => {
+                            rec.push_event("scheduled_start", Some(format!("引擎 add 失败: {e}")));
+                            let to =
+                                rec.fail_or_schedule_retry(Some(&format!("引擎 add 失败: {e}")));
+                            to == TaskState::Queued
+                        }
+                        None => false,
+                    }
+                };
+                self.autosave();
+                if !retrying {
+                    self.hub.publish(SchedulerEvent::Failed {
+                        task_id: id.to_string(),
+                        reason: format!("定时激活失败: {e}"),
+                    });
+                }
+                false
+            }
+        }
+    }
+
+    /// 调度激活循环驱动点（E23+E30+S1-b）：把等待中的任务（未接入引擎、
+    /// Queued）逐个接入引擎。候选与到期判定：
+    /// - 带重试安排（next_retry_at > 0）→ 按 next_retry_at 判定（重试安排
+    ///   优先，避免定时任务首次激活间隙被误读）
+    /// - 否则 start_at > 0 → 按 E23 start_at 判定
+    /// - 否则 → S1-b queue_wait（add 时配额满落队），视为随时到期
+    ///
+    /// 激活统一过 S1-b 配额闸门：槽位不足则本轮跳过（队首优先）。递补排序 =
+    /// (queue_priority 升序, created_at 升序)——Task 46 qbit 队列位置对标：
+    /// 值小者先补位，同值保持 FIFO（create 序，Instant 纳秒粒度同刻碰撞实际
+    /// 不可能）。serve 以 1s 周期驱动（终态/暂停/移除释放槽位 → 下轮递补）；
+    /// 测试可直接调用。返回激活成功的 task_id 列表（激活序）。
+    pub async fn activate_due_tasks(&self) -> Vec<String> {
+        let now = now_unix();
+        let due: Vec<(String, DownloadTask, EngineKind)> = {
+            let tasks = self.tasks.lock();
+            let mut v: Vec<(String, DownloadTask, EngineKind, i32, std::time::Instant)> = tasks
+                .iter()
+                .filter(|(_, rec)| {
+                    if rec.engine_tid.is_some() || rec.task.state != TaskState::Queued {
+                        return false;
+                    }
+                    let m = &rec.task.metadata;
+                    if m.next_retry_at_unix > 0 {
+                        // E30：重试等待中——到期才激活
+                        m.next_retry_at_unix <= now
+                    } else if m.start_at_unix > 0 {
+                        // E23：定时启动等待中——到期才激活
+                        m.start_at_unix <= now
+                    } else {
+                        // S1-b：queue_wait 等槽位——随时可激活（下方配额闸门把关）
+                        true
+                    }
+                })
+                .map(|(id, rec)| {
+                    (
+                        id.clone(),
+                        rec.task.clone(),
+                        rec.engine_kind,
+                        rec.task.queue_priority,
+                        rec.task.created_at,
+                    )
+                })
+                .collect();
+            // S1-b 递补序：优先级小者先，同值 FIFO（创建序）
+            v.sort_by_key(|(_, _, _, prio, created)| (*prio, *created));
+            v.into_iter().map(|(id, t, k, _, _)| (id, t, k)).collect()
+        };
+        let mut counts = self.active_slot_counts();
+        let mut activated = Vec::new();
+        for (id, task, kind) in due {
+            // S1-b 配额闸门：槽位不足本轮跳过（下一 tick 再试）
+            if let Some(limit) = self.queue_limit_of(kind) {
+                if counts[Self::slot_index(kind)] >= limit {
+                    continue;
+                }
+            }
+            if self.activate_one(&id, task, kind).await {
+                counts[Self::slot_index(kind)] += 1;
+                activated.push(id);
+            }
+        }
+        activated
+    }
+
+    /// 顺序下载变体：`sequential` 写入任务（HTTP=在飞窗口；BT=sequential
+    /// flag；其余引擎忽略）。引擎 add 后对 BT 任务立即下发（handle 级 flag，
+    /// metadata 未就绪也可设）。
+    /// 任务级代理（E5）：仅 HTTP 任务生效；magnet/ed2k 等任务忽略该字段。
+    /// 链接任务创建（E6 opts 收口）：HTTP 分支整体透传 `AddHttpOpts`；
+    /// magnet 分支仅取 `sequential`（其余字段对 BT 无语义，静默忽略）；
+    /// ed2k/ftp/xunlei 分支不受影响。
+    /// 文件冲突改名候选（E21）：`a.bin` → `a(1).bin`（无扩展名 → `a(1)`）；
+    /// 首个磁盘不存在的候选。上限 1000（防极端目录全占满时死循环）。
+    pub(super) fn bump_conflict_name(dir: &Path, name: &str) -> Option<String> {
+        let (stem, ext) = match name.rsplit_once('.') {
+            // 无扩展名或纯点：整体当 stem（对齐常见下载器行为）
+            Some((st, e)) if !st.is_empty() && !e.is_empty() => (st, Some(e)),
+            _ => (name, None),
+        };
+        for k in 1..1000 {
+            let cand = match ext {
+                Some(e) => format!("{stem}({k}).{e}"),
+                None => format!("{stem}({k})"),
+            };
+            if !dir.join(&cand).exists() {
+                return Some(cand);
+            }
+        }
+        None
+    }
+
+    /// 完成文件移动（E27）：目标目录自动创建；同名冲突自动改名
+    /// （`bump_conflict_name`）；同盘 rename 直达，跨盘（EXDEV 等错误）
+    /// copy+remove 回退。返回最终落位路径。
+    pub(super) fn move_completed_file(
+        src: &Path,
+        dst_dir: &Path,
+        name: &str,
+    ) -> Result<PathBuf, String> {
+        fs::create_dir_all(dst_dir).map_err(|e| format!("目标目录创建失败 {dst_dir:?}: {e}"))?;
+        let target_name = if dst_dir.join(name).exists() {
+            DaemonState::bump_conflict_name(dst_dir, name)
+                .ok_or_else(|| format!("目标目录同名冲突且改名候选耗尽: {dst_dir:?}/{name}"))?
+        } else {
+            name.to_string()
+        };
+        let target = dst_dir.join(target_name);
+        if let Err(e) = fs::rename(src, &target) {
+            // 跨设备 rename 失败（EXDEV）→ copy + remove 回退
+            fs::copy(src, &target).map_err(|e2| {
+                let _ = fs::remove_file(&target); // 半份拷贝不留垃圾
+                format!("rename 失败（{e}）且 copy 回退也失败: {e2}")
+            })?;
+            fs::remove_file(src)
+                .map_err(|e| format!("copy 成功但源文件删除失败（存在重复副本）: {e}"))?;
+        }
+        Ok(target)
+    }
+
+    /// 完成后目录整体移动（batch5，BT 多文件任务；与 move_completed_file
+    /// 同语义）：同盘 rename；跨盘 copy_dir_all + remove_dir_all 回退
+    ///（目录无原子跨盘移动；回退中途失败会留部分副本，错误信息如实报告）。
+    /// 同名冲突自动改名 `name(1)`（复用 bump_conflict_name）。
+    pub(super) fn move_completed_dir(
+        src: &Path,
+        dst_dir: &Path,
+        name: &str,
+    ) -> Result<PathBuf, String> {
+        fs::create_dir_all(dst_dir).map_err(|e| format!("目标目录创建失败 {dst_dir:?}: {e}"))?;
+        let target_name = if dst_dir.join(name).exists() {
+            DaemonState::bump_conflict_name(dst_dir, name)
+                .ok_or_else(|| format!("目标目录同名冲突且改名候选耗尽: {dst_dir:?}/{name}"))?
+        } else {
+            name.to_string()
+        };
+        let target = dst_dir.join(target_name);
+        if let Err(e) = fs::rename(src, &target) {
+            // 跨设备 rename 失败（EXDEV）→ 递归 copy + remove 回退
+            copy_dir_recursive(src, &target).map_err(|e2| {
+                let _ = fs::remove_dir_all(&target); // 半份拷贝不留垃圾
+                format!("rename 失败（{e}）且递归 copy 回退也失败: {e2}")
+            })?;
+            fs::remove_dir_all(src)
+                .map_err(|e| format!("copy 成功但源目录删除失败（存在重复副本）: {e}"))?;
+        }
+        Ok(target)
+    }
+
+    pub async fn add_link_task_opts(
+        &self,
+        link: String,
+        dest_root: Option<String>,
+        opts: AddHttpOpts,
+    ) -> Result<TaskId, DaemonError> {
+        match normalize_user_link(&link) {
+            NormalizedSource::Http(real) => self.add_http_task_opts(real, dest_root, opts).await,
+            NormalizedSource::Magnet(m) => {
+                #[cfg(feature = "bt")]
+                {
+                    // batch5（E30 贯通 BT）：magnet 入口同 consuming opts.auto_retry
+                    return self
+                        .add_bt_task_opts(
+                            m,
+                            dest_root,
+                            opts.sequential,
+                            opts.start_at_unix,
+                            opts.auto_retry,
+                        )
+                        .await;
+                }
+                #[cfg(not(feature = "bt"))]
+                {
+                    let _ = opts.sequential;
+                    let _ = opts.start_at_unix;
+                    let _ = opts.auto_retry;
+                    Err(DaemonError::InvalidSource(format!(
+                        "magnet 需 BT 引擎（编译时启用 --features daemon/bt）: {m}"
+                    )))
+                }
+            }
+            NormalizedSource::Ed2k(e) => {
+                Err(DaemonError::InvalidSource(format!("ed2k 不支持: {e}")))
+            }
+            NormalizedSource::Ftp(u) => {
+                #[cfg(feature = "ftp")]
+                {
+                    return self
+                        .add_ftp_task_opts(u, dest_root, opts.start_at_unix, opts.auto_retry)
+                        .await;
+                }
+                #[cfg(not(feature = "ftp"))]
+                {
+                    let _ = opts.start_at_unix;
+                    let _ = opts.auto_retry;
+                    Err(DaemonError::InvalidSource(format!(
+                        "ftp 需 FTP 引擎（编译时启用 --features ftp）: {u}"
+                    )))
+                }
+            }
+            NormalizedSource::Sftp(u) => {
+                #[cfg(feature = "sftp")]
+                {
+                    return self
+                        .add_sftp_task_opts(u, dest_root, opts.start_at_unix)
+                        .await;
+                }
+                #[cfg(not(feature = "sftp"))]
+                {
+                    let _ = opts.start_at_unix;
+                    Err(DaemonError::InvalidSource(format!(
+                        "sftp 需 SFTP 引擎（编译时启用 --features sftp）: {u}"
+                    )))
+                }
+            }
+            NormalizedSource::XunleiShare(u) => Err(DaemonError::InvalidSource(format!(
+                "迅雷网盘分享暂不支持直接导入: {u}"
+            ))),
+            NormalizedSource::Unsupported(orig) => Err(DaemonError::InvalidSource(format!(
+                "无法识别的链接: {orig}"
+            ))),
+        }
+    }
+
+    /// 添加 BT 任务（feature `bt`，顺序下载 opts 直通入口）：btih canonical 查重 → 引擎 add → TaskCreated 事件。
+    /// `start_at_unix`（E23）：Some(未来) = 延迟入引擎（不调 engine.add），
+    /// 到点由调度循环激活。`auto_retry`（batch5，E30 贯通 BT）：失败自动
+    /// 重试次数上限（拦截器 bt_alerts 已接线，指数退避；0 = 不重试）。
+    #[cfg(feature = "bt")]
+    pub(super) async fn add_bt_task_opts(
+        &self,
+        magnet: String,
+        dest_root: Option<String>,
+        sequential: bool,
+        start_at_unix: Option<u64>,
+        auto_retry: u32,
+    ) -> Result<TaskId, DaemonError> {
+        // B10：目标目录预检（创建/可写）；magnet 总大小元数据前未知 → 空间预检跳过
+        // dest 未指定 → 默认落盘目录（与 HTTP 一致：default_dest_root 配置）
+        let def = self.default_dest_root.lock().to_string_lossy().into_owned();
+        let dest_root =
+            ensure_dest_root(non_empty_dest(dest_root).or(Some(def)), &self.dest_roots())?;
+        let canonical = CanonicalId {
+            kind: CanonicalKind::Bt,
+            identity: btih_of(&magnet).unwrap_or_else(|| magnet.clone()),
+            validator: None,
+            token_sensitive: false,
+        };
+        let task_id = format!("t{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+
+        // 查重（canonical 一致 → DuplicateRejected）
+        {
+            let tasks = self.tasks.lock();
+            for (existing, rec) in tasks.iter() {
+                if rec.task.canonical_id == canonical {
+                    self.hub.publish(SchedulerEvent::DuplicateRejected {
+                        task_id: task_id.clone(),
+                        existing: existing.clone(),
+                    });
+                    return Err(DaemonError::Duplicate(existing.clone()));
+                }
+            }
+        }
+
+        let task = DownloadTask {
+            id: task_id.clone(),
+            canonical_id: canonical,
+            source: DownloadSource::Magnet(magnet.clone()),
+            identity: ContentIdentity::SingleFile {
+                size: 0,
+                etag: None,
+                sha256: None,
+                sha1: None,
+                md5: None,
+                backup_md5: None,
+            },
+            dest_root: dest_root.clone(),
+            files: vec![],
+            acquisitions: vec![],
+            aggregate: Default::default(),
+            state: TaskState::Queued,
+            retry: RetryState {
+                retries: 0,
+                max_retries: auto_retry,
+            },
+            created_at: std::time::Instant::now(),
+            file_priorities: None,
+            sequential,
+            metadata: TaskMetadata {
+                name: None,
+                added_at_unix: 0,
+                tags: Vec::new(),
+                finished_at_unix: 0,
+                start_at_unix: self.resolve_start_at(start_at_unix),
+                next_retry_at_unix: 0,
+            },
+            limits: None,
+            max_connections: None,
+            queue_priority: 0,
+        };
+
+        // E23 定时启动：start_at 未来 → 延迟入引擎（记录 Queued + 无句柄），
+        // 到点由调度循环接入（engine.add 与查重/预检后置同链路）。
+        if task.metadata.start_at_unix > now_unix() {
+            return Ok(self.insert_scheduled_task(task, EngineKind::Bt));
+        }
+        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
+        if !self.gate_or_enqueue(task.clone(), EngineKind::Bt) {
+            return Ok(task_id);
+        }
+
+        let engine_tid = self
+            .engine_for(EngineKind::Bt)?
+            .add(&task)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        // 顺序下载立即下发（handle 级 flag，metadata 未就绪也可设；
+        // 失败不回滚任务，恢复重放 + set_sequential 端点可补）。
+        if sequential {
+            let engine = self.engine_for(EngineKind::Bt)?;
+            if let Err(e) = engine.set_sequential(&engine_tid, true).await {
+                tracing::warn!("BT 任务 {task_id} 顺序下载 flag 下发失败: {e}");
+            }
+        }
+        let mut rec = TaskRecord {
+            seeding_since: None,
+            task,
+            engine_tid: Some(engine_tid),
+            engine_kind: EngineKind::Bt,
+            engine_status: None,
+            events: vec![],
+        };
+        rec.push_event("add", None);
+        // batch3-P1：记录态同步 Downloading——BT 无 HTTP 式 2s 轮询纠偏
+        //（轮询候选过滤只认 Downloading/Seeding），旧实现记录恒 Queued：
+        // GET /tasks 全程显示排队、/stats 聚合速率漏 BT、名称回填被推迟。
+        rec.task.state = TaskState::Downloading(EngineKind::Bt);
+        self.tasks.lock().insert(task_id.clone(), rec);
+        self.autosave();
+        self.hub.publish(SchedulerEvent::TaskCreated {
+            task_id: task_id.clone(),
+        });
+        self.hub.publish(SchedulerEvent::StateChanged {
+            task_id: task_id.clone(),
+            from: TaskState::Queued,
+            to: TaskState::Downloading(EngineKind::Bt),
+        });
+        Ok(task_id)
+    }
+
+    /// 添加 .torrent 文件任务（feature `bt`）：infohash canonical 查重 → 引擎
+    /// add_torrent_file → TaskCreated 事件。torrent 字节来自 API base64 解码。
+    #[cfg(feature = "bt")]
+    pub async fn add_torrent_task(
+        &self,
+        torrent_bytes: Vec<u8>,
+        dest_root: Option<String>,
+    ) -> Result<TaskId, DaemonError> {
+        self.add_torrent_task_opts(torrent_bytes, dest_root, false, None, 0)
+            .await
+    }
+
+    /// 顺序下载变体：`sequential` 写入任务 + 引擎 add 后立即下发 flag。
+    /// `start_at_unix`（E23）：Some(未来) = 延迟入引擎，到点由调度循环激活。
+    /// `auto_retry`（batch5，E30 贯通 BT）：同 magnet 入口。
+    #[cfg(feature = "bt")]
+    pub async fn add_torrent_task_opts(
+        &self,
+        torrent_bytes: Vec<u8>,
+        dest_root: Option<String>,
+        sequential: bool,
+        start_at_unix: Option<u64>,
+        auto_retry: u32,
+    ) -> Result<TaskId, DaemonError> {
+        // B10：目标目录预检（创建/可写）；dest 未指定 → 默认落盘目录（与 HTTP/BT-magnet 一致）
+        let def = self.default_dest_root.lock().to_string_lossy().into_owned();
+        let dest_root =
+            ensure_dest_root(non_empty_dest(dest_root).or(Some(def)), &self.dest_roots())?;
+        let Some(ih) = torrent_infohash(&torrent_bytes) else {
+            return Err(DaemonError::InvalidSource(
+                ".torrent 解析失败：无法定位 info dict".into(),
+            ));
+        };
+        // B10：torrent 总大小已知 → 空间预检（多文件按 files 各项求和；解析失败
+        // 回退单文件最小解析；均拿不到才跳过）
+        if let Some(total) = torrent_precheck_total(&torrent_bytes) {
+            precheck_space(&dest_root, total, self.disk_precheck_strict)?;
+        }
+        let canonical = CanonicalId {
+            kind: CanonicalKind::Bt,
+            identity: ih.clone(),
+            validator: None,
+            token_sensitive: false,
+        };
+        let task_id = format!("t{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+
+        // 查重（canonical 一致 → DuplicateRejected）
+        {
+            let tasks = self.tasks.lock();
+            for (existing, rec) in tasks.iter() {
+                if rec.task.canonical_id == canonical {
+                    self.hub.publish(SchedulerEvent::DuplicateRejected {
+                        task_id: task_id.clone(),
+                        existing: existing.clone(),
+                    });
+                    return Err(DaemonError::Duplicate(existing.clone()));
+                }
+            }
+        }
+
+        let task = DownloadTask {
+            id: task_id.clone(),
+            canonical_id: canonical,
+            source: DownloadSource::TorrentFile(torrent_bytes),
+            identity: ContentIdentity::SingleFile {
+                size: 0,
+                etag: None,
+                sha256: None,
+                sha1: None,
+                md5: None,
+                backup_md5: None,
+            },
+            dest_root: dest_root.clone(),
+            files: vec![],
+            acquisitions: vec![],
+            aggregate: Default::default(),
+            state: TaskState::Queued,
+            retry: RetryState {
+                retries: 0,
+                max_retries: auto_retry,
+            },
+            created_at: std::time::Instant::now(),
+            file_priorities: None,
+            sequential,
+            metadata: TaskMetadata {
+                name: None,
+                added_at_unix: 0,
+                tags: Vec::new(),
+                finished_at_unix: 0,
+                start_at_unix: self.resolve_start_at(start_at_unix),
+                next_retry_at_unix: 0,
+            },
+            limits: None,
+            max_connections: None,
+            queue_priority: 0,
+        };
+
+        // E23 定时启动：start_at 未来 → 延迟入引擎，到点由调度循环接入。
+        if task.metadata.start_at_unix > now_unix() {
+            return Ok(self.insert_scheduled_task(task, EngineKind::Bt));
+        }
+        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
+        if !self.gate_or_enqueue(task.clone(), EngineKind::Bt) {
+            return Ok(task_id);
+        }
+
+        let engine_tid = self
+            .engine_for(EngineKind::Bt)?
+            .add(&task)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        // 顺序下载立即下发（同 magnet 路径：handle 级 flag，失败不回滚）。
+        if sequential {
+            let engine = self.engine_for(EngineKind::Bt)?;
+            if let Err(e) = engine.set_sequential(&engine_tid, true).await {
+                tracing::warn!("BT 任务 {task_id} 顺序下载 flag 下发失败: {e}");
+            }
+        }
+        let mut rec = TaskRecord {
+            seeding_since: None,
+            task,
+            engine_tid: Some(engine_tid),
+            engine_kind: EngineKind::Bt,
+            engine_status: None,
+            events: vec![],
+        };
+        rec.push_event("add", None);
+        // batch3-P1：记录态同步 Downloading——BT 无 HTTP 式 2s 轮询纠偏
+        //（轮询候选过滤只认 Downloading/Seeding），旧实现记录恒 Queued：
+        // GET /tasks 全程显示排队、/stats 聚合速率漏 BT、名称回填被推迟。
+        rec.task.state = TaskState::Downloading(EngineKind::Bt);
+        self.tasks.lock().insert(task_id.clone(), rec);
+        self.autosave();
+        self.hub.publish(SchedulerEvent::TaskCreated {
+            task_id: task_id.clone(),
+        });
+        self.hub.publish(SchedulerEvent::StateChanged {
+            task_id: task_id.clone(),
+            from: TaskState::Queued,
+            to: TaskState::Downloading(EngineKind::Bt),
+        });
+        Ok(task_id)
+    }
+
+    /// 迅雷任务导入（M9）：xlbt.cfg + 一组 .bt.xltd + .torrent → xunlei-convert fastresume
+    /// → btcore.add_xunlei_resume → TaskCreated 事件。
+    ///
+    /// 单文件 torrent：`xltds` 应包含恰好 1 个 `.bt.xltd`（对应唯一文件）。
+    /// 多文件 torrent：`xltds` 按 `meta.files` 顺序，每个文件对应一个 `.bt.xltd`。
+    #[cfg(feature = "xunlei-import")]
+    pub async fn add_xunlei_import_task(
+        &self,
+        torrent: Vec<u8>,
+        cfg: Vec<u8>,
+        xltds: Vec<Vec<u8>>,
+        dest_root: Option<String>,
+    ) -> Result<TaskId, DaemonError> {
+        use xunlei_convert::{build_bitfield_from_indices, FastresumeConverter, XlbtCfg};
+
+        // 1. 解析 torrent
+        let meta = TorrentMeta::parse(&torrent)?;
+
+        // 单文件/多文件统一归一化为文件列表
+        let files: Vec<FileMeta> = if meta.files.is_empty() {
+            vec![FileMeta {
+                path: meta.name.clone(),
+                size: meta.file_size,
+                piece_offset: 0,
+                piece_count: meta.pieces_hash.len(),
+            }]
+        } else {
+            meta.files.clone()
+        };
+        let total_size: u64 = files.iter().map(|f| f.size).sum();
+
+        // xltd 数量须与文件数一致
+        if xltds.len() != files.len() {
+            return Err(DaemonError::InvalidSource(format!(
+                "xltd 数量 {} 与 torrent 文件数 {} 不匹配",
+                xltds.len(),
+                files.len()
+            )));
+        }
+
+        // 2. 确保目标目录存在
+        let def = self.default_dest_root.lock().to_string_lossy().into_owned();
+        let dest_root =
+            ensure_dest_root(non_empty_dest(dest_root).or(Some(def)), &self.dest_roots())?;
+
+        // 3. 空间预检（总大小已知）
+        precheck_space(&dest_root, total_size, self.disk_precheck_strict)?;
+
+        // 4. 查重
+        let canonical = CanonicalId {
+            kind: CanonicalKind::Bt,
+            identity: meta.info_hash.clone(),
+            validator: None,
+            token_sensitive: false,
+        };
+        let task_id = format!("t{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+        {
+            let tasks = self.tasks.lock();
+            for (existing, rec) in tasks.iter() {
+                if rec.task.canonical_id == canonical {
+                    self.hub.publish(SchedulerEvent::DuplicateRejected {
+                        task_id: task_id.clone(),
+                        existing: existing.clone(),
+                    });
+                    return Err(DaemonError::Duplicate(existing.clone()));
+                }
+            }
+        }
+
+        // 5. 转换：逐文件分析 xltd，合并全局 bitfield
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp_dir = std::env::temp_dir().join(format!("xunlei-import-{}-{}", task_id, unique));
+        std::fs::create_dir_all(&tmp_dir)
+            .map_err(|e| DaemonError::Engine(format!("创建临时目录失败: {e}")))?;
+        let torrent_path = tmp_dir.join("source.torrent");
+        let cfg_path = tmp_dir.join("source.xlbt.cfg");
+        std::fs::write(&torrent_path, &torrent)
+            .map_err(|e| DaemonError::Engine(format!("写临时 torrent 失败: {e}")))?;
+        std::fs::write(&cfg_path, &cfg)
+            .map_err(|e| DaemonError::Engine(format!("写临时 cfg 失败: {e}")))?;
+
+        // 全局完成位图（初始全 0）
+        let mut bitfield = vec![0u8; (meta.pieces_hash.len() + 7) / 8];
+        // 审计修复（P0-2）：按真实索引合并全局完成集。原实现把各文件完成数
+        // 累加后当全局前缀长度置位 0..N——多文件种子跨文件进度不均衡（迅雷
+        // 子文件选择下载）或非顺序完成时，前置未下载 piece 被误标完成 →
+        // libtorrent 信任 fastresume → 落盘文件混入全零块（静默损坏）。
+        let mut completed_global: std::collections::BTreeSet<usize> =
+            std::collections::BTreeSet::new();
+        let mut partial_infos: Vec<xunlei_convert::PartialPieceInfo> = Vec::new();
+
+        let mut converter = FastresumeConverter::new();
+        for (file_idx, file) in files.iter().enumerate() {
+            let xltd_path = tmp_dir.join(format!("source.{}.bt.xltd", file_idx));
+            std::fs::write(&xltd_path, &xltds[file_idx])
+                .map_err(|e| DaemonError::Engine(format!("写临时 xltd[{}] 失败: {e}", file_idx)))?;
+
+            // 该文件对应的 pieces 子集（局部索引从 0 起，xltd 是文件镜像）
+            let file_pieces =
+                &meta.pieces_hash[file.piece_offset..file.piece_offset + file.piece_count];
+
+            let report = converter.analyze(
+                &torrent_path,
+                &cfg_path,
+                &xltd_path,
+                meta.piece_length,
+                file_pieces,
+                0, // file_offset：xltd 是文件镜像，局部偏移固定 0
+                file.size,
+            )?;
+
+            // 把局部 partial piece 索引映射回全局索引
+            for &(local_idx, nonzero, total) in &report.xltd.partial_details {
+                let global_idx = file.piece_offset + local_idx;
+                partial_infos.push(xunlei_convert::PartialPieceInfo {
+                    index: global_idx,
+                    nonzero_bytes: nonzero,
+                    total_bytes: total,
+                });
+            }
+            // 局部完成索引映射回全局索引（file.piece_offset 为该文件首 piece）
+            for &local_idx in &report.completed_piece_indices {
+                completed_global.insert(file.piece_offset + local_idx);
+            }
+        }
+
+        // 用 lenient 策略构建全局 bitfield（按真实索引 + partial 阈值合并）
+        let completed_vec: Vec<usize> = completed_global.into_iter().collect();
+        bitfield = build_bitfield_from_indices(
+            meta.pieces_hash.len(),
+            &completed_vec,
+            &partial_infos,
+            0.5,
+        );
+
+        // fastresume file_sizes：[[size, pad], ...]，pad = piece 边界填充
+        let file_sizes: Vec<[u64; 2]> = files
+            .iter()
+            .map(|f| {
+                let plen = meta.piece_length as u64;
+                let pad = (plen - (f.size % plen)) % plen;
+                [f.size, pad]
+            })
+            .collect();
+
+        let fr = converter.build_fastresume(
+            &meta.info_hash,
+            &bitfield,
+            &meta.name,
+            dest_root.to_str().unwrap_or("./"),
+            &file_sizes,
+        )?;
+        let fastresume_bytes = xunlei_convert::fastresume::bencode_fastresume(&fr)
+            .map_err(|e| DaemonError::Engine(format!("fastresume bencode 失败: {e}")))?;
+
+        // 清理临时文件（best-effort）
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+
+        // 6. 通过 btcore 导入
+        let engine_tid = self
+            .engine_for(EngineKind::Bt)?
+            .add_xunlei_resume(fastresume_bytes)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+
+        // 7. 创建任务记录
+        let task = DownloadTask {
+            id: task_id.clone(),
+            canonical_id: canonical,
+            source: DownloadSource::TorrentFile(torrent),
+            identity: ContentIdentity::SingleFile {
+                size: total_size,
+                etag: None,
+                sha256: None,
+                backup_md5: None,
+            },
+            dest_root: dest_root.clone(),
+            files: files
+                .iter()
+                .map(|f| TaskFile {
+                    rel_path: f.path.clone(),
+                    size: f.size,
+                    done: 0,
+                    state: FileState::Pending,
+                    source_urls: vec![],
+                    identity: None,
+                    etag: None,
+                    engine: EngineKind::Bt,
+                })
+                .collect(),
+            acquisitions: vec![],
+            aggregate: Default::default(),
+            state: TaskState::Queued,
+            retry: Default::default(),
+            created_at: std::time::Instant::now(),
+            file_priorities: None,
+            sequential: false,
+            metadata: TaskMetadata {
+                name: Some(meta.name.clone()),
+                added_at_unix: 0,
+                tags: Vec::new(),
+                finished_at_unix: 0,
+                start_at_unix: 0,
+                next_retry_at_unix: 0,
+            },
+            limits: None,
+            max_connections: None,
+            queue_priority: 0,
+        };
+        let mut rec = TaskRecord {
+            seeding_since: None,
+            task,
+            engine_tid: Some(engine_tid.clone()),
+            engine_kind: EngineKind::Bt,
+            engine_status: None,
+            events: vec![],
+        };
+        rec.push_event("xunlei-import", None);
+        // batch3-P1：记录态同步 Downloading（与前两处 BT add 同口径）
+        rec.task.state = TaskState::Downloading(EngineKind::Bt);
+
+        // 8. peer 注入（best-effort）：把 cfg 里的 bt:// 地址注入引擎
+        if let Ok(cfg_obj) = XlbtCfg::parse(&cfg) {
+            let engine = self.engine_for(EngineKind::Bt)?;
+            for peer_str in cfg_obj.peers {
+                if let Some((ip, port)) = parse_bt_peer(&peer_str) {
+                    let addr = format!("{}:{}", ip, port);
+                    if let Ok(addr) = addr.parse::<std::net::SocketAddr>() {
+                        let _ = engine.add_peer(&engine_tid, addr).await;
+                    }
+                }
+            }
+        }
+
+        self.tasks.lock().insert(task_id.clone(), rec);
+        self.autosave();
+        self.hub.publish(SchedulerEvent::TaskCreated {
+            task_id: task_id.clone(),
+        });
+        self.hub.publish(SchedulerEvent::StateChanged {
+            task_id: task_id.clone(),
+            from: TaskState::Queued,
+            to: TaskState::Downloading(EngineKind::Bt),
+        });
+        Ok(task_id)
+    }
+
+    /// 添加 HTTP 任务：canonical 查重 → HttpEngine.add → TaskCreated 事件。
+    pub async fn add_http_task(
+        &self,
+        url: String,
+        dest_root: Option<String>,
+    ) -> Result<TaskId, DaemonError> {
+        self.add_http_task_opts(url, dest_root, AddHttpOpts::default())
+            .await
+    }
+
+    /// 创建 HTTP 任务（E6 opts 收口）：sequential/proxy（E5）+ headers/auth/
+    /// sha256/backup_url+backup_md5/name（E6 新暴露）。入参校验（E6 validate +
+    /// E5 代理构建试水）在探测/建任务之前——远端不可达 ≠ 入参非法，分开定性。
+    pub async fn add_http_task_opts(
+        &self,
+        url: String,
+        dest_root: Option<String>,
+        opts: AddHttpOpts,
+    ) -> Result<TaskId, DaemonError> {
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Err(DaemonError::InvalidSource(url));
+        }
+        opts.validate().map_err(DaemonError::InvalidSource)?;
+        let AddHttpOpts {
+            sequential,
+            proxy,
+            headers,
+            basic_auth,
+            sha256,
+            sha1,
+            md5,
+            backup_url,
+            backup_md5,
+            name,
+            conflict,
+            start_at_unix,
+            auto_retry,
+        } = opts;
+        // E5：任务级代理 URL 校验（构建一次 client 试水，成功即合法）。
+        if let Some(p) = &proxy {
+            if p.is_empty() {
+                return Err(DaemonError::InvalidSource("proxy 不能为空字符串".into()));
+            }
+            smart_dl_httpdl::build_proxied_client(p)
+                .map_err(|e| DaemonError::InvalidSource(format!("proxy 非法 {p:?}: {e}")))?;
+        }
+        // 校验和归一（引擎端摘要为小写 hex；trim 防复制粘贴带空白）
+        let sha256 = sha256.map(|s| normalize_digest(&s));
+        let sha1 = sha1.map(|s| normalize_digest(&s));
+        let md5 = md5.map(|s| normalize_digest(&s));
+        let backup_md5 = backup_md5.map(|s| normalize_digest(&s));
+        // B10：目标目录预检（创建/可写）；HTTP 大小在响应头才知 → 空间预检跳过
+        // dest 未指定 → 默认落盘目录（serve 配置 dest_root；未注入时为 daemon cwd）
+        // batch5-P2：与其余 5 处调用点同构——non_empty_dest 包 dest_root 本身，
+        // Some("") 时回落默认根（原包在 or 之后，默认根本身为空串时会落 cwd）
+        let def = self.default_dest_root.lock().to_string_lossy().into_owned();
+        let dest_root =
+            ensure_dest_root(non_empty_dest(dest_root).or(Some(def)), &self.dest_roots())?;
+        let canonical = CanonicalId {
+            kind: CanonicalKind::Http,
+            identity: canonical_http_url(&url), // D34：剥 token 参数后的 canonical 身份
+            validator: None,
+            token_sensitive: false,
+        };
+        let task_id = format!("t{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+
+        // 查重（canonical 一致 → DuplicateRejected）
+        {
+            let tasks = self.tasks.lock();
+            for (existing, rec) in tasks.iter() {
+                if rec.task.canonical_id == canonical {
+                    self.hub.publish(SchedulerEvent::DuplicateRejected {
+                        task_id: task_id.clone(),
+                        existing: existing.clone(),
+                    });
+                    return Err(DaemonError::Duplicate(existing.clone()));
+                }
+            }
+        }
+
+        // E21 文件冲突策略：仅显式名任务可预判目标路径（派生名任务最终名在
+        // 引擎侧 CD 才确定，v1 保持引擎默认覆盖）。`.part` 存在不属冲突
+        //（那是续传现场），只看最终落盘名。
+        let mut skip_download = false;
+        let name = match (name, conflict) {
+            (Some(n), Some(ConflictPolicy::Rename)) => {
+                if dest_root.join(&n).exists() {
+                    let bumped = Self::bump_conflict_name(&dest_root, &n).ok_or_else(|| {
+                        DaemonError::InvalidSource("改名冲突：连续 1000 个候选名均被占用".into())
+                    })?;
+                    tracing::info!("冲突策略 rename: {n:?} → {bumped:?}");
+                    Some(bumped)
+                } else {
+                    Some(n)
+                }
+            }
+            (Some(n), Some(ConflictPolicy::Skip)) if dest_root.join(&n).exists() => {
+                skip_download = true;
+                Some(n)
+            }
+            (n, _) => n, // overwrite（默认）或目标不存在：原样
+        };
+
+        let task = DownloadTask {
+            id: task_id.clone(),
+            canonical_id: canonical,
+            source: DownloadSource::Http {
+                url: url.clone(),
+                headers,
+                auth: basic_auth.map(|(u, p)| Auth::Basic(u, p)),
+                backup_url,
+                proxy: proxy.clone(),
+            },
+            identity: ContentIdentity::SingleFile {
+                size: 0,
+                etag: None,
+                sha256,
+                sha1,
+                md5,
+                backup_md5,
+            },
+            dest_root: dest_root.clone(),
+            files: vec![],
+            acquisitions: vec![],
+            aggregate: Default::default(),
+            state: TaskState::Queued,
+            retry: RetryState {
+                retries: 0,
+                max_retries: auto_retry,
+            },
+            created_at: std::time::Instant::now(),
+            file_priorities: None,
+            sequential,
+            metadata: TaskMetadata {
+                name,
+                added_at_unix: 0,
+                tags: Vec::new(),
+                finished_at_unix: 0,
+                start_at_unix: self.resolve_start_at(start_at_unix),
+                next_retry_at_unix: 0,
+            },
+            limits: None,
+            max_connections: None,
+            queue_priority: 0,
+        };
+
+        // E21 skip：目标文件已在 → 不入引擎，任务直接落 Completed
+        //（既有文件保持原样；完成事件/Webhook 照常——publish_task_completed
+        // 一并写 finished_at）
+        if skip_download {
+            let mut rec = TaskRecord {
+                seeding_since: None,
+                task,
+                engine_tid: None,
+                engine_kind: EngineKind::Http,
+                engine_status: None,
+                events: vec![],
+            };
+            rec.push_event("add", Some("conflict_skip".into()));
+            rec.task.state = TaskState::Completed;
+            rec.task.identity = ContentIdentity::SingleFile {
+                size: rec
+                    .task
+                    .metadata
+                    .name
+                    .as_deref()
+                    .and_then(|n| dest_root.join(n).metadata().ok())
+                    .map(|m| m.len())
+                    .unwrap_or(0),
+                etag: None,
+                sha256: None,
+                sha1: None,
+                md5: None,
+                backup_md5: None,
+            };
+            rec.task.metadata.finished_at_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            self.tasks.lock().insert(task_id.clone(), rec);
+            self.autosave();
+            self.hub.publish(SchedulerEvent::TaskCreated {
+                task_id: task_id.clone(),
+            });
+            self.publish_task_completed(&task_id);
+            return Ok(task_id);
+        }
+        // E23 定时启动：start_at 未来 → 延迟入引擎（记录 Queued + 无句柄），
+        // 到点由调度循环接入。置于 conflict_skip 之后：文件已在即完成，
+        // 调度无意义（两开关同时给出时 skip 优先）。
+        if task.metadata.start_at_unix > now_unix() {
+            return Ok(self.insert_scheduled_task(task, EngineKind::Http));
+        }
+        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
+        if !self.gate_or_enqueue(task.clone(), EngineKind::Http) {
+            return Ok(task_id);
+        }
+        let engine_tid = self
+            .engine_for(EngineKind::Http)?
+            .add(&task)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        let mut rec = TaskRecord {
+            seeding_since: None,
+            task,
+            engine_tid: Some(engine_tid),
+            engine_kind: EngineKind::Http,
+            engine_status: None,
+            events: vec![],
+        };
+        rec.push_event("add", None);
+        self.tasks.lock().insert(task_id.clone(), rec);
+        self.autosave();
+        self.hub.publish(SchedulerEvent::TaskCreated {
+            task_id: task_id.clone(),
+        });
+        self.hub.publish(SchedulerEvent::StateChanged {
+            task_id: task_id.clone(),
+            from: TaskState::Queued,
+            to: TaskState::Downloading(EngineKind::Http),
+        });
+        Ok(task_id)
+    }
+
+    /// 添加 FTP 任务（feature `ftp`）：校验 `ftp://` 前缀 → ensure_dest_root →
+    /// `parse_ftp_auth` 提取 user/pass → 归一化 URL 作 canonical 查重 → 路由 `EngineKind::Ftp`
+    /// 引擎 → add → TaskCreated/StateChanged 事件与持久化（完全仿照 add_http_task）。
+    ///
+    /// 目录任务（url 以 `/` 结尾）：引擎 `add` 时已同步 LIST 出文件清单，此处做【有限次数的
+    /// files 同步】——轮询 `engine.status(tid)` 数次直到 `files` 非空，按 TaskFile 结构映射写入
+    /// `task.files`；始终为空（目录瞬时无文件/解析延迟）则静默跳过，文件级进度后续经既有轮询
+    /// 链路从 EngineStatus 透出，不做强制阻塞。
+    #[cfg(feature = "ftp")]
+    pub async fn add_ftp_task(
+        &self,
+        url: String,
+        dest_root: Option<String>,
+    ) -> Result<TaskId, DaemonError> {
+        self.add_ftp_task_opts(url, dest_root, None, 0).await
+    }
+
+    /// 定时变体（E23）：`start_at_unix` Some(未来) = 延迟入引擎，到点由
+    /// 调度循环激活。
+    #[cfg(feature = "ftp")]
+    pub async fn add_ftp_task_opts(
+        &self,
+        url: String,
+        dest_root: Option<String>,
+        start_at_unix: Option<u64>,
+        auto_retry: u32,
+    ) -> Result<TaskId, DaemonError> {
+        if !url.starts_with("ftp://") && !url.starts_with("ftps://") {
+            return Err(DaemonError::InvalidSource(url));
+        }
+        // B10：目标目录预检；目录总大小需 LIST 才可知 → 空间预检跳过（同 HTTP 逻辑）
+        let def = self.default_dest_root.lock().to_string_lossy().into_owned();
+        let dest_root =
+            ensure_dest_root(non_empty_dest(dest_root).or(Some(def)), &self.dest_roots())?;
+        let (user, pass) = smart_dl_core::source_parse::ftp::parse_ftp_auth(&url);
+        // D34 复用 canonical 归一化（url 无 query 时基本原样）：FTP 身份键 = 归一化 URL
+        let canonical = CanonicalId {
+            kind: CanonicalKind::Ftp,
+            identity: canonical_http_url(&url),
+            validator: None,
+            token_sensitive: false,
+        };
+        let task_id = format!("t{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+
+        // 查重（canonical 一致 → DuplicateRejected）
+        {
+            let tasks = self.tasks.lock();
+            for (existing, rec) in tasks.iter() {
+                if rec.task.canonical_id == canonical {
+                    self.hub.publish(SchedulerEvent::DuplicateRejected {
+                        task_id: task_id.clone(),
+                        existing: existing.clone(),
+                    });
+                    return Err(DaemonError::Duplicate(existing.clone()));
+                }
+            }
+        }
+
+        let is_dir = url.ends_with('/');
+        // 单文件任务：落盘名取 URL 最后一段（引擎 `add` 用作 dest 相对文件名）；目录任务由引擎自理
+        let name = url
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let task = DownloadTask {
+            id: task_id.clone(),
+            canonical_id: canonical,
+            source: DownloadSource::Ftp {
+                url: url.clone(),
+                user,
+                pass,
+            },
+            identity: ContentIdentity::SingleFile {
+                size: 0,
+                etag: None,
+                sha256: None,
+                sha1: None,
+                md5: None,
+                backup_md5: None,
+            },
+            dest_root: dest_root.clone(),
+            files: vec![],
+            acquisitions: vec![],
+            aggregate: Default::default(),
+            state: TaskState::Queued,
+            retry: RetryState {
+                retries: 0,
+                max_retries: auto_retry,
+            },
+            created_at: std::time::Instant::now(),
+            file_priorities: None,
+            sequential: false,
+            metadata: TaskMetadata {
+                name: if is_dir { None } else { name },
+                added_at_unix: 0,
+                tags: Vec::new(),
+                finished_at_unix: 0,
+                start_at_unix: self.resolve_start_at(start_at_unix),
+                next_retry_at_unix: 0,
+            },
+            limits: None,
+            max_connections: None,
+            queue_priority: 0,
+        };
+
+        // E23 定时启动：start_at 未来 → 延迟入引擎，到点由调度循环接入。
+        if task.metadata.start_at_unix > now_unix() {
+            return Ok(self.insert_scheduled_task(task, EngineKind::Ftp));
+        }
+        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
+        if !self.gate_or_enqueue(task.clone(), EngineKind::Ftp) {
+            return Ok(task_id);
+        }
+
+        let engine = self.engine_for(EngineKind::Ftp)?;
+        let engine_tid = engine
+            .add(&task)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        let mut rec = TaskRecord {
+            seeding_since: None,
+            task,
+            engine_tid: Some(engine_tid.clone()),
+            engine_kind: EngineKind::Ftp,
+            engine_status: None,
+            events: vec![],
+        };
+        rec.push_event("add", None);
+
+        // 目录任务：有限次 files 同步（FtpEngine::add 已同步 LIST，首轮通常即可命中）
+        if is_dir {
+            for _ in 0..8 {
+                if let Ok(st) = engine.status(&engine_tid).await {
+                    if !st.files.is_empty() {
+                        rec.task.files = st
+                            .files
+                            .into_iter()
+                            .map(|f| TaskFile {
+                                rel_path: f.rel_path,
+                                size: f.size,
+                                done: f.done,
+                                state: FileState::Active,
+                                source_urls: vec![url.clone()],
+                                identity: None,
+                                etag: None,
+                                engine: EngineKind::Ftp,
+                            })
+                            .collect();
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+        }
+
+        self.tasks.lock().insert(task_id.clone(), rec);
+        self.autosave();
+        self.hub.publish(SchedulerEvent::TaskCreated {
+            task_id: task_id.clone(),
+        });
+        self.hub.publish(SchedulerEvent::StateChanged {
+            task_id: task_id.clone(),
+            from: TaskState::Queued,
+            to: TaskState::Downloading(EngineKind::Ftp),
+        });
+        Ok(task_id)
+    }
+
+    /// 添加 SFTP 任务（feature `sftp`，C-S1）：校验 `sftp://` 前缀 + user 必填
+    /// （SSH 无匿名惯例）→ ensure_dest_root → `parse_sftp_auth` 提取 user/pass →
+    /// 归一化 URL 作 canonical 查重（CanonicalKind::Sftp，与 ftp:// 键不相撞）→
+    /// 路由 `EngineKind::Sftp` 引擎 → add → TaskCreated/StateChanged 事件与
+    /// 持久化（完全仿照 add_ftp_task；v1 仅单文件——目录任务路由层报错）。
+    #[cfg(feature = "sftp")]
+    pub async fn add_sftp_task(
+        &self,
+        url: String,
+        dest_root: Option<String>,
+    ) -> Result<TaskId, DaemonError> {
+        self.add_sftp_task_opts(url, dest_root, None).await
+    }
+
+    /// 定时变体（E23）：`start_at_unix` Some(未来) = 延迟入引擎，到点由
+    /// 调度循环激活。
+    #[cfg(feature = "sftp")]
+    pub async fn add_sftp_task_opts(
+        &self,
+        url: String,
+        dest_root: Option<String>,
+        start_at_unix: Option<u64>,
+    ) -> Result<TaskId, DaemonError> {
+        if !url.starts_with("sftp://") {
+            return Err(DaemonError::InvalidSource(url));
+        }
+        let (user, _pass) = smart_dl_core::source_parse::sftp::parse_sftp_auth(&url);
+        if user.is_empty() {
+            return Err(DaemonError::InvalidSource(format!(
+                "sftp 需显式 user（SSH 无匿名惯例）: {url}"
+            )));
+        }
+        // B10：目标目录预检（单文件 size 由引擎 add 时 stat，预检略过同 FTP 单文件）
+        let def = self.default_dest_root.lock().to_string_lossy().into_owned();
+        let dest_root =
+            ensure_dest_root(non_empty_dest(dest_root).or(Some(def)), &self.dest_roots())?;
+        // canonical 归一化同 FTP 键构方式；CanonicalKind::Sftp 与 ftp:// 键不相撞
+        let canonical = CanonicalId {
+            kind: CanonicalKind::Sftp,
+            identity: canonical_http_url(&url),
+            validator: None,
+            token_sensitive: false,
+        };
+        let task_id = format!("t{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+
+        // 查重（canonical 一致 → DuplicateRejected）
+        {
+            let tasks = self.tasks.lock();
+            for (existing, rec) in tasks.iter() {
+                if rec.task.canonical_id == canonical {
+                    self.hub.publish(SchedulerEvent::DuplicateRejected {
+                        task_id: task_id.clone(),
+                        existing: existing.clone(),
+                    });
+                    return Err(DaemonError::Duplicate(existing.clone()));
+                }
+            }
+        }
+
+        // 单文件：落盘名取 URL 最后一段（引擎 `add` 用作 dest 相对文件名）
+        let name = url
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let task = DownloadTask {
+            id: task_id.clone(),
+            canonical_id: canonical,
+            source: DownloadSource::Sftp {
+                url: url.clone(),
+                user,
+                pass: _pass,
+            },
+            identity: ContentIdentity::SingleFile {
+                size: 0,
+                etag: None,
+                sha256: None,
+                sha1: None,
+                md5: None,
+                backup_md5: None,
+            },
+            dest_root: dest_root.clone(),
+            files: vec![],
+            acquisitions: vec![],
+            aggregate: Default::default(),
+            state: TaskState::Queued,
+            retry: Default::default(),
+            created_at: std::time::Instant::now(),
+            file_priorities: None,
+            sequential: false,
+            metadata: TaskMetadata {
+                name,
+                added_at_unix: 0,
+                tags: Vec::new(),
+                finished_at_unix: 0,
+                start_at_unix: self.resolve_start_at(start_at_unix),
+                next_retry_at_unix: 0,
+            },
+            limits: None,
+            max_connections: None,
+            queue_priority: 0,
+        };
+
+        // E23 定时启动：start_at 未来 → 延迟入引擎，到点由调度循环接入。
+        if task.metadata.start_at_unix > now_unix() {
+            return Ok(self.insert_scheduled_task(task, EngineKind::Sftp));
+        }
+        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
+        //（Sftp 与 Ftp 共用 ftp 桶配额，见 slot_index 注释）
+        if !self.gate_or_enqueue(task.clone(), EngineKind::Sftp) {
+            return Ok(task_id);
+        }
+
+        let engine = self.engine_for(EngineKind::Sftp)?;
+        let engine_tid = engine
+            .add(&task)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        let mut rec = TaskRecord {
+            seeding_since: None,
+            task,
+            engine_tid: Some(engine_tid.clone()),
+            engine_kind: EngineKind::Sftp,
+            engine_status: None,
+            events: vec![],
+        };
+        rec.push_event("add", None);
+
+        self.tasks.lock().insert(task_id.clone(), rec);
+        self.autosave();
+        self.hub.publish(SchedulerEvent::TaskCreated {
+            task_id: task_id.clone(),
+        });
+        self.hub.publish(SchedulerEvent::StateChanged {
+            task_id: task_id.clone(),
+            from: TaskState::Queued,
+            to: TaskState::Downloading(EngineKind::Sftp),
+        });
+        Ok(task_id)
+    }
+
+    /// Metalink 引导 XML 拉取（B1，`.meta4`/`.metalink` URL 入口）：bootstrap
+    /// client（serve 注入 = 引擎全局 client 克隆，代理/cookie/超时同源）；
+    /// 未注入时按需新建裸 client 兜底（部分测试/嵌入式调用）。2xx 外状态
+    /// → InvalidSource；响应体不裁剪（大小护栏交给后续 parse 的 XML 错误
+    /// 上限——quick-xml 流式解析，超大输入天然可处理）。
+    pub(crate) async fn fetch_metalink_xml(&self, url: &str) -> Result<String, DaemonError> {
+        let client = match &self.bootstrap_client {
+            Some(c) => c.clone(),
+            None => reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .read_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|e| {
+                    DaemonError::InvalidSource(format!("bootstrap client 构建失败: {e}"))
+                })?,
+        };
+        let resp = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| DaemonError::InvalidSource(format!("metalink 引导拉取失败: {e}")))?;
+        let resp = resp
+            .error_for_status()
+            .map_err(|e| DaemonError::InvalidSource(format!("metalink 引导拉取失败: {e}")))?;
+        // batch3-P2：限长读取（16MB 封顶）——旧 resp.text() 不限量，已认证
+        // 客户端指向高带宽/无限流响应可在 read_timeout 窗口内注入数 GB 字符串
+        // 打爆 daemon 内存（OOM）。
+        const METALINK_MAX: u64 = 16 * 1024 * 1024;
+        if let Some(len) = resp.content_length() {
+            if len > METALINK_MAX {
+                return Err(DaemonError::InvalidSource(format!(
+                    "metalink 引导响应过大: {len} 字节（上限 {METALINK_MAX}）"
+                )));
+            }
+        }
+        let mut xml: Vec<u8> = Vec::new();
+        let mut resp = resp;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| DaemonError::InvalidSource(format!("metalink 读取失败: {e}")))?
+        {
+            if xml.len() as u64 + chunk.len() as u64 > METALINK_MAX {
+                return Err(DaemonError::InvalidSource(
+                    "metalink 引导响应超过 16MB 上限".into(),
+                ));
+            }
+            xml.extend_from_slice(&chunk);
+        }
+        String::from_utf8(xml)
+            .map_err(|e| DaemonError::InvalidSource(format!("metalink 编码非法: {e}")))
+    }
+
+    /// 创建 Metalink4 任务集（B1）：解析 RFC 5854 XML → 逐 `<file>` 展开为
+    /// HTTP 任务，全链复用既有能力——主 URL = priority 最高（数值最小）者，
+    /// 次高者作 backup_url（E2/E3 mirror failover 直通）；内建哈希择强
+    /// （sha256 > sha1 > md5）直通 E3 校验链；文件名取 name 属性末段
+    /// （`MetalinkFile::display_name`，V3 终审）。
+    ///
+    /// 语义边界：
+    /// - 任务级字段（sequential/proxy/headers/basic_auth/conflict/start_at/
+    ///   auto_retry）逐文件继承 opts；哈希/名字/URL 每文件各异由 XML 覆写。
+    /// - 仅展开 http(s) URL（`http_sorted_urls`）；ftp:// 等混合协议 URL
+    ///   过滤不参与。文件无可用 URL → InvalidSource（含文件名定位）。
+    /// - 展开失败即中止（已创建任务保留，不回滚——引擎句柄回收代价大，
+    ///   错误信息带已创建计数）；metalink 来自同一发布者，部分失败通常
+    ///   意味着整份描述文件不可用。
+    /// - `<size>` 空间预检：add_http_task_opts 的 HTTP 大小在响应头才知
+    ///   （B10 同口径），XML size 未直接参与预检，仅随探测链由引擎校验。
+    pub(crate) async fn add_metalink_tasks(
+        &self,
+        xml: &str,
+        dest_root: Option<String>,
+        opts: AddHttpOpts,
+    ) -> Result<Vec<TaskId>, DaemonError> {
+        let files = crate::metalink::parse_metalink4(xml).map_err(DaemonError::InvalidSource)?;
+        let mut ids: Vec<TaskId> = Vec::with_capacity(files.len());
+        for f in &files {
+            let name = f.display_name().map_err(DaemonError::InvalidSource)?;
+            let urls = f.http_sorted_urls();
+            let primary = urls.first().map(|u| u.url.clone()).ok_or_else(|| {
+                DaemonError::InvalidSource(format!(
+                    "metalink <file name={:?}> 无可用 http(s) <url>",
+                    f.name
+                ))
+            })?;
+            let backup_url = urls.get(1).map(|u| u.url.clone());
+            // 哈希择强填单槽位（AddHttpOpts 主源互斥）；backup_md5 恒不设
+            // ——metalink 哈希是内容级（主备同内容），备用源校验由引擎既有
+            // 身份切换逻辑接管。
+            let (sha256, sha1, md5) = match f.best_hash() {
+                Some(("sha256", h)) => (Some(h.to_string()), None, None),
+                Some(("sha1", h)) => (None, Some(h.to_string()), None),
+                Some(("md5", h)) => (None, None, Some(h.to_string())),
+                // best_hash 契约仅返回以上三档；wildcard 为类型完备性兜底
+                _ => (None, None, None),
+            };
+            let id = self
+                .add_http_task_opts(
+                    primary,
+                    dest_root.clone(),
+                    AddHttpOpts {
+                        backup_url,
+                        sha256,
+                        sha1,
+                        md5,
+                        name: Some(name),
+                        backup_md5: None,
+                        ..opts.clone()
+                    },
+                )
+                .await
+                .map_err(|e| match e {
+                    DaemonError::Duplicate(existing) => DaemonError::InvalidSource(format!(
+                        "metalink 展开中断：<file name={:?}> 与已有任务 {existing} 重复",
+                        f.name
+                    )),
+                    other => DaemonError::InvalidSource(format!(
+                        "metalink 展开中断（已创建 {} 个任务，不回滚）: {other}",
+                        ids.len()
+                    )),
+                })?;
+            ids.push(id);
+        }
+        Ok(ids)
+    }
+
+    /// 任务快照（实时读引擎状态；未完成时引擎可能已移动）。
+    pub async fn task_snapshot(&self, id: &str) -> Option<TaskSnapshot> {
+        let rec = self.tasks.lock().get(id).cloned()?;
+        let engine = self.engine_for(rec.engine_kind).ok();
+        let (engine_name, status) = match (&rec.engine_tid, &engine) {
+            (Some(tid), Some(eng)) => {
+                let st = eng.status(tid).await.ok();
+                (Some(eng.id().to_string()), st)
+            }
+            _ => (None, None),
+        };
+        // 显示层权威（qB 式）：用户暂停是记录级事实，不被引擎实时态覆盖
+        // （lt 暂停后 status 枚举仍报 downloading，ABI 未透出 paused 位）。
+        let effective_state = match &rec.task.state {
+            TaskState::Paused => rec.task.state.clone(),
+            other => match &status {
+                Some(s) => engine_state_to_task(&s.state, rec.engine_kind),
+                None => other.clone(),
+            },
+        };
+        let state = state_label(&effective_state);
+        // E13：速率与 done/total 同源同新鲜度；Paused 记录态是显示层权威
+        // （qB 式），速率同样以记录为准清零——引擎侧 <200ms 窗口会沿用
+        // 平滑值（陈旧非零），不锁则暂停后最长 200ms 内快照仍报旧速率。
+        let rates = status.as_ref().map(|s| {
+            if matches!(effective_state, TaskState::Paused) {
+                TaskRates {
+                    down_bytes_s: 0,
+                    up_bytes_s: 0,
+                }
+            } else {
+                TaskRates {
+                    down_bytes_s: s.down_rate,
+                    up_bytes_s: s.up_rate,
+                }
+            }
+        });
+        Some(TaskSnapshot {
+            task_id: id.to_string(),
+            state,
+            // 安全修复（V6）：source 可能含凭据（headers/auth/userinfo），不得 {:?} 直通
+            source: rec.task.source.redacted_debug(),
+            dest_root: rec.task.dest_root.clone(),
+            engine: engine_name,
+            done: status.as_ref().map(|s| s.total_done).unwrap_or(0),
+            total: status.as_ref().map(|s| s.total).unwrap_or(0),
+            error: status.as_ref().and_then(|s| s.error.clone()),
+            files: status.as_ref().map(|s| s.files.clone()).unwrap_or_default(),
+            rates,
+            // E33：累计统计与分享率（同一次引擎快照取样，非 2s 轮询缓存）
+            total_downloaded: status.as_ref().map(|s| s.total_downloaded).unwrap_or(0),
+            total_uploaded: status.as_ref().map(|s| s.total_uploaded).unwrap_or(0),
+            share_ratio: status
+                .as_ref()
+                .and_then(|s| share_ratio(s.total_uploaded, s.total_downloaded)),
+            limits: rec.task.limits.clone(),
+            file_priorities: rec.task.file_priorities.clone(),
+            sequential: rec.task.sequential,
+            max_connections: rec.task.max_connections,
+            name: rec.task.metadata.name.clone(),
+            tags: rec.task.metadata.tags.clone(),
+            start_at_unix: rec.task.metadata.start_at_unix,
+            retries: rec.task.retry.retries as u64,
+            max_retries: rec.task.retry.max_retries as u64,
+            next_retry_at_unix: rec.task.metadata.next_retry_at_unix,
+        })
+    }
+
+    /// 全量列表（兼容入口：无过滤无分页，形状与 E7 之前一致）。
+    pub fn list(&self) -> Vec<TaskSummary> {
+        self.list_filtered(&ListQuery::default()).0
+    }
+
+    /// 过滤 + 排序 + 分页列表（E7）：
+    /// - 排序：task_id 数值后缀升序（创建序；HashMap 迭代序不稳定，分页必须
+    ///   确定性排序。task_id = `t{u64}` 自增序号，parse 失败兜底排序键 u64::MAX）。
+    /// - 过滤：states/engines 任一命中即保留（OR 语义）；空集合 = 该维度跳过；
+    ///   两维度间 AND；匹配大小写不敏感（查询方可写小写）。
+    /// - 返回 `(当前页, 过滤后总数)`——总数供 `X-Total-Count`，客户端算页数。
+    pub fn list_filtered(&self, q: &ListQuery) -> (Vec<TaskSummary>, usize) {
+        let tasks = self.tasks.lock();
+        let mut rows: Vec<(&String, &TaskRecord)> = tasks.iter().collect();
+        rows.sort_by_cached_key(|(id, _)| {
+            id.strip_prefix('t')
+                .and_then(|n| n.parse::<u64>().ok())
+                .unwrap_or(u64::MAX)
+        });
+        let filtered: Vec<&TaskRecord> = rows
+            .into_iter()
+            .filter(|(_, rec)| {
+                let st = state_label(&rec.task.state);
+                let en = kind_label(&rec.engine_kind);
+                (q.states.is_empty() || q.states.iter().any(|s| s.eq_ignore_ascii_case(&st)))
+                    && (q.engines.is_empty()
+                        || q.engines.iter().any(|e| e.eq_ignore_ascii_case(en)))
+                    // E14：名字或脱敏 URL 子串命中即保留（大小写不敏感；
+                    // 空针 contains 恒真 → 自然退化为不过滤）
+                    && match &q.search {
+                        None => true,
+                        Some(needle) => {
+                            let n = needle.trim().to_lowercase();
+                            let name_hit = rec
+                                .task
+                                .metadata
+                                .name
+                                .as_deref()
+                                .is_some_and(|s| s.to_lowercase().contains(&n));
+                            let url_hit = rec
+                                .task
+                                .source
+                                .search_urls()
+                                .iter()
+                                .any(|u| u.to_lowercase().contains(&n));
+                            // E18：标签入搜索语料（名字/URL 同款子串命中）
+                            let tag_hit = rec
+                                .task
+                                .metadata
+                                .tags
+                                .iter()
+                                .any(|t| t.to_lowercase().contains(&n));
+                            name_hit || url_hit || tag_hit
+                        }
+                    }
+                    // E18：标签 any-of 过滤（空集合跳过；大小写不敏感）
+                    && (q.tags.is_empty()
+                        || rec.task.metadata.tags.iter().any(|t| {
+                            q.tags
+                                .iter()
+                                .any(|want| want.eq_ignore_ascii_case(t))
+                        }))
+            })
+            .map(|(_, rec)| rec)
+            .collect();
+        let total = filtered.len();
+        let page = filtered
+            .into_iter()
+            .skip(q.offset)
+            .take(q.limit.unwrap_or(usize::MAX))
+            .map(|rec| TaskSummary {
+                task_id: rec.task.id.clone(),
+                state: state_label(&rec.task.state),
+                // 安全修复（V6）：同快照，source 脱敏
+                source: rec.task.source.redacted_debug(),
+                engine: kind_label(&rec.engine_kind),
+                name: rec.task.metadata.name.clone(),
+                tags: rec.task.metadata.tags.clone(),
+                start_at_unix: rec.task.metadata.start_at_unix,
+                retries: rec.task.retry.retries as u64,
+                max_retries: rec.task.retry.max_retries as u64,
+                next_retry_at_unix: rec.task.metadata.next_retry_at_unix,
+            })
+            .collect();
+        (page, total)
+    }
+
+    /// 批量操作（E7）：按入参顺序逐任务执行；重复 id 静默去重（保留首次出现序，
+    /// 避免同一任务被 pause 两次产生假失败）；单项失败（NotFound/引擎错误）
+    /// 记入该项结果后继续，绝不短路。永远返回 BatchOutcome（HTTP 层恒 200）。
+    pub async fn batch(&self, ids: &[String], action: BatchAction) -> BatchOutcome {
+        let mut seen = std::collections::HashSet::new();
+        let mut results = Vec::new();
+        let (mut ok, mut bad) = (0usize, 0usize);
+        for id in ids {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let r = match action {
+                BatchAction::Pause => self.pause(id).await,
+                BatchAction::Resume => self.resume(id).await,
+                BatchAction::Remove { delete_data } => self.remove_with(id, delete_data).await,
+            };
+            match r {
+                Ok(()) => {
+                    ok += 1;
+                    results.push(BatchItemResult {
+                        id: id.clone(),
+                        ok: true,
+                        error: None,
+                    });
+                }
+                Err(e) => {
+                    bad += 1;
+                    results.push(BatchItemResult {
+                        id: id.clone(),
+                        ok: false,
+                        error: Some(e.to_string()),
+                    });
+                }
+            }
+        }
+        BatchOutcome {
+            results,
+            succeeded: ok,
+            failed: bad,
+        }
+    }
+
+    /// 按条件批量操作（E19）：`ListQuery` 选择器（states/engines/tags/search
+    /// 复用列表过滤口径，无分页 → 全量命中集）解析命中任务后复用 `batch`。
+    ///
+    /// - **只开放非破坏性动作**（pause/resume）：按过滤条件选择后 remove 属
+    ///   危险操作（误配过滤 = 批量误删），批量删除仍走显式 id 路径（E7）
+    /// - 命中集上限 `batch_select` 内 1000（防御性；显式 id 批量另有 100 上限
+    ///   语义，选择器面向"一键重试全部失败"这类可能超 100 的运维场景）
+    /// - 命中集为空 → 空 BatchOutcome（幂等便利，不报错）
+    pub async fn batch_select(
+        &self,
+        q: &ListQuery,
+        action: BatchAction,
+    ) -> Result<BatchOutcome, DaemonError> {
+        if matches!(action, BatchAction::Remove { .. }) {
+            return Err(DaemonError::InvalidSource(
+                "按条件选择不支持 remove（批量删除请走显式 ids 路径）".into(),
+            ));
+        }
+        // 无分页取全量命中（limit=None offset=0），按创建序稳定执行
+        let (rows, _) = self.list_filtered(&ListQuery {
+            states: q.states.clone(),
+            engines: q.engines.clone(),
+            limit: None,
+            offset: 0,
+            search: q.search.clone(),
+            tags: q.tags.clone(),
+        });
+        const SELECT_CAP: usize = 1000;
+        if rows.len() > SELECT_CAP {
+            return Err(DaemonError::InvalidSource(format!(
+                "条件命中数量超上限（{} > {SELECT_CAP}），请收窄选择条件",
+                rows.len()
+            )));
+        }
+        let ids: Vec<String> = rows.into_iter().map(|r| r.task_id).collect();
+        Ok(self.batch(&ids, action).await)
+    }
+
+    /// 全局统计快照（`GET /stats`）：总数 + 按状态/引擎聚合 + 速率求和。
+    pub fn stats(&self) -> DaemonStats {
+        let mut st = DaemonStats::default();
+        let tasks = self.tasks.lock();
+        st.total = tasks.len();
+        for rec in tasks.values() {
+            *st.by_state.entry(state_label(&rec.task.state)).or_insert(0) += 1;
+            *st.by_engine
+                .entry(kind_label(&rec.engine_kind))
+                .or_insert(0) += 1;
+            if let Some(s) = &rec.engine_status {
+                st.down_bytes_s += s.down_rate;
+                st.up_bytes_s += s.up_rate;
+            }
+        }
+        let (sd, su) = *self.session_traffic.lock();
+        st.session_down_bytes = sd;
+        st.session_up_bytes = su;
+        st
+    }
+
+    /// 会话累计流量累加（batch5 对标 qB 会话统计）：按引擎缓存速率 × 轮询
+    /// 间隔估算（down/up 各自 saturating_add）。由状态轮询循环每轮调用——
+    /// 估算口径：速率快照为轮询期代表值，间隔恒定故累计曲线与真实流量
+    /// 同形状；重启清零（会话语义）。
+    pub(crate) fn accumulate_session_traffic(&self, interval: std::time::Duration) {
+        let tasks = self.tasks.lock();
+        let mut d = 0u64;
+        let mut u = 0u64;
+        for rec in tasks.values() {
+            if let Some(s) = &rec.engine_status {
+                d += s.down_rate;
+                u += s.up_rate;
+            }
+        }
+        drop(tasks);
+        let secs = interval.as_secs_f64();
+        let mut t = self.session_traffic.lock();
+        t.0 = t.0.saturating_add((d as f64 * secs) as u64);
+        t.1 = t.1.saturating_add((u as f64 * secs) as u64);
+    }
+
+    /// 任务级速率样本（A4 `/metrics` histogram 数据源）：`(engine 标签,
+    /// down, up)` 三元组。仅含引擎缓存中**任一方向速率 > 0** 的任务（活跃
+    /// 传输分布口径；全零任务不进样本——histogram count = 传输中任务数，
+    /// 空闲任务堆积不会灌爆低桶）。`/stats` JSON 面保持既有字段不变。
+    pub fn task_speed_samples(&self) -> Vec<(&'static str, u64, u64)> {
+        let tasks = self.tasks.lock();
+        tasks
+            .values()
+            .filter_map(|rec| {
+                let s = rec.engine_status.as_ref()?;
+                (s.down_rate > 0 || s.up_rate > 0)
+                    .then(|| (kind_label(&rec.engine_kind), s.down_rate, s.up_rate))
+            })
+            .collect()
+    }
+
+    pub async fn pause(&self, id: &str) -> Result<(), DaemonError> {
+        // E23：调度等待中任务（engine_tid 空 + Queued）无引擎句柄可暂停——
+        // 语义 = 取消自动启动（记录置 Paused；start_at 保留供展示，激活器
+        // 只认 Queued 不会误触发）。resume 回该任务 = 立即激活。
+        // 其余无句柄任务（E21 skip Completed / restore add 失败 Failed）→
+        // 落到引擎侧逻辑按 404 口径拒绝，与现行为一致。
+        // 结构约束：锁作用域内不得出现 await（guard 非 Send，会污染整个
+        // handler future 的 Send 判定）——锁内纯决策，await 全部在锁外。
+        let decision = {
+            let mut tasks = self.tasks.lock();
+            match tasks.get_mut(id) {
+                Some(rec) if rec.engine_tid.is_some() => Some(true), // 已被激活 → 引擎侧暂停
+                Some(rec) => {
+                    if rec.task.state != TaskState::Queued {
+                        return Err(DaemonError::NotFound(id.to_string()));
+                    }
+                    rec.push_event("pause", Some("scheduled".into()));
+                    rec.task.state = TaskState::Paused;
+                    if let Some(es) = rec.engine_status.as_mut() {
+                        es.down_rate = 0;
+                        es.up_rate = 0;
+                    }
+                    Some(false) // 调度中 → 记录级暂停已完成
+                }
+                None => return Err(DaemonError::NotFound(id.to_string())),
+            }
+        };
+        match decision {
+            Some(true) => self.pause_engine_task(id).await,
+            _ => {
+                self.autosave();
+                self.hub.publish(SchedulerEvent::StateChanged {
+                    task_id: id.to_string(),
+                    from: TaskState::Queued,
+                    to: TaskState::Paused,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// 引擎侧暂停（原 pause 主体，E23 拆出：调度中任务走记录级暂停分支）。
+    pub(super) async fn pause_engine_task(&self, id: &str) -> Result<(), DaemonError> {
+        let rec = self
+            .tasks
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        let tid = rec
+            .engine_tid
+            .clone()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        // batch6-P2：广播 from = 记录态实际值（旧实现硬编码 Downloading，
+        // 执法暂停发生在 Seeding 态时事件失真）
+        let from = rec.task.state.clone();
+        self.engine_for(rec.engine_kind)?
+            .pause(&tid)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        if let Some(rec) = self.tasks.lock().get_mut(id) {
+            rec.push_event("pause", None);
+            rec.task.state = TaskState::Paused; // 记录缓存同步（alert 流不迁移 pause）
+                                                // E11：暂停即清零缓存速率——轮询器不再光顾暂停任务，
+                                                // 不清则 /stats 恒把最后窗口速率计入聚合（恢复后下一轮刷新）。
+            if let Some(es) = rec.engine_status.as_mut() {
+                es.down_rate = 0;
+                es.up_rate = 0;
+            }
+            rec.seeding_since = None; // Task 39：离开做种态清计时
+        }
+        // 暂停意图必须立刻持久化（P4 G5）：否则重启后暂停任务被当作运行任务恢复
+        self.autosave();
+        self.hub.publish(SchedulerEvent::StateChanged {
+            task_id: id.to_string(),
+            from,
+            to: TaskState::Paused,
+        });
+        Ok(())
+    }
+
+    pub async fn resume(&self, id: &str) -> Result<(), DaemonError> {
+        // E23：未接入引擎的任务（调度等待 Queued / 调度等待期被暂停 Paused）
+        // → resume = 立即激活（消费定时，直接开始）。激活后记录态置
+        // Downloading（对齐引擎侧 resume 语义；HTTP add 自启下载循环，BT 内
+        // 核由 add 后正常下载链路接管）。
+        // E32：终态 Failed（无句柄——激活失败/E30 激活失败路径）→ resume =
+        // 手动重试：重新接入引擎。auto_retry 预算【不重置】——耗尽后手动
+        // 重试仅再给一次机会，任务再败时 fail_or_schedule_retry 依既有计数
+        // 直接终态（防预算白给循环）；有句柄 Failed 走下方引擎侧 resume
+        // （httpdl epoch 重入 + 段账本续传，BT handle 恢复）语义不变。
+        // 其余无句柄终态（E21 skip Completed / Stopped）→ 404 口径拒绝。
+        let pending = {
+            let tasks = self.tasks.lock();
+            match tasks.get(id) {
+                Some(rec) => {
+                    if rec.engine_tid.is_none() {
+                        Some((rec.task.clone(), rec.engine_kind))
+                    } else {
+                        None
+                    }
+                }
+                None => return Err(DaemonError::NotFound(id.to_string())),
+            }
+        };
+        if let Some((task, kind)) = pending {
+            if !matches!(
+                task.state,
+                TaskState::Queued | TaskState::Paused | TaskState::Failed
+            ) {
+                return Err(DaemonError::NotFound(id.to_string()));
+            }
+            let from = task.state.clone();
+            if !self.activate_one(id, task, kind).await {
+                return Err(DaemonError::Engine(format!(
+                    "任务 {id} 调度激活失败（任务已标 Failed，详情见任务事件）"
+                )));
+            }
+            {
+                let mut tasks = self.tasks.lock();
+                if let Some(rec) = tasks.get_mut(id) {
+                    if from == TaskState::Failed {
+                        rec.push_event("retry", Some("手动重试（resume）".into()));
+                    } else {
+                        rec.push_event("resume", None);
+                    }
+                    rec.task.state = TaskState::Downloading(kind);
+                }
+            }
+            self.autosave();
+            self.hub.publish(SchedulerEvent::StateChanged {
+                task_id: id.to_string(),
+                from,
+                to: TaskState::Downloading(kind),
+            });
+            return Ok(());
+        }
+        let rec = self
+            .tasks
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        let tid = rec
+            .engine_tid
+            .clone()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        self.engine_for(rec.engine_kind)?
+            .resume(&tid)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        // batch6-P1：做种态任务 resume 后记录态/计时收敛引擎实况——内核对
+        // 已完成种子 pause→resume 不再产生 finished alert，旧实现恒写
+        // Downloading → UI 恒显"下载中 100%"、seeding_since 永不重登记
+        // （max_seeding_time 对该任务从此失效，与执法注释承诺
+        // "resume 后再达标再次触发"相悖）。resume 后查询引擎实况：
+        // Seeding → 记录态 Seeding + 计时重起。
+        let engine = self.engine_for(rec.engine_kind)?;
+        let engine_seeding = if rec.engine_kind == EngineKind::Bt {
+            matches!(
+                engine.status(&tid).await.map(|s| s.state),
+                Ok(smart_dl_core::types::EngineState::Seeding)
+            )
+        } else {
+            false
+        };
+        if let Some(rec) = self.tasks.lock().get_mut(id) {
+            rec.push_event("resume", None);
+            if engine_seeding {
+                rec.task.state = TaskState::Seeding;
+                rec.seeding_since = Some(std::time::Instant::now());
+            } else {
+                rec.task.state = TaskState::Downloading(rec.engine_kind);
+            }
+        }
+        // 恢复态同步持久化（P4 G5：与 pause 对称）
+        self.autosave();
+        self.hub.publish(SchedulerEvent::StateChanged {
+            task_id: id.to_string(),
+            from: rec.task.state.clone(),
+            to: if engine_seeding {
+                TaskState::Seeding
+            } else {
+                TaskState::Downloading(rec.engine_kind)
+            },
+        });
+        Ok(())
+    }
+
+    /// 任务级限速（P1 能力增强）。合并口径：请求中 `None` 的方向沿用既有值
+    /// （首设即不限）；引擎调用总拿到全量两方向（BT 引擎 None 方向按不限下发，
+    /// 避免 lt_set_limits 全量语义把已设方向清零）。
+    ///
+    /// - `Some(0)` = 该方向不限速；`Some(n)` = 上限 n KiB/s
+    /// - HTTP/FTP：仅 down 方向有意义（up → 引擎报错，HTTP 层映射 409/422）
+    /// - 合并结果持久化（tasks.json）并在恢复时重放；内存中即时生效
+    ///   （HTTP 引擎热调速率；BT 引擎 libtorrent per-torrent limit）
+    pub async fn set_task_limits(
+        &self,
+        id: &str,
+        down_kb_s: Option<u32>,
+        up_kb_s: Option<u32>,
+    ) -> Result<smart_dl_core::task::TaskLimits, DaemonError> {
+        let (engine, tid, merged) = {
+            let mut tasks = self.tasks.lock();
+            let rec = tasks
+                .get_mut(id)
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            let tid = rec
+                .engine_tid
+                .clone()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            // up 方向仅 BT 引擎有意义；其余引擎在此预拒（HTTP 层映射 409，
+            // 避免引擎层 Engine 错误被当成服务端 500）
+            if up_kb_s.is_some() && rec.engine_kind != EngineKind::Bt {
+                return Err(DaemonError::UnsupportedOp(format!(
+                    "任务 {id}（{:?}）无上传方向，up_kb_s 仅对 BT 任务有意义",
+                    rec.engine_kind
+                )));
+            }
+            let old = rec.task.limits.take().unwrap_or_default();
+            let merged = smart_dl_core::task::TaskLimits {
+                down_kb_s: down_kb_s.or(old.down_kb_s),
+                up_kb_s: up_kb_s.or(old.up_kb_s),
+            };
+            // 两方向均为空（从未设置且请求未带）→ 维持 None（快照不出噪声字段）
+            rec.task.limits = if merged.is_empty() {
+                None
+            } else {
+                Some(merged.clone())
+            };
+            rec.push_event(
+                "limits_changed",
+                Some(format!(
+                    "down={:?} up={:?}",
+                    merged.down_kb_s, merged.up_kb_s
+                )),
+            );
+            let engine = self.engine_for(rec.engine_kind)?;
+            (engine, tid, merged)
+        };
+        engine
+            .set_limits(&tid, merged.down_kb_s, merged.up_kb_s)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        self.autosave();
+        Ok(merged)
+    }
+
+    /// 任务级子文件优先级（P1 能力增强，BT 多文件）。设置后返回当前各文件
+    /// 优先级快照（下标 = 文件序，与 TaskSnapshot.files 对齐）。
+    ///
+    /// - 仅 BT 任务（其余 → UnsupportedOp，HTTP 层映射 409）
+    /// - 文件数锚定与 metadata 就绪性探测合一：先 readback 当前优先级表
+    ///   （engine 侧真实文件数），metadata 未就绪/句柄缺失 → UnsupportedOp（409）
+    /// - 下标越界 / 优先级 >7 → InvalidSource（400）；内核侧两段式校验兜底
+    /// - 持久化 + 恢复重放：成功后把全量快照（readback None 视为默认 4）写入
+    ///   `task.file_priorities` 并落盘；恢复时原样重放（magnet 未就绪场景由
+    ///   重放循环延迟收敛，见 `replay_pending_file_priorities`）
+    pub async fn set_task_file_priorities(
+        &self,
+        id: &str,
+        priorities: &[(usize, u32)],
+    ) -> Result<Vec<Option<u32>>, DaemonError> {
+        let (engine, tid) = {
+            let rec = self
+                .tasks
+                .lock()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            if rec.engine_kind != EngineKind::Bt {
+                return Err(DaemonError::UnsupportedOp(format!(
+                    "仅 BT 任务支持子文件优先级（{id} 为 {:?}）",
+                    rec.engine_kind
+                )));
+            }
+            let tid = rec
+                .engine_tid
+                .clone()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            (self.engine_for(rec.engine_kind)?, tid)
+        };
+        // metadata 就绪探测 + 文件数锚定（当前优先级表长度 = 引擎侧文件数）。
+        // 引擎 NotFound（torrent/metadata 缺失）→ 409「metadata 未就绪」，
+        // 与任务记录级 404（tasks 表无此 id）语义分离。
+        let current = engine.file_priorities(&tid).await.map_err(|e| match e {
+            smart_dl_core::types::EngineError::NotFound => DaemonError::UnsupportedOp(
+                "BT 任务 metadata 未就绪（或引擎句柄不存在），无法设置子文件优先级".into(),
+            ),
+            other => DaemonError::Engine(other.to_string()),
+        })?;
+        let nf = current.len();
+        for (idx, prio) in priorities {
+            if *idx >= nf {
+                return Err(DaemonError::InvalidSource(format!(
+                    "文件下标 {idx} 越界（任务 {id} 引擎侧共 {nf} 个文件）"
+                )));
+            }
+            if *prio > 7 {
+                return Err(DaemonError::InvalidSource(format!(
+                    "优先级 {prio} 越界（0..=7：0=不下载 1=低 4=默认 7=最高）"
+                )));
+            }
+        }
+        engine
+            .set_file_priorities(&tid, priorities)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        let snapshot = engine
+            .file_priorities(&tid)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        // 持久化全量快照：readback 的 None（内核未定值）按 libtorrent 默认
+        // 优先级 4 归一，保证重放值与引擎语义一致。
+        let persisted: Vec<u32> = snapshot.iter().map(|p| p.unwrap_or(4)).collect();
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.task.file_priorities = Some(persisted);
+                rec.push_event(
+                    "file_priorities_changed",
+                    Some(
+                        priorities
+                            .iter()
+                            .map(|(i, p)| format!("{i}={p}"))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    ),
+                );
+            }
+        }
+        self.pending_file_prio.lock().remove(id);
+        self.autosave();
+        Ok(snapshot)
+    }
+
+    /// 任务级顺序下载开关（边下边播）：引擎即时生效（HTTP=字段改写下轮拾取；
+    /// BT=sequential flag 即时）+ 任务持久化 + TaskSequentialChanged 事件。
+    /// FTP 引擎不支持（Unsupported → 400）。
+    pub async fn set_task_sequential(&self, id: &str, on: bool) -> Result<(), DaemonError> {
+        let (engine, tid) = {
+            let rec = self
+                .tasks
+                .lock()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            let tid = rec
+                .engine_tid
+                .clone()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            (self.engine_for(rec.engine_kind)?, tid)
+        };
+        engine.set_sequential(&tid, on).await.map_err(|e| match e {
+            smart_dl_core::types::EngineError::Unsupported => {
+                DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持顺序下载"))
+            }
+            other => DaemonError::Engine(other.to_string()),
+        })?;
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.task.sequential = on;
+                rec.push_event("sequential_changed", Some(on.to_string()));
+            }
+        }
+        self.autosave();
+        Ok(())
+    }
+
+    /// 超级种子开关（qbit 任务右键同名能力）：仅 BT 任务（其余 kind →
+    /// `UnsupportedOp` 409，同 set_max_connections 预拒惯例）。仅下发引擎
+    /// flag（做种态生效、下载中无效果），不改记录状态、不落盘。
+    pub async fn set_task_super_seeding(&self, id: &str, on: bool) -> Result<(), DaemonError> {
+        let (engine, tid, kind) = {
+            let rec = self
+                .tasks
+                .lock()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            let tid = rec
+                .engine_tid
+                .clone()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            (self.engine_for(rec.engine_kind)?, tid, rec.engine_kind)
+        };
+        if kind != EngineKind::Bt {
+            return Err(DaemonError::UnsupportedOp(format!(
+                "任务 {id} 的引擎不支持超级种子（仅 BT 任务）"
+            )));
+        }
+        engine
+            .set_super_seeding(&tid, on)
+            .await
+            .map_err(|e| match e {
+                smart_dl_core::types::EngineError::Unsupported => {
+                    DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持超级种子"))
+                }
+                // batch6-P2：句柄已不存在 → NotFound 语义而非 500
+                smart_dl_core::types::EngineError::NotFound => {
+                    DaemonError::NotFound(id.to_string())
+                }
+                other => DaemonError::Engine(other.to_string()),
+            })?;
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.push_event("super_seeding_changed", Some(on.to_string()));
+            }
+        }
+        Ok(())
+    }
+
+    /// 强制宣告/重新校验/导出（Task 46）：公共前置——BT 任务预拒 + 引擎句柄
+    /// 解析（同 set_task_super_seeding 惯例）。
+    async fn bt_op_engine(
+        &self,
+        id: &str,
+        op_name: &str,
+    ) -> Result<
+        (
+            std::sync::Arc<dyn smart_dl_core::types::DownloadEngine>,
+            String,
+        ),
+        DaemonError,
+    > {
+        let rec = self
+            .tasks
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        let tid = rec
+            .engine_tid
+            .clone()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        if rec.engine_kind != EngineKind::Bt {
+            return Err(DaemonError::UnsupportedOp(format!(
+                "任务 {id} 的引擎不支持 {op_name}（仅 BT 任务）"
+            )));
+        }
+        Ok((self.engine_for(EngineKind::Bt)?, tid))
+    }
+
+    /// 强制宣告（Task 46，qbit/BitComet 任务右键对标）：tracker 宣告与
+    /// DHT 宣告可组合（`tracker`/`dht` 均真 = 两者都执行）。全部请求失败
+    /// 才返回 Err（单路失败聚合进错误文本）。
+    pub async fn announce_task(
+        &self,
+        id: &str,
+        tracker: bool,
+        dht: bool,
+    ) -> Result<(), DaemonError> {
+        if !tracker && !dht {
+            return Err(DaemonError::InvalidSource(
+                "announce 请求无效：tracker 与 dht 至少一项为 true".into(),
+            ));
+        }
+        let (engine, tid) = self.bt_op_engine(id, "强制宣告").await?;
+        let mut errs: Vec<String> = Vec::new();
+        if tracker {
+            if let Err(e) = engine.force_reannounce(&tid).await {
+                // batch6-P2：句柄已不存在（引擎侧被摘）→ NotFound 语义而非 500
+                if matches!(e, smart_dl_core::types::EngineError::NotFound) {
+                    return Err(DaemonError::NotFound(id.to_string()));
+                }
+                errs.push(format!("tracker 宣告失败: {e}"));
+            }
+        }
+        if dht {
+            if let Err(e) = engine.force_dht_announce(&tid).await {
+                if matches!(e, smart_dl_core::types::EngineError::NotFound) {
+                    return Err(DaemonError::NotFound(id.to_string()));
+                }
+                errs.push(format!("DHT 宣告失败: {e}"));
+            }
+        }
+        if errs.len() == usize::from(tracker) + usize::from(dht) {
+            return Err(DaemonError::Engine(errs.join("; ")));
+        }
+        // batch5-P2：部分失败不再静默吞——失败摘要入事件详情 + warn 日志
+        //（原仅全部失败才上抛，单路失败无日志无事件，用户无从知晓）。
+        if !errs.is_empty() {
+            tracing::warn!("任务 {id} 强制宣告部分失败: {}", errs.join("; "));
+        }
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.push_event(
+                    "force_announce",
+                    Some(if errs.is_empty() {
+                        format!("tracker={tracker} dht={dht}")
+                    } else {
+                        format!("tracker={tracker} dht={dht}; 部分失败: {}", errs.join("; "))
+                    }),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// 强制重新校验（Task 46，qbit「强制重新校验」对标）：任务转入 checking，
+    /// 校验期下载/做种挂起，完成后自动恢复。仅下发引擎，不改记录态（状态
+    /// 推进由 bt_events 轮询自然回流）。
+    pub async fn recheck_task(&self, id: &str) -> Result<(), DaemonError> {
+        let (engine, tid) = self.bt_op_engine(id, "强制重新校验").await?;
+        engine.force_recheck(&tid).await.map_err(|e| match e {
+            // batch6-P2：句柄已不存在 → NotFound 语义而非 500
+            smart_dl_core::types::EngineError::NotFound => DaemonError::NotFound(id.to_string()),
+            other => DaemonError::Engine(other.to_string()),
+        })?;
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.push_event("force_recheck", None);
+            }
+        }
+        Ok(())
+    }
+
+    /// 首尾块优先（batch5，qbit「首尾块优先」对标）：每文件首/末块优先级
+    /// 置为 prio（0..=7；0 = 恢复默认）。需要 metadata（未就绪 → 409 可重试）。
+    pub async fn set_task_piece_first_last(&self, id: &str, prio: i32) -> Result<(), DaemonError> {
+        if !(0..=7).contains(&prio) {
+            return Err(DaemonError::InvalidSource(format!(
+                "piece 优先级须在 0..=7（收到的 {prio}）"
+            )));
+        }
+        let (engine, tid) = self.bt_op_engine(id, "首尾块优先").await?;
+        engine
+            .set_piece_first_last(&tid, prio)
+            .await
+            .map_err(|e| match e {
+                smart_dl_core::types::EngineError::Unsupported => {
+                    DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持首尾块优先"))
+                }
+                smart_dl_core::types::EngineError::NotFound => {
+                    DaemonError::NotFound(id.to_string())
+                }
+                other => DaemonError::Engine(other.to_string()),
+            })?;
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.push_event("piece_first_last", Some(format!("priority={prio}")));
+            }
+        }
+        Ok(())
+    }
+
+    /// 导出 .torrent（Task 46，qbit「导出 .torrent」对标）：metainfo bencode
+    /// 字节。magnet 任务 metadata 未就绪 → 409（batch5：NotReady/Unsupported
+    /// 统一映射，原 Other → 500 与文档承诺 409 相悖）；任务不在引擎 → 404。
+    pub async fn export_task_torrent(&self, id: &str) -> Result<Vec<u8>, DaemonError> {
+        let (engine, tid) = self.bt_op_engine(id, "导出种子").await?;
+        engine.export_torrent(&tid).await.map_err(|e| match e {
+            smart_dl_core::types::EngineError::Unsupported => {
+                DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持导出种子"))
+            }
+            smart_dl_core::types::EngineError::NotReady(msg) => DaemonError::UnsupportedOp(msg),
+            smart_dl_core::types::EngineError::NotFound => DaemonError::NotFound(id.to_string()),
+            other => DaemonError::Engine(other.to_string()),
+        })
+    }
+
+    /// 生成 magnet URI（Task 46）：btih + dn + 全量 tracker。
+    pub async fn task_magnet_uri(&self, id: &str) -> Result<String, DaemonError> {
+        let (engine, tid) = self.bt_op_engine(id, "生成磁链").await?;
+        engine.magnet_uri(&tid).await.map_err(|e| match e {
+            smart_dl_core::types::EngineError::Unsupported => {
+                DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持生成磁链"))
+            }
+            smart_dl_core::types::EngineError::NotFound => DaemonError::NotFound(id.to_string()),
+            other => DaemonError::Engine(other.to_string()),
+        })
+    }
+
+    /// Session 级 IP 封禁（Task 46，qbit「永久封禁」对标）：逐条校验 IP →
+    /// 下发 BT 引擎 → 成功者入列表并落盘。返回逐条结果（部分成功语义）。
+    /// 锁纪律：短锁判存，await 在锁外（guard !Send 不跨 await）。
+    /// batch5-P2：全程持 `ban_ops` 串行锁（tokio Mutex，guard Send 可跨
+    /// await）——原 contains→await→push 三段非原子，并发 ban(A)/unban(A)
+    /// 交錯使列表与内核脱节；batch5 另支持 v4-mapped IPv6 归一与区间条目。
+    pub async fn ban_ips(&self, ips: Vec<String>) -> Vec<(String, Result<(), String>)> {
+        let _serial = self.ban_ops.lock().await; // 串行化：与 unban/import 互斥
+        let mut out = Vec::with_capacity(ips.len());
+        let engine = self.engine_for(EngineKind::Bt).ok();
+        let mut newly: Vec<String> = Vec::new();
+        for ip in ips {
+            let ip_trim = ip.trim().to_string();
+            let canon = normalize_ban_entry(&ip_trim);
+            let res = match canon {
+                Err(e) => Err(format!("非法 IP: {e}")),
+                Ok(c) => {
+                    // 锁纪律：短锁，不跨 await（guard !Send）
+                    // 审查修复（P2）：contains + push 合并为单次加锁，消除
+                    // 并发 ban 同一 IP 时两段短锁窗口产生的重复条目（重复项
+                    // 会持久化进 bans.json）。
+                    let already = self.bt_bans.lock().contains(&c);
+                    if already {
+                        Ok(()) // 幂等：已封禁直接成功
+                    } else if let Some(eng) = engine.as_ref() {
+                        match eng.ban_ip(&c).await {
+                            Ok(()) => {
+                                // 引擎成功后确认式入列（双重 contains 防御并发窗口）
+                                let mut bans = self.bt_bans.lock();
+                                if !bans.contains(&c) {
+                                    bans.push(c.clone());
+                                    newly.push(c);
+                                }
+                                Ok(())
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    } else {
+                        Err("BT 引擎不可用（feature 未启用）".into())
+                    }
+                }
+            };
+            out.push((ip_trim, res));
+        }
+        if !newly.is_empty() {
+            self.persist_bans();
+        }
+        out
+    }
+
+    /// 解除封禁（Task 46）：逐条下发 + 列表移除 + 落盘（幂等）。
+    /// 锁纪律：短锁判存/移除，await 一律在锁外（guard !Send 不跨 await）；
+    /// batch5-P2：全程持 `ban_ops` 串行锁（同 ban_ips）。
+    pub async fn unban_ips(&self, ips: Vec<String>) -> Vec<(String, Result<(), String>)> {
+        let _serial = self.ban_ops.lock().await; // 串行化：与 ban/import 互斥
+        let mut out = Vec::with_capacity(ips.len());
+        let engine = self.engine_for(EngineKind::Bt).ok();
+        let mut removed = false;
+        for ip in ips {
+            let ip_trim = ip.trim().to_string();
+            let canon = normalize_ban_entry(&ip_trim);
+            let res = match canon {
+                Err(e) => Err(format!("非法 IP: {e}")),
+                Ok(c) => {
+                    let present = self.bt_bans.lock().contains(&c);
+                    if !present {
+                        Ok(()) // 幂等：未封禁也算成功
+                    } else if let Some(eng) = engine.as_ref() {
+                        match eng.unban_ip(&c).await {
+                            Ok(()) => {
+                                self.bt_bans.lock().retain(|b| b != &c);
+                                removed = true;
+                                Ok(())
+                            }
+                            Err(e) => Err(e.to_string()),
+                        }
+                    } else {
+                        Err("BT 引擎不可用（feature 未启用）".into())
+                    }
+                }
+            };
+            out.push((ip_trim, res));
+        }
+        if removed {
+            self.persist_bans();
+        }
+        out
+    }
+
+    /// IP 段批量导入（batch5 对标：qB/BitComet IP filter 文件语义）：解析
+    /// DAT（"000.000.000.000 - 000.000.000.255 , 000 , name"）与 P2P
+    /// （"range:1.2.3.0-1.2.3.255,desc"）两格式文本，逐区间下发引擎
+    /// ban_ip_range，成功者以 "start-end" 复合串入列表并落盘。
+    /// 锁纪律：全程持 `ban_ops` 串行锁（同 ban/unban）。
+    /// 返回 (成功区间数, 逐行错误列表)。
+    pub async fn import_ban_ranges(&self, text: &str) -> (usize, Vec<String>) {
+        let _serial = self.ban_ops.lock().await; // 串行化
+        let engine = self.engine_for(EngineKind::Bt).ok();
+        let mut imported = 0usize;
+        let mut errors: Vec<String> = Vec::new();
+        let mut newly: Vec<String> = Vec::new();
+        for (lineno, raw) in text.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((a, b)) = parse_ban_range_line(line) else {
+                errors.push(format!(
+                    "L{}: 无法解析区间（{}）",
+                    lineno + 1,
+                    truncate_len(line, 48)
+                ));
+                continue;
+            };
+            if engine.is_none() {
+                errors.push("BT 引擎不可用（feature 未启用）".into());
+                break;
+            }
+            let eng = engine.as_ref().unwrap();
+            match eng.ban_ip_range(&a, &b).await {
+                Ok(()) => {
+                    let entry = format!("{a}-{b}");
+                    let mut bans = self.bt_bans.lock();
+                    if !bans.contains(&entry) {
+                        bans.push(entry.clone());
+                        newly.push(entry);
+                    }
+                    imported += 1;
+                }
+                Err(e) => errors.push(format!("L{}: 引擎拒绝 {a}-{b}: {}", lineno + 1, e)),
+            }
+        }
+        if !newly.is_empty() {
+            self.persist_bans();
+        }
+        (imported, errors)
+    }
+
+    /// 当前显式封禁列表快照（GET /security/bans）。
+    pub fn list_bans(&self) -> Vec<String> {
+        self.bt_bans.lock().clone()
+    }
+
+    /// 队列优先级设置（Task 46，qbit 队列位置对标）：仅对排队中任务（Queued
+    /// 且未接入引擎）有实际递补语义，但对任意任务均可设置（提前设定，等它
+    /// 未来落队时生效——qbit 同语义）。`action` 相对移动基于**当前排队集**
+    /// 的 (queue_priority, created_at) 排序：
+    /// - top/bottom：取队列极值 ∓1（队空 = 不变，返回原值）
+    /// - up/down：与相邻任务交换 priority；相邻并列时越级 ±1（保证严格移动）
+    ///
+    /// 返回设置后的 queue_priority（事件已记录）。
+    pub async fn set_task_priority(
+        &self,
+        id: &str,
+        value: Option<i32>,
+        action: Option<String>,
+    ) -> Result<i32, DaemonError> {
+        // 相对移动先在 tasks 快照外计算目标值（短锁读队列快照）。
+        // batch5-P2：语义对齐文档「同给以 value 优先」——原实现 action 一律
+        // 覆盖 value；现在 value 已给出时跳过 action 计算。
+        let mut new_val: Option<i32> = value;
+        if new_val.is_none() {
+            if let Some(act) = &action {
+                let cur = {
+                    let tasks = self.tasks.lock();
+                    let rec = tasks
+                        .get(id)
+                        .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+                    rec.task.queue_priority
+                };
+                // 排队集快照：Queued 无句柄任务，排序键 (priority, created_at)
+                let queue: Vec<(String, i32, std::time::Instant)> = {
+                    let tasks = self.tasks.lock();
+                    let mut v: Vec<(String, i32, std::time::Instant)> = tasks
+                        .iter()
+                        .filter(|(_, r)| {
+                            r.engine_tid.is_none() && r.task.state == TaskState::Queued
+                        })
+                        .map(|(tid, r)| (tid.clone(), r.task.queue_priority, r.task.created_at))
+                        .collect();
+                    v.sort_by_key(|(_, p, c)| (*p, *c));
+                    v
+                };
+                match act.as_str() {
+                    "top" => {
+                        // 审查修复（P2）：saturating——用户先设 i32::MIN/MAX 后
+                        // -1/+1 溢出（debug panic、release 回绕破坏 top/bottom 语义）
+                        new_val = Some(
+                            queue
+                                .iter()
+                                .map(|(_, p, _)| *p)
+                                .min()
+                                .unwrap_or(cur)
+                                .saturating_sub(1),
+                        );
+                    }
+                    "bottom" => {
+                        new_val = Some(
+                            queue
+                                .iter()
+                                .map(|(_, p, _)| *p)
+                                .max()
+                                .unwrap_or(cur)
+                                .saturating_add(1),
+                        );
+                    }
+                    "up" | "down" => {
+                        let pos = queue.iter().position(|(tid, _, _)| tid == id);
+                        match pos {
+                            None => {
+                                // 不在当前排队集（运行中/暂停等）：无相邻语义 → 按极值移动
+                                new_val = if act == "up" {
+                                    Some(
+                                        queue
+                                            .iter()
+                                            .map(|(_, p, _)| *p)
+                                            .min()
+                                            .unwrap_or(cur)
+                                            .saturating_sub(1),
+                                    )
+                                } else {
+                                    Some(
+                                        queue
+                                            .iter()
+                                            .map(|(_, p, _)| *p)
+                                            .max()
+                                            .unwrap_or(cur)
+                                            .saturating_add(1),
+                                    )
+                                };
+                            }
+                            Some(i) if act == "up" && i > 0 => {
+                                // 越过前一个：±1 而非取同值——并列时 (priority, created_at)
+                                // 排序仍按创建序，同值不保证上移（本任务创建晚则原地）
+                                // batch5-P2：saturating（同 top/bottom 分支）——邻值
+                                // 为 i32::MIN/MAX 时原裸 ±1 溢出（debug panic / release 回绕）
+                                new_val = Some(queue[i - 1].1.saturating_sub(1));
+                            }
+                            Some(i) if act == "down" && i + 1 < queue.len() => {
+                                new_val = Some(queue[i + 1].1.saturating_add(1));
+                            }
+                            _ => new_val = Some(cur), // 已在队首/队尾：不变
+                        }
+                    }
+                    other => {
+                        return Err(DaemonError::InvalidSource(format!(
+                            "未知 priority action {other:?}（支持 top/bottom/up/down）"
+                        )))
+                    }
+                }
+            }
+        }
+        let Some(v) = new_val else {
+            return Err(DaemonError::InvalidSource(
+                "priority 请求无效：value 与 action 至少一项".into(),
+            ));
+        };
+        {
+            let mut tasks = self.tasks.lock();
+            let rec = tasks
+                .get_mut(id)
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            rec.task.queue_priority = v;
+            rec.push_event(
+                "priority_changed",
+                Some(match &action {
+                    Some(a) => format!("{a} → {v}"),
+                    None => v.to_string(),
+                }),
+            );
+        }
+        self.autosave();
+        Ok(v)
+    }
+
+    /// 封禁列表落盘（best-effort：失败仅 warn，运行时列表为准）。
+    fn persist_bans(&self) {
+        let Some(path) = self.bans_persist_path.clone() else {
+            return;
+        };
+        let bans = self.bt_bans.lock().clone();
+        if let Err(e) = super::persistence::write_bans_atomic(&path, &bans) {
+            tracing::warn!("bans.json 落盘失败 {path:?}: {e}");
+        }
+    }
+
+    /// 手动添加 peer（qbit「添加 peer」对标）：addr 逐条注入 BT 任务；
+    /// 逐条返回结果（部分成功语义——单条失败不影响其余）。非 BT 引擎 /
+    /// 不支持注入 → 逐条 Err（HTTP 层 409）。事件一条汇总（成功率）。
+    pub async fn add_task_peers(
+        &self,
+        id: &str,
+        addrs: Vec<std::net::SocketAddr>,
+    ) -> Vec<(String, Result<(), String>)> {
+        let resolved: Result<
+            (
+                std::sync::Arc<dyn smart_dl_core::types::DownloadEngine>,
+                String,
+                EngineKind,
+            ),
+            DaemonError,
+        > = {
+            let rec = self.tasks.lock().get(id).cloned();
+            match rec {
+                None => Err(DaemonError::NotFound(id.to_string())),
+                Some(rec) => match rec.engine_tid.clone() {
+                    None => Err(DaemonError::NotFound(id.to_string())),
+                    Some(tid) => self
+                        .engine_for(rec.engine_kind)
+                        .map(|e| (e, tid, rec.engine_kind)),
+                },
+            }
+        };
+        let (engine, tid, kind) = match resolved {
+            Ok(v) => v,
+            Err(e) => {
+                let msg = e.to_string();
+                return addrs
+                    .into_iter()
+                    .map(|a| (a.to_string(), Err(msg.clone())))
+                    .collect();
+            }
+        };
+        if kind != EngineKind::Bt {
+            return addrs
+                .into_iter()
+                .map(|a| (a.to_string(), Err("仅 BT 任务支持添加 peer".into())))
+                .collect();
+        }
+        let mut results = Vec::with_capacity(addrs.len());
+        for a in addrs {
+            let key = a.to_string();
+            let r = engine.add_peer(&tid, a).await;
+            results.push((key, r.map_err(|e| e.to_string())));
+        }
+        let ok = results.iter().filter(|(_, r)| r.is_ok()).count();
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.push_event("peers_added", Some(format!("{ok}/{}", results.len())));
+            }
+        }
+        results
+    }
+
+    /// 任务级连接数上限（S1-c，qbit 每任务连接数）：仅 BT 任务（daemon 侧
+    /// 预拒，其余 kind → `UnsupportedOp` 409，同 task_proxy 预拒惯例）。
+    /// `n > 0` = 上限；`n == 0` = 复位会话级连接数默认。写入记录字段
+    /// （持久化 + 恢复重放，metadata 未就绪也可设）+ 引擎即时下发。
+    pub async fn set_task_max_connections(&self, id: &str, n: u32) -> Result<(), DaemonError> {
+        let (engine, tid) = {
+            let rec = self
+                .tasks
+                .lock()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            if rec.engine_kind != EngineKind::Bt {
+                return Err(DaemonError::UnsupportedOp(format!(
+                    "任务 {id} 非 BT 任务（{:?}），不支持连接数上限",
+                    rec.engine_kind
+                )));
+            }
+            let tid = rec
+                .engine_tid
+                .clone()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            (self.engine_for(rec.engine_kind)?, tid)
+        };
+        engine
+            .set_max_connections(&tid, n)
+            .await
+            .map_err(|e| match e {
+                smart_dl_core::types::EngineError::Unsupported => {
+                    DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持连接数上限"))
+                }
+                other => DaemonError::Engine(other.to_string()),
+            })?;
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.task.max_connections = Some(n);
+                rec.push_event("max_connections_changed", Some(n.to_string()));
+            }
+        }
+        self.autosave();
+        Ok(())
+    }
+
+    /// 任务级代理热改（E8）：`Some(url)` = 切任务专用 client（覆盖全局，
+    /// add 时 E5 语义的运行时版）；`None` = 清除回引擎共享 client。
+    ///
+    /// - 仅 HTTP 任务：daemon 侧预拒（其余 kind → `UnsupportedOp` 409），
+    ///   不依赖引擎 trait default 拒绝——错误信息带任务 kind，且避免
+    ///   engine_for 未注册引擎时的笼统报错。
+    /// - `Some` 空串拒绝（与 add 口径一致：空串是非法 URL 不是清除；清除
+    ///   语义由 `None` 承担）。
+    /// - URL 试水（`build_proxied_client`）先行 → `InvalidSource` 400；
+    ///   远端不可达 ≠ 代理非法（不发起连接，纯本地构建校验）。
+    /// - 引擎应用成功后才改记录（引擎侧对下载中任务 epoch+1 重入，
+    ///   段账本恢复进度）；记录改写用 match 下钻 enum（`DownloadSource::Http`
+    ///   的 `proxy` 字段）。
+    /// - 事件 detail 不放 URL 原文（proxy 可含凭据；push_event 链路无
+    ///   脱敏通道）——只记 set/cleared。
+    pub async fn set_task_proxy(&self, id: &str, proxy: Option<String>) -> Result<(), DaemonError> {
+        if let Some(p) = &proxy {
+            if p.is_empty() {
+                return Err(DaemonError::InvalidSource(
+                    "proxy 不能为空字符串（清除语义请传 null）".into(),
+                ));
+            }
+            smart_dl_httpdl::build_proxied_client(p)
+                .map_err(|e| DaemonError::InvalidSource(format!("proxy 非法 {p:?}: {e}")))?;
+        }
+        let (engine, tid) = {
+            let rec = self
+                .tasks
+                .lock()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            let tid = rec
+                .engine_tid
+                .clone()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            if rec.engine_kind != EngineKind::Http {
+                return Err(DaemonError::UnsupportedOp(format!(
+                    "任务 {id}（{:?}）不支持任务级代理——仅 HTTP 任务（BT 代理属会话级配置）",
+                    rec.engine_kind
+                )));
+            }
+            (self.engine_for(rec.engine_kind)?, tid)
+        };
+        engine
+            .set_task_proxy(&tid, proxy.clone())
+            .await
+            .map_err(|e| match e {
+                smart_dl_core::types::EngineError::Unsupported => {
+                    DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持任务级代理"))
+                }
+                other => DaemonError::Engine(other.to_string()),
+            })?;
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                // 引擎 kind 已预拒非 Http；此处必然命中 Http 变体（防御性 if let）
+                if let DownloadSource::Http { proxy: p, .. } = &mut rec.task.source {
+                    *p = proxy.clone();
+                }
+                rec.push_event(
+                    "proxy_changed",
+                    Some(if proxy.is_some() { "set" } else { "cleared" }.into()),
+                );
+            }
+        }
+        self.autosave();
+        Ok(())
+    }
+
+    /// 任务重命名（E15）：`POST /tasks/:id/name`。显示层改名——落盘路径在
+    /// 引擎 add 时即已决定（httpdl `resolved_name` 决策链），改名不迁移已
+    /// 落盘/在传文件；名字是列表/快照透出与 E14 搜索语料（name 分量）。
+    /// `None` = 清除显式名（E9 回填仅在"名字为空且引擎报名"的轮询点发生，
+    /// 活跃任务下一轮可能自动补回派生名——清除语义即"交还派生链"）。
+    /// 事件 detail 只记 set/cleared（与 proxy_changed 同口径，名字本体走
+    /// 快照/列表查询，不进事件链路）。
+    pub fn set_task_name(&self, id: &str, name: Option<String>) -> Result<(), DaemonError> {
+        if let Some(n) = &name {
+            if n.trim().is_empty() {
+                return Err(DaemonError::InvalidSource(
+                    "name 不能为空白（清除语义请传 null）".into(),
+                ));
+            }
+            // V3 终审同函数：与 add 入参同一裁决点（非法路径分量即拒）
+            smart_dl_core::session::output::sanitize_rel(n)
+                .map_err(|e| DaemonError::InvalidSource(format!("name 非法: {e}")))?;
+        }
+        {
+            let mut tasks = self.tasks.lock();
+            let rec = tasks
+                .get_mut(id)
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            let detail = if name.is_some() { "set" } else { "cleared" };
+            rec.task.metadata.name = name;
+            rec.push_event("name_changed", Some(detail.into()));
+        }
+        self.autosave();
+        Ok(())
+    }
+
+    /// 任务标签设置（E18）：**替换式**全量覆盖（请求携带的标签列表即为最终权威，
+    /// 语义可预测）；`None`/空表 = 清除全部。显示/分组元数据——引擎无关零副作用
+    /// （对齐 set_task_name 边界），持久化随 tasks.json（TaskMetadata serde default
+    /// 兼容旧档案），入 `?tag=` 过滤与 `?search=` 语料。
+    ///
+    /// 归一化：逐个 trim → 丢空串 → 去重（保留首次出现序，大小写敏感——
+    /// 标签匹配大小写不敏感但显示保留原样）→ 上限 16 个/单个 1..=64 字符
+    ///（超限 400 InvalidSource，调用方可先归一化再展示）。
+    pub fn set_task_tags(
+        &self,
+        id: &str,
+        tags: Option<Vec<String>>,
+    ) -> Result<Vec<String>, DaemonError> {
+        let normalized = match tags {
+            None => Vec::new(),
+            Some(list) => {
+                if list.len() > 16 {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "标签数量超上限 16（实际 {}）",
+                        list.len()
+                    )));
+                }
+                let mut out: Vec<String> = Vec::new();
+                for t in list {
+                    let t = t.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    if t.chars().count() > 64 {
+                        return Err(DaemonError::InvalidSource(format!("标签超 64 字符: {t:?}")));
+                    }
+                    if !out.iter().any(|e| e == t) {
+                        out.push(t.to_string());
+                    }
+                }
+                out
+            }
+        };
+        {
+            let mut tasks = self.tasks.lock();
+            let rec = tasks
+                .get_mut(id)
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            let detail = if normalized.is_empty() {
+                "cleared"
+            } else {
+                "set"
+            };
+            rec.task.metadata.tags = normalized.clone();
+            rec.push_event("tags_changed", Some(detail.into()));
+        }
+        self.autosave();
+        Ok(normalized)
+    }
+
+    /// 子文件优先级重放收敛（单轮）：对恢复时 metadata 未就绪而挂起的任务，
+    /// 探测就绪性（readback 非空）→ 成功后全量重放并移除 pending。
+    /// 返回本轮成功重放的任务 id 列表（测试/日志用）。
+    ///
+    /// 容错口径：任务已移除 / engine_tid 缺失（恢复 add 失败，v1 不会自愈）/
+    /// 引擎不支持（Unsupported）→ 移除 pending（永不收敛项不留尾）；
+    /// 其余失败（引擎忙/暂不可用）保留 pending 下轮再试。
+    pub async fn replay_pending_file_priorities(&self) -> Vec<TaskId> {
+        let pending: Vec<TaskId> = self.pending_file_prio.lock().iter().cloned().collect();
+        if pending.is_empty() {
+            return Vec::new();
+        }
+        let mut done = Vec::new();
+        for id in pending {
+            let (engine, tid, prios) = {
+                let tasks = self.tasks.lock();
+                let Some(rec) = tasks.get(&id) else {
+                    self.pending_file_prio.lock().remove(&id);
+                    continue;
+                };
+                let Some(tid) = rec.engine_tid.clone() else {
+                    self.pending_file_prio.lock().remove(&id);
+                    continue;
+                };
+                let Some(prios) = rec.task.file_priorities.clone() else {
+                    self.pending_file_prio.lock().remove(&id);
+                    continue;
+                };
+                match self.engine_for(rec.engine_kind) {
+                    Ok(e) => (e, tid, prios),
+                    Err(_) => continue, // 引擎暂不可用：下轮再试
+                }
+            };
+            // 就绪性探测：readback 成功且非空 = metadata 已就绪
+            match engine.file_priorities(&tid).await {
+                Ok(cur) if !cur.is_empty() => {
+                    let pairs: Vec<(usize, u32)> =
+                        prios.iter().enumerate().map(|(i, p)| (i, *p)).collect();
+                    match engine.set_file_priorities(&tid, &pairs).await {
+                        Ok(()) => {
+                            self.pending_file_prio.lock().remove(&id);
+                            if let Some(rec) = self.tasks.lock().get_mut(&id) {
+                                rec.push_event("restored", Some("子文件优先级重放完成".into()));
+                            }
+                            tracing::info!("任务 {id} 子文件优先级重放完成（{} 项）", pairs.len());
+                            done.push(id);
+                        }
+                        Err(smart_dl_core::types::EngineError::Unsupported) => {
+                            self.pending_file_prio.lock().remove(&id);
+                        }
+                        Err(_) => {} // 引擎忙/瞬态错误：下轮再试
+                    }
+                }
+                Err(smart_dl_core::types::EngineError::Unsupported) => {
+                    self.pending_file_prio.lock().remove(&id);
+                }
+                _ => {} // 未就绪/暂不可读：下轮再试
+            }
+        }
+        done
+    }
+
+    /// F5 P2SP：给运行中的 BT 任务逐条注入 web seed（云盘直链，BEP-19），
+    /// 返回成功注入条数。仅 BT 任务可注入（其余 → UnsupportedOp，HTTP 层映射
+    /// 409）；engine_tid 缺失（尚未入引擎/恢复失败）→ NotFound。
+    /// **URL 必须原样使用**：禁止增删改任何 query 参数——云盘直链带 `at=`
+    /// 防篡改签名，改动即失效；要多条链请重新调用取链 API 取新链（F5 PoC-1b）。
+    pub async fn add_webseeds(&self, id: &str, urls: &[String]) -> Result<usize, DaemonError> {
+        let rec = self
+            .tasks
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        let tid = rec
+            .engine_tid
+            .clone()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        if rec.engine_kind != EngineKind::Bt {
+            return Err(DaemonError::UnsupportedOp(format!(
+                "仅 BT 任务支持注入 web seed（{id} 为 {:?}）",
+                rec.engine_kind
+            )));
+        }
+        let engine = self.engine_for(EngineKind::Bt)?;
+        let mut added = 0usize;
+        for url in urls {
+            engine
+                .add_url_seed(&tid, url)
+                .await
+                .map_err(|e| DaemonError::Engine(e.to_string()))?;
+            added += 1;
+        }
+        if let Some(rec) = self.tasks.lock().get_mut(id) {
+            rec.push_event("webseed", Some(format!("+{added}")));
+        }
+        Ok(added)
+    }
+
+    /// 列举任务 tracker 表（E29，仅 BT 任务；metadata 未就绪也可查）。
+    pub async fn list_trackers(&self, id: &str) -> Result<Vec<TrackerEntry>, DaemonError> {
+        let rec = self
+            .tasks
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        if rec.engine_kind != EngineKind::Bt {
+            return Err(DaemonError::UnsupportedOp(format!(
+                "仅 BT 任务支持 tracker 管理（{id} 为 {:?}）",
+                rec.engine_kind
+            )));
+        }
+        let tid = rec
+            .engine_tid
+            .clone()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        let engine = self.engine_for(EngineKind::Bt)?;
+        engine
+            .list_trackers(&tid)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))
+    }
+
+    /// 批量追加 tracker（E29，仅 BT 任务）：URL 非空 + 无空白校验；
+    /// 返回实际追加数。追加即时生效（libtorrent announce 表，metadata
+    /// 未就绪也可设）。运行时追加不持久化（重启后以 magnet/.torrent 自带
+    /// 表为准——与 webseed 注入同口径）。
+    pub async fn add_trackers(&self, id: &str, urls: &[String]) -> Result<usize, DaemonError> {
+        if urls.is_empty() {
+            return Err(DaemonError::InvalidSource("urls 不能为空".into()));
+        }
+        for u in urls {
+            if u.trim() != u || u.is_empty() || u.split_whitespace().count() != 1 {
+                return Err(DaemonError::InvalidSource(format!(
+                    "tracker URL 非法（空白/空串）: {u:?}"
+                )));
+            }
+        }
+        let rec = self
+            .tasks
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        if rec.engine_kind != EngineKind::Bt {
+            return Err(DaemonError::UnsupportedOp(format!(
+                "仅 BT 任务支持 tracker 管理（{id} 为 {:?}）",
+                rec.engine_kind
+            )));
+        }
+        let tid = rec
+            .engine_tid
+            .clone()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        let engine = self.engine_for(EngineKind::Bt)?;
+        engine
+            .add_trackers(&tid, urls)
+            .await
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        if let Some(rec) = self.tasks.lock().get_mut(id) {
+            rec.push_event("tracker", Some(format!("+{}", urls.len())));
+        }
+        Ok(urls.len())
+    }
+
+    /// 删 tracker（E29，仅 BT 任务）：URL 精确匹配；无匹配 → NotFound（404）。
+    pub async fn remove_tracker(&self, id: &str, url: &str) -> Result<(), DaemonError> {
+        let rec = self
+            .tasks
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        if rec.engine_kind != EngineKind::Bt {
+            return Err(DaemonError::UnsupportedOp(format!(
+                "仅 BT 任务支持 tracker 管理（{id} 为 {:?}）",
+                rec.engine_kind
+            )));
+        }
+        let tid = rec
+            .engine_tid
+            .clone()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        let engine = self.engine_for(EngineKind::Bt)?;
+        engine
+            .remove_tracker(&tid, url)
+            .await
+            .map_err(|e| match e {
+                smart_dl_core::types::EngineError::NotFound => {
+                    DaemonError::NotFound(format!("tracker 不存在: {url}"))
+                }
+                other => DaemonError::Engine(other.to_string()),
+            })?;
+        if let Some(rec) = self.tasks.lock().get_mut(id) {
+            rec.push_event("tracker", Some(format!("-{url}")));
+        }
+        Ok(())
+    }
+
+    /// 删除任务（E7 前 semantics：保留已下载数据）。
+    pub async fn remove(&self, id: &str) -> Result<(), DaemonError> {
+        self.remove_with(id, false).await
+    }
+
+    /// 删除任务 + 数据处置开关（E7）：`delete_data = true` 时引擎侧同步删除
+    /// 已下载数据（BT 删种子数据 / HTTP 删落盘文件）。引擎删除失败不阻塞
+    /// 记录移除（引擎 remove 本就是尽力而为——任务可能已不在引擎侧）。
+    pub async fn remove_with(&self, id: &str, delete_data: bool) -> Result<(), DaemonError> {
+        let rec = self
+            .tasks
+            .lock()
+            .remove(id)
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        if let Some(tid) = rec.engine_tid {
+            if let Ok(engine) = self.engine_for(rec.engine_kind) {
+                let _ = engine.remove(&tid, delete_data).await;
+            }
+        }
+        self.autosave();
+        Ok(())
+    }
+
+    /// Provider 运行态快照（健康/配额/冷却）。
+    pub fn provider_status(&self) -> Vec<(String, ProviderRuntime)> {
+        self.providers
+            .iter()
+            .map(|p| (p.name().to_string(), p.runtime()))
+            .collect()
+    }
+
+    /// Q-B9 手动兜底（M6 接线）：BT 任务 → 云 Provider → 直链 → HTTP 引擎传输。
+    /// 前置（FallbackPolicy 默认冻结）：任务须为 BT 且已暂停；BT 进度 < 50%。
+    /// 成功 → 任务置 Completed + 事件广播 + 落盘。
+    pub async fn fallback(&self, id: &str) -> Result<FallbackOutcome, DaemonError> {
+        // 1. 任务存在性 + 必须是 BT
+        let rec = self
+            .tasks
+            .lock()
+            .get(id)
+            .cloned()
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        if rec.engine_kind != EngineKind::Bt {
+            return Err(DaemonError::Fallback(format!(
+                "仅 BT 任务支持云兜底（{} 为 {:?}）",
+                id, rec.engine_kind
+            )));
+        }
+        // 2. 串行策略（默认禁双份占盘）→ 必须先暂停
+        if rec.task.state != TaskState::Paused {
+            return Err(DaemonError::Fallback(format!(
+                "需先暂停 BT 任务 {id}（串行兜底策略：禁 BT/直链双份占盘）"
+            )));
+        }
+        // 3. BT 进度（metadata 未到 → total=0 → 进度 0，允许兜底）；≥50% 拒绝
+        let bt_progress = match (&rec.engine_tid, self.engine_for(EngineKind::Bt).ok()) {
+            (Some(tid), Some(engine)) => engine
+                .status(tid)
+                .await
+                .ok()
+                .map(|s| {
+                    if s.total == 0 {
+                        0.0
+                    } else {
+                        s.total_done as f64 / s.total as f64
+                    }
+                })
+                .unwrap_or(0.0),
+            _ => 0.0,
+        };
+        // 4. 协商器 + 传输 sink → 执行兜底
+        if self.providers.is_empty() {
+            return Err(DaemonError::Fallback(
+                "无可用 provider（未配置或全部不可用）".into(),
+            ));
+        }
+        let coord = FallbackCoordinator::new(
+            self.providers.clone(),
+            smart_dl_core::ownership::FallbackPolicy::default(),
+        );
+        let http = self
+            .engine_for(EngineKind::Http)
+            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        let sink = FallbackSink { http };
+        let outcome = coord
+            .begin_fallback(&rec.task, bt_progress, true, &sink)
+            .await
+            .map_err(map_provider_err)?;
+        // 4b. BT 引擎任务退役（直链已替代 BT 传输，keep data）：
+        // 快照不再读引擎实时下载态 → 回落到记录态 Completed
+        // 审计修复（P1-4）：engine_tid 必须一并清空——残留的 Some(tid) 让
+        // pause/resume/set_limits/set_sequential/set_max_connections/peers/
+        // trackers/webseeds 继续对已退役句柄操作（EngineError），与记录态
+        // Completed 彻底错位；恢复链路也会对不存在引擎任务 resume。
+        // （锁纪律：tasks 锁内不得 await——先取句柄快照，remove 在锁外执行。）
+        let retired_tid = {
+            let tasks = self.tasks.lock();
+            tasks.get(id).and_then(|r| r.engine_tid.clone())
+        };
+        if let Some(tid) = retired_tid {
+            if let Ok(bt) = self.engine_for(EngineKind::Bt) {
+                let _ = bt.remove(&tid, false).await;
+            }
+        }
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(r) = tasks.get_mut(id) {
+                r.engine_tid = None;
+            }
+        }
+        // 5. 成功：置 Completed + 事件 + 落盘
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(r) = tasks.get_mut(id) {
+                r.push_event("fallback", Some(format!("provider={}", outcome.provider)));
+                r.task.state = TaskState::Completed;
+            }
+        }
+        self.autosave();
+        self.hub.publish(SchedulerEvent::StateChanged {
+            task_id: id.to_string(),
+            from: TaskState::Downloading(EngineKind::Bt),
+            to: TaskState::Completed,
+        });
+        // E17：完成事件统一出口（广播 + Webhook）
+        self.publish_task_completed(id);
+        Ok(outcome)
+    }
+
+    /// 任务操作日志（`GET /tasks/:id/logs`）：快照 + 事件序列。
+    pub fn task_logs(&self, id: &str) -> Result<serde_json::Value, DaemonError> {
+        let tasks = self.tasks.lock();
+        let rec = tasks
+            .get(id)
+            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+        Ok(serde_json::json!({
+            "task_id": rec.task.id,
+            "state": state_label(&rec.task.state),
+            "source": rec.task.source.redacted_debug(),
+            "error": rec.engine_status.as_ref().and_then(|s| s.error.clone()),
+            "events": rec.events,
+        }))
+    }
+
+    /// 已完成任务自动清扫（E20）：扫描 Completed 且完成龄期 ≥
+    /// `auto_remove_completed_days` 的任务，逐个按 `auto_remove_keep_data`
+    /// 处置（默认保留文件）。返回本次清扫的任务 id（测试断言用）。
+    /// days=0 禁用；记录无完成时刻（旧档未记）→ 跳过（不猜测龄期）。
+    pub async fn sweep_completed_cleanup(&self) -> Vec<String> {
+        let (days, keep_data) = {
+            let c = self.cleanup.lock();
+            (c.auto_remove_completed_days, c.auto_remove_keep_data)
+        };
+        if days == 0 {
+            return Vec::new(); // 禁用
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let deadline = now.saturating_sub(days as u64 * 86_400);
+        let due: Vec<String> = {
+            let tasks = self.tasks.lock();
+            tasks
+                .values()
+                .filter(|r| {
+                    r.task.state == TaskState::Completed
+                        && r.task.metadata.finished_at_unix > 0
+                        && r.task.metadata.finished_at_unix <= deadline
+                })
+                .map(|r| r.task.id.clone())
+                .collect()
+        };
+        let mut swept = Vec::new();
+        for id in due {
+            // remove_with 处置记录 + 引擎退役 + 落盘；保持清扫尽力而为不短路
+            match self.remove_with(&id, !keep_data).await {
+                Ok(()) => {
+                    tracing::info!("自动清扫已完成任务: {id}（保留数据={keep_data}）");
+                    swept.push(id);
+                }
+                Err(e) => tracing::warn!("自动清扫 {id} 失败（跳过）: {e}"),
+            }
+        }
+        if !swept.is_empty() {
+            tracing::info!("本次自动清扫 {} 个已完成任务", swept.len());
+        }
+        swept
+    }
+
+    /// 引擎状态轮询：HTTP/FTP 任务状态推进（记录权威=引擎实时态）+ 全引擎速率缓存。
+    /// 每轮对候选项调用 `engine.status()`：
+    /// - 缓存：`EngineStatus` 整体写入 `engine_status`（速率/错误供 `/stats`、
+    ///   `task_logs` 读取；运行态字段不落盘，无 autosave 负担）；
+    /// - HTTP/FTP：引擎终态（Completed/Error）→ 记录推进 Completed/Failed + 落盘；
+    ///   引擎活跃（Downloading/MetadataPending）→ Queued 记录顺带推进 Downloading；
+    /// - BT：仅缓存（状态权威 = alert 流，轮询不得双头迁移）。
+    ///
+    /// 返回本批 HTTP/FTP 迁移效果供事件广播；无变化的任务跳过。
+    pub async fn poll_engine_states(&self) -> Vec<HttpPollEffect> {
+        // 先收集候选（锁外做引擎调用；避免长持锁）。HTTP/FTP 引擎无 alert 回调，
+        // 状态推进依赖轮询；BT 活跃任务仅做速率缓存（Downloading/Seeding——
+        // 做种中 up_rate 对 /stats 有意义）。
+        let candidates: Vec<(String, EngineTaskId, EngineKind)> = {
+            let tasks = self.tasks.lock();
+            tasks
+                .iter()
+                .filter(|(_, rec)| match rec.engine_kind {
+                    // SFTP 与 HTTP/FTP 同为轮询推进引擎（无 alert 回调）
+                    EngineKind::Http | EngineKind::Ftp | EngineKind::Sftp => matches!(
+                        rec.task.state,
+                        TaskState::Queued | TaskState::Downloading(_)
+                    ),
+                    EngineKind::Bt => matches!(
+                        rec.task.state,
+                        TaskState::Downloading(_) | TaskState::Seeding
+                    ),
+                    // provider/xunlei-nas 暂无轮询路径
+                    EngineKind::Provider | EngineKind::XunleiNas => false,
+                })
+                .filter_map(|(id, rec)| {
+                    rec.engine_tid
+                        .clone()
+                        .map(|t| (id.clone(), t, rec.engine_kind))
+                })
+                .collect()
+        };
+        let mut effects = Vec::new();
+        for (id, tid, kind) in candidates {
+            let Ok(engine) = self.engine_for(kind) else {
+                continue;
+            };
+            // 引擎侧已移除/不可用 → 跳过（任务移除后轮询器自然停）
+            let Ok(st) = engine.status(&tid).await else {
+                continue;
+            };
+            if matches!(kind, EngineKind::Bt) {
+                // BT 缓存分支：状态权威 = alert 流（状态不迁移、不落盘）。
+                // E28：任务名回填在此放行——torrent metadata name 就绪 +
+                // metadata.name 空缺 → 幂等回填 + 事件（E9 同语义：一次成功
+                // 后 name 非 None 自然停）。快照缓存照旧整体入缓存。
+                let seeding_since = self.cache_bt_poll(&id, &st);
+                // F3/Task 39 执法：share_ratio（E33 all-time 口径，与快照字段
+                // 同源）+ 做种时长（seeding_since 起算）。仅 Seeding 态触发；
+                // 达阈值 → 完整 pause 语义（记录同步 Paused + autosave + 广播，
+                // 与手动暂停同口径，用户可 resume，resume 后再达标再次触发）。
+                // 独立 async fn：锁与 await 的跨点隔离在内部生成器（Send 门禁）。
+                self.enforce_seeding_limit(&id, engine.clone(), &st, seeding_since)
+                    .await;
+                continue;
+            }
+            // Bug B 根因修复：autosave 移到锁外（persisted_tasks 重入同一把非重入锁
+            // 会同线程自死锁——与 apply_bt_alert 同源缺陷）。
+            let mut backfilled = false;
+            let advanced: Option<(TaskState, TaskState)> = {
+                let mut tasks = self.tasks.lock();
+                let Some(rec) = tasks.get_mut(&id) else {
+                    continue;
+                };
+                // 双检：轮询间隙状态可能已被别处推进（remove/pause/恢复）
+                if !matches!(
+                    rec.task.state,
+                    TaskState::Queued | TaskState::Downloading(_)
+                ) {
+                    continue;
+                }
+                // E11 速率缓存：引擎快照整体入缓存（含速率/错误；运行态不落盘，
+                // 不 autosave）。置于回填/迁移之前——to==from 轮次缓存仍刷新。
+                rec.engine_status = Some(st.clone());
+                // E9 名字回填（幂等）：metadata.name 空缺 + 引擎报了最终落盘名
+                // → 回填 + 事件。置于状态迁移判断之前：下载中任务 to==from
+                // 不迁移，但回填仍需进行（回填一次成功后 name 非 None 自然停）。
+                if rec.task.metadata.name.is_none() {
+                    if let Some(n) = &st.name {
+                        rec.task.metadata.name = Some(n.clone());
+                        rec.push_event("name_backfilled", Some(n.clone()));
+                        backfilled = true;
+                    }
+                }
+                let from = rec.task.state.clone();
+                let raw_to = engine_state_to_task(&st.state, kind);
+                // E30：失败拦截——重试预算未用尽 → 清句柄回 Queued 安排退避
+                // 重激活（调度循环到期重接入引擎）；用尽 → Failed 终态。
+                let to = if raw_to == TaskState::Failed {
+                    rec.fail_or_schedule_retry(st.error.as_deref())
+                } else {
+                    raw_to.clone()
+                };
+                if to == from {
+                    // 已在目标态（活跃→活跃）：不迁移，但本轮回填/缓存仍生效
+                    None
+                } else {
+                    // 错误随快照整体入缓存（st.error），无需单独写点
+                    rec.task.state = to.clone();
+                    Some((from, to))
+                }
+            }; // ← tasks 锁在此释放
+            if backfilled {
+                self.autosave(); // 锁外落盘：名字回填持久化（P4 G5 同口径）
+            }
+            if advanced.is_some() {
+                self.autosave(); // 锁外落盘：终态/推进落盘（修复 Bug B 重入自死锁）
+            }
+            // 仅真迁移产生 effect（to==from 的纯回填轮次不广播）；
+            // E30：to 取拦截后的实际目标（重试安排 = Queued，非引擎报的 Failed）
+            if let Some((from, to)) = advanced {
+                effects.push(HttpPollEffect {
+                    task_id: id,
+                    from,
+                    to,
+                    message: st.error.clone().unwrap_or_default(),
+                });
+            }
+        }
+        effects
+    }
+
+    /// BT 轮询缓存 + E28 名回填（同步、锁内无 await）：快照整体入
+    /// `engine_status` 缓存；metadata name 就绪且记录空缺 → 幂等回填 + 事件。
+    /// 返回该记录的 `seeding_since`（做种时长执法入参）。
+    fn cache_bt_poll(
+        &self,
+        id: &str,
+        st: &smart_dl_core::types::EngineStatus,
+    ) -> Option<std::time::Instant> {
+        let mut tasks = self.tasks.lock();
+        if let Some(rec) = tasks.get_mut(id) {
+            // 双检：轮询间隙状态可能已被 alert 推进至终态
+            //（终态不缓存——与 apply_bt_alert 的终态清零同口径）
+            if matches!(
+                rec.task.state,
+                TaskState::Downloading(_) | TaskState::Seeding
+            ) {
+                if rec.task.metadata.name.is_none() {
+                    if let Some(n) = &st.name {
+                        rec.task.metadata.name = Some(n.clone());
+                        rec.push_event("name_backfilled", Some(n.clone()));
+                    }
+                }
+                rec.engine_status = Some(st.clone());
+                return rec.seeding_since;
+            }
+        }
+        None
+    }
+
+    /// F3/Task 39 做种限制执法（qbit Share Ratio Limit + 做种时间限制）：
+    /// Seeding 态 + （share_ratio ≥ 阈值 或 做种时长 ≥ 上限）→ 完整 pause
+    /// 语义（复用 `pause`：引擎暂停 + 记录同步 Paused + autosave + 状态广播；
+    /// 与手动暂停同口径，用户可 resume，resume 后再达标会再次触发）+
+    /// `seeding_limit_reached` 事件（原因明细）。
+    /// 独立 async fn —— 内部锁不跨自身 await（外层轮询生成器的 Send 门禁）。
+    async fn enforce_seeding_limit(
+        &self,
+        id: &str,
+        engine: std::sync::Arc<dyn DownloadEngine>,
+        st: &smart_dl_core::types::EngineStatus,
+        seeding_since: Option<std::time::Instant>,
+    ) {
+        if !matches!(st.state, smart_dl_core::types::EngineState::Seeding) {
+            return;
+        }
+        let ratio_limit = engine.seeding_ratio_limit();
+        let time_limit_min = engine.seeding_time_limit();
+        if ratio_limit.is_none() && time_limit_min.is_none() {
+            return;
+        }
+        let ratio = crate::state::share_ratio(st.total_uploaded, st.total_downloaded);
+        let elapsed_min = seeding_since
+            .map(|t| t.elapsed().as_secs() / 60)
+            .unwrap_or(0);
+        // batch6-P2：downloaded==0 且 uploaded>0 视作 ratio=∞（qbit 同口径）
+        // ——种子导入/已完整数据直接做种时 all-time downloaded=0，旧实现
+        // share_ratio 返回 None → 限制永不触发。
+        let ratio_infinite = st.total_downloaded == 0 && st.total_uploaded > 0;
+        let ratio_hit = match (ratio_limit, ratio) {
+            (Some(l), Some(r)) => r >= l,
+            (Some(_), None) => ratio_infinite,
+            _ => false,
+        };
+        let time_hit = matches!((time_limit_min, elapsed_min), (Some(l), m) if m >= l as u64);
+        if !ratio_hit && !time_hit {
+            return;
+        }
+        let reason = match (ratio_hit, time_hit) {
+            (true, true) => format!(
+                "ratio={:.2}>=?{:?} time={elapsed_min}min>=?{:?}min（双达）",
+                ratio.unwrap_or(f64::INFINITY),
+                ratio_limit,
+                time_limit_min
+            ),
+            (true, false) => format!(
+                "ratio={:.2} >= limit={:?}",
+                ratio.unwrap_or(f64::INFINITY),
+                ratio_limit
+            ),
+            (false, true) => format!(
+                "seeding time={elapsed_min}min >= limit={:?}min",
+                time_limit_min
+            ),
+            (false, false) => unreachable!("已由 hit 判定"),
+        };
+        // 完整 pause 语义（记录同步/事件/持久化/广播都在里面）
+        if self.pause(id).await.is_ok() {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.seeding_since = None;
+                rec.push_event("seeding_limit_reached", Some(reason));
+            }
+        }
+    }
+}
+
+/// 兜底传输 sink：HTTP 引擎承接 provider 直链下载（M5 直链 → HttpEngine）。
+/// 每个文件建引擎任务 → 轮询到终态 → 移除引擎任务（不留记录，属于父 BT 任务流程）。
+struct FallbackSink {
+    http: Arc<dyn DownloadEngine>,
+}
+
+#[async_trait::async_trait]
+impl HttpSink for FallbackSink {
+    async fn transfer(
+        &self,
+        task_id: &str,
+        url: &str,
+        dest_root: std::path::PathBuf,
+        name: Option<String>,
+    ) -> Result<(), SinkError> {
+        // 目标父目录（rel_path 可能含子目录）
+        if let Some(rel) = &name {
+            if let Some(parent) = dest_root.join(rel).parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+        }
+        let task = DownloadTask {
+            id: task_id.to_string(),
+            canonical_id: CanonicalId {
+                kind: CanonicalKind::Http,
+                identity: url.to_string(),
+                validator: None,
+                token_sensitive: false,
+            },
+            source: DownloadSource::Http {
+                url: url.to_string(),
+                headers: vec![],
+                auth: None,
+                backup_url: None,
+                proxy: None,
+            },
+            identity: ContentIdentity::SingleFile {
+                size: 0,
+                etag: None,
+                sha256: None,
+                sha1: None,
+                md5: None,
+                backup_md5: None,
+            },
+            dest_root,
+            files: vec![],
+            acquisitions: vec![],
+            aggregate: Default::default(),
+            state: TaskState::Queued,
+            retry: Default::default(),
+            created_at: std::time::Instant::now(),
+            file_priorities: None,
+            sequential: false,
+            metadata: TaskMetadata {
+                name,
+                added_at_unix: 0,
+                tags: Vec::new(),
+                finished_at_unix: 0,
+                start_at_unix: 0,
+                next_retry_at_unix: 0,
+            },
+            limits: None,
+            max_connections: None,
+            queue_priority: 0,
+        };
+        let tid = self
+            .http
+            .add(&task)
+            .await
+            .map_err(|e| SinkError::Failed(e.to_string()))?;
+        // 轮询到终态（直链传输上限 600s：免费档聚合 ~1MB/s，须容纳数百 MB 文件）
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        let started = std::time::Instant::now();
+        let mut last_beat = started;
+        let mut last_done = u64::MAX;
+        let result = loop {
+            let st = self
+                .http
+                .status(&tid)
+                .await
+                .map_err(|e| SinkError::Failed(e.to_string()))?;
+            if last_done == u64::MAX {
+                last_done = st.total_done;
+            }
+            if st.total_done != last_done {
+                last_done = st.total_done;
+            }
+            if last_beat.elapsed() >= std::time::Duration::from_secs(5) {
+                last_beat = std::time::Instant::now();
+            }
+            match st.state {
+                EngineState::Completed => break Ok(()),
+                EngineState::Error => {
+                    break Err(SinkError::Failed(
+                        st.error.unwrap_or_else(|| "engine error".into()),
+                    ))
+                }
+                _ => {
+                    if std::time::Instant::now() >= deadline {
+                        break Err(SinkError::Failed("直链传输超时(60s)".into()));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+        };
+        let _ = self.http.remove(&tid, false).await;
+        result
+    }
+
+    async fn update_sources(&self, _task_id: &str, _urls: Vec<String>) -> Result<(), SinkError> {
+        // v1：直链不续期（真实 provider 的 refresh_links 接入后实现）
+        Ok(())
+    }
+}
+
+/// ProviderError → DaemonError 的人类可读映射。
+fn map_provider_err(e: ProviderError) -> DaemonError {
+    use ProviderError as P;
+    let msg = match e {
+        P::ManualOnly => "BT 进度 ≥50%，按兜底策略不允许（仅进度 <50% 可兜底）".to_string(),
+        P::RequiresPause => "需先暂停 BT 任务（串行兜底策略）".to_string(),
+        P::NoProvider => "无可用 provider（未配置/未认证/配额耗尽/冷却中/并发满）".to_string(),
+        P::Expired => "直链已过期且刷新/重提交均失败".to_string(),
+        P::RetriesExhausted => "直链过期恢复次数超限（update_sources≤3 + resubmit≤2）".to_string(),
+        other => other.to_string(),
+    };
+    DaemonError::Fallback(msg)
+}
+
+/// 解析 `bt://ip:port` 为 `(ip, port)`。
+#[cfg(feature = "xunlei-import")]
+fn parse_bt_peer(s: &str) -> Option<(String, u16)> {
+    let s = s.strip_prefix("bt://")?;
+    let mut parts = s.rsplitn(2, ':');
+    let port_str = parts.next()?;
+    let ip = parts.next()?;
+    let port = port_str.parse::<u16>().ok()?;
+    Some((ip.to_string(), port))
+}
+
+/// B10（§12 D36）：dest_root 预检——缺失目录自动创建 + 可写探测（探针文件）。
+/// 空间充足性由 `precheck_space` 在总大小已知时另行检查。
+///
+/// 安全修复（V2，CWE-22 变体）：`allowed_roots` 白名单——dest 规范化后必须落在
+/// 某个白名单根内（拒 symlink 逃逸）；原始输入含 `..` 分量直接拒绝。
+/// `allowed_roots` 传空切片 = 不校验（仅测试/serve 初始化自身使用；
+/// 生产路径必须传非空，DaemonState 内部兜底 default_dest_root）。
+/// 空串 dest 归一为 None（回落默认根）。审查修复：`dest:""` 传入为 Some("")
+/// 绕过调用方 `or(Some(def))` 回落，ensure_dest_root 内空路径必然白名单越界。
+pub fn non_empty_dest(dest: Option<String>) -> Option<String> {
+    dest.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+pub fn ensure_dest_root(
+    dest: Option<String>,
+    allowed_roots: &[PathBuf],
+) -> Result<PathBuf, DaemonError> {
+    let raw = dest.unwrap_or_else(|| ".".to_string());
+    let p = PathBuf::from(&raw);
+    // 1) 原始输入拒绝 `..`（canonicalize 前快速拒绝，语义清晰）
+    for comp in p.components() {
+        if matches!(comp, std::path::Component::ParentDir) {
+            return Err(DaemonError::InvalidSource(format!(
+                "dest 含 `..` 分量已拒绝: {raw}"
+            )));
+        }
+    }
+    // 2) 白名单校验：canonicalize 后比对前缀（同时拦截 symlink 指向白名单外）。
+    //    审查修复（P2）：白名单判定必须先于 create_dir_all——原顺序在白名单外
+    //    预创建任意目录后才拒绝（已认证调用方可借此预建目录结构）。
+    if !allowed_roots.is_empty() {
+        // dest 未创建时 canonicalize 会失败 → 以 dest_root 视角校验父链：
+        // 逐级向上找第一个已存在祖先做前缀比对，再统一建目录。
+        let mut probe = p.clone();
+        let mut anchor = None;
+        loop {
+            if probe.exists() {
+                anchor = Some(probe.clone());
+                break;
+            }
+            match probe.parent() {
+                Some(parent) if probe != parent => probe = parent.to_path_buf(),
+                _ => break,
+            }
+        }
+        let inside = match anchor {
+            Some(a) => a
+                .canonicalize()
+                .ok()
+                .map(|ca| {
+                    // p 与 anchor 的相对尾链无 `..`（第 1 步已拒），拼接比对
+                    let tail = p.strip_prefix(&a).unwrap_or(Path::new(""));
+                    ca.join(tail)
+                })
+                .map(|full| {
+                    allowed_roots.iter().any(|r| {
+                        let _ = fs::create_dir_all(r);
+                        match r.canonicalize() {
+                            Ok(cr) => full.starts_with(&cr),
+                            Err(_) => false,
+                        }
+                    })
+                })
+                .unwrap_or(false),
+            None => false,
+        };
+        if !inside {
+            return Err(DaemonError::InvalidSource(format!(
+                "dest 越界（不在允许的下载根目录内）: {raw}"
+            )));
+        }
+    }
+    fs::create_dir_all(&p)
+        .map_err(|e| DaemonError::InvalidSource(format!("目标目录不可创建: {e}")))?;
+    // 3) 可写探针：随机后缀防可预测竞态（V10-3）
+    let probe = p.join(format!(
+        ".write_probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::write(&probe, b"ok")
+        .map_err(|e| DaemonError::InvalidSource(format!("目标目录不可写: {e}")))?;
+    let _ = fs::remove_file(&probe);
+    Ok(p)
+}
+
+/// B10：空间预检（总大小已知时调用）——`evaluate_disk` 判定不足 → 拒绝入队。
+/// 安全/健壮性修复（V10-2）：磁盘可用空间取不到（fs2 失败）时不再静默放行——
+/// 非严格模式（默认）告警日志 + 放行（保留旧行为）；`strict=true` 时拒绝入队，
+/// 防止预检被绕过后续盘写满。由配置 `[download] disk_precheck_strict` 控制。
+pub fn precheck_space(p: &Path, total: u64, strict: bool) -> Result<(), DaemonError> {
+    let Ok(avail) = fs2::free_space(p) else {
+        if strict {
+            return Err(DaemonError::InvalidSource(format!(
+                "磁盘可用空间不可探测且 disk_precheck_strict=true，拒绝入队: {}",
+                p.display()
+            )));
+        }
+        tracing::warn!(
+            "磁盘可用空间不可探测，空间预检已跳过（可配置 [download] disk_precheck_strict=true 强制拒绝）: {}",
+            p.display()
+        );
+        return Ok(());
+    };
+    use smart_dl_core::session::output::{evaluate_disk, DiskCheck};
+    if let DiskCheck::Insufficient {
+        required,
+        available,
+    } = evaluate_disk(avail, total)
+    {
+        return Err(DaemonError::InvalidSource(format!(
+            "磁盘空间不足: 需要 {} 字节, 可用 {} 字节",
+            required, available
+        )));
+    }
+    Ok(())
+}
+
+/// D34：canonical URL —— 剥离签名/token 参数后作为去重身份，使同一资源的
+/// 带签名链接（token 过期/轮换）仍能识别为同一任务。
+/// 黑名单（设计文档 §7 D34）：`token|sig|signature|expires|auth|X-Amz-*|X-Goog-*|X-Tencent-*|X-QiNiu-*`
+pub fn canonical_http_url(raw: &str) -> String {
+    let Ok(mut u) = url::Url::parse(raw) else {
+        return raw.to_string();
+    };
+    let mut kept: Vec<(String, String)> = Vec::new();
+    for (k, v) in u.query_pairs() {
+        if !is_token_param(&k) {
+            kept.push((k.into_owned(), v.into_owned()));
+        }
+    }
+    if kept.is_empty() {
+        u.set_query(None);
+    } else {
+        let qs: Vec<String> = kept.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        u.set_query(Some(&qs.join("&")));
+    }
+    u.to_string()
+}
+
+/// 参数名是否命中 D34 token 黑名单（大小写敏感匹配，前缀通配 X-* 云签名族）。
+fn is_token_param(name: &str) -> bool {
+    matches!(name, "token" | "sig" | "signature" | "expires" | "auth")
+        || name.starts_with("X-Amz-")
+        || name.starts_with("X-Goog-")
+        || name.starts_with("X-Tencent-")
+        || name.starts_with("X-QiNiu-")
+}
+
+/// 引擎状态 → 对外任务状态（快照实时化；元数据获取中归入 Downloading）。
+fn engine_state_to_task(st: &EngineState, kind: EngineKind) -> TaskState {
+    match st {
+        EngineState::MetadataPending | EngineState::Downloading => TaskState::Downloading(kind),
+        EngineState::Paused => TaskState::Paused,
+        EngineState::Completed => TaskState::Completed,
+        EngineState::Seeding => TaskState::Seeding,
+        EngineState::Error => TaskState::Failed,
+    }
+}
+
+/// 封禁条目归一化（batch5-P2）：单 IP 解析为规范字符串；v4-mapped IPv6
+/// （`::ffff:1.2.3.4`）优先转回 v4 形式——否则 libtorrent add_rule 落在
+/// v6 族规则，拦不住实际以 v4 连入的 peer。区间条目（"a-b"）两端同样
+/// 归一后再校验同族/有序（batch6-P2）。非法 → Err。
+pub(crate) fn normalize_ban_entry(s: &str) -> Result<String, String> {
+    let t = s.trim();
+    if let Some((a, b)) = t.split_once('-') {
+        // 区间条目（batch6-P2）：两端各自归一（v4-mapped IPv6 回 v4——否则
+        // add_rule 落 v6 族拦不住实际以 v4 连入的 peer，与单 IP 路径同口径）
+        // + 归一后同族校验
+        let norm = |x: &str| -> Result<std::net::IpAddr, String> {
+            let ip: std::net::IpAddr = x
+                .trim()
+                .parse()
+                .map_err(|e| format!("区间端点非法 {x:?}: {e}"))?;
+            Ok(match ip {
+                std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                    Some(v4) => std::net::IpAddr::V4(v4),
+                    None => std::net::IpAddr::V6(v6),
+                },
+                v4 => v4,
+            })
+        };
+        let pa = norm(a)?;
+        let pb = norm(b)?;
+        if pa.is_ipv4() != pb.is_ipv4() {
+            return Err(format!("区间 {t:?} 地址族不一致"));
+        }
+        return Ok(format!("{}-{}", pa, pb));
+    }
+    let ip: std::net::IpAddr = t.parse().map_err(|e| format!("{t:?}: {e}"))?;
+    Ok(match ip {
+        std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => v6.to_string(),
+        },
+        v4 => v4.to_string(),
+    })
+}
+
+/// IP filter 文本行 → 区间 (start, end)（batch5 对标：qB/BitComet 导入）：
+/// - DAT（PeerGuardian .dat）：`000.000.000.000 - 000.000.000.255 , 000 , name`
+///   （按第一个 ` - ` 切两端，再截 `,` 后的元信息）；
+/// - P2P（.p2p）：`range:1.2.3.0-1.2.3.255,description` 或
+///   `1.2.3.0-1.2.3.255,description`。
+///
+/// 无法解析 → None。
+pub(crate) fn parse_ban_range_line(line: &str) -> Option<(String, String)> {
+    let l = line.trim();
+    let l = l.strip_prefix("range:").unwrap_or(l);
+    // DAT 逗号元信息截断（保留前两段中的 IP 区间部分）
+    let body = l.split(',').next().unwrap_or(l);
+    let body = body.trim();
+    let (a, b) = body.split_once('-')?;
+    let a = a.trim();
+    let b = b.trim();
+    if a.is_empty() || b.is_empty() {
+        return None;
+    }
+    // batch6-P2：两端 v4-mapped IPv6 归一（与 normalize_ban_entry 同口径）
+    let norm = |x: &str| -> Option<std::net::IpAddr> {
+        match x.parse::<std::net::IpAddr>().ok()? {
+            std::net::IpAddr::V6(v6) => Some(match v6.to_ipv4_mapped() {
+                Some(v4) => std::net::IpAddr::V4(v4),
+                None => std::net::IpAddr::V6(v6),
+            }),
+            v4 => Some(v4),
+        }
+    };
+    let pa = norm(a)?;
+    let pb = norm(b)?;
+    if pa.is_ipv4() != pb.is_ipv4() || pb < pa {
+        return None;
+    }
+    Some((pa.to_string(), pb.to_string()))
+}
+
+/// 事件/日志用行截断（batch5）：超长行截尾加省略号，防错误列表膨胀。
+fn truncate_len(s: &str, cap: usize) -> String {
+    if s.chars().count() <= cap {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(cap).collect();
+        format!("{cut}…")
+    }
+}
+
+#[cfg(test)]
+mod ban_entry_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_single_ips() {
+        assert_eq!(normalize_ban_entry(" 1.2.3.4 ").unwrap(), "1.2.3.4");
+        assert_eq!(
+            normalize_ban_entry("::ffff:1.2.3.4").unwrap(),
+            "1.2.3.4",
+            "v4-mapped IPv6 必须转回 v4（否则 ip_filter 落 v6 族拦不住 v4 peer）"
+        );
+        assert_eq!(normalize_ban_entry("2001:db8::1").unwrap(), "2001:db8::1");
+        assert!(normalize_ban_entry("not-an-ip").is_err());
+    }
+
+    #[test]
+    fn normalize_range_entries() {
+        assert_eq!(
+            normalize_ban_entry("1.2.3.0-1.2.3.255").unwrap(),
+            "1.2.3.0-1.2.3.255"
+        );
+        assert!(normalize_ban_entry("1.2.3.0-::1").is_err(), "跨族拒绝");
+        assert!(normalize_ban_entry("1.2.3.9-x").is_err());
+    }
+
+    #[test]
+    fn parse_dat_and_p2p_lines() {
+        // DAT（PeerGuardian）
+        assert_eq!(
+            parse_ban_range_line("000.000.000.000 - 000.000.000.255 , 000 , bogus"),
+            None,
+            "DAT 前导零不是合法 IP 字面量（std 解析拒绝）→ 跳过该行"
+        );
+        assert_eq!(
+            parse_ban_range_line("1.2.3.0 - 1.2.3.255 , 000 , some range"),
+            Some(("1.2.3.0".into(), "1.2.3.255".into()))
+        );
+        // P2P
+        assert_eq!(
+            parse_ban_range_line("range:5.6.7.0-5.6.7.255,bad isp"),
+            Some(("5.6.7.0".into(), "5.6.7.255".into()))
+        );
+        assert_eq!(parse_ban_range_line("garbage line"), None);
+        assert_eq!(parse_ban_range_line("2.2.2.2-1.1.1.1"), None, "逆序拒绝");
+        // 注释与空行由调用方跳过；此处保证解析器对前缀 range: 的容忍
+        assert_eq!(
+            parse_ban_range_line("range:9.9.9.0-9.9.9.9"),
+            Some(("9.9.9.0".into(), "9.9.9.9".into()))
+        );
+    }
+
+    #[test]
+    fn truncate_len_caps() {
+        assert_eq!(truncate_len("abc", 5), "abc");
+        assert_eq!(truncate_len("abcdef", 5), "abcde…");
+    }
+}
+
+/// 递归目录拷贝（batch5；std::fs 无 copy_dir_all）：目录逐层创建 + 文件
+/// 逐个 copy（保留权限位 via fs::copy）。符号链接按目标内容展开（v1 从简：
+/// BT 数据目录内不应有 symlink）。
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let ty = entry.file_type()?;
+        let to = dst.join(entry.file_name());
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &to)?;
+        } else {
+            fs::copy(entry.path(), &to)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod copy_dir_tests {
+    use super::*;
+
+    #[test]
+    fn copy_dir_recursive_copies_tree() {
+        let td = tempfile::tempdir().unwrap();
+        let src = td.path().join("src");
+        fs::create_dir_all(src.join("nested/deep")).unwrap();
+        fs::write(src.join("a.bin"), b"AAA").unwrap();
+        fs::write(src.join("nested/b.bin"), b"BB").unwrap();
+        fs::write(src.join("nested/deep/c.txt"), b"C").unwrap();
+        let dst = td.path().join("dst");
+        copy_dir_recursive(&src, &dst).unwrap();
+        assert_eq!(fs::read(dst.join("a.bin")).unwrap(), b"AAA");
+        assert_eq!(fs::read(dst.join("nested/b.bin")).unwrap(), b"BB");
+        assert_eq!(fs::read(dst.join("nested/deep/c.txt")).unwrap(), b"C");
+    }
+}

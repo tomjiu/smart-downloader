@@ -48,7 +48,8 @@ async fn main() {
     };
     let DeviceFlowState::AwaitingScan {
         user_code,
-        verification_uri,
+        // 服务端 verification_uri 仅作回退展示，本示例用本地构造的官方授权页 URL。
+        verification_uri: _,
         expires_at,
         ..
     } = &state

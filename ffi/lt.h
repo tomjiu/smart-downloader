@@ -40,11 +40,31 @@ lt_err lt_apply_network(lt_session* s,
                         const char* proxy_user, const char* proxy_pass,
                         int64_t down_bytes, int64_t up_bytes);
 
-/* —— 发现层开关（DHT / LSD / UPnP）——
-   三个开关独立设置（0=关 1=开）；enable_upnp 同时控制 enable_natpmp
+/* —— 发现层开关（DHT / LSD / UPnP / PEX）——
+   四个开关独立设置（0=关 1=开）；enable_upnp 同时控制 enable_natpmp
    （端口映射族同进退，不提供单独 NAT-PMP 开关）。
-   会话默认全关（M0 确定性语义，见 lt_session_new）；本函数后置覆盖。 */
-lt_err lt_apply_discovery(lt_session* s, int enable_dht, int enable_lsd, int enable_upnp);
+   enable_pex 特殊：内核 2.0.x 无会话级 settings_pack 开关（PEX 默认开）——
+   置 0 时会话记录意图，对其后新增任务注入 per-torrent disable_pex flag
+   （不回溯既有任务；daemon 在任务装配前 apply 故覆盖全部任务）。
+   会话默认 DHT/LSD/UPnP 全关、PEX 开（M0 确定性语义，见 lt_session_new）；
+   本函数后置覆盖。 */
+lt_err lt_apply_discovery(lt_session* s, int enable_dht, int enable_lsd, int enable_upnp,
+                          int enable_pex);
+
+/* —— 传输层开关（uTP / MSE 加密）——
+   enable_utp 同时控制 enable_incoming_utp/enable_outgoing_utp
+   （uTP 族同进退，不提供单向开关）。
+   enc_policy: 0=禁用（纯明文）1=允许（明文+MSE 皆收，内核默认）2=强制（仅加密）。
+   allowed_enc_level / prefer_rc4 不在此暴露（保持内核默认 pe_both/false）；
+   会话默认 uTP 关 + 加密允许（M0 确定性语义）；本函数后置覆盖。 */
+lt_err lt_apply_transport(lt_session* s, int enable_utp, int enc_policy);
+
+/* —— 会话连接参数（监听端口 / 全局连接数上限）——
+   port: 0 = 不修改（沿用内核默认/上次设置）；>0 时 listen_interfaces =
+   "0.0.0.0:<port>,[::]:<port>"（IPv4+IPv6 双栈；apply_settings 后内核自动
+   re-listen，运行中调用安全）。
+   max_connections: 0 = 不修改（内核默认 200）；>0 时 connections_limit。 */
+lt_err lt_apply_conn(lt_session* s, int port, int max_connections);
 
 /* —— 添加/移除（5）—— */
 lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, char* ih_out /*41 字节*/);
@@ -64,6 +84,11 @@ typedef struct {
     int     num_peers, num_seeds;   /* 已连接数（F2） */
     int     metadata_received;      /* F2 三阶段评估前提 */
     int     paused;                 /* torrent_handle::pause() 后的 paused 标志 */
+    char    name[256];         /* E28: torrent 名（metadata 就绪前为空串；NUL 结尾，
+                                  截断安全——内核侧 strncpy + 预置 memset） */
+    int64_t all_time_download, /* E33: 全生命周期累计下行（含历史，随 resume data
+                                  持久；>= 本次 done——hashfail/断点重复收字节计入） */
+            all_time_upload;   /* E33: 全生命周期累计上行（做种贡献；暂停不清零） */
 } lt_torrent_status;
 
 lt_err lt_status(lt_session* s, const char* ih, lt_torrent_status* out);
@@ -71,6 +96,13 @@ lt_err lt_piece_count(lt_session* s, const char* ih, int* out);
 lt_err lt_bitfield(lt_session* s, const char* ih, uint8_t* buf, size_t cap, size_t* out_len); /* 位打包，LSB 先 */
 lt_err lt_file_count(lt_session* s, const char* ih, int* out);
 lt_err lt_file_progress(lt_session* s, const char* ih, int64_t* done_arr, int64_t* size_arr, int n);
+
+/* —— 子文件优先级（BT 多文件；P1 任务级能力）——
+   priority 语义同 libtorrent：0 = 不下载（skip）、1 = 低、4 = 默认、7 = 最高。
+   idx_arr/prio_arr 等长（n 项，逐条 set）；n/容量必须 >= 文件数（与
+   lt_file_progress 同口径，否则 BUFFER_TOO_SMALL）。需要 metadata。 */
+lt_err lt_set_file_priorities(lt_session* s, const char* ih, const int* idx_arr, const int* prio_arr, int n);
+lt_err lt_get_file_priorities(lt_session* s, const char* ih, int* out_arr, int n);
 
 /* —— 富 peer（1）—— */
 typedef struct {
@@ -95,6 +127,17 @@ typedef struct {
 #define LT_PEER_UTP           (1u << 8)
 
 lt_err lt_peers(lt_session* s, const char* ih, lt_peer* buf, size_t cap, size_t* out_count);
+
+/* —— tracker 运行时增删查（E29，BT 任务级；契约与 lt_peers 同两段式）——
+   cap=0/out=NULL → 探测数量（空表 → LT_OK + *out_len=0）；
+   cap < 实际数 → LT_ERR_BUFFER_TOO_SMALL + *out_len=实际数；
+   否则填充 min(cap, 实际数) 项 + *out_len=填充数 → LT_OK。 */
+typedef struct {
+    char url[256];   /* announce URL（NUL 结尾，截断安全） */
+    int  tier;       /* libtorrent tier（优先级组，小者优先） */
+} lt_tracker_info;
+lt_err lt_list_trackers(lt_session* s, const char* ih, lt_tracker_info* out, int cap, int* out_len);
+lt_err lt_remove_tracker(lt_session* s, const char* ih, const char* url); /* 无匹配 URL → LT_ERR_NOT_FOUND */
 
 /* —— alert 队列（D31 预算 ≤12 种；扁平化值拷贝，所有权归 wrapper；溢出计数）—— */
 typedef enum {
@@ -124,12 +167,40 @@ lt_err lt_request_save_resume(lt_session* s, const char* ih);
 lt_err lt_take_resume_data(lt_session* s, const char* ih, uint8_t* buf, size_t cap, size_t* out_len);
 
 /* —— 控制/限制（6）—— */
-lt_err lt_ban_peer(lt_session* s, const char* ih, const char* ip, uint16_t port); /* v2：Session IP ban 实现 */
+/* v2 真实现：session 级 IP 封禁（libtorrent ip_filter，持久列表由 daemon 层维护）。
+   幂等：重复封禁同一 IP 返回 LT_OK。ih 仅用于验证任务存在（封禁本身作用于全 session）。 */
+lt_err lt_ban_peer(lt_session* s, const char* ih, const char* ip, uint16_t port);
+/* 解除封禁（qbit「解除 IP 封禁」对标）：恢复该 IP 允许；未封禁 → LT_OK（幂等）。 */
+lt_err lt_unban_peer(lt_session* s, const char* ip);
+/* 查询：out = 1 已封禁 / 0 未封禁（读 C++ 侧 banned 集合，O(1)）。 */
+lt_err lt_is_banned(lt_session* s, const char* ip, int* out);
+/* IP 段封禁（batch5 对标：qB/BitComet IP filter 文件语义）：[start, end]
+   闭区间加入 ip_filter。start/end 为 IPv4/IPv6 字面量（同族）。 */
+lt_err lt_ban_range(lt_session* s, const char* start, const char* end);
+/* 首尾块优先（batch5 对标：qB「首尾块优先」）：每文件首/末块优先级置为
+   prio（0..=7，7 最高）。需要 metadata（否则 NOT_FOUND）。 */
+lt_err lt_set_piece_first_last(lt_session* s, const char* ih, int prio);
+/* 会话级存储模式（batch5 对标：qB「预分配磁盘空间」）：alloc 非 0 = 后续
+   新增任务预分配；影响 lt_add_magnet / lt_add_torrent_file 路径（fastresume
+   回灌保留原模式）。须在任务装配前调用。 */
+lt_err lt_set_storage_mode(lt_session* s, int alloc);
 lt_err lt_add_peer(lt_session* s, const char* ih, const char* ip, uint16_t port); /* 本地 seeder 直连注入 */
 lt_err lt_add_url_seed(lt_session* s, const char* ih, const char* url);
 lt_err lt_add_tracker(lt_session* s, const char* ih, const char* url);
 lt_err lt_set_sequential(lt_session* s, const char* ih, int on);
 lt_err lt_set_limits(lt_session* s, const char* ih, int64_t down_limit, int64_t up_limit); /* 字节/秒；0=不限 */
+
+/* —— 强制操作三件套（qbit/BitComet 任务右键对标，Task 46）—— */
+/* 强制向全部 tracker 立即宣告（force_reannounce）。任务不存在 → LT_ERR_NOT_FOUND。 */
+lt_err lt_force_reannounce(lt_session* s, const char* ih);
+/* 强制 DHT 宣告（force_dht_announce；DHT 关闭时 libtorrent 内部 no-op，不报错）。 */
+lt_err lt_force_dht_announce(lt_session* s, const char* ih);
+/* 强制重新校验（force_recheck）：状态转入 checking；校验期下载/做种挂起。 */
+lt_err lt_force_recheck(lt_session* s, const char* ih);
+
+/* 任务级连接数上限（S1-c）：>0 = torrent_handle::set_max_connections；
+   0 = 复位为会话级 connections_limit 当前值（qbit「无限制」回到全局口径）。 */
+lt_err lt_torrent_set_max_connections(lt_session* s, const char* ih, int max_connections);
 
 /* —— 块读取（v2；async read_piece → 轮询取数）—— */
 lt_err lt_read_piece(lt_session* s, const char* ih, int idx, uint8_t* buf, size_t buflen, size_t* out_len);

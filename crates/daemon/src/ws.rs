@@ -1,14 +1,18 @@
-//! WsHub（§12 D36）：事件发布中枢——monotonic seq + 有界队列（默认 256）+ 背压
-//! 丢最旧非关键；drain 全量重同步（掉队客户端重连）；snapshot_upto 跳号补拉。
-//! 真 WS 升级端点在 http 层；本模块是纯逻辑，测试直连。
+//! WsHub（§12 D36）：事件发布中枢——monotonic seq + 有界环形历史缓冲（默认
+//! 4096，E10 扩容兼作事件历史）+ 背压丢最旧非关键；drain 全量重同步（破坏性
+//! 快照，遗留/测试入口）；read_after 系列非破坏游标读（E10：多消费者安全，
+//! REST GET /events 与 WS 轮询共用）；gap_after 检测缓冲冲掉的缺口（客户端
+//! 应改走全量重同步）。真 WS 升级端点在 http 层；本模块是纯逻辑，测试直连。
 
 use crate::events::{Envelope, SchedulerEvent};
 use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// 默认事件队列上限（D36：队列 256）。
-pub const DEFAULT_CAPACITY: usize = 256;
+/// 默认事件历史缓冲上限（E10：256 → 4096 扩容兼作事件历史——256 在高频
+/// Progress 下很快被冲掉，REST /events 补拉/审计价值尽失；4096 × ~百字节
+/// 事件 ≈ 数百 KB，内存可接受）。背压策略不变：满丢最旧非关键。
+pub const DEFAULT_CAPACITY: usize = 4096;
 
 pub struct WsHub {
     seq: AtomicU64,
@@ -73,6 +77,53 @@ impl WsHub {
             .filter(|e| e.seq > last_seen)
             .cloned()
             .collect()
+    }
+
+    /// 非破坏游标读（E10）：seq > after 的前 limit 条（缓冲保留，多消费者
+    /// 安全——REST /events 分页与 WS 轮询共用；游标语义与 D36 monotonic seq
+    /// 对齐）。limit=0 视为无上限由调用方约束。
+    pub fn read_after(&self, after: u64, limit: usize) -> Vec<Envelope> {
+        self.queue
+            .lock()
+            .iter()
+            .filter(|e| e.seq > after)
+            .take(limit)
+            .cloned()
+            .collect()
+    }
+
+    /// 非破坏过滤读（E10）：seq > after 且 pred 命中的前 limit 条 +
+    /// `has_more`（命中数超 limit，还有下一页）。limit 语义 = 过滤后条数
+    /// （过滤在分页前生效，避免"过滤后页稀疏导致客户端误判到头"）。
+    pub fn read_filtered(
+        &self,
+        after: u64,
+        limit: usize,
+        pred: impl Fn(&Envelope) -> bool,
+    ) -> (Vec<Envelope>, bool) {
+        let q = self.queue.lock();
+        let matched: Vec<&Envelope> = q.iter().filter(|e| e.seq > after && pred(e)).collect();
+        let has_more = matched.len() > limit;
+        let page = matched.into_iter().take(limit).cloned().collect();
+        (page, has_more)
+    }
+
+    /// 缓冲内最旧 seq（空缓冲 → None；背压观测 + gap 判定输入）。
+    pub fn oldest_seq(&self) -> Option<u64> {
+        self.queue.lock().front().map(|e| e.seq)
+    }
+
+    /// 客户端游标 after 与缓冲之间是否存在缺口（E10）：缓冲已冲掉
+    /// (after, oldest) 区间的事件时为 true——客户端应放弃增量补拉，改走
+    /// 全量重同步。统一公式 `after + 1 < front`（front 取缓冲最旧；空缓冲
+    /// 取 last_seq+1），对"空缓冲全丢 / 头部冲掉 / 恰好续上"三种情形一致。
+    pub fn gap_after(&self, after: u64) -> bool {
+        let q = self.queue.lock();
+        let front = q
+            .front()
+            .map(|e| e.seq)
+            .unwrap_or_else(|| self.seq.load(Ordering::SeqCst) + 1);
+        after + 1 < front
     }
 
     /// 已发布的最大 seq。

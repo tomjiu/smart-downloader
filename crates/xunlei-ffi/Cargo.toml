@@ -1,6 +1,6 @@
 [package]
 name = "xunlei-ffi"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
 authors = ["smart-downloader"]
 description = "Thunder DownloadSDK FFI bindings for Windows-only BT/P2SP acceleration"

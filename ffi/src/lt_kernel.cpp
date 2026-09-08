@@ -17,6 +17,8 @@
 #include <libtorrent/file_storage.hpp>
 #include <libtorrent/announce_entry.hpp>
 #include <libtorrent/peer_info.hpp>
+// 版本守卫依据：2.0.x（Debian trixie 2.0.11 / Ubuntu noble 2.0.10）缺 4 个 2.1 API
+#include <libtorrent/version.hpp>
 #include <libtorrent/read_resume_data.hpp>
 #include <libtorrent/write_resume_data.hpp>
 #include <libtorrent/alert.hpp>
@@ -35,7 +37,9 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <atomic>
 #include <mutex>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -51,11 +55,33 @@ struct lt_session {
     uint32_t dropped = 0;
     uint32_t mask = 0;
     std::string last_err;
+    // Task 46：显式 IP 封禁列表（session 级 ip_filter 的 Rust 可查回镜像）。
+    // 重启重放由 daemon 层持久化（bans.json）负责，C++ 侧仅运行时状态。
+    // 审查修复（P1）：banned 专锁——Session 被 unsafe impl Sync 且 daemon 以
+    // Arc 共享，ban/unban/is_banned 可从多个 tokio worker 并发调用，std::set
+    // 无锁并发修改 = 红黑树损坏 UB（同 err_mtx 已修过的同类问题）。独立叶子锁：
+    // 锁内不取其他锁，无锁序面。ip_filter 本身的并发由 libtorrent 内部保障。
+    mutable std::mutex ban_mtx;
+    std::set<std::string> banned;
+    // 审计修复（P1-4）：last_err 专锁——daemon 单 session 被 bt_events 轮询
+    // 循环与 API handler（pause/remove/peers 等）并发调用，set_err 写与
+    // lt_err_str 读此前无任何同步（std::string 重分配期被读 = UB）。
+    // 独立叶子锁：set_err 可在持有 mtx 的路径（如 lt_take_resume_data）
+    // 内安全调用，无锁序倒置面。
+    mutable std::mutex err_mtx;
     // resume 异步流（D16）：request_save_resume → save_resume_data_alert →
     //   drain 时 bencode 存此 map → lt_take_resume_data 拷贝出（cap 不足则 LT_ERR_BUFFER_TOO_SMALL）
     std::map<std::string, std::vector<char>> resume_map;
     // read_piece 轮询（v2）：lt_read_piece 触发 async read_piece；drain 时存 "ih:idx" → 数据
     std::map<std::string, std::vector<char>> read_map;
+    // PEX 会话策略：内核 2.0.x 无 settings_pack 会话级开关（PEX 默认开），
+    // 由 lt_apply_discovery 记录意图，新增任务时注入 per-torrent disable_pex
+    // flag（不回溯既有任务；daemon 在任务装配前 apply 故覆盖全部任务）。
+    // 审计修复（P1-4）：与 last_err 同族——apply 与 add 跨线程无同步，改 atomic。
+    std::atomic<bool> pex_disabled{false};
+    // batch5（存储模式）：会话级预分配开关，同 pex_disabled 语义族（装配前
+    // apply 后续全部新增生效；fastresume 回灌保留原模式不覆盖）。atomic。
+    std::atomic<bool> storage_allocate{false};
 
     explicit lt_session(const char* path)
         : ses(lt::session_params())
@@ -127,8 +153,13 @@ int map_alert_kind(const lt::alert* a) {
 
 void fill_ih_from_torrent_alert(const lt::alert* a, char out[41]) {
     out[0] = '\0';
-    const auto* ta = dynamic_cast<const lt::torrent_alert*>(a);
-    if (ta && ta->handle.is_valid() && ta->handle.info_hashes().has_v1()) {
+    // 审查修复（P2）：原 dynamic_cast 在 -fno-rtti 构建下恒空 → 所有扁平化
+    // alert 的 ih 为空串，daemon 按 ih 归位任务的终态推进整体失效。
+    // desktop-v0.2.1 首跑实证（brew 2.1.0）：已弃用的 torrent_alert::alert_type
+    // 静态成员在 2.1 被移除；且 2.0.x 中该值为 0，原 `a->type() < alert_type`
+    // 守卫恒假（无实际过滤作用）——直接删除，下方 handle 有效性检查已兑底。
+    const auto* ta = static_cast<const lt::torrent_alert*>(a);
+    if (ta->handle.is_valid() && ta->handle.info_hashes().has_v1()) {
         hex_encode_v1(ta->handle.info_hashes().v1, out);
     }
 }
@@ -177,6 +208,13 @@ void drain_session(lt_session* s) {
             m = "torrent finished";
         } else if (a->type() == lt::torrent_paused_alert::alert_type) {
             m = "torrent paused";
+        } else if (a->type() == lt::torrent_error_alert::alert_type) {
+            // 审计修复（P1-5）：error 与 finished/paused 同构规范化。原透传原始
+            // message()——libtorrent 2.x 格式为 "<torrent名>: <errc.message()>"，
+            // 多数错误文案不含字面 "error"（如 "No such file or directory"），
+            // Rust 侧 state_subkind() 依 contains("error") 判定 → Failed 迁移
+            // 对多数引擎错误静默失效，任务卡在 Downloading。
+            m = "torrent error: " + m;
         } else if (a->type() == lt::save_resume_data_alert::alert_type) {
             m = "resume ready";
         } else if (a->type() == lt::save_resume_data_failed_alert::alert_type) {
@@ -228,8 +266,12 @@ lt_err lt_apply_network(lt_session* s,
         } else {
             sp.set_int(lt::settings_pack::proxy_type, 0);
         }
-        if (down_bytes > 0) sp.set_int(lt::settings_pack::download_rate_limit, static_cast<int>(down_bytes));
-        if (up_bytes > 0) sp.set_int(lt::settings_pack::upload_rate_limit, static_cast<int>(up_bytes));
+        // batch3-P2：限速钳制（与 lt_set_limits 同口径）——i64 超界时
+        // static_cast<int> 回绕为负/错值，限速被静默设错
+        if (down_bytes > 0) sp.set_int(lt::settings_pack::download_rate_limit,
+            static_cast<int>(down_bytes > INT32_MAX ? INT32_MAX : down_bytes));
+        if (up_bytes > 0) sp.set_int(lt::settings_pack::upload_rate_limit,
+            static_cast<int>(up_bytes > INT32_MAX ? INT32_MAX : up_bytes));
         s->ses.apply_settings(sp);
         return LT_OK;
     } catch (...) {
@@ -237,10 +279,11 @@ lt_err lt_apply_network(lt_session* s,
     }
 }
 
-lt_err lt_apply_discovery(lt_session* s, int enable_dht, int enable_lsd, int enable_upnp) {
+lt_err lt_apply_discovery(lt_session* s, int enable_dht, int enable_lsd, int enable_upnp,
+                          int enable_pex) {
     if (!s) return LT_ERR_ARG;
     try {
-        // 会话默认全关（M0 确定性语义，见 lt_session_new）；此处显式覆盖三项。
+        // 会话默认全关（M0 确定性语义，见 lt_session_new）；此处显式覆盖四项。
         // enable_upnp 同时控制 enable_natpmp（端口映射族同进退，见 lt.h 契约注释）。
         lt::settings_pack sp;
         sp.set_bool(lt::settings_pack::enable_dht, enable_dht != 0);
@@ -248,10 +291,78 @@ lt_err lt_apply_discovery(lt_session* s, int enable_dht, int enable_lsd, int ena
         sp.set_bool(lt::settings_pack::enable_upnp, enable_upnp != 0);
         sp.set_bool(lt::settings_pack::enable_natpmp, enable_upnp != 0);
         s->ses.apply_settings(sp);
+        // PEX 特殊：2.0.x 无会话级开关，会话记录意图，新增任务时注入
+        // per-torrent disable_pex flag（见 apply_pex_policy；不回溯既有任务）。
+        s->pex_disabled = (enable_pex == 0);
         return LT_OK;
     } catch (...) {
         return LT_ERR_ENGINE;
     }
+}
+
+lt_err lt_apply_transport(lt_session* s, int enable_utp, int enc_policy) {
+    if (!s) return LT_ERR_ARG;
+    try {
+        // 会话默认 uTP 关 + 加密允许（M0 确定性语义，见 lt_session_new）；此处显式覆盖。
+        // enable_utp 同时控制 incoming/outgoing（uTP 族同进退，见 lt.h 契约注释）。
+        lt::settings_pack sp;
+        sp.set_bool(lt::settings_pack::enable_incoming_utp, enable_utp != 0);
+        sp.set_bool(lt::settings_pack::enable_outgoing_utp, enable_utp != 0);
+        // MSE 加密三态映射（in/out_enc_policy：pe_disabled/pe_enabled/pe_forced）。
+        // allowed_enc_level 保持内核默认 pe_both、prefer_rc4 保持 false，不干预。
+        switch (enc_policy) {
+        case 0:
+            sp.set_int(lt::settings_pack::in_enc_policy, lt::settings_pack::pe_disabled);
+            sp.set_int(lt::settings_pack::out_enc_policy, lt::settings_pack::pe_disabled);
+            break;
+        case 2:
+            sp.set_int(lt::settings_pack::in_enc_policy, lt::settings_pack::pe_forced);
+            sp.set_int(lt::settings_pack::out_enc_policy, lt::settings_pack::pe_forced);
+            break;
+        default:
+            sp.set_int(lt::settings_pack::in_enc_policy, lt::settings_pack::pe_enabled);
+            sp.set_int(lt::settings_pack::out_enc_policy, lt::settings_pack::pe_enabled);
+            break;
+        }
+        s->ses.apply_settings(sp);
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+lt_err lt_apply_conn(lt_session* s, int port, int max_connections) {
+    if (!s) return LT_ERR_ARG;
+    try {
+        lt::settings_pack sp;
+        if (port > 0) {
+            // IPv4+IPv6 双栈监听（apply_settings 后内核自动 re-listen，运行中安全）
+            const std::string ifs = "0.0.0.0:" + std::to_string(port) +
+                                    ",[::]:" + std::to_string(port);
+            sp.set_str(lt::settings_pack::listen_interfaces, ifs);
+        }
+        if (max_connections > 0) {
+            sp.set_int(lt::settings_pack::connections_limit,
+                       static_cast<int>(max_connections));
+        }
+        s->ses.apply_settings(sp);
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+// PEX 会话策略落地（内核 2.0.x 无 settings_pack 会话开关）：pex_disabled=true
+// 时对新增任务注入 per-torrent disable_pex；默认（false）不动 flags = 内核行为。
+void apply_pex_policy(lt_session* s, lt::add_torrent_params& p) {
+    if (s->pex_disabled) p.flags |= lt::torrent_flags::disable_pex;
+}
+
+// batch5（存储模式）：会话级预分配开关落地（sparse/allocate）。
+void apply_storage_policy(lt_session* s, lt::add_torrent_params& p) {
+    p.storage_mode = s->storage_allocate.load()
+                         ? lt::storage_mode_allocate
+                         : lt::storage_mode_sparse;
 }
 
 lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, char* ih_out) {
@@ -263,9 +374,30 @@ lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, 
         // 从源头阻止 lt 队列在 metadata/checking 完成后自动复活。
         p.flags &= ~lt::torrent_flags::auto_managed;
         p.flags |= lt::torrent_flags::paused;
+        apply_pex_policy(s, p);
+        apply_storage_policy(s, p);
         if (web_seeds) {
             for (const char** ws = web_seeds; *ws != nullptr; ++ws) {
                 p.url_seeds.emplace_back(*ws);
+            }
+        }
+        // 审查修复（P1）：幂等 add + errored 重建。daemon 侧失败重试/手动
+        // resume 会重新 add 同一 btih，而 libtorrent 默认 duplicate_is_error
+        // → session 内残存的 errored handle 使 add_torrent 抛 duplicate 异常，
+        // BT 任务重试机制全程失效。语义应为：同 btih = 同一下载——
+        //   * 存活 handle → 幂等返回 OK（不重复添加）；
+        //   * errored handle → 摘除后重加（保留数据，仅重建会话句柄）。
+        lt::info_hash_t existing_ih = p.info_hashes;
+        if (existing_ih.has_v1()) {
+            // libtorrent 2.0.x 的 find_torrent 仅接受 sha1_hash（v1）；2.1 的
+            // info_hash_t 重载不可用（Debian 2.0.11 本地构建同此口径）。
+            if (lt::torrent_handle dup = s->ses.find_torrent(existing_ih.v1); dup.is_valid()) {
+                lt::torrent_status st = dup.status();
+                if (!st.errc) {
+                    hex_encode_v1(existing_ih.v1, ih_out);
+                    return LT_OK; // 幂等：handle 存活，直接复用
+                }
+                s->ses.remove_torrent(dup, lt::remove_flags_t{}); // 保留数据仅重建句柄
             }
         }
         const lt::torrent_handle h = s->ses.add_torrent(p);
@@ -276,6 +408,7 @@ lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, 
         hex_encode_v1(ih.v1, ih_out);
         return LT_OK;
     } catch (...) {
+        set_err(s, "add_magnet: engine error (duplicate or invalid magnet)");
         return LT_ERR_ENGINE;
     }
 }
@@ -320,6 +453,10 @@ lt_err lt_status(lt_session* s, const char* ih, lt_torrent_status* out) {
         const lt::torrent_status st = h.status();
         out->metadata_received = st.has_metadata ? 1 : 0;
         out->paused = (st.flags & lt::torrent_flags::paused) ? 1 : 0;
+        /* E28: torrent 名透出（任务名回填链路）；metadata 前为空串。
+           memset 预置 + strncpy 截断安全（缓冲区 256 字节恒 NUL 结尾）。 */
+        std::memset(out->name, 0, sizeof(out->name));
+        std::strncpy(out->name, st.name.c_str(), sizeof(out->name) - 1);
         switch (st.state) {
             case lt::torrent_status::downloading_metadata:
                 out->state = 4;
@@ -344,6 +481,10 @@ lt_err lt_status(lt_session* s, const char* ih, lt_torrent_status* out) {
         out->up_rate = st.upload_rate;
         out->num_peers = st.num_peers;
         out->num_seeds = st.num_seeds;
+        /* E33: 全生命周期累计上/下行透出（上传/分享率统计链路的数据源）。
+           libtorrent 1.x 起恒有该字段，无需版本守卫。 */
+        out->all_time_download = st.all_time_download;
+        out->all_time_upload = st.all_time_upload;
         return LT_OK;
     } catch (...) {
         return LT_ERR_ENGINE;
@@ -382,11 +523,30 @@ lt_err lt_alerts_dropped(lt_session* s, uint32_t* out) {
 // —— M1 全量（§8.3）——
 
 static void set_err(lt_session* s, std::string m) {
-    if (s && s->last_err != m) s->last_err = std::move(m);
+    if (!s) return;
+    std::lock_guard<std::mutex> lk(s->err_mtx);
+    if (s->last_err != m) s->last_err = std::move(m);
 }
 
 static lt_err fill_ih(lt_session* s, const lt::add_torrent_params& p, const char** web_seeds, char* ih_out) {
     try {
+        // 审查修复（batch6-P1，与 lt_add_magnet 同语义）：幂等 add + errored
+        // 重建——daemon 侧 E30 重试/手动 resume 会重新 add 同一 btih，而
+        // session 内残存的 errored handle 使 add_torrent 抛 duplicate，
+        // 重试对 .torrent/fastresume 路径（有 fastresume 文件的任务几乎
+        // 全部覆盖）全程失效。语义：存活 handle 幂等返回；errored 摘除后重加。
+        lt::info_hash_t existing_ih = p.info_hashes;
+        if (!existing_ih.has_v1() && p.ti) existing_ih = p.ti->info_hashes();
+        if (existing_ih.has_v1()) {
+            if (lt::torrent_handle dup = s->ses.find_torrent(existing_ih.v1); dup.is_valid()) {
+                lt::torrent_status st = dup.status();
+                if (!st.errc) {
+                    hex_encode_v1(existing_ih.v1, ih_out);
+                    return LT_OK; // 幂等：handle 存活，直接复用
+                }
+                s->ses.remove_torrent(dup, lt::remove_flags_t{}); // 保留数据仅重建句柄
+            }
+        }
         lt::torrent_handle h;
         if (p.ti) {
             lt::error_code ec;
@@ -408,7 +568,11 @@ static lt_err fill_ih(lt_session* s, const lt::add_torrent_params& p, const char
 
 lt_err lt_err_str(lt_session* s, char* buf, size_t cap, size_t* out_len) {
     if (!s || !buf || !out_len) return LT_ERR_ARG;
-    const std::string m = s->last_err.empty() ? "ok" : s->last_err;
+    std::string m;
+    {
+        std::lock_guard<std::mutex> lk(s->err_mtx);
+        m = s->last_err.empty() ? "ok" : s->last_err;
+    }
     if (cap < m.size() + 1) { *out_len = m.size() + 1; return LT_ERR_BUFFER_TOO_SMALL; }
     std::memcpy(buf, m.c_str(), m.size() + 1);
     *out_len = m.size(); // 不含 NUL
@@ -434,14 +598,22 @@ lt_err lt_add_torrent_file(lt_session* s, const uint8_t* meta, size_t len, const
         // 新 API = info-section 构造（from_info_section_t 标签）
         const lt::bdecode_node info = node.dict_find("info");
         if (!info) { set_err(s, "torrent parse: no info section"); return LT_ERR_IO; }
+#if LIBTORRENT_VERSION_NUM >= 20100
         auto ti = std::make_shared<lt::torrent_info>(
             info, ec, lt::load_torrent_limits{}, lt::from_info_section);
+#else
+        // 2.0.x 无 from_info_section：回退全文件 bdecode_node ctor（node 即完整 .torrent）
+        (void)info;
+        auto ti = std::make_shared<lt::torrent_info>(node, ec);
+#endif
         if (ec) { set_err(s, "torrent parse: " + ec.message()); return LT_ERR_IO; }
         lt::add_torrent_params p;
         p.ti = std::move(ti);
         p.save_path = s->save_path;
         p.flags &= ~lt::torrent_flags::auto_managed;
         p.flags |= lt::torrent_flags::paused;
+        apply_pex_policy(s, p);
+        apply_storage_policy(s, p);
         set_web_seeds(p, web_seeds);
         return fill_ih(s, p, web_seeds, ih_out);
     } catch (...) {
@@ -460,6 +632,7 @@ lt_err lt_add_torrent_resume(lt_session* s, const uint8_t* resume_data, size_t l
         p.save_path = s->save_path;
         p.flags &= ~lt::torrent_flags::auto_managed;
         p.flags |= lt::torrent_flags::paused;
+        apply_pex_policy(s, p);
         set_web_seeds(p, web_seeds);
         return fill_ih(s, p, web_seeds, ih_out);
     } catch (...) {
@@ -488,6 +661,18 @@ lt_err lt_remove(lt_session* s, const char* ih, int delete_data) {
         if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
         s->ses.remove_torrent(h, delete_data ? lt::session_handle::delete_files
                                              : lt::remove_flags_t{});
+        {
+            // 审查修复（P2）：清理该 ih 的 resume/read 残留——request_save_resume
+            // 已触发而 alert 未被取走时，bencode 永驻 resume_map（数十 KB 级/任务）；
+            // read_map 同理。持锁清理与既有锁序一致（mtx 叶子）。
+            std::lock_guard<std::mutex> lk(s->mtx);
+            s->resume_map.erase(ih);
+            const std::string prefix = std::string(ih) + ":";
+            for (auto it = s->read_map.begin(); it != s->read_map.end();) {
+                if (it->first.rfind(prefix, 0) == 0) it = s->read_map.erase(it);
+                else ++it;
+            }
+        }
         return LT_OK;
     } catch (...) {
         set_err(s, "engine error");
@@ -557,7 +742,54 @@ lt_err lt_file_progress(lt_session* s, const char* ih, int64_t* done_arr, int64_
         h.file_progress(prog);
         for (int i = 0; i < nf; ++i) {
             done_arr[i] = prog[i];
+#if LIBTORRENT_VERSION_NUM >= 20100
             size_arr[i] = tf->files_impl().file_size(lt::file_index_t{i}); // ABI100：files() 仅 ABI<4
+#else
+            size_arr[i] = tf->files().file_size(lt::file_index_t{i});
+#endif
+        }
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+lt_err lt_set_file_priorities(lt_session* s, const char* ih, const int* idx_arr, const int* prio_arr, int n) {
+    if (!s || !ih || !idx_arr || !prio_arr || n <= 0) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        const std::shared_ptr<const lt::torrent_info> tf = h.torrent_file();
+        if (!tf) { set_err(s, "metadata not available"); return LT_ERR_NOT_FOUND; }
+        const int nf = tf->num_files();
+        // 两段式：先全量校验再逐条 file_priority(index, prio) 应用
+        //（注意 libtorrent 异步记账：设后立即查可能读到旧值，以 file_prio_alert 为准）
+        for (int i = 0; i < n; ++i) {
+            if (idx_arr[i] < 0 || idx_arr[i] >= nf) { set_err(s, "file index out of range"); return LT_ERR_ARG; }
+            if (prio_arr[i] < 0 || prio_arr[i] > 7) { set_err(s, "priority out of range (0..=7)"); return LT_ERR_ARG; }
+        }
+        for (int i = 0; i < n; ++i) {
+            h.file_priority(lt::file_index_t{idx_arr[i]},
+                            lt::download_priority_t{static_cast<std::uint8_t>(prio_arr[i])});
+        }
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+lt_err lt_get_file_priorities(lt_session* s, const char* ih, int* out_arr, int n) {
+    if (!s || !ih || !out_arr || n <= 0) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        const std::shared_ptr<const lt::torrent_info> tf = h.torrent_file();
+        if (!tf) { set_err(s, "metadata not available"); return LT_ERR_NOT_FOUND; }
+        const std::vector<lt::download_priority_t> prios = h.get_file_priorities();
+        const int nf = static_cast<int>(prios.size());
+        if (n < nf) return LT_ERR_BUFFER_TOO_SMALL;
+        for (int i = 0; i < nf; ++i) {
+            out_arr[i] = static_cast<int>(static_cast<std::uint8_t>(prios[i]));
         }
         return LT_OK;
     } catch (...) {
@@ -590,13 +822,19 @@ lt_err lt_peers(lt_session* s, const char* ih, lt_peer* buf, size_t cap, size_t*
             const lt::peer_info& pi = v[i];
             lt_peer& o = buf[i];
             std::memset(&o, 0, sizeof(o));
+#if LIBTORRENT_VERSION_NUM >= 20100
             // ABI100：ip 字段由 remote_endpoint() 提供（ip 成员仅 ABI==1）
             const lt::tcp::endpoint ep = pi.remote_endpoint();
+#else
+            const lt::tcp::endpoint ep = pi.ip;
+#endif
             const std::string ipstr = ep.address().to_string();
             std::strncpy(o.ip, ipstr.c_str(), sizeof(o.ip) - 1);
             o.port = ep.port();
-            const std::string pid = pi.pid.to_string();
-            hex_encode_20(pid.c_str(), o.peer_id, sizeof(o.peer_id));
+            // batch3-P2：peer_id 单次 hex——sha1_hash::to_string() 已是 40 位
+            // hex 文本，旧实现对该文本再 hex 一次且截断为前 10 字节，与 lt.h
+            // 「原始 peer_id 的 hex」契约不符（peer 客户端识别全错）。
+            hex_encode_v1(pi.pid, o.peer_id);
             std::strncpy(o.client, pi.client.c_str(), sizeof(o.client) - 1);
             o.progress_ppm = pi.progress_ppm;
             o.down_rate = pi.payload_down_speed;
@@ -617,6 +855,54 @@ lt_err lt_peers(lt_session* s, const char* ih, lt_peer* buf, size_t cap, size_t*
             if (f & lt::peer_info::utp_socket) o.flags |= LT_PEER_UTP;
         }
         *out_count = total;
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* —— tracker 运行时增删查（E29；契约与 lt_peers 同两段式）—— */
+lt_err lt_list_trackers(lt_session* s, const char* ih, lt_tracker_info* out, int cap, int* out_len) {
+    if (!s || !ih || !out_len) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        const std::vector<lt::announce_entry> v = h.trackers();
+        const size_t total = v.size();
+        if (total == 0) { *out_len = 0; return LT_OK; }
+        if (!out || (size_t)cap < total) { *out_len = (int)total; return LT_ERR_BUFFER_TOO_SMALL; }
+        for (size_t i = 0; i < total; ++i) {
+            lt_tracker_info& o = out[i];
+            std::memset(&o, 0, sizeof(o));
+            std::strncpy(o.url, v[i].url.c_str(), sizeof(o.url) - 1);
+            o.tier = v[i].tier;
+        }
+        *out_len = (int)total;
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+lt_err lt_remove_tracker(lt_session* s, const char* ih, const char* url) {
+    if (!s || !ih || !url) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        // libtorrent 2.0 无 remove_tracker（1.1 曾提供）→ 版本可移植方案：
+        // replace_trackers 过滤式删除（按 URL 精确匹配）。
+        // daemon 语义要求"删不存在的 tracker"可定性 404（libtorrent 原生
+        // 删除对无匹配静默 no-op，故先扫描确认存在）。
+        const std::vector<lt::announce_entry> v = h.trackers();
+        std::vector<lt::announce_entry> kept;
+        kept.reserve(v.size());
+        bool found = false;
+        for (const lt::announce_entry& e : v) {
+            if (e.url == url) { found = true; continue; }
+            kept.push_back(e);
+        }
+        if (!found) { set_err(s, "tracker not found"); return LT_ERR_NOT_FOUND; }
+        h.replace_trackers(kept);
         return LT_OK;
     } catch (...) {
         return LT_ERR_ENGINE;
@@ -644,14 +930,189 @@ lt_err lt_take_resume_data(lt_session* s, const char* ih, uint8_t* buf, size_t c
     if (!buf || cap < sz) { *out_len = sz; return LT_ERR_BUFFER_TOO_SMALL; }
     std::memcpy(buf, it->second.data(), sz);
     *out_len = sz;
+    // 审计修复（P1-3）："take" = 一次性消费（对齐 read_map 与 lt.h D16 契约
+    // “数据 C++ 侧持有至 take 拷贝出”）。原实现从不 erase——长驻 daemon 每
+    // torrent 常驻一份 resume bencode，且重复 take 返回旧数据而非 NotFound。
+    // BUFFER_TOO_SMALL 重试路径不 erase（数据仍在，扩容后可重取）。
+    s->resume_map.erase(it);
     return LT_OK;
 }
 
-lt_err lt_ban_peer(lt_session* s, const char* /*ih*/, const char* /*ip*/, uint16_t /*port*/) {
-    // v2：2.x 公开 API 无 per-endpoint ban（ban_ip 在 aux_ 内部）；v1 存根
+/* v2 真实现（Task 46，qbit「封禁 IP」对标）：libtorrent 2.x 公开 API 无
+   per-endpoint ban，session 级走 ip_filter（1.2/2.x 均有 set/get_ip_filter）。
+   封禁集合同步存 s->banned（daemon 重启重放由 Rust 层持久化负责）。
+   幂等：已在集合中直接 LT_OK。ih 仅验证任务存在（封禁作用域 = 全 session，
+   与 qbit「永久封禁」一致；port 无作用——filter 按 address 匹配）。 */
+lt_err lt_ban_peer(lt_session* s, const char* ih, const char* ip, uint16_t /*port*/) {
+    if (!s || !ip) return LT_ERR_ARG;
+    try {
+        if (ih) {
+            const lt::torrent_handle h = find_handle(s, ih);
+            if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        }
+        const std::string a(ip);
+        boost::system::error_code ec;
+        const lt::address addr = lt::make_address(a, ec);
+        if (ec) { set_err(s, "invalid ip: " + a); return LT_ERR_ARG; }
+        /* batch5-P1：get→add→set 读改写全程持锁——原两段式只护集合，
+           并发 ban/unban 的 filter 快照互相覆盖丢规则（镜像与真实 filter
+           脱节）。ban_mtx 为叶子锁：锁内不取其他锁，无锁序面。 */
+        std::lock_guard<std::mutex> lk(s->ban_mtx);
+        if (s->banned.count(a)) return LT_OK; /* 幂等 */
+        auto f = s->ses.get_ip_filter();
+        /* ip_filter 语义：flags 0 = allowed，access_flags::blocked = 封禁 */
+        f.add_rule(addr, addr, lt::ip_filter::access_flags::blocked);
+        s->ses.set_ip_filter(f);
+        s->banned.insert(a);
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* 解除封禁（qbit「解除封禁」对标）：filter 规则恢复 allow + 集合移除。
+   未封禁的 IP 幂等 LT_OK（filter 层规则本就不存在）。 */
+lt_err lt_unban_peer(lt_session* s, const char* ip) {
+    if (!s || !ip) return LT_ERR_ARG;
+    try {
+        const std::string a(ip);
+        /* batch5：区间条目（"a-b"）→ 整段恢复 allow（与 lt_ban_range 对称；
+           单 IP/IPv6 字面量不含 '-'，无歧义）。 */
+        const auto dash = a.find('-');
+        boost::system::error_code ec, ec2;
+        lt::address addr, addr2;
+        bool is_range = false;
+        if (dash != std::string::npos) {
+            addr = lt::make_address(a.substr(0, dash), ec);
+            addr2 = lt::make_address(a.substr(dash + 1), ec2);
+            if (!ec && !ec2 && addr.is_v4() == addr2.is_v4() && addr <= addr2) {
+                is_range = true;
+            } else {
+                set_err(s, "invalid range: " + a);
+                return LT_ERR_ARG;
+            }
+        } else {
+            addr = lt::make_address(a, ec);
+            if (ec) { set_err(s, "invalid ip: " + a); return LT_ERR_ARG; }
+        }
+        /* batch5-P1：同 ban，读改写全程持锁（叶子锁）*/
+        std::lock_guard<std::mutex> lk(s->ban_mtx);
+        if (!s->banned.count(a)) return LT_OK;
+        auto f = s->ses.get_ip_filter();
+        /* 解封 = 恢复 allow（flags 0；区间则整段恢复）*/
+        if (is_range) {
+            f.add_rule(addr, addr2, 0);
+        } else {
+            f.add_rule(addr, addr, 0);
+        }
+        s->ses.set_ip_filter(f);
+        s->banned.erase(a);
+        return LT_OK;
+    } catch (...) {
+        set_err(s, "unban: engine error");
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* 查询封禁状态：out = 1 已封禁 / 0 未封禁。读 banned 集合（O(log n)），
+   不查 libtorrent 内部（auto-ban 的临时封禁不入本集合，语义 = 显式封禁列表）。
+   审查修复（P1）：ban_mtx 加锁读（并发 ban/unban 下 std::set 读 = UB）；
+   补 try/catch（原为本文件唯一无异常屏障的查询入口，std::string 分配
+   异常可穿越 extern "C"）。 */
+lt_err lt_is_banned(lt_session* s, const char* ip, int* out) {
+    if (!s || !ip || !out) return LT_ERR_ARG;
+    try {
+        std::lock_guard<std::mutex> lk(s->ban_mtx);
+        *out = s->banned.count(std::string(ip)) ? 1 : 0;
+        return LT_OK;
+    } catch (...) {
+        set_err(s, "is_banned: engine error");
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* IP 段封禁（batch5 对标）：[start, end] 闭区间加入 ip_filter（libtorrent
+   原生支持区间规则）。同族校验（v4 对 v4 / v6 对 v6）；镜像集合存
+   "start-end" 复合串（lt_is_banned 单 IP 查询语义不变 = 只匹配显式单 IP；
+   区间命中查询交由 daemon 层 list 口径）。叶子锁 ban_mtx 全程持锁
+   （与 batch5-P1 ban/unban 同纪律）。 */
+lt_err lt_ban_range(lt_session* s, const char* start, const char* end) {
+    if (!s || !start || !end) return LT_ERR_ARG;
+    try {
+        boost::system::error_code ec1, ec2;
+        const lt::address a1 = lt::make_address(start, ec1);
+        const lt::address a2 = lt::make_address(end, ec2);
+        if (ec1) { set_err(s, "invalid start ip"); return LT_ERR_ARG; }
+        if (ec2) { set_err(s, "invalid end ip"); return LT_ERR_ARG; }
+        if (a1.is_v4() != a2.is_v4()) { set_err(s, "ip family mismatch"); return LT_ERR_ARG; }
+        if (a1 > a2) { set_err(s, "start > end"); return LT_ERR_ARG; }
+        std::lock_guard<std::mutex> lk(s->ban_mtx);
+        auto f = s->ses.get_ip_filter();
+        f.add_rule(a1, a2, lt::ip_filter::access_flags::blocked);
+        s->ses.set_ip_filter(f);
+        s->banned.insert(std::string(start) + "-" + std::string(end));
+        return LT_OK;
+    } catch (...) {
+        set_err(s, "ban_range: engine error");
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* 首尾块优先（batch5 对标）：逐文件（跳过 pad 文件）按 offset/size 派生
+   首/末 piece 下标，priority 置为 prio。其余块不动。需要 metadata。 */
+lt_err lt_set_piece_first_last(lt_session* s, const char* ih, int prio) {
+    if (!s || !ih || prio < 0 || prio > 7) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        const std::shared_ptr<const lt::torrent_info> tf = h.torrent_file();
+        if (!tf) { set_err(s, "metadata not ready"); return LT_ERR_NOT_FOUND; }
+        // desktop-v0.2.1 终跑实证：2.1 起 files() 标记 TORRENT_DEPRECATED
+        //（vcpkg 构建 deprecated-functions=off 时成员整体移除，brew 2.1.0 仅告警）
+        // ——版本宏分流：2.1+ 公开面取整份 file_storage 的唯一途径是
+        // files_impl()（"internal" 注释但 public，2.0.11 无此成员）；2.0 走 files()。
+#if LIBTORRENT_VERSION_NUM >= 20100 // 2.1.0（版本宏=十进制编码 major*10000+minor*100+tiny）
+        const lt::file_storage& fs = tf->files_impl();
+#else
+        const lt::file_storage& fs = tf->files();
+#endif
+        const int num_pieces = tf->num_pieces();
+        if (num_pieces <= 0) { set_err(s, "no pieces"); return LT_ERR_ENGINE; }
+        const int piece_len = tf->piece_length();
+        if (piece_len <= 0) { set_err(s, "bad piece length"); return LT_ERR_ENGINE; }
+        // daemon 契约 prio==0 = 恢复默认；lt 中 piece priority 0 = skip（不下载）
+        // ——直接透传会把首/末块标成永不下载（小于一块的文件整个文件永不完成）。
+        // 映射到内核默认优先级（batch6-P1 修复，desktop-v0.2.0 审计发现）。
+        // download_priority_t 强类型构造（2.0/2.1 通用：2.1 移除了
+        // download_priority_t → int 的隐式转换，显式构造两版皆可）。
+        const lt::download_priority_t effective = (prio == 0)
+            ? lt::default_priority
+            : lt::download_priority_t(static_cast<std::uint8_t>(prio));
+        for (lt::file_index_t fi(0); fi < lt::file_index_t(fs.num_files()); ++fi) {
+            if (fs.pad_file_at(fi)) continue;
+            const std::int64_t off = fs.file_offset(fi);
+            const std::int64_t size = fs.file_size(fi);
+            if (size <= 0) continue;
+            const int first = static_cast<int>(off / piece_len);
+            int last = static_cast<int>((off + size - 1) / piece_len);
+            if (last >= num_pieces) last = num_pieces - 1;
+            if (first < 0 || first >= num_pieces) continue;
+            h.piece_priority(lt::piece_index_t(first), effective);
+            h.piece_priority(lt::piece_index_t(last), effective);
+        }
+        return LT_OK;
+    } catch (...) {
+        set_err(s, "piece first/last: engine error");
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* 会话级存储模式（batch5 对标）：atomic 写；后续新增任务生效（见
+   apply_storage_policy），fastresume 回灌路径不读此开关（保留原模式）。 */
+lt_err lt_set_storage_mode(lt_session* s, int alloc) {
     if (!s) return LT_ERR_ARG;
-    set_err(s, "ban_peer: not implemented (2.x public API lacks endpoint ban)");
-    return LT_ERR_ENGINE;
+    s->storage_allocate.store(alloc != 0);
+    return LT_OK;
 }
 
 lt_err lt_add_url_seed(lt_session* s, const char* ih, const char* url) {
@@ -683,10 +1144,100 @@ lt_err lt_set_sequential(lt_session* s, const char* ih, int on) {
     try {
         const lt::torrent_handle h = find_handle(s, ih);
         if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+#if LIBTORRENT_VERSION_NUM >= 20100
         // 2.x：set_sequential_download 仅 ABI==1；全局开关由 range API 表达：
         // on → 从第 0 片起顺序下载；off → 无全局解除 API，no-op（等待 range 自然耗尽/寻址策略接管）
         if (on) {
             h.set_sequential_range(lt::piece_index_t{0});
+        }
+#else
+        // 2.0.x 无 set_sequential_range：classic sequential_download flag（on/off 均可）
+        if (on) h.set_flags(lt::torrent_flags::sequential_download);
+        else h.unset_flags(lt::torrent_flags::sequential_download);
+#endif
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* 超级种子（BitComet 首创，qBittorrent 任务右键同名能力）：seed_mode flag
+   仅在任务处于做种态（metadata 齐全且全部 piece 就绪）时有意义——下载中设置
+   libtorrent 静默接受但无效果（与 qbit 行为一致，无需上层拦截）。
+   on/off 均可逆：set_flags / unset_flags。句柄不存在 → LT_ERR_NOT_FOUND。 */
+lt_err lt_set_seed_mode(lt_session* s, const char* ih, int on) {
+    if (!s || !ih) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        if (on) {
+            h.set_flags(lt::torrent_flags::seed_mode);
+        } else {
+            h.unset_flags(lt::torrent_flags::seed_mode);
+        }
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* —— 强制操作三件套（Task 46，qbit/BitComet 任务右键对标）—— */
+
+/* 强制向全部 tracker 立即宣告。libtorrent 侧无同步错误通道（宣告失败走
+   tracker_error alert），成功路径恒 LT_OK；仅句柄不存在报 NOT_FOUND。 */
+lt_err lt_force_reannounce(lt_session* s, const char* ih) {
+    if (!s || !ih) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        h.force_reannounce();
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* 强制 DHT 宣告。DHT 未启用时 libtorrent 内部 no-op（不报错）——
+   与 qbit 行为一致，上层无需预检 DHT 开关。 */
+lt_err lt_force_dht_announce(lt_session* s, const char* ih) {
+    if (!s || !ih) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        h.force_dht_announce();
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* 强制重新校验：任务转入 checking（校验期下载/做种挂起，完成后自动恢复）。
+   magnet 元数据未就绪时 libtorrent 侧 no-op。 */
+lt_err lt_force_recheck(lt_session* s, const char* ih) {
+    if (!s || !ih) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        h.force_recheck();
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* 任务级连接数上限（S1-c）：>0 = set_max_connections；0 = 复位为会话级
+   connections_limit 当前值（add 时 libtorrent 以会话值初始化 per-torrent
+   上限，复位即回到该口径）。句柄不存在 → LT_ERR_NOT_FOUND。 */
+lt_err lt_torrent_set_max_connections(lt_session* s, const char* ih, int max_connections) {
+    if (!s || !ih) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        if (max_connections > 0) {
+            h.set_max_connections(max_connections);
+        } else {
+            h.set_max_connections(
+                s->ses.get_settings().get_int(lt::settings_pack::connections_limit));
         }
         return LT_OK;
     } catch (...) {
@@ -743,8 +1294,27 @@ lt_err lt_metadata(lt_session* s, const char* ih, uint8_t* buf, size_t cap, size
         if (!ti) { set_err(s, "metadata not received"); return LT_ERR_NOT_FOUND; }
         // create_torrent(ti) → generate → bencode：由 torrent_info 重建标准 .torrent
         // 字节（info dict 原样 + announce 族回填；v1 torrent 为无损往返）。
+#if LIBTORRENT_VERSION_NUM >= 20100
+        // 2.1：create_torrent(torrent_info const&) ctor 在 ABI>=4 构建态被移除
+        //（vcpkg x64-windows 实证 C2665；brew 2.1.1 ABI<4 仅 deprecated 警告）。
+        // 官方替代 write_torrent_file(atp)（write_resume_data.hpp，TORRENT_EXPORT
+        // 无 ABI 守卫，dylib 必导出）：info dict 经 atp.ti 原样保留。
+        // 注意 ti 的 trackers()/web_seeds() 访问器在 ABI>=4 同样被移除（C2039
+        // 二次实证），announce 族改走 torrent_handle 未废弃面（h.trackers()/
+        // h.url_seeds()）；dht nodes 磁力派生 ti 本就为空，按空省略。
+        lt::add_torrent_params atp;
+        atp.ti = std::const_pointer_cast<lt::torrent_info>(ti);
+        for (const lt::announce_entry& ae : h.trackers()) {
+            atp.trackers.push_back(ae.url);
+        }
+        for (const std::string& u : h.url_seeds()) {
+            atp.url_seeds.push_back(u);
+        }
+        const lt::entry e = lt::write_torrent_file(atp);
+#else
         lt::create_torrent ct(*ti);
         const lt::entry e = ct.generate();
+#endif
         std::vector<char> data;
         lt::bencode(std::back_inserter(data), e);
         const size_t sz = data.size();

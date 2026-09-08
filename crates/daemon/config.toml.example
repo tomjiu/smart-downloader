@@ -20,6 +20,13 @@ enabled = true
 enable_dht = false
 enable_lsd = false
 enable_upnp = false
+# PEX（peer 交换）：默认关闭保持确定性且对私有 tracker 更友好
+enable_pex = false
+# uTP（UDP 传输，incoming/outgoing 同进退）：默认关闭保持确定性
+enable_utp = false
+# MSE 加密策略：disable=纯明文 / allow=明文+加密皆收（默认，内核行为不变）/
+# require=强制加密（明文直接拒绝）
+encrypt = "allow"
 
 [lock]
 # 单实例锁文件（重复启动 → 直接退出）

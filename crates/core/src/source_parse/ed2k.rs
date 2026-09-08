@@ -273,7 +273,7 @@ mod tests {
             Err(Ed2kError::MissingFields)
         );
         assert_eq!(
-            parse_ed2k(&format!("ed2k://|file|a.bin|1|")),
+            parse_ed2k("ed2k://|file|a.bin|1|"),
             Err(Ed2kError::MissingFields)
         );
     }

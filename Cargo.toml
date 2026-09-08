@@ -13,7 +13,7 @@ members = [
 exclude = ["spike/cxx"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.1"
 edition = "2021"
 
 # Task 5-a（2026-08-30）：dev/test 只保留行表级调试信息。
@@ -31,6 +31,17 @@ percent-encoding = "2"
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Metalink4 XML 解析（B1，RFC 5854）：纯 Rust 零拷贝事件流，默认 features
+# 关闭 serialize（仅读）；无前缀/带前缀标签统一按 local name 匹配。
+quick-xml = "0.37"
+# FTPS（B2，RFC 4217）：显式 AUTH TLS 控制连接升级 + PROT P 数据连接。
+# tokio-rustls 与 reqwest rustls-tls 共享 rustls 0.23 栈（ring provider，
+# aarch64-android 交叉兼容——见下方 reqwest 注释）；webpki-roots 固定根集。
+tokio-rustls = { version = "0.26", default-features = false, features = [
+    "ring",
+    "tls12",
+] }
+webpki-roots = "0.26"
 thiserror = "1"
 async-trait = "0.1"
 # TLS 后端（P1-3 安卓交叉，2026-08-31）：default-features=false 关掉 native-tls
@@ -45,6 +56,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "charset",
     "http2",
+    "cookies",
 ] }
 tracing = "0.1"
 futures = "0.3"
@@ -52,5 +64,12 @@ uuid = { version = "1", features = ["v4"] }
 url = "2"
 sha1 = "0.10"
 base64 = "0.22"
+# SFTP（C-S1）：纯 Rust SSH2 传输（russh）+ SFTP 子系统协议（russh-sftp，
+# client/server 双端——server 侧供 hermetic 测试桩复用）。默认 features 已
+# 关无谓依赖；crypto 后端选 ring（与 reqwest rustls-tls/tokio-rustls 共享
+# 同一 ring 编译单元，aarch64-android asm 支路见上方 reqwest 注释），
+# 回避 aws-lc-rs（CMake/C++ 构建，交叉编译即断点）。
+russh = { version = "0.63", default-features = false, features = ["ring", "flate2"] }
+russh-sftp = "2.4"
 fs2 = "0.4"
 parking_lot = "0.12"

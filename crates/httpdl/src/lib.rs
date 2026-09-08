@@ -6,20 +6,27 @@
 // 测试以 `httpdl::` 引用（包名为 smart-dl-httpdl）。
 extern crate self as httpdl;
 
+/// DASH（ISO/IEC 23009-1，MPD 清单）static VOD 下载支持（C-DASH）。
+pub mod dash;
 pub mod download;
 pub mod engine;
+/// HLS（RFC 8216）VOD 下载支持（C-HLS）。
+pub mod hls;
+pub mod ledger;
 pub mod range;
 pub mod rate;
-pub mod resume;
 pub mod retry;
 pub mod segment_manager;
 pub mod static_split;
 pub mod verify;
 
-#[cfg(feature = "ftp")]
+#[cfg(any(feature = "ftp", feature = "sftp"))]
 pub mod protocol;
 
-pub use engine::HttpEngine;
+pub use engine::{build_proxied_client, proxy_auth_of, url_basename, HttpEngine};
 
 #[cfg(feature = "ftp")]
 pub use protocol::ftp::FtpEngine;
+
+#[cfg(feature = "sftp")]
+pub use protocol::sftp::SftpEngine;

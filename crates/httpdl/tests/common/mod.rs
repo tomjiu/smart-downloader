@@ -34,11 +34,14 @@ pub fn make_http_task_to(
             headers: vec![],
             auth: None,
             backup_url: None,
+            proxy: None,
         },
         identity: ContentIdentity::SingleFile {
             size: 0,
             etag: None,
             sha256: None,
+            sha1: None,
+            md5: None,
             backup_md5: None,
         },
         dest_root,
@@ -48,10 +51,19 @@ pub fn make_http_task_to(
         state: TaskState::Evaluating(EvalPhase::MetadataPending),
         retry: RetryState::default(),
         created_at: Instant::now(),
+        file_priorities: None,
+        sequential: false,
         metadata: TaskMetadata {
             name: name.map(str::to_string),
             added_at_unix: 0,
+            tags: Vec::new(),
+            finished_at_unix: 0,
+            start_at_unix: 0,
+            next_retry_at_unix: 0,
         },
+        limits: None,
+        max_connections: None,
+        queue_priority: 0,
     }
 }
 
@@ -68,6 +80,48 @@ pub fn make_http_task_sha256(
         size: 0,
         etag: None,
         sha256: Some(sha256.to_string()),
+        sha1: None,
+        md5: None,
+        backup_md5: None,
+    };
+    t
+}
+
+/// 带主源 sha1 的任务（E25 verify 用例）。
+pub fn make_http_task_sha1(
+    id: &str,
+    url: &str,
+    dest_root: PathBuf,
+    name: &str,
+    sha1: &str,
+) -> DownloadTask {
+    let mut t = make_http_task_to(id, url, dest_root, Some(name));
+    t.identity = ContentIdentity::SingleFile {
+        size: 0,
+        etag: None,
+        sha256: None,
+        sha1: Some(sha1.to_string()),
+        md5: None,
+        backup_md5: None,
+    };
+    t
+}
+
+/// 带主源 md5 的任务（E25 verify 用例）。
+pub fn make_http_task_md5(
+    id: &str,
+    url: &str,
+    dest_root: PathBuf,
+    name: &str,
+    md5: &str,
+) -> DownloadTask {
+    let mut t = make_http_task_to(id, url, dest_root, Some(name));
+    t.identity = ContentIdentity::SingleFile {
+        size: 0,
+        etag: None,
+        sha256: None,
+        sha1: None,
+        md5: Some(md5.to_string()),
         backup_md5: None,
     };
     t
@@ -89,11 +143,14 @@ pub fn make_http_task_backup(
         headers: vec![],
         auth: None,
         backup_url: Some(backup_url.to_string()),
+        proxy: None,
     };
     t.identity = ContentIdentity::SingleFile {
         size: 0,
         etag: None,
         sha256: Some(sha256.to_string()),
+        sha1: None,
+        md5: None,
         backup_md5: Some(backup_md5.to_string()),
     };
     t
@@ -119,6 +176,8 @@ pub fn make_ftp_task(id: &str, url: &str, dest_root: PathBuf, name: &str) -> Dow
             size: 0,
             etag: None,
             sha256: None,
+            sha1: None,
+            md5: None,
             backup_md5: None,
         },
         dest_root,
@@ -128,10 +187,19 @@ pub fn make_ftp_task(id: &str, url: &str, dest_root: PathBuf, name: &str) -> Dow
         state: TaskState::Evaluating(EvalPhase::MetadataPending),
         retry: RetryState::default(),
         created_at: Instant::now(),
+        file_priorities: None,
+        sequential: false,
         metadata: TaskMetadata {
             name: Some(name.to_string()),
             added_at_unix: 0,
+            tags: Vec::new(),
+            finished_at_unix: 0,
+            start_at_unix: 0,
+            next_retry_at_unix: 0,
         },
+        limits: None,
+        max_connections: None,
+        queue_priority: 0,
     }
 }
 

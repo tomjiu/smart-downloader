@@ -1,24 +1,3 @@
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn request_roundtrip() {
-        let r = build_request(15, 0x180000, BLOCK_SIZE);
-        assert_eq!(r.len(), 13);
-        assert_eq!(r[0], MSG_REQUEST);
-        let (piece, begin, length) = parse_request(&r).unwrap();
-        assert_eq!((piece, begin, length), (15, 0x180000, BLOCK_SIZE));
-    }
-
-    #[test]
-    fn parse_request_rejects_wrong_id() {
-        let mut r = build_request(1, 0, BLOCK_SIZE);
-        r[0] = MSG_BITFIELD;
-        assert!(parse_request(&r).is_none());
-    }
-}
-
 // BT 消息 ID
 pub const MSG_CHOKE: u8 = 0x00;
 pub const MSG_UNCHOKE: u8 = 0x01;
@@ -63,4 +42,25 @@ pub fn build_interested() -> Vec<u8> {
 
 pub fn build_unchoke() -> Vec<u8> {
     vec![MSG_UNCHOKE]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_roundtrip() {
+        let r = build_request(15, 0x180000, BLOCK_SIZE);
+        assert_eq!(r.len(), 13);
+        assert_eq!(r[0], MSG_REQUEST);
+        let (piece, begin, length) = parse_request(&r).unwrap();
+        assert_eq!((piece, begin, length), (15, 0x180000, BLOCK_SIZE));
+    }
+
+    #[test]
+    fn parse_request_rejects_wrong_id() {
+        let mut r = build_request(1, 0, BLOCK_SIZE);
+        r[0] = MSG_BITFIELD;
+        assert!(parse_request(&r).is_none());
+    }
 }

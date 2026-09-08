@@ -103,11 +103,14 @@ impl HttpSink for EngineSink {
                 headers: vec![],
                 auth: None,
                 backup_url: None,
+                proxy: None,
             },
             identity: smart_dl_core::identity::ContentIdentity::SingleFile {
                 size: 0,
                 etag: None,
                 sha256: None,
+                sha1: None,
+                md5: None,
                 backup_md5: None,
             },
             dest_root,
@@ -117,10 +120,19 @@ impl HttpSink for EngineSink {
             state: TaskState::Queued,
             retry: Default::default(),
             created_at: std::time::Instant::now(),
+            file_priorities: None,
+            sequential: false,
             metadata: smart_dl_core::task::TaskMetadata {
                 name,
                 added_at_unix: 0,
+                tags: Vec::new(),
+                finished_at_unix: 0,
+                start_at_unix: 0,
+                next_retry_at_unix: 0,
             },
+            limits: None,
+            max_connections: None,
+            queue_priority: 0,
         };
         let tid = self
             .engine
@@ -181,6 +193,8 @@ async fn full_flow_transfers_two_files_to_disk() {
             size: 0,
             etag: None,
             sha256: None,
+            sha1: None,
+            md5: None,
             backup_md5: None,
         },
         dest_root: dir.path().to_path_buf(),
@@ -190,10 +204,19 @@ async fn full_flow_transfers_two_files_to_disk() {
         state: TaskState::Queued,
         retry: Default::default(),
         created_at: std::time::Instant::now(),
+        file_priorities: None,
+        sequential: false,
+        max_connections: None,
+        queue_priority: 0,
         metadata: smart_dl_core::task::TaskMetadata {
             name: None,
             added_at_unix: 0,
+            tags: Vec::new(),
+            finished_at_unix: 0,
+            start_at_unix: 0,
+            next_retry_at_unix: 0,
         },
+        limits: None,
     };
 
     let outcome = coord.begin_fallback(&task, 0.1, true, &sink).await.unwrap();

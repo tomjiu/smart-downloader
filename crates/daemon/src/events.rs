@@ -53,6 +53,22 @@ pub enum SchedulerEvent {
         provider: String,
         runtime: ProviderRuntime,
     },
+    /// 全局限速总阀门变更（E16）：daemon 级事件（无 task_id）。
+    GlobalLimitsChanged {
+        max_download_kb_s: u32,
+        max_upload_kb_s: u32,
+    },
+    /// 定时任务到点激活（E23）：start_at 未来不入引擎，到期由调度循环
+    /// 接入（引擎 add 成功后发出；记录态由轮询器对齐引擎实时值）。
+    TaskActivated {
+        task_id: String,
+    },
+    /// 设置面变更（S1）：`PUT /settings` 应用成功后发出（daemon 级，无
+    /// task_id）。`keys` = 本次应用/落盘的设置键全集（点分路径，含重启
+    /// 生效项）——UI 订阅后重拉 `/settings` 对齐。
+    SettingsChanged {
+        keys: Vec<String>,
+    },
 }
 
 impl SchedulerEvent {
@@ -77,10 +93,58 @@ impl SchedulerEvent {
             | SchedulerEvent::Error { task_id, .. }
             | SchedulerEvent::Completed { task_id }
             | SchedulerEvent::Failed { task_id, .. }
-            | SchedulerEvent::DuplicateRejected { task_id, .. } => Some(task_id),
-            SchedulerEvent::ProviderStatus { .. } => None,
+            | SchedulerEvent::DuplicateRejected { task_id, .. }
+            | SchedulerEvent::TaskActivated { task_id } => Some(task_id),
+            SchedulerEvent::ProviderStatus { .. }
+            | SchedulerEvent::GlobalLimitsChanged { .. }
+            | SchedulerEvent::SettingsChanged { .. } => None,
         }
     }
+
+    /// 事件类型标签（E10）：与 serde `tag = "type"` `rename_all =
+    /// snake_case` 的线格式一致——match 全变体且无通配臂，新增变体漏标
+    /// 由编译期拦截（对齐 E7 known_state_labels 防漂移模式）。
+    pub fn type_label(&self) -> &'static str {
+        match self {
+            SchedulerEvent::TaskCreated { .. } => "task_created",
+            SchedulerEvent::StateChanged { .. } => "state_changed",
+            SchedulerEvent::Progress { .. } => "progress",
+            SchedulerEvent::Speed { .. } => "speed",
+            SchedulerEvent::HealthEvent { .. } => "health_event",
+            SchedulerEvent::Error { .. } => "error",
+            SchedulerEvent::Completed { .. } => "completed",
+            SchedulerEvent::Failed { .. } => "failed",
+            SchedulerEvent::DuplicateRejected { .. } => "duplicate_rejected",
+            SchedulerEvent::ProviderStatus { .. } => "provider_status",
+            SchedulerEvent::GlobalLimitsChanged { .. } => "global_limits_changed",
+            SchedulerEvent::TaskActivated { .. } => "task_activated",
+            SchedulerEvent::SettingsChanged { .. } => "settings_changed",
+        }
+    }
+}
+
+/// 合法事件类型标签全集（E10 `GET /events?type=` 校验输入；顺序与枚举
+/// 声明序一致，返回形状对齐 E7 known_state_labels）。一致性由测试锁定：
+/// 与 `type_label()` 全变体映射逐项相等。
+pub fn known_event_type_labels() -> Vec<String> {
+    [
+        "task_created",
+        "state_changed",
+        "progress",
+        "speed",
+        "health_event",
+        "error",
+        "completed",
+        "failed",
+        "duplicate_rejected",
+        "provider_status",
+        "global_limits_changed",
+        "task_activated",
+        "settings_changed",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 /// 带 monotonic seq 的事件信封（D36）。

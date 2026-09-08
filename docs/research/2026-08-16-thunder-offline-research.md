@@ -152,7 +152,7 @@ Header: X-Captcha-Token: <step2 的 token>
 Body:
 {
   "client_id":"Xp6vsxz_7IYVw2BB",
-  "client_secret":"Xp6vsy4tN9toTVdMSpomVdXpRmES",
+  "client_secret":"<redacted>",
   "provider":"access_end_point_token",     # SignProvider 常量
   "signin_token":"<step1 的 sessionID>"
 }
@@ -166,7 +166,7 @@ Body:
 POST https://xluser-ssl.xunlei.com/v1/auth/token
 Body:
 { "grant_type":"refresh_token", "refresh_token":"<rt>",
-  "client_id":"Xp6vsxz_7IYVw2BB", "client_secret":"Xp6vsy4tN9toTVdMSpomVdXpRmES" }
+  "client_id":"Xp6vsxz_7IYVw2BB", "client_secret":"<redacted>" }
 # 返回新的 TokenResp（服务端可能不轮换 refresh_token，此时保留旧 rt）
 ```
 
@@ -553,7 +553,7 @@ curl -sX POST https://xluser-ssl.xunlei.com/v1/shield/captcha/init \
 # 3) signin token
 curl -sX POST 'https://xluser-ssl.xunlei.com/v1/auth/signin/token?client_id=Xp6vsxz_7IYVw2BB' \
   -H 'Content-Type: application/json' -H 'X-Captcha-Token: <ct>' \
-  -d '{"client_id":"Xp6vsxz_7IYVw2BB","client_secret":"Xp6vsy4tN9toTVdMSpomVdXpRmES","provider":"access_end_point_token","signin_token":"<sessionID>"}'
+  -d '{"client_id":"Xp6vsxz_7IYVw2BB","client_secret":"<redacted>","provider":"access_end_point_token","signin_token":"<sessionID>"}'
 # → access_token / refresh_token
 
 # 4) submit 离线（磁力）

@@ -14,6 +14,7 @@ use axum::{
 };
 use md5::{Digest as Md5Digest, Md5};
 use parking_lot::Mutex;
+use sha1::Sha1;
 use sha2::Sha256;
 use std::net::SocketAddr;
 use std::sync::{
@@ -42,6 +43,14 @@ pub fn md5_of(bytes: &[u8]) -> String {
     format!("{:x}", h.finalize())
 }
 
+/// E25 主源 SHA1 校验用。
+#[allow(dead_code)]
+pub fn sha1_of(bytes: &[u8]) -> String {
+    let mut h = Sha1::new();
+    h.update(bytes);
+    format!("{:x}", h.finalize())
+}
+
 #[derive(Clone)]
 pub struct HttpServerConfig {
     /// 文件总大小（字节）。
@@ -51,6 +60,8 @@ pub struct HttpServerConfig {
     /// 所有 Range 请求回 416（+Content-Range: bytes */size）。
     pub always_416: bool,
     pub etag: Option<&'static str>,
+    /// E26：Last-Modified 响应头（备援指纹 e2e 用）。
+    pub last_modified: Option<&'static str>,
     /// 前 N 次请求回 429（按请求计数）。
     pub retry_429: u32,
     /// 这些 Range 起点 → 404（模拟中途断流/mirror 失效）。
@@ -63,6 +74,11 @@ pub struct HttpServerConfig {
     pub patterned_content: bool,
     /// 自定义内容（覆盖 size/pattern；仅全文件语义，Range 仍按 size 切）。
     pub content: Option<Vec<u8>>,
+    /// 响应携带的 Content-Disposition 头（E4 文件名识别测试用）。
+    pub content_disposition: Option<String>,
+    /// 每个请求先睡 N 毫秒再响应（E24 多源分摊的确定性断言：慢源拖住
+    /// 一个 worker，另一个 worker 领取下一段时必然落在快源）。
+    pub delay_ms: u64,
 }
 
 impl Default for HttpServerConfig {
@@ -72,12 +88,15 @@ impl Default for HttpServerConfig {
             range: true,
             always_416: false,
             etag: Some("etag-1"),
+            last_modified: None,
             retry_429: 0,
             fail_ranges: vec![],
             fail_ranges_min_len: None,
             bad_first: 0,
             patterned_content: false,
             content: None,
+            content_disposition: None,
+            delay_ms: 0,
         }
     }
 }
@@ -137,6 +156,9 @@ struct ServerState {
 }
 
 async fn handler(State(st): State<ServerState>, headers: HeaderMap) -> Response {
+    if st.cfg.delay_ms > 0 {
+        tokio::time::sleep(std::time::Duration::from_millis(st.cfg.delay_ms)).await;
+    }
     let req_no = st.request_count.fetch_add(1, Ordering::SeqCst);
     if (req_no as u32) < st.cfg.retry_429 {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
@@ -145,6 +167,12 @@ async fn handler(State(st): State<ServerState>, headers: HeaderMap) -> Response 
     let mut builder = Response::builder();
     if let Some(etag) = st.cfg.etag {
         builder = builder.header(header::ETAG, etag);
+    }
+    if let Some(lm) = st.cfg.last_modified {
+        builder = builder.header(header::LAST_MODIFIED, lm);
+    }
+    if let Some(cd) = &st.cfg.content_disposition {
+        builder = builder.header(header::CONTENT_DISPOSITION, cd.as_str());
     }
 
     let range = headers

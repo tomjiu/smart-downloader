@@ -31,6 +31,10 @@ pub struct FastresumeReport {
     pub info_hash: String,
     /// 已完成 piece 数。
     pub completed_pieces: usize,
+    /// 已完成 piece 的局部索引集（审计修复 P0-2 新增，与 completed_pieces
+    /// 一致；供调用方按真实位置合并全局位图，不再假设前缀）。旧 JSON 兼容。
+    #[serde(default)]
+    pub completed_piece_indices: Vec<usize>,
     /// 在途 piece 数。
     pub partial_pieces: usize,
     /// 缺失 piece 数。
@@ -126,6 +130,7 @@ impl FastresumeConverter {
             infohash_match: true, // 由外部校验后传入
             info_hash: cfg.info_hash.clone(),
             completed_pieces: xltd_analysis.completed_pieces,
+            completed_piece_indices: xltd_analysis.completed_indices.clone(),
             partial_pieces: xltd_analysis.partial_pieces,
             missing_pieces: xltd_analysis.missing_pieces,
             mismatches: xltd_analysis.mismatches.clone(),
@@ -225,6 +230,46 @@ pub fn build_bitfield_lenient(
     min_nonzero_ratio: f32,
 ) -> Vec<u8> {
     let mut bitfield = build_bitfield(num_pieces, completed_count);
+    for info in partial_details {
+        if info.index >= num_pieces {
+            continue;
+        }
+        let ratio = if info.total_bytes == 0 {
+            0.0
+        } else {
+            info.nonzero_bytes as f32 / info.total_bytes as f32
+        };
+        if ratio >= min_nonzero_ratio {
+            bitfield[info.index / 8] |= 1 << (7 - (info.index % 8));
+        }
+    }
+    bitfield
+}
+
+/// 构建 piece 完成位图（审计修复 P0-2：按真实索引置位）。
+///
+/// 原 `build_bitfield(num_pieces, completed_count)` 把完成数当**前缀长度**
+/// 置位 0..N——仅当完成块恰为全局前缀时正确；多文件种子跨文件进度不均衡
+/// 或 P2SP 非顺序完成时，前置未下载 piece 会被误标完成 → libtorrent 信任
+/// fastresume 不再重下 → 落盘文件混入全零块（静默损坏）。本函数接收真实
+/// 索引集，位置语义严格正确。
+///
+/// # Panics
+///
+/// 无（越界索引被忽略；partial 策略与 `build_bitfield_lenient` 一致）。
+pub fn build_bitfield_from_indices(
+    num_pieces: usize,
+    completed_indices: &[usize],
+    partial_details: &[PartialPieceInfo],
+    min_nonzero_ratio: f32,
+) -> Vec<u8> {
+    let byte_len = num_pieces.div_ceil(8);
+    let mut bitfield = vec![0u8; byte_len];
+    for &i in completed_indices {
+        if i < num_pieces {
+            bitfield[i / 8] |= 1 << (7 - (i % 8));
+        }
+    }
     for info in partial_details {
         if info.index >= num_pieces {
             continue;
@@ -390,7 +435,11 @@ fn bdecode_bytes(data: &[u8], pos: usize) -> Result<(Vec<u8>, usize), BencodeErr
     let len: usize = len_str
         .parse()
         .map_err(|e| BencodeError::InvalidData(format!("invalid len at pos {}: {}", pos, e)))?;
-    let end = colon + 1 + len;
+    // 安全修复（H-3 同型）：colon+1+len 裸加法回绕可绕过截断检查 → 切片 panic。
+    let end = colon
+        .checked_add(1)
+        .and_then(|s| s.checked_add(len))
+        .ok_or_else(|| BencodeError::InvalidData(format!("len overflow at pos {pos}")))?;
     if end > data.len() {
         return Err(BencodeError::InvalidData("bytes truncated".into()));
     }
@@ -508,6 +557,31 @@ mod bencode_tests {
         assert!(err.to_string().contains("depth"), "got: {err}");
     }
 
+    // 审计回归（P0-2）：非前缀索引必须精确置位，不得再按计数当前缀。
+    #[test]
+    fn bitfield_from_indices_non_prefix_exact() {
+        let partials: Vec<PartialPieceInfo> = Vec::new();
+        let bf = build_bitfield_from_indices(16, &[2, 15], &partials, 0.5);
+        assert_eq!(bf, vec![0b0010_0000, 0b0000_0001]);
+    }
+
+    #[test]
+    fn bitfield_from_indices_prefix_compat() {
+        let partials: Vec<PartialPieceInfo> = Vec::new();
+        let idx: Vec<usize> = (0..4).collect();
+        assert_eq!(
+            build_bitfield_from_indices(16, &idx, &partials, 0.5),
+            build_bitfield(16, 4)
+        );
+    }
+
+    #[test]
+    fn bitfield_from_indices_out_of_range_ignored() {
+        let partials: Vec<PartialPieceInfo> = Vec::new();
+        let bf = build_bitfield_from_indices(8, &[7, 8, 100], &partials, 0.5);
+        assert_eq!(bf, vec![0b0000_0001]);
+    }
+
     #[test]
     fn bdecode_deep_but_legal_ok() {
         let mut data = Vec::new();
@@ -516,9 +590,7 @@ mod bencode_tests {
             data.extend_from_slice(b"1:k");
         }
         data.extend_from_slice(b"i1e");
-        for _ in 0..60 {
-            data.push(b'e');
-        }
+        data.extend(std::iter::repeat_n(b'e', 60));
         assert!(bdecode(&data).is_ok());
     }
 }

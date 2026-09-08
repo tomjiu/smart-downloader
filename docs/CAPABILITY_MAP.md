@@ -34,8 +34,11 @@
 ```
 
 **已实现对照**：Source Pool 的雏形=Provider fallback + webseeds 注入端点；
-Piece 合并=libtorrent 原生；多连接 Range=httpdl。DHT/PEX/uTP=内核内置开关
-（M0 关闭决策，G1 手动验证脚本已备）。
+Piece 合并=libtorrent 原生；多连接 Range=httpdl。DHT/PEX/uTP/MSE 加密=配置开关
+（2026-09-05 落地 `[bt]` 四键配置面：enable_dht/lsd/upnp/pex + enable_utp + encrypt 三态；
+PEX 经 per-torrent disable_pex 实现——内核 2.0.x 无会话级开关；M0 默认全关决策，
+G1 手动验证脚本已备）。云盘 Provider 面：迅雷（登录/转存/直链）+ 夸克（骨架，待真机校准）
++ 百度分享解析（2026-09-05 B3-a：免登录 verify→list 真实 e2e；dlink 待 BDUSS 真机校准）。
 
 ---
 
@@ -45,7 +48,7 @@ Piece 合并=libtorrent 原生；多连接 Range=httpdl。DHT/PEX/uTP=内核内�
 |---|------|---------|--------|
 | N1 | **Swarm Merging**：多 torrent 同内容 piece 可用性合并 | BiglyBT | 调度层新增「同 gcid/v2 hash 群组」→ 多任务共享 piece 池 |
 | N2 | **Source Exchange 抽象**：Kad 的"问谁有这文件"泛化 | eMule/MLDonkey | `trait SourceProvider { async fn discover_sources(...) }` |
-| N3 | **Streaming / Sequential**：边下边播的顺序下载模式 | μT/qB/玩家需求 | httpdl 顺序段模式 + BT piece 优先级 |
+| N3 | **Streaming / Sequential**：边下边播的顺序下载模式 | μT/qB/玩家需求 | ✅ **已落地（2026-09-02）**：任务级 sequential（HTTP 在飞窗口=2 + BT sequential_download flag + API/持久化/恢复重放，见 IMPLEMENTED.md §20）；BT piece 优先级已由 PR #14/#15 覆盖 |
 | N4 | **Super Seeding + 磁盘缓存策略** | μT/Tixati/BitComet | btcore 内核开关与缓存参数（需内核暴露时再议） |
 
 ---

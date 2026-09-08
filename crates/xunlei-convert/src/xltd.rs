@@ -80,6 +80,11 @@ pub struct XltdAnalysis {
     pub page_aligned: bool,
     /// 已下载 piece 数（通过 SHA1 验证）。
     pub completed_pieces: usize,
+    /// 已完成 piece 的局部索引集（审计修复 P0-2 新增：原实现只累计计数，
+    /// 位置信息丢失，多文件/非顺序进度被误当全局前缀置位 → 迁移静默数据
+    /// 损坏）。`#[serde(default)]` 保证旧 JSON 报告可反序列化。
+    #[serde(default)]
+    pub completed_indices: Vec<usize>,
     /// 在途 piece 数（部分非零但哈希不匹配）。
     pub partial_pieces: usize,
     /// 未下载 piece 数（全零）。
@@ -131,26 +136,35 @@ impl XltdAnalysis {
         let mut f = std::fs::File::open(path).map_err(|_| XltdError::IoError)?;
         let piece_length = piece_length as usize;
         let mut completed = 0usize;
+        let mut completed_indices = Vec::new();
         let mut partial = 0usize;
         let mut missing = 0usize;
 
+        // batch3-P1：file_offset 语义修正——传入的 pieces_hash 为全局 piece 序列
+        // （idx 按全 torrent 编号），本文件占据 [file_offset, file_offset+file_size)。
+        // 旧实现把 piece_start 与「本文件局部 file_size」比较、offset 直接
+        // saturating_sub：多文件 torrent 第 2+ 文件会把前一文件的 piece 哈希
+        // 拿来对比本文件头部数据（假 partial），而本文件真正的 piece 因
+        // `piece_start >= file_size` 全部被跳过（完成位图漏标 → 已下载数据重下）。
+        let file_end = file_offset + file_size;
         for (idx, &expected_hash) in pieces_hash.iter().enumerate() {
             let piece_start = (idx as u64) * (piece_length as u64);
             let piece_end = piece_start + piece_length as u64;
 
-            // 只处理完全落在文件内的 piece
-            if piece_start >= file_size {
+            // 与本文件区间 [file_offset, file_end) 无交集的 piece 跳过
+            if piece_end <= file_offset || piece_start >= file_end {
                 continue;
             }
-            let valid_len = (piece_end.min(file_size) - piece_start) as usize;
+            // piece 与本文件相交的有效字节区间（相对本文件起点）
+            let valid_start = piece_start.max(file_offset) - file_offset;
+            let valid_end = piece_end.min(file_end) - file_offset;
+            let valid_len = (valid_end - valid_start) as usize;
 
             // piece 在 xltd 中的偏移（xltd 是文件的位置镜像）
-            // 公式: xltd_offset = piece_index * piece_length - file_offset
-            let xltd_offset = piece_start.saturating_sub(file_offset);
+            let xltd_offset = valid_start;
 
-            // 只处理 xltd_offset 在文件范围内的 piece
+            // 超出 xltd 范围（边界 piece）
             if xltd_offset + valid_len as u64 > xltd_size {
-                // 超出 xltd 范围（边界 piece）
                 continue;
             }
 
@@ -169,6 +183,7 @@ impl XltdAnalysis {
 
             if actual_array == expected_hash {
                 completed += 1;
+                completed_indices.push(idx);
             } else if buf.iter().any(|&b| b != 0) {
                 partial += 1;
                 let nonzero = buf.iter().filter(|&&b| b != 0).count();
@@ -180,6 +195,7 @@ impl XltdAnalysis {
         }
 
         self.completed_pieces = completed;
+        self.completed_indices = completed_indices;
         self.partial_pieces = partial;
         self.missing_pieces = missing;
         Ok(())
