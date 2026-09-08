@@ -1067,7 +1067,15 @@ lt_err lt_set_piece_first_last(lt_session* s, const char* ih, int prio) {
         if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
         const std::shared_ptr<const lt::torrent_info> tf = h.torrent_file();
         if (!tf) { set_err(s, "metadata not ready"); return LT_ERR_NOT_FOUND; }
+        // desktop-v0.2.1 终跑实证：2.1 起 files() 标记 TORRENT_DEPRECATED
+        //（vcpkg 构建 deprecated-functions=off 时成员整体移除，brew 2.1.0 仅告警）
+        // ——版本宏分流：2.1+ 公开面取整份 file_storage 的唯一途径是
+        // files_impl()（"internal" 注释但 public，2.0.11 无此成员）；2.0 走 files()。
+#if LIBTORRENT_VERSION_NUM >= 0x020100
+        const lt::file_storage& fs = tf->files_impl();
+#else
         const lt::file_storage& fs = tf->files();
+#endif
         const int num_pieces = tf->num_pieces();
         if (num_pieces <= 0) { set_err(s, "no pieces"); return LT_ERR_ENGINE; }
         const int piece_len = tf->piece_length();
