@@ -8,7 +8,20 @@
 
 第七轮收尾批次（batch7）：batch6 遗留 5 项暂缓缺陷全部落地 + 回归测试；
 第八轮全仓安全审计批次（batch8）：4×P1 全修 + 5×P2 修复（详见
-[docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md)）。
+[docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md)）；
+第九轮工具化安全审计批次（batch9）：cargo-audit/cargo-deny/gitleaks 三件
+行业标准工具全量扫描 + 依赖漏洞修复 + 审计门禁固化入库。
+
+### 安全加固（batch9，工具化审计）
+- **依赖漏洞清零**：h2 0.4.15→0.4.19（RUSTSEC-2026-0258 HTTP/2 空帧 DoS）、
+  quick-xml 0.37→0.41（RUSTSEC-2026-0194/0195 清单解析 DoS）——cargo-audit
+  复扫 0 漏洞
+- **quick-xml 0.41 事件模型适配**：DASH/Metalink4/RSS 三解析器补
+  `GeneralRef` 实体事件分支与文本累积语义；新增实体切分回归测试
+- **审计门禁固化**：`deny.toml`（advisories/bans/licenses/sources）+
+  `.gitleaks.toml`（精准 allowlist，逐条取证理由）入库；CI 新增 security
+  job（cargo-deny-action + gitleaks-action 全历史扫描）
+- **许可与发布元数据**：workspace 统一 `MIT OR Apache-2.0` + `publish=false`
 
 ### 安全修复（batch8，P1 全部）
 - **空 token 击穿 fail-closed**（P1）：config `http_token = ""` 可同时骗过

@@ -1,0 +1,32 @@
+# gitleaks 政策（batch9 工具化安全审计引入，2026-09-08）
+# 运行：gitleaks git .（历史）/ gitleaks dir .（工作树）
+# 原则：只豁免"public-by-construction 的厂商公开常量"与"非真实的测试 fixture"，
+#       不做无理由的目录级宽免；每条豁免的取证结论见 docs/SECURITY_AUDIT.md。
+
+title = "smart-downloader gitleaks policy"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "精确豁免清单（逐条理由）"
+regexes = [
+    # 迅雷客户端公开设备/签名常量：自厂商发行客户端提取、逆向社区公知的
+    # 应用级标识（非用户凭证），遍布 docs/research 研究文档与 PoC 脚本。
+    '''Xp6vsy4tN9toTVdMSpomVdXpRmES''',
+    # NAS 设备流样例 client_secret 常量：同上为厂商公开内嵌值；
+    # 现行 scripts/nas/*.py 已改为 SD_XL_CLIENT_SECRET 环境变量注入，命中仅存历史。
+    '''BlPF2z7HEeutzH4t6zyjLw''',
+    # provider 登录页模拟伺服器的 alg=none 样例 JWT（测试 fixture，
+    # header 明文 {"alg":"none"}，非真实凭证）。
+    '''eyJhbGciOiJub25lIn0''',
+]
+paths = [
+    # 构建产物（加密库 .rmeta 元数据必然含字面量样例，非项目源码）
+    '''^target/''',
+    '''^spike/.*target/''',
+    # NAS 厂商取证静态产物（历史遗留：厂商前端 bundle 与抓取证据，HEAD 已删；
+    # 其中抓取的会话 JWT 属厂商侧会话级 token，早已过期，已在安全报告中
+    # 记录并建议吊销——豁免仅服务于历史扫描的可持续门禁）。
+    '''^docs/nas/evidence/''',
+]
