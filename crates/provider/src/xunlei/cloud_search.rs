@@ -53,7 +53,12 @@ pub const FILE_SEARCH_PATH: &str = "xlppc.searcher.api/drive_file_search";
 /// `?user_id=<id>&keyword=<q>&limit=<n>&order_by_fields=<enc>`。
 /// `keyword`/`order_by_fields` 经 `url_encode`（RFC3986 非 unreserved 百分号编码），
 /// 与 cache 中 `keyword=magnet%3A%3Fxt%3D...`、`order_by_fields=created_time%3Adesc` 一致。
-pub fn build_common_search_url(keyword: &str, user_id: &str, limit: u32, order_by_fields: &str) -> String {
+pub fn build_common_search_url(
+    keyword: &str,
+    user_id: &str,
+    limit: u32,
+    order_by_fields: &str,
+) -> String {
     format!(
         "{}/{COMMON_SEARCH_PATH}?user_id={}&keyword={}&limit={}&order_by_fields={}",
         GATEWAY_BASE,
@@ -101,12 +106,16 @@ pub struct CloudSearch {
 }
 
 impl Default for CloudSearch {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CloudSearch {
     pub fn new() -> Self {
-        CloudSearch { http: reqwest::Client::new() }
+        CloudSearch {
+            http: reqwest::Client::new(),
+        }
     }
 
     /// 云盘通用搜索（【B级待验】未实测）。鉴权复用 `api-pan` 三要素头推断。

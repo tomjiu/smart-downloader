@@ -81,7 +81,8 @@ async fn preexisting_dest_same_size_finalizes_over_it() {
 #[tokio::test]
 async fn preexisting_dest_wrong_content_overwritten() {
     // 目标已存在但内容错误（同大小）：必须被 .part 真实内容覆盖，不得短路保留旧文件
-    let (dir, expected) = run_with_preexisting_dest("out.bin", Some(&[0xAA; 8 * MB as usize])).await;
+    let (dir, expected) =
+        run_with_preexisting_dest("out.bin", Some(&[0xAA; 8 * MB as usize])).await;
     let got = std::fs::read(dir.path().join("out.bin")).unwrap();
     assert_eq!(sha256_of(&got), expected, "旧内容不得残留");
     assert!(!dir.path().join("out.bin.part").exists());

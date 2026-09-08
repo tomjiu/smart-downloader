@@ -107,9 +107,9 @@ pub fn fetch_metadata(
     let bytes = loop {
         let st = core.status(&ih)?;
         if st.metadata_received {
-            break core
-                .metadata(&ih)?
-                .ok_or_else(|| FetchError::Other("metadata_received 但导出为空（引擎状态竞态）".into()))?;
+            break core.metadata(&ih)?.ok_or_else(|| {
+                FetchError::Other("metadata_received 但导出为空（引擎状态竞态）".into())
+            })?;
         }
         if st.state == 3 {
             // state==ERROR：附 err_str 便于排障

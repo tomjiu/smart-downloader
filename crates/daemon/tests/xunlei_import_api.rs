@@ -25,27 +25,17 @@ fn read_sample(name: &str) -> Vec<u8> {
     std::fs::read(&path).expect("read sample")
 }
 
-async fn serve(
-    dest: std::path::PathBuf,
-) -> (std::net::SocketAddr, Arc<DaemonState>) {
+async fn serve(dest: std::path::PathBuf) -> (std::net::SocketAddr, Arc<DaemonState>) {
     let engine = smart_dl_httpdl::HttpEngine::new(reqwest::Client::new());
-    let bt = smart_dl_daemon::bt::BtEngine::new(
-        &dest,
-        None,
-        0,
-        0,
-        false,
-        false,
-        false,
-    )
-    .expect("bt engine");
+    let bt = smart_dl_daemon::bt::BtEngine::new(&dest, None, 0, 0, false, false, false)
+        .expect("bt engine");
     let state = Arc::new(
         DaemonState::new(Arc::new(engine), vec![])
             .with_dest_root(dest.clone())
             .with_bt(Arc::new(bt)),
     );
-    let app = http::router(state.clone())
-        .layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024));
+    let app =
+        http::router(state.clone()).layer(axum::extract::DefaultBodyLimit::max(10 * 1024 * 1024));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
@@ -85,15 +75,17 @@ async fn xunlei_import_creates_bt_task() {
 
     let status = resp.status();
     let text = resp.text().await.unwrap();
-    let body: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text.clone()));
+    let body: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text.clone()));
     if status != reqwest::StatusCode::CREATED {
         eprintln!("xunlei_import response: {status} {body:?}");
     }
-    assert_eq!(status, reqwest::StatusCode::CREATED, "import body: {body:?}");
-    let tid = body["task_id"]
-        .as_str()
-        .expect("task_id")
-        .to_string();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "import body: {body:?}"
+    );
+    let tid = body["task_id"].as_str().expect("task_id").to_string();
     assert!(tid.starts_with('t'));
 
     // 任务快照确认引擎类型（真实 BtEngine 可能立即进入 Downloading）
@@ -110,7 +102,10 @@ async fn xunlei_import_creates_bt_task() {
         "初始状态应为 Queued 或 Downloading: {}",
         snap["state"]
     );
-    assert_eq!(snap.get("engine"), Some(serde_json::Value::String("bt".into())).as_ref());
+    assert_eq!(
+        snap.get("engine"),
+        Some(serde_json::Value::String("bt".into())).as_ref()
+    );
 }
 
 #[tokio::test]

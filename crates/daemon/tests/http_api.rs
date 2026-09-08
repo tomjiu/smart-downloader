@@ -40,8 +40,7 @@ async fn serve() -> (std::net::SocketAddr, Arc<DaemonState>) {
             .with_bt(Arc::new(bt))
     };
     #[cfg(not(feature = "bt"))]
-    let state =
-        DaemonState::new(Arc::new(engine), vec![]).with_dest_root(std::env::temp_dir());
+    let state = DaemonState::new(Arc::new(engine), vec![]).with_dest_root(std::env::temp_dir());
     let state = Arc::new(state);
     let app = http::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -322,12 +321,22 @@ async fn magnet_ed2k_unknown_rejected_with_clear_error() {
         .await
         .unwrap();
     let s = resp.status();
-    let b = resp.json::<serde_json::Value>().await.unwrap_or(serde_json::Value::Null);
-    assert_eq!(s, reqwest::StatusCode::CREATED, "magnet 应创建 BT 任务: {b}");
+    let b = resp
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or(serde_json::Value::Null);
+    assert_eq!(
+        s,
+        reqwest::StatusCode::CREATED,
+        "magnet 应创建 BT 任务: {b}"
+    );
     assert!(b["task_id"].as_str().unwrap().starts_with('t'), "{b}");
     // BT 任务必须落到全局 save_path（v1 约束），再删掉避免污染后续测试
     let tid = b["task_id"].as_str().unwrap().to_string();
-    let _ = client.post(format!("{base}/tasks/{tid}/remove")).send().await;
+    let _ = client
+        .post(format!("{base}/tasks/{tid}/remove"))
+        .send()
+        .await;
 
     let (s, b) = add_task(&client, &base, "ed2k://file|a|1|hash|").await;
     assert_eq!(s, reqwest::StatusCode::BAD_REQUEST);
@@ -615,8 +624,8 @@ async fn http_task_failure_marks_failed_in_list() {
 /// 带 token 的测试 server：`Authorization: Bearer test-token-123` 必须校验。
 async fn serve_with_token() -> std::net::SocketAddr {
     let engine = HttpEngine::new(reqwest::Client::new());
-    let state = DaemonState::new(Arc::new(engine), vec![])
-        .with_http_token(Some("test-token-123".into()));
+    let state =
+        DaemonState::new(Arc::new(engine), vec![]).with_http_token(Some("test-token-123".into()));
     let state = Arc::new(state);
     let app = http::router(state.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -636,7 +645,11 @@ async fn auth_required_when_token_configured() {
     // 无 Authorization → 401（快照/列表/配置三个代表性端点）
     for path in ["/tasks", "/config", "/providers"] {
         let r = client.get(format!("{base}{path}")).send().await.unwrap();
-        assert_eq!(r.status(), reqwest::StatusCode::UNAUTHORIZED, "GET {path} 应 401");
+        assert_eq!(
+            r.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "GET {path} 应 401"
+        );
     }
 
     // 错误 token → 401
@@ -692,8 +705,7 @@ fn verify_http_token_unit() {
     assert!(bare.verify_http_token(Some("whatever")));
 
     let engine2 = HttpEngine::new(reqwest::Client::new());
-    let secured = DaemonState::new(Arc::new(engine2), vec![])
-        .with_http_token(Some("t-abc".into()));
+    let secured = DaemonState::new(Arc::new(engine2), vec![]).with_http_token(Some("t-abc".into()));
     assert!(!secured.verify_http_token(None));
     assert!(!secured.verify_http_token(Some("Bearer wrong")));
     assert!(!secured.verify_http_token(Some("t-abc"))); // 必须带 Bearer 前缀

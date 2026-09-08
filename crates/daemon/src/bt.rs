@@ -282,8 +282,16 @@ impl DownloadEngine for BtEngine {
             },
             _ => return Err(EngineError::Other("source is not bt".to_string())),
         };
-        ih.map_err(|e| EngineError::Other(core_err(&e)))
-            .map(|ih| ih)
+        let ih = ih.map_err(|e| EngineError::Other(core_err(&e)))?;
+        // 内核语义（Bug A 修复）：add 即 paused + 非 auto_managed → 必须 resume
+        // 才会 announce / 连 peer / 下载（对齐 /bt/metadata 抓取路径与 restore
+        // 重入队语义）。暂停仍走 pause()（intent 登记 → alert 循环压制复活）。
+        // 修复（Linux 实弹验收发现）：此前 add 后无人 resume → 磁链任务永停
+        // Downloading 标签、引擎内 paused 零活动。
+        self.core
+            .resume(&ih)
+            .map_err(|e| EngineError::Other(core_err(&e)))?;
+        Ok(ih)
     }
 
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError> {

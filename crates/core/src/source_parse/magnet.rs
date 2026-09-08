@@ -65,10 +65,16 @@ fn pct_decode(s: &str, plus_as_space: bool) -> Result<String, MagnetError> {
         match b[i] {
             b'%' => {
                 // 须有两个 hex 位跟随；缺失/非 hex → 显式报错
-                let h1 = *b.get(i + 1).ok_or_else(|| MagnetError::BadPercentEncoding(s.to_string()))?;
-                let h2 = *b.get(i + 2).ok_or_else(|| MagnetError::BadPercentEncoding(s.to_string()))?;
-                let hi = hex_val(h1).ok_or_else(|| MagnetError::BadPercentEncoding(s.to_string()))?;
-                let lo = hex_val(h2).ok_or_else(|| MagnetError::BadPercentEncoding(s.to_string()))?;
+                let h1 = *b
+                    .get(i + 1)
+                    .ok_or_else(|| MagnetError::BadPercentEncoding(s.to_string()))?;
+                let h2 = *b
+                    .get(i + 2)
+                    .ok_or_else(|| MagnetError::BadPercentEncoding(s.to_string()))?;
+                let hi =
+                    hex_val(h1).ok_or_else(|| MagnetError::BadPercentEncoding(s.to_string()))?;
+                let lo =
+                    hex_val(h2).ok_or_else(|| MagnetError::BadPercentEncoding(s.to_string()))?;
                 out.push(hi * 16 + lo);
                 i += 3;
             }
@@ -100,9 +106,7 @@ fn is_hex40(v: &str) -> bool {
 
 /// 解析 magnet URI。多个 xt 取第一个合法 v1；v2-only 显式报错。
 pub fn parse_magnet(uri: &str) -> Result<MagnetInfo, MagnetError> {
-    let rest = uri
-        .strip_prefix("magnet:?")
-        .ok_or(MagnetError::NotMagnet)?;
+    let rest = uri.strip_prefix("magnet:?").ok_or(MagnetError::NotMagnet)?;
     if rest.is_empty() {
         return Err(MagnetError::MissingXt);
     }

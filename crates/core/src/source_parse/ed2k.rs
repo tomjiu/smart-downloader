@@ -222,10 +222,7 @@ mod tests {
     #[test]
     fn chinese_name_percent_decoded() {
         // "电影.mkv" 的 UTF-8 百分号编码
-        let l = parse_ed2k(&format!(
-            "ed2k://|file|%E7%94%B5%E5%BD%B1.mkv|2048|{MD4}|/"
-        ))
-        .unwrap();
+        let l = parse_ed2k(&format!("ed2k://|file|%E7%94%B5%E5%BD%B1.mkv|2048|{MD4}|/")).unwrap();
         assert_eq!(l.name, "电影.mkv");
         assert_eq!(l.size, 2048);
     }
@@ -240,8 +237,7 @@ mod tests {
     #[test]
     fn extra_source_field_ignored() {
         // s=（HTTP 源）等扩展字段宽容忽略
-        let l =
-            parse_ed2k(&format!("ed2k://|file|a.bin|1|{MD4}|s=http://x/a.bin|/")).unwrap();
+        let l = parse_ed2k(&format!("ed2k://|file|a.bin|1|{MD4}|s=http://x/a.bin|/")).unwrap();
         assert_eq!(l.md4, MD4);
         assert!(l.segment_hashes.is_empty());
     }
@@ -272,7 +268,10 @@ mod tests {
     #[test]
     fn missing_fields_rejected() {
         assert_eq!(parse_ed2k("ed2k://|file|"), Err(Ed2kError::MissingFields));
-        assert_eq!(parse_ed2k("ed2k://|file|a.bin|"), Err(Ed2kError::MissingFields));
+        assert_eq!(
+            parse_ed2k("ed2k://|file|a.bin|"),
+            Err(Ed2kError::MissingFields)
+        );
         assert_eq!(
             parse_ed2k(&format!("ed2k://|file|a.bin|1|")),
             Err(Ed2kError::MissingFields)
@@ -291,7 +290,9 @@ mod tests {
             Err(Ed2kError::InvalidSize(_))
         ));
         assert!(matches!(
-            parse_ed2k(&format!("ed2k://|file|a.bin|99999999999999999999999|{MD4}|/")),
+            parse_ed2k(&format!(
+                "ed2k://|file|a.bin|99999999999999999999999|{MD4}|/"
+            )),
             Err(Ed2kError::InvalidSize(_))
         ));
     }

@@ -47,22 +47,30 @@ mod real_sample_tests {
 
         // V1: peers (validation report listed 4, actual file has 8)
         assert!(
-            cfg.peers.iter().any(|p| p.starts_with("bt://102.132.137.234:51229")),
+            cfg.peers
+                .iter()
+                .any(|p| p.starts_with("bt://102.132.137.234:51229")),
             "expected peer bt://102.132.137.234:51229 in {:?}",
             cfg.peers
         );
         assert!(
-            cfg.peers.iter().any(|p| p.starts_with("bt://185.149.91.151:51028")),
+            cfg.peers
+                .iter()
+                .any(|p| p.starts_with("bt://185.149.91.151:51028")),
             "expected peer bt://185.149.91.151:51028 in {:?}",
             cfg.peers
         );
         assert!(
-            cfg.peers.iter().any(|p| p.starts_with("bt://185.21.217.29:32777")),
+            cfg.peers
+                .iter()
+                .any(|p| p.starts_with("bt://185.21.217.29:32777")),
             "expected peer bt://185.21.217.29:32777 in {:?}",
             cfg.peers
         );
         assert!(
-            cfg.peers.iter().any(|p| p.starts_with("bt://205.147.16.145:52961")),
+            cfg.peers
+                .iter()
+                .any(|p| p.starts_with("bt://205.147.16.145:52961")),
             "expected peer bt://205.147.16.145:52961 in {:?}",
             cfg.peers
         );
@@ -107,10 +115,10 @@ mod real_sample_tests {
         assert!(xltd_analysis.page_aligned);
 
         // 2. 从 torrent 提取实际参数
-        let piece_length = 16384u32;   // e2e 实际 piece_length
-        let file_size = 2097152u64;    // 2MB
+        let piece_length = 16384u32; // e2e 实际 piece_length
+        let file_size = 2097152u64; // 2MB
         let file_offset = 0u64;
-        let num_pieces = 128usize;     // e2e 实际 piece 数
+        let num_pieces = 128usize; // e2e 实际 piece 数
 
         // 3. 生成与 e2e_test_converter.py 一致的 piece 哈希
         let pieces_hash = generate_e2e_piece_hashes(num_pieces, piece_length as usize);
@@ -118,7 +126,13 @@ mod real_sample_tests {
         // 4. 验证 piece 哈希（前 64 个 piece 应匹配）
         let mut analysis = xltd_analysis;
         analysis
-            .verify_piece_hashes(&xltd_path, piece_length, &pieces_hash, file_offset, file_size)
+            .verify_piece_hashes(
+                &xltd_path,
+                piece_length,
+                &pieces_hash,
+                file_offset,
+                file_size,
+            )
             .expect("verify piece hashes");
         assert_eq!(analysis.completed_pieces, 64);
         assert_eq!(analysis.partial_pieces, 0);
@@ -132,15 +146,31 @@ mod real_sample_tests {
         // 6. 生成 fastresume bencode
         let mut converter = crate::FastresumeConverter::new();
         let report = converter
-            .analyze(&torrent_path, &cfg_path, &xltd_path, piece_length, &pieces_hash, file_offset, file_size)
+            .analyze(
+                &torrent_path,
+                &cfg_path,
+                &xltd_path,
+                piece_length,
+                &pieces_hash,
+                file_offset,
+                file_size,
+            )
             .expect("analyze");
         assert_eq!(report.completed_pieces, 64);
 
         let fr = converter
-            .build_fastresume("2a7e369a7aaa242458bf20d7426a68e75556b053", &bitfield, "source_file.bin", "./output", &[[file_size, 0]])
+            .build_fastresume(
+                "2a7e369a7aaa242458bf20d7426a68e75556b053",
+                &bitfield,
+                "source_file.bin",
+                "./output",
+                &[[file_size, 0]],
+            )
             .expect("build fastresume");
         let tmp = tempfile::NamedTempFile::new().expect("tmp file");
-        converter.write_fastresume(&fr, tmp.path()).expect("write fastresume");
+        converter
+            .write_fastresume(&fr, tmp.path())
+            .expect("write fastresume");
         let encoded = std::fs::read(tmp.path()).expect("read fastresume");
 
         // 7. 校验 bencode 内容
@@ -153,13 +183,25 @@ mod real_sample_tests {
 
         // 8. 用 bencode 解码器校验 bitfield + file sizes 嵌套结构
         let decoded = crate::fastresume::bdecode(&encoded).expect("bdecode fastresume");
-        let pieces = decoded.dict_get(b"pieces").expect("pieces key").as_bytes().expect("pieces bytes");
+        let pieces = decoded
+            .dict_get(b"pieces")
+            .expect("pieces key")
+            .as_bytes()
+            .expect("pieces bytes");
         assert_eq!(pieces.len(), 16);
         assert_eq!(&pieces[0..8], &[0xFF; 8], "first 64 bits should be 0xFF");
         assert_eq!(&pieces[8..16], &[0u8; 8], "last 64 bits should be 0x00");
 
-        let file_sizes = decoded.dict_get(b"file sizes").expect("file sizes key").as_list().expect("file sizes list");
-        assert_eq!(file_sizes.len(), 1, "single-file torrent should have one [size,0] pair");
+        let file_sizes = decoded
+            .dict_get(b"file sizes")
+            .expect("file sizes key")
+            .as_list()
+            .expect("file sizes list");
+        assert_eq!(
+            file_sizes.len(),
+            1,
+            "single-file torrent should have one [size,0] pair"
+        );
         let pair = file_sizes[0].as_list().expect("file size pair");
         assert_eq!(pair.len(), 2);
         assert_eq!(pair[0].as_int(), Some(file_size as i64));
@@ -246,4 +288,3 @@ mod real_sample_tests {
         assert_eq!(set_bits(&bf), 4);
     }
 }
-

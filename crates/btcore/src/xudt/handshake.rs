@@ -3,7 +3,10 @@ mod tests {
     use super::*;
 
     fn hex_decode(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
     }
 
     #[test]
@@ -29,12 +32,8 @@ pub const CLIENT_VERSION: &[u8] = b"XunLei 0019";
 pub const LOCAL_PORT: u16 = 15000;
 
 pub fn build_handshake(port: u16, reqq: u32) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.push(0x14);
-    buf.push(0x00);
-
-    // d
-    buf.push(b'd');
+    // 0x14 协议扩展位 + 0x00 保留位 + bencode 字典 'd'
+    let mut buf = vec![0x14, 0x00, b'd'];
 
     // 1:e i0 e
     buf.push(b'1');
@@ -125,7 +124,10 @@ pub fn parse_handshake(payload: &[u8]) -> Option<(u16, u32, Vec<u8>)> {
         return None;
     }
     let e_pos = p_rest.iter().position(|&b| b == b'e')?;
-    let port = std::str::from_utf8(&p_rest[1..e_pos]).ok()?.parse::<u16>().ok()?;
+    let port = std::str::from_utf8(&p_rest[1..e_pos])
+        .ok()?
+        .parse::<u16>()
+        .ok()?;
 
     // find "4:reqq" marker
     let reqq_pos = find_substr(data, b"4:reqq")?;
@@ -135,7 +137,10 @@ pub fn parse_handshake(payload: &[u8]) -> Option<(u16, u32, Vec<u8>)> {
         return None;
     }
     let reqq_e = reqq_rest.iter().position(|&b| b == b'e')?;
-    let reqq = std::str::from_utf8(&reqq_rest[1..reqq_e]).ok()?.parse::<u32>().ok()?;
+    let reqq = std::str::from_utf8(&reqq_rest[1..reqq_e])
+        .ok()?
+        .parse::<u32>()
+        .ok()?;
 
     // find "1:v" marker
     let v_pos = find_substr(data, b"1:v")?;
@@ -143,7 +148,10 @@ pub fn parse_handshake(payload: &[u8]) -> Option<(u16, u32, Vec<u8>)> {
     let v_rest = &v_section[3..];
     // parse bencode string: <len>:<value>
     let colon = v_rest.iter().position(|&b| b == b':')?;
-    let len = std::str::from_utf8(&v_rest[..colon]).ok()?.parse::<usize>().ok()?;
+    let len = std::str::from_utf8(&v_rest[..colon])
+        .ok()?
+        .parse::<usize>()
+        .ok()?;
     if v_rest.len() < colon + 1 + len {
         return None;
     }

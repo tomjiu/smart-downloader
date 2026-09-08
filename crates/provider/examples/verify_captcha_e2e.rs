@@ -2,8 +2,8 @@
 //! 用法: cargo run -p smart-dl-provider --example verify_captcha_e2e
 //! 前置: 同目录下 login_state_tokens.json 含真实 access_token/device_id/user_id。
 
-use smart_dl_provider::xunlei::sign::{captcha_sign, device_id_32};
 use smart_dl_provider::xunlei::client::CLIENT_ID;
+use smart_dl_provider::xunlei::sign::{captcha_sign, device_id_32};
 
 const XLUSER_BASE: &str = "https://xluser-ssl.xunlei.com";
 const PAN_BASE: &str = "https://api-pan.xunlei.com";
@@ -12,13 +12,18 @@ const PACKAGE_NAME: &str = "pan.xunlei.com";
 
 fn now_millis() -> u64 {
     std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 读真实登录态
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/research/cloud_delivery/login_reverse/login_state_tokens.json");
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../scripts/research/cloud_delivery/login_reverse/login_state_tokens.json"
+    );
     let data = std::fs::read_to_string(path).unwrap_or_else(|_| {
         eprintln!("未找到 login_state_tokens.json，跳过 e2e 验证");
         std::process::exit(0);
@@ -59,7 +64,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             "redirect_uri": "xlaccsdk01://xunlei.com/callback?state=harbor",
         }))
-        .send().await?;
+        .send()
+        .await?;
 
     let status = resp.status();
     let body: serde_json::Value = resp.json().await?;
@@ -68,16 +74,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let captcha_token = body["captcha_token"].as_str().unwrap_or("");
-    println!("✅ captcha/init 200, token 前 40: {}", &captcha_token[..40.min(captcha_token.len())]);
+    println!(
+        "✅ captcha/init 200, token 前 40: {}",
+        &captcha_token[..40.min(captcha_token.len())]
+    );
 
     // [2] drive/v1/files
     let resp2 = client
-        .get(format!("{PAN_BASE}/drive/v1/files?parent_id=&usage=DISPLAY&with_audit=true&limit=50"))
+        .get(format!(
+            "{PAN_BASE}/drive/v1/files?parent_id=&usage=DISPLAY&with_audit=true&limit=50"
+        ))
         .header("Authorization", format!("Bearer {access_token}"))
         .header("X-Captcha-Token", captcha_token)
         .header("X-Client-Id", CLIENT_ID)
         .header("X-Device-Id", did32)
-        .send().await?;
+        .send()
+        .await?;
 
     let status2 = resp2.status();
     let body2: serde_json::Value = resp2.json().await?;

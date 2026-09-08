@@ -83,7 +83,14 @@ pub fn unwrap_frame(data: &[u8]) -> Option<Frame> {
         return None;
     }
     let payload = data[24..24 + plen].to_vec();
-    Some(Frame { ftype, seq, aux, fixed, ctr, payload })
+    Some(Frame {
+        ftype,
+        seq,
+        aux,
+        fixed,
+        ctr,
+        payload,
+    })
 }
 
 pub fn wrap_data(block: &[u8], seq: u32, ctr: u32, sess: u32) -> Vec<u8> {

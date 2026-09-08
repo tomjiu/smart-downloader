@@ -4,7 +4,7 @@
 
 use tokio::task;
 
-use crate::error::{XunleiError, Result};
+use crate::error::{Result, XunleiError};
 use crate::handle::XunleiHandle;
 use crate::task::TaskId;
 
@@ -17,10 +17,7 @@ impl XunleiHandle {
         task::spawn_blocking(move || unsafe {
             let r = (sym.XL_EnableFreeDcdn)(task_id_u32, 1);
             if r != 0 {
-                return Err(XunleiError::with_context(
-                    r,
-                    "XL_EnableFreeDcdn failed",
-                ));
+                return Err(XunleiError::with_context(r, "XL_EnableFreeDcdn failed"));
             }
             Ok(())
         })
@@ -36,10 +33,7 @@ impl XunleiHandle {
         task::spawn_blocking(move || unsafe {
             let r = (sym.XL_DisableFreeDcdn)(task_id_u32);
             if r != 0 {
-                return Err(XunleiError::with_context(
-                    r,
-                    "XL_DisableFreeDcdn failed",
-                ));
+                return Err(XunleiError::with_context(r, "XL_DisableFreeDcdn failed"));
             }
             Ok(())
         })

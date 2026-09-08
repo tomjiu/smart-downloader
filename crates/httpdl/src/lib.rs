@@ -11,8 +11,8 @@ pub mod engine;
 pub mod range;
 pub mod rate;
 pub mod resume;
-pub mod segment_manager;
 pub mod retry;
+pub mod segment_manager;
 pub mod static_split;
 pub mod verify;
 

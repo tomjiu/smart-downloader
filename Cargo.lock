@@ -1510,6 +1510,7 @@ dependencies = [
  "fs2",
  "futures",
  "parking_lot",
+ "percent-encoding",
  "qrcode",
  "reqwest",
  "serde",

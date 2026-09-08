@@ -115,6 +115,79 @@ fn update_score(scores: &Mutex<HashMap<String, i64>>, url: &str, delta: i64) {
 /// 失败缩小粒度重试的最小粒度（P1）：低于该粒度不再拆分（对齐设计 §3.1 的 1MB 防碎片）。
 const MIN_RETRY_GRANULARITY: u64 = 1024 * 1024;
 
+/// 无 Range 能力源站的整文件单流下载（B-accept 补，Linux 实弹验收发现）：
+/// probe 对 200 记 `range_supported=false`（设计上支持非 Range 源），但分段器
+/// 硬性要求 206 → 非 Range 源必然全段失败。此处退化为整流 GET：服务器忽略
+/// Range 时返回 200 全文件 → 截断 .part 全量写入。
+/// `offset` 语义对齐 download_dynamic：`offset >= total`（total>0）= 已完整 →
+/// 直接 Ok；否则一律全量重下（无 Range 无法只取尾部区间）。
+pub(crate) async fn download_full_stream(
+    client: &reqwest::Client,
+    part: &Path,
+    total: u64,
+    offset: u64,
+    mirrors: &[String],
+    limiter: Arc<RateLimiter>,
+) -> Result<(), String> {
+    if total > 0 && offset >= total {
+        return Ok(());
+    }
+    let mut last_err = "no mirrors".to_string();
+    for url in mirrors {
+        let mut resp = match client.get(url).send().await {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = e.to_string();
+                continue;
+            }
+        };
+        let st = resp.status();
+        if st != reqwest::StatusCode::OK && st != reqwest::StatusCode::PARTIAL_CONTENT {
+            last_err = format!("full stream status {st}");
+            continue;
+        }
+        let mut f = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(part)
+        {
+            Ok(f) => f,
+            Err(e) => return Err(format!("part open: {e}")),
+        };
+        let mut written: u64 = 0;
+        let mut read_err = None;
+        loop {
+            match resp.chunk().await {
+                Ok(Some(chunk)) => {
+                    limiter.wait(chunk.len() as u64).await;
+                    if let Err(e) = f.write_all(&chunk) {
+                        read_err = Some(e.to_string());
+                        break;
+                    }
+                    written += chunk.len() as u64;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    read_err = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        // 响应体读完/中断：按实际写入归一化 .part 长度（下一 mirror 重试会重截断）
+        let _ = f.set_len(written);
+        if let Some(e) = read_err {
+            last_err = e;
+            continue;
+        }
+        if total == 0 || written == total {
+            return Ok(());
+        }
+        last_err = format!("full stream length {written} != expected {total}");
+    }
+    Err(last_err)
+}
+
 /// 段下载 + 失败缩小粒度重试（P1）：整段全 mirror 失败时，若可拆（len/2 >= MIN_RETRY_GRANULARITY）
 /// 则拆半重试；左右子段都成功才视为成功。子段写入各自区间（与整段写入等价）；
 /// 已成功子段的字节不回收（后续重试覆盖写，语义无害）。迭代式拆分栈（避免 async 递归装箱）。

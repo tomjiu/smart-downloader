@@ -8,7 +8,7 @@ use std::sync::Arc;
 use tokio::task;
 
 use crate::bindings::XLInitParam;
-use crate::error::{XunleiError, Result};
+use crate::error::{Result, XunleiError};
 use crate::loader::{ensure_dlls_loaded, symbols, Symbols};
 
 /// 迅雷引擎句柄（线程安全，可 clone）。
@@ -100,9 +100,7 @@ impl XunleiHandle {
         .map_err(|e| XunleiError::Other(format!("spawn_blocking failed: {}", e)))??;
 
         Ok(Self {
-            inner: Arc::new(HandleInner {
-                symbols: sym,
-            }),
+            inner: Arc::new(HandleInner { symbols: sym }),
         })
     }
 
@@ -133,9 +131,8 @@ impl XunleiHandle {
         let sym = self.inner.symbols;
         let ua = ua.to_string();
         task::spawn_blocking(move || unsafe {
-            let ua_c = std::ffi::CString::new(ua).map_err(|_| {
-                XunleiError::InvalidParam("user_agent contains null byte".into())
-            })?;
+            let ua_c = std::ffi::CString::new(ua)
+                .map_err(|_| XunleiError::InvalidParam("user_agent contains null byte".into()))?;
             let r = (sym.XL_SetUserAgent)(ua_c.as_ptr());
             if r != 0 {
                 return Err(XunleiError::with_context(r, "XL_SetUserAgent failed"));
@@ -151,9 +148,8 @@ impl XunleiHandle {
         let sym = self.inner.symbols;
         let proxy = proxy.to_string();
         task::spawn_blocking(move || unsafe {
-            let proxy_c = std::ffi::CString::new(proxy).map_err(|_| {
-                XunleiError::InvalidParam("proxy contains null byte".into())
-            })?;
+            let proxy_c = std::ffi::CString::new(proxy)
+                .map_err(|_| XunleiError::InvalidParam("proxy contains null byte".into()))?;
             let r = (sym.XL_SetProxy)(proxy_c.as_ptr());
             if r != 0 {
                 return Err(XunleiError::with_context(r, "XL_SetProxy failed"));
