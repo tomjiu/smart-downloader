@@ -438,9 +438,22 @@ fn save_fastresume_impl(
     tracing::debug!("fastresume: ready ih={ih}");
     let r = saved.expect("saved checked");
     let p = save_path.join(format!("{ih}.fastresume"));
-    let tmp = p.with_extension("fastresume.tmp");
+    // batch8：唯一 tmp 名（纳秒后缀）+ 0600——对齐 tasks.json 原子写配方
+    //（固定 tmp 名并发互踩 + 世界可读面收敛）。
+    let tmp = p.with_extension(format!(
+        "fastresume.tmp.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
     std::fs::write(&tmp, r.as_bytes())
         .map_err(|e| EngineError::Other(format!("写 fastresume 失败: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
     std::fs::rename(&tmp, &p)
         .map_err(|e| EngineError::Other(format!("落位 fastresume 失败: {e}")))?;
     Ok(Some(p))
