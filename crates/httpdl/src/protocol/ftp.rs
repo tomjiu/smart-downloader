@@ -593,6 +593,24 @@ impl FtpSession {
             .ok_or_else(|| format!("SIZE failed: {resp}"))
     }
 
+    /// 远端文件修改时间（batch7，RFC 3659 MDTM）：`213 YYYYMMDDHHMMSS[.sss]`
+    /// （UTC）。服务器不支持/路径不存在（4xx/5xx）→ Ok(None)——与 SIZE 不同，
+    /// MDTM 缺失是常规降级（继续用旧 size-only 语义），不是错误。返回原始
+    /// 规范化数字串作指纹（串等价 = 文件未变；对非 conformant 本地时钟服务器
+    /// 同样成立——指纹只要求同一服务器对未变文件回同一串）。
+    async fn mdtm(&mut self, path: &str) -> Result<Option<String>, String> {
+        let resp = self.cmd(&format!("MDTM {path}")).await?;
+        let Some(stamp) = resp.strip_prefix("213 ").map(str::trim) else {
+            return Ok(None); // 不支持/无此文件：降级为无指纹
+        };
+        // 宽松校验：前缀至少 14 位数字（YYYYMMDDHHMMSS），可选 .sss 小数
+        let digits: String = stamp.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.len() < 14 {
+            return Ok(None);
+        }
+        Ok(Some(stamp.to_string()))
+    }
+
     /// 发命令并读单行响应。
     async fn cmd(&mut self, line: &str) -> Result<String, String> {
         let mut buf = line.to_string();
@@ -895,10 +913,19 @@ async fn download_file(
     let epoch0 = epoch.load(Ordering::SeqCst);
     let part = part_path_of(dest);
     let ledger_path = ledger::ledger_path(&part);
+    // batch7（G2 类 FTP 残留根治）：本下载轮起点探一次 MDTM 远端指纹——
+    // 旧实现 FTP 只比 total 大小，远端文件变化但总长不变时旧 .part 前缀 +
+    // 新内容拼出静默损坏混合文件。探针失败/服务器不支持 → None（降级为
+    // 旧语义，不阻断）。
+    let mdtm = probe_mdtm(host, port, user, pass, path, use_tls).await;
     // 段账本加载（P4 唯一进度真源，与 HTTP engine.rs 同口径）：合法账本 →
     // 恢复已完成段并沿用其粒度；缺失/损坏/total 失配 → 全新计划 + .part 作废。
     // 旧「.part 长度前缀续传」语义废弃（G1/G2：预分配后长度恒为 total，不可信）。
-    let loaded = ledger::load(&ledger_path).filter(|l| l.total == total && l.validate_segments());
+    // batch7：MDTM 指纹核对同 HTTP 双指纹口径（fingerprint_ok：账本有指纹而
+    // 本次探测消失 → 拒绝，宁枉勿纵；账本无指纹 → 放行，旧档/降级兼容）。
+    let loaded = ledger::load(&ledger_path).filter(|l| {
+        l.total == total && l.validate_segments() && ledger::fingerprint_ok(&l.last_modified, &mdtm)
+    });
     if loaded.is_none() {
         let _ = std::fs::remove_file(&part);
     }
@@ -961,6 +988,8 @@ async fn download_file(
         let pause = pause.clone();
         let paused_seen = paused_seen.clone();
         let epoch = epoch.clone();
+        // batch7：MDTM 指纹随 worker 克隆（账本快照写入用；per-iteration move）
+        let mdtm = mdtm.clone();
         workers.spawn(async move {
             loop {
                 // 审计修复（P1-4）：段边界检查暂停旗标——置位即退出（在飞段
@@ -1009,7 +1038,9 @@ async fn download_file(
                         total,
                         min_split: eff_min_split,
                         etag: None,
-                        last_modified: None,
+                        // batch7：FTP 账本指纹（MDTM 原始串；None = 服务器不支持
+                        // 或探针失败——恢复时 fingerprint_ok(None,_) 放行，旧语义）
+                        last_modified: mdtm.clone(),
                         done: m.done_ranges().to_vec(),
                     };
                     ledger::save(&ledger_path, &snapshot);
@@ -1625,6 +1656,29 @@ async fn probe_size(
     let size = s.size(path).await;
     s.quit().await;
     size
+}
+
+/// 探测远端修改时间指纹（batch7）：连接 + 登录 + MDTM。连接/登录失败或
+/// 服务器不支持 MDTM（4xx/5xx）→ None（降级为旧 size-only 语义，不阻断
+/// 下载）。仅在本下载轮起点探一次，作账本指纹（写入 + 恢复核对双向）。
+async fn probe_mdtm(
+    host: &str,
+    port: u16,
+    user: &str,
+    pass: &str,
+    path: &str,
+    use_tls: bool,
+) -> Option<String> {
+    async {
+        let mut s = FtpSession::connect(host, port, use_tls).await?;
+        s.login(user, pass).await?;
+        let stamp = s.mdtm(path).await;
+        s.quit().await;
+        stamp
+    }
+    .await
+    // 连接失败：无指纹（不阻断下载，账本照常 size 校验）
+    .unwrap_or_default()
 }
 
 /// 现有 .part 已下载字节数（续传起点）。

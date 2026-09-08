@@ -33,6 +33,9 @@ pub struct FtpServerConfig {
     pub files: Vec<(String, Vec<u8>)>,
     /// LIST 响应中额外插入的子目录行名（目录下载过滤测试用）。
     pub list_subdirs: Vec<String>,
+    /// MDTM 响应指纹（batch7）：Some(stamp) → `213 {stamp}`；None →
+    /// `502 not supported`（模拟不支持 MDTM 的老服务器，客户端降级旧语义）。
+    pub mdtm: Option<String>,
 }
 
 impl Default for FtpServerConfig {
@@ -46,6 +49,7 @@ impl Default for FtpServerConfig {
             fail_ranges_max_hits: None,
             files: Vec::new(),
             list_subdirs: Vec::new(),
+            mdtm: None,
         }
     }
 }
@@ -154,6 +158,17 @@ async fn handle_control(
                     None => cfg.size,
                 };
                 let _ = conn.write_all(format!("213 {n}\r\n").as_bytes()).await;
+            }
+            "MDTM" => {
+                // batch7：可配置指纹（None = 模拟老服务器不支持）
+                match &cfg.mdtm {
+                    Some(stamp) => {
+                        let _ = conn.write_all(format!("213 {stamp}\r\n").as_bytes()).await;
+                    }
+                    None => {
+                        let _ = conn.write_all(b"502 MDTM not supported\r\n").await;
+                    }
+                }
             }
             "REST" => {
                 if let Ok(n) = arg.parse::<u64>() {

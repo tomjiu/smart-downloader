@@ -150,14 +150,20 @@ impl DaemonState {
             .map_err(|e| DaemonError::Persist(format!("解析 {path:?} 失败: {e}")))?;
         let mut restored = 0usize;
         let mut failed = 0usize;
-        for pt in pts {
+        for (idx, pt) in pts.into_iter().enumerate() {
             let mut t = pt.task.clone();
             let was_paused = pt.paused; // 用户暂停意图（P4 G5，旧文件无此字段 = false）
-                                        // 审计修复（P1-2）：终态任务（Completed/Stopped/Failed）不再重新入队——
-                                        // 原实现一律 state=Queued 并 engine.add：HTTP 完成任务 .part/账本已清
-                                        // （httpdl 只认 .part 续传）→ 重启后整文件重新下载并覆盖已落盘文件；
-                                        // Failed 任务被静默复活重试；与 E20 完成龄清扫冲突（清扫条件永不满足）。
-                                        // 终态任务仅重建记录（有记录无句柄），状态原样保留。
+                                        // batch7（FIFO 保序）：旧档 added_at_ms 缺失（0 值）→ 按加载序
+                                        // 回填 1..n——序号恒小于真实墙钟毫秒，恢复任务在递补 FIFO 中排
+                                        // 在重启后新任务之前（语义正确：它们更早创建），且跨重启稳定。
+            if t.metadata.added_at_ms == 0 {
+                t.metadata.added_at_ms = idx as u64 + 1;
+            }
+            // 审计修复（P1-2）：终态任务（Completed/Stopped/Failed）不再重新入队——
+            // 原实现一律 state=Queued 并 engine.add：HTTP 完成任务 .part/账本已清
+            // （httpdl 只认 .part 续传）→ 重启后整文件重新下载并覆盖已落盘文件；
+            // Failed 任务被静默复活重试；与 E20 完成龄清扫冲突（清扫条件永不满足）。
+            // 终态任务仅重建记录（有记录无句柄），状态原样保留。
             if matches!(
                 t.state,
                 TaskState::Completed | TaskState::Stopped | TaskState::Failed

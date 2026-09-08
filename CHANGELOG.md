@@ -4,6 +4,47 @@
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本号语义：`0.x` 阶段以能力批次为单位推进，不承诺字段级兼容。
 
+## [0.2.2] - 2026-09-08
+
+第七轮收尾批次（batch7）：batch6 遗留 5 项暂缓缺陷全部落地 + 回归测试。
+
+### 并发与竞态（同根因闭环）
+- **配额闸门 TOCTOU 根治（预留槽位改造）**：add 路径改「预留占位记录 + 引擎接入」
+  两段式——有槽位（或 0 = 不限）时同步插入 Queued 占位记录并登记
+  slot_reservations 集合，engine.add 成功 attach 句柄 / 失败回滚删除。
+  add await 在途窗口任务对并发 add 可见且占槽，关闭「记录未插入前并发 add
+  双双过闸」的超卖窗口（magnet/.torrent/HTTP/FTP/SFTP 五入口统一）。
+  attach 双检竞态间隙用户意图：暂停/移除/resume 抢先激活 → 尽力回滚引擎
+  任务不留孤儿；resume 在预留窗口内幂等成功（不二次 engine.add）
+- **完成动作全表快照竞态根治**：终态判定与 execute_completion_action 收进
+  同一 tasks 锁临界区（execute 同步：exit 内联、power 动作仅 dispatch），
+  间隙插入的新任务（RSS 自动建任务/并发 add）不再被 exit/shutdown 误杀
+
+### 正确性
+- **ban 重放失败脏标记重试**：replay_bans 单条失败/引擎不可用不再仅 warn
+  后整会话丢失——挂入 ban_replay_failed 待重试集，serve 30s tick 经
+  retry_pending_bans 重发至成功；全程持 ban_ops 串行锁（防与用户 unban
+  交错把已解封 IP 重新封回），用户已解封条目自动丢弃
+- **FTP 续传 MDTM 指纹（G2 类 FTP 残留根治）**：下载轮起点经 RFC 3659
+  MDTM 探测远端 mtime 写入段账本 last_modified 位，恢复时按 HTTP 双指纹
+  同款 fingerprint_ok 核对——远端文件同长被替换 → 账本作废整文件重下
+  （旧实现只比 total，同长不同内容拼出静默混合文件）；服务器不支持 MDTM
+  → 降级旧 size-only 语义；账本有指纹而探测消失 → 宁枉勿纵重下
+
+### 队列
+- **created_at 持久化（重启 FIFO 保序）**：TaskMetadata 新增 added_at_ms
+  （unix 毫秒，serde default 兼容旧档），add 路径统一写入；排队递补/队列
+  位置排序键升级为 (queue_priority, added_at_ms, created_at)——created_at
+  是单调时钟不可持久化，重启后恢复任务 FIFO 并列退化 + HashMap 无序；
+  恢复路径对旧档（0 值）按加载序回填 1..n（恒小于真实墙钟 = 恢复任务排在
+  新任务前，跨重启稳定）
+
+### 测试
+- 新增 9 例：并发 add 不超卖（multi_thread + 引擎延迟注入）/ add 失败预留
+  回滚 / 预留窗口 resume 幂等 / ban 重试三态（失败入集-恢复收敛-unban
+  不复活）/ added_at_ms 跨重启 FIFO 保序（E23 定时任务链路）/ FTP MDTM
+  四态（一致续传-失配重下-不支持降级-指纹消失宁枉勿纵）
+
 ## [0.2.1] - 2026-09-07
 
 第六轮子智能体批量代码审查修复（batch6）+ 桌面端三平台打包矩阵首跑验证。

@@ -65,6 +65,7 @@ pub fn make_task(id: &str, name: &str) -> DownloadTask {
         file_priorities: None,
         sequential: false,
         metadata: TaskMetadata {
+            added_at_ms: 0,
             name: Some(name.to_string()),
             added_at_unix: 1,
             tags: Vec::new(),

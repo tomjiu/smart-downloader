@@ -207,3 +207,113 @@ async fn queue_gate_engine_kinds_isolated() {
         "FTP 配额独立于 HTTP，不得被 HTTP 满槽连坐"
     );
 }
+
+// ==================== batch7-P1：预留槽位（add 在途窗口 TOCTOU 根治） ====================
+
+/// 并发 add 不超卖：配额 1 + 引擎 add 延迟 100ms，6 个并发 add 只有 1 个
+/// 过闸入引擎，其余全部落队。旧实现（记录 add 成功后才插入）在延迟窗口内
+/// 全部过闸 → 6 连超卖，本用例回归锚定。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slot_reservation_closes_inflight_oversell() {
+    let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+    fake.set_add_delay_ms(100);
+    let state = Arc::new(DaemonState::new(fake.clone(), vec![]).with_queue_cfg(queue_cfg(0, 1, 0)));
+
+    let mut futs = Vec::new();
+    for i in 0..6 {
+        let st = state.clone();
+        futs.push(tokio::spawn(async move {
+            st.add_http_task(format!("https://srv/c{i}.bin"), None)
+                .await
+                .unwrap()
+        }));
+    }
+    let mut ids = Vec::new();
+    for f in futs {
+        ids.push(f.await.unwrap());
+    }
+
+    let (active, queued) = {
+        let tasks = state.tasks.lock();
+        let active = tasks.values().filter(|r| r.engine_tid.is_some()).count();
+        let queued = tasks
+            .values()
+            .filter(|r| r.engine_tid.is_none() && r.task.state == TaskState::Queued)
+            .count();
+        (active, queued)
+    };
+    assert_eq!(active, 1, "配额 1 必须只放行 1 个任务入引擎（超卖即缺陷）");
+    assert_eq!(queued, 5, "其余任务必须全部落队");
+    assert_eq!(fake.added().len(), 1, "引擎侧不得收到超额任务");
+    assert_eq!(ids.len(), 6);
+    // 预留集必须已全部摘除（add 均已完成 attach/落队）
+    assert!(state.slot_reservations.lock().is_empty());
+}
+
+/// engine.add 失败 → 预留回滚：占位记录删除（对齐旧「add 失败 = 无记录」
+/// 语义），槽位计数归零，后续 add 不被残留占位卡死。
+#[tokio::test]
+async fn slot_rollback_on_engine_add_failure() {
+    let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+    let state = DaemonState::new(fake.clone(), vec![]).with_queue_cfg(queue_cfg(0, 1, 0));
+    fake.fail_url("https://srv/bad.bin");
+
+    let err = state
+        .add_http_task("https://srv/bad.bin".into(), None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DaemonError::Engine(_)));
+    // 占位记录必须回滚删除（空状态不得残留任何记录）+ 预留集摘除
+    assert!(state.tasks.lock().is_empty(), "add 失败不得残留占位记录");
+    assert!(state.slot_reservations.lock().is_empty());
+    assert_eq!(state.active_slot_counts()[1], 0, "失败任务不得占槽");
+
+    // 恢复后同一闸门可正常放行（无幽灵占位）
+    fake.unfail_url("https://srv/bad.bin");
+    let tid = state
+        .add_http_task("https://srv/bad.bin".into(), None)
+        .await
+        .unwrap();
+    assert!(state.tasks.lock().get(&tid).unwrap().engine_tid.is_some());
+}
+
+/// add 在途窗口 resume = 幂等成功（不重复 engine.add，不产生双引擎任务）。
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_during_reservation_is_idempotent() {
+    let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+    fake.set_add_delay_ms(150);
+    let state = Arc::new(DaemonState::new(fake.clone(), vec![]));
+
+    let st = state.clone();
+    let adder = tokio::spawn(async move {
+        st.add_http_task("https://srv/res.bin".into(), None)
+            .await
+            .unwrap()
+    });
+    // 等待进入预留窗口（占位记录已插入，engine.add 还在 sleep）
+    let mut tid = String::new();
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let reserved = state.slot_reservations.lock();
+        if let Some(id) = reserved.iter().next() {
+            tid = id.clone();
+            break;
+        }
+    }
+    assert!(!tid.is_empty(), "必须先进入预留窗口");
+    // 在途窗口 resume：幂等 Ok，不得二次 engine.add
+    state.resume(&tid).await.unwrap();
+    // 等 add 全链收尾
+    adder.await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(
+        fake.added().len(),
+        1,
+        "resume 不得在预留窗口内重复激活（双引擎任务）"
+    );
+    let rec = state.tasks.lock().get(&tid).cloned().unwrap();
+    assert!(rec.engine_tid.is_some());
+    // batch3-P1 口径：HTTP add 后记录态留 Queued（首轮轮询迁移 Downloading）；
+    // 断言核心 = 有句柄且无重复引擎任务
+    assert_eq!(rec.task.state, TaskState::Queued);
+}

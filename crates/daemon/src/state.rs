@@ -484,6 +484,15 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// 当前 unix 毫秒（batch7）：可持久化的 FIFO 排序键（TaskMetadata.added_at_ms）。
+/// 时钟回拨/系统异常兑底 0（并列时由运行期 created_at tie-break，无序性不恶化）。
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// serde skip_serializing_if 谓词：start_at_unix 为 0（未调度）时快照省略。
 fn is_zero_u64(v: &u64) -> bool {
     *v == 0
@@ -594,6 +603,18 @@ pub struct DaemonState {
     /// 子文件优先级待重放集合（task_id）。恢复时 metadata 未就绪（magnet）
     /// 挂入；就绪后由 replay 循环下发并移除；任务移除/引擎不支持时清理。
     pending_file_prio: Mutex<HashSet<TaskId>>,
+    /// add 在途窗口槽位预留集（batch7-P1，配额闸门 TOCTOU 根治）：
+    /// gate_or_enqueue 有槽位分支同步插入占位记录（Queued + 无句柄）并在本
+    /// 集登记 task_id，engine.add 成功 attach / 失败回滚时摘除。槽位计数
+    /// 将集内 id 一并计入——add await 期间任务对并发 add 可见且占槽，
+    /// 关闭「记录未插入前并发 add 双双过闸」的超卖窗口。仅内存（崩溃
+    /// 自愈：占位记录重启后成为普通 queue_wait 任务，调度循环按既有语义
+    /// 递补）。
+    slot_reservations: Mutex<HashSet<TaskId>>,
+    /// ban 重放失败待重试集（batch7-P2）：replay_bans 单条失败（引擎瞬时
+    /// 不可用/下发报错）不再仅 warn 后整会话丢失——挂入本集，由 serve
+    /// 30s tick 经 retry_pending_bans 重发至成功。仅内存（重启自然重放）。
+    pub(crate) ban_replay_failed: Mutex<Vec<String>>,
     /// 全局限速总阀门当前值（E16）：启动时由 config 注入；运行中经
     /// POST /config/limit 或 TOML 热重载调整（apply_global_limits）。
     /// 不持久化（重启回到配置文件口径——与 dest_root 同为配置层，任务层

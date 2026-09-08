@@ -139,3 +139,11 @@
 > 配额闸门 TOCTOU 预留槽位改造（add 在途窗口超卖，四入口统一）、完成动作全表快照
 > 竞态（同根因）、ban 重放失败脏标记重试、created_at 持久化（重启 FIFO 保序）、
 > FTP 续传 MDTM 指纹（G2 缺陷类 FTP 残留）。
+
+> 更新：2026-09-08（一）。**batch7：上述 5 项暂缓项全部落地（0.2.2）**——
+> ① 配额闸门预留槽位（slot_reservations 集合 + 占位记录两段式，五入口统一，
+> attach 双检用户意图 + resume 预留窗口幂等）；② 完成动作判定与执行收进
+> 同一 tasks 临界区（TOCTOU 根治）；③ ban 重放失败待重试集 + 30s tick 重试泵
+> （ban_ops 串行，unban 权威表仲裁）；④ added_at_ms 持久化 FIFO 键
+> （旧档恢复按加载序回填 1..n）；⑤ FTP MDTM 指纹（fingerprint_ok 同口径，
+> 四态回归）。新增 9 例回归锚测试。遗留观察项不变（见 ACCEPTANCE-REPORT）。
