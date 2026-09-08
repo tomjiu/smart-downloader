@@ -2761,6 +2761,7 @@ dependencies = [
  "futures",
  "md-5",
  "parking_lot",
+ "percent-encoding",
  "qrcode",
  "quick-xml",
  "regex",

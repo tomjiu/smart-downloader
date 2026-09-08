@@ -133,6 +133,8 @@ fn strip_layout_assertions(src: &str) -> String {
 }
 
 fn main() {
+    // 声明自定义 cfg（回退绑定开关），否则新 rustc/clippy 报 unexpected_cfgs
+    println!("cargo::rustc-check-cfg=cfg(lt_bindings_fallback)");
     let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
     let repo = PathBuf::from(&manifest).join("..").join("..");
 

@@ -63,6 +63,10 @@ struct HttpTask {
     /// 身份重下重校验的候选队列（评分降序；backup_url 除外——它走专属优先
     /// 分支）。空池且当前表单源 = 无隔离试错价值 → 走降级接受（Q-B5 保留）。
     rotate_pool: Vec<String>,
+    /// 源站 Range 能力（probe 结论）：false（服务器忽略 Range → 200 全文件）
+    /// 时路由到未知总长单流循环——分段器的 206 硬要求对非 Range 源必败
+    /// （Linux 实弹验收发现；该循环对 200 有 truncate 全量重下同语义分支）。
+    range_supported: bool,
     /// 换源代次：etag 变化 → gen+1 → 旧下载循环退出、新循环启动。
     /// .part 路径随 gen 隔离（`dest.<gen>.part`），避免新旧循环并发写同一文件。
     gen: u64,
@@ -238,7 +242,7 @@ impl HttpEngine {
             let tasks = inner.tasks.lock();
             tasks
                 .get(&tid)
-                .map(|t| t.total == 0 && t.stream == StreamKind::Plain)
+                .map(|t| t.stream == StreamKind::Plain && (t.total == 0 || !t.range_supported))
                 .unwrap_or(false)
         };
         let handle = if unknown_len {
@@ -1086,6 +1090,7 @@ impl DownloadEngine for HttpEngine {
                         proxy,
                         resolved_name: Some(resolved_name),
                         stream: StreamKind::Hls,
+                        range_supported: true,
                     },
                 );
             }
@@ -1139,6 +1144,7 @@ impl DownloadEngine for HttpEngine {
                         proxy,
                         resolved_name: Some(resolved_name),
                         stream: StreamKind::Dash,
+                        range_supported: true,
                     },
                 );
             }
@@ -1319,6 +1325,7 @@ impl DownloadEngine for HttpEngine {
                     proxy,
                     resolved_name: Some(resolved_name),
                     stream: StreamKind::Plain,
+                    range_supported: probe.range_supported,
                 },
             );
         }
