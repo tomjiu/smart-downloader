@@ -357,9 +357,23 @@ pub fn parse_feed(xml: &str) -> Result<ParsedFeed, String> {
             Ok(Event::Text(t)) => {
                 let Some(tgt) = &target else { continue };
                 let text = t
-                    .unescape()
+                    .xml10_content()
                     .map(|c| c.into_owned())
                     .map_err(|e| format!("rss 文本转义非法: {e}"))?;
+                store_text(
+                    tgt,
+                    text,
+                    &mut feed_title,
+                    &mut cur_title,
+                    &mut cur_link_text,
+                    &mut cur_guid,
+                    &mut cur_date,
+                );
+            }
+            Ok(Event::GeneralRef(r)) => {
+                // `&amp;` 等实体引用自 0.38 起拆为独立事件，解析回值走同一累加链
+                let Some(tgt) = &target else { continue };
+                let text = resolve_ref(&r)?;
                 store_text(
                     tgt,
                     text,
@@ -459,9 +473,27 @@ fn decode(
     a: quick_xml::events::attributes::Attribute,
     reader: &Reader<&[u8]>,
 ) -> Result<String, String> {
-    a.decode_and_unescape_value(reader.decoder())
+    a.decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, reader.decoder())
         .map(|c| c.into_owned())
         .map_err(|e| format!("rss 属性解码失败: {e}"))
+}
+
+/// 实体引用事件（0.38+ `Event::GeneralRef`）解析回原值：
+/// 数字字符引用与预定义 XML 实体；未知命名实体与旧版 unescape 一致地报错。
+fn resolve_ref(r: &quick_xml::events::BytesRef<'_>) -> Result<String, String> {
+    if r.is_char_ref() {
+        return r
+            .resolve_char_ref()
+            .map_err(|e| format!("rss 数字字符引用非法: {e}"))?
+            .map(|c| c.to_string())
+            .ok_or_else(|| "rss 数字字符引用非法".to_string());
+    }
+    let name = r
+        .xml10_content()
+        .map_err(|e| format!("rss 实体引用解码失败: {e}"))?;
+    quick_xml::escape::resolve_xml_entity(&name)
+        .map(str::to_string)
+        .ok_or_else(|| format!("rss 未知实体引用: &{name};"))
 }
 
 /// 规则匹配（batch5）：关键词（子串或正则）must 全命中 且 must_not 全不命中，

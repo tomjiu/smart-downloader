@@ -1,0 +1,52 @@
+# cargo-deny 门禁配置（batch9 工具化安全审计引入，2026-09-08）
+# 运行：cargo deny check advisories bans licenses sources
+# CI：.github/workflows/ci.yml security job 与本配置联动
+
+[advisories]
+version = 2
+# RustSec 漏洞与 yanked 包一律阻断
+yanked = "deny"
+ignore = []
+
+[bans]
+# 已知良性重复版本（当前树：getrandom/rand_core/shlex/syn/windows-sys）
+multiple-versions = "warn"
+# 外部依赖禁止通配符版本；workspace 内部 path 依赖（无 version）属标准做法放行
+wildcards = "deny"
+# path 依赖（workspace 内部无 version 写法）放行，外部通配符仍 deny
+allow-wildcard-paths = true
+skip = []
+
+[licenses]
+version = 2
+confidence-threshold = 0.93
+# 本仓库依赖树的许可白名单：MIT 系 / Apache 系 / BSD 系 / ISC / Unicode / Zlib /
+# MPL-2.0（部分 GUI 相关）/ CC0（测试数据）/ BSL-1.0（boost 相关）/ CDLA-Permissive-2.0
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+]
+
+# ring 0.17 自声明 LicenseRef-ring（实际为 ISC AND MIT AND OpenSSL 组合，SPDX 数据库
+# 未收录自定义标识），按 cargo-deny 官方配方澄清：
+[[licenses.clarify]]
+name = "ring"
+expression = "ISC AND MIT AND OpenSSL"
+license-files = [{ path = "LICENSE", hash = 0xbd0eed23 }]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

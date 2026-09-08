@@ -5,6 +5,7 @@ edition = "2021"
 authors = ["smart-downloader"]
 description = "Thunder BT task migration tools (xlbt.cfg + xltd -> libtorrent fastresume) - UNVERIFIED"
 license = "MIT OR Apache-2.0"
+publish.workspace = true
 
 [lib]
 name = "xunlei_convert"
