@@ -185,7 +185,9 @@ fn main() {
                         tauri_plugin_shell::process::CommandEvent::Stdout(line) => {
                             println!("[daemon] {}", String::from_utf8_lossy(&line));
                         }
-                        tauri_plugin_shell::process::CommandEvent::Terminated => {
+                        tauri_plugin_shell::process::CommandEvent::Terminated(_) => {
+                            // 2.3.x 起 Terminated 为元组变体（携带 Option<退出状态>）；
+                            // (_) 兼容任意携带形态（cargo lock 随 release 刷新漂移实锤）
                             eprintln!("[daemon] sidecar 进程已退出（崩溃/被杀）——不再等待就绪");
                             dead_flag.store(true, Ordering::SeqCst);
                             kill_daemon(&ev_handle.state::<DaemonChild>());

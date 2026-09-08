@@ -153,10 +153,11 @@ int map_alert_kind(const lt::alert* a) {
 
 void fill_ih_from_torrent_alert(const lt::alert* a, char out[41]) {
     out[0] = '\0';
-    // type() + static_cast：不依赖 RTTI（vcpkg libtorrent 可能无 RTTI）。
     // 审查修复（P2）：原 dynamic_cast 在 -fno-rtti 构建下恒空 → 所有扁平化
     // alert 的 ih 为空串，daemon 按 ih 归位任务的终态推进整体失效。
-    if (a->type() < lt::torrent_alert::alert_type) return;
+    // desktop-v0.2.1 首跑实证（brew 2.1.0）：已弃用的 torrent_alert::alert_type
+    // 静态成员在 2.1 被移除；且 2.0.x 中该值为 0，原 `a->type() < alert_type`
+    // 守卫恒假（无实际过滤作用）——直接删除，下方 handle 有效性检查已兑底。
     const auto* ta = static_cast<const lt::torrent_alert*>(a);
     if (ta->handle.is_valid() && ta->handle.info_hashes().has_v1()) {
         hex_encode_v1(ta->handle.info_hashes().v1, out);
@@ -1074,7 +1075,11 @@ lt_err lt_set_piece_first_last(lt_session* s, const char* ih, int prio) {
         // daemon 契约 prio==0 = 恢复默认；lt 中 piece priority 0 = skip（不下载）
         // ——直接透传会把首/末块标成永不下载（小于一块的文件整个文件永不完成）。
         // 映射到内核默认优先级（batch6-P1 修复，desktop-v0.2.0 审计发现）。
-        const int effective = (prio == 0) ? static_cast<int>(lt::default_priority) : prio;
+        // download_priority_t 强类型构造（2.0/2.1 通用：2.1 移除了
+        // download_priority_t → int 的隐式转换，显式构造两版皆可）。
+        const lt::download_priority_t effective = (prio == 0)
+            ? lt::default_priority
+            : lt::download_priority_t(static_cast<std::uint8_t>(prio));
         for (lt::file_index_t fi(0); fi < lt::file_index_t(fs.num_files()); ++fi) {
             if (fs.pad_file_at(fi)) continue;
             const std::int64_t off = fs.file_offset(fi);
