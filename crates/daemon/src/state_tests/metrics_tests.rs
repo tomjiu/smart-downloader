@@ -42,6 +42,7 @@ fn http_rec_with_rates(id: &str, down: u64, up: u64) -> TaskRecord {
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
+                added_at_ms: 0,
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: 0,

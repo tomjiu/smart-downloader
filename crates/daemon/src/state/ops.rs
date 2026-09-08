@@ -30,6 +30,13 @@ impl DaemonState {
     /// 空任务表不触发（无意义）；非终态任务存在（含 Paused/Queued/Seeding）
     /// 阻塞触发——qbit 同语义（暂停/做种中均算未完成）。触发后置位 fired。
     /// pub(crate)：lifecycle 的 set_completion_action 热更后补判（batch5-P2）。
+    ///
+    /// batch7-P1（TOCTOU 根治）：终态判定与 execute 同一 tasks 锁临界区——
+    /// 旧实现「锁内快照 → 锁外执行」，间隙里 RSS 规则/并发 add 可插入新
+    /// 任务，exit/shutdown 会把新任务一并杀掉。execute 为同步 fn（exit 内联
+    /// process::exit；power 动作仅 dispatch spawn_blocking，锁内停留亚毫秒），
+    /// 锁贯穿判定→执行无死锁风险；add 路径建任务必须先取同一把锁——
+    /// 判定与建任务自此互斥（与 F7-1 预留槽位同根因闭环）。
     pub(crate) fn maybe_run_completion_action(&self) {
         let action = self.completion_action.lock().clone();
         if action == "none" || action.is_empty() {
@@ -47,23 +54,27 @@ impl DaemonState {
         {
             return; // 本会话已触发过
         }
-        let all_terminal = {
+        let fired = {
             let tasks = self.tasks.lock();
-            !tasks.is_empty()
+            let all_terminal = !tasks.is_empty()
                 && tasks.values().all(|r| {
                     matches!(
                         r.task.state,
                         TaskState::Completed | TaskState::Failed | TaskState::Stopped
                     )
-                })
+                });
+            if all_terminal {
+                execute_completion_action(&action);
+                true
+            } else {
+                false
+            }
         };
-        if !all_terminal {
+        if !fired {
             // 尚有活跃/暂停/排队任务 → 复位旗标，下次完成事件再判
             self.completion_fired
                 .store(false, std::sync::atomic::Ordering::SeqCst);
-            return;
         }
-        execute_completion_action(&action);
     }
 
     /// 完成自动处理（E27，清单 #15）：`[post_download] move_to` 移动 +
@@ -326,7 +337,7 @@ impl DaemonState {
     // ==================== S1-b 并发队列门控 ====================
     // [queue] max_active_{bt,http,ftp}（0 = 不限）：add 入口配额满 → 任务落
     // Queued 排队（无句柄），由 activate_due_tasks（serve 1s tick）在槽位空闲
-    // 后按 FIFO（created_at 升序）递补激活。槽位释放 = 任务进入非传输态
+    // 后按 FIFO（added_at_ms 升序，重启后保序）递补激活。槽位释放 = 任务进入非传输态
     // （Completed/Failed/Stopped/Paused/Seeding/移除）。手动 resume = 强制
     // 开始（无视配额，对齐 qbit「强制继续」语义）；恢复路径重放不设闸
     // （保持停机前在飞集合，仅新增激活受闸）。
@@ -357,12 +368,15 @@ impl DaemonState {
 
     /// 当前占用引擎槽位的任务数（S1-b）：有句柄且不在释放态（Paused = 用户
     /// 挂起 / Seeding = 做种不占下载槽 / 终态）。add 后记录态短暂停留 Queued
-    /// （首轮引擎状态同步前）——有句柄即占位，防同 tick 连发超卖。
+    /// （首轮引擎状态同步前）——有句柄即占位。batch7-P1：slot_reservations
+    /// 集内 id（add 在途窗口的占位记录，Queued 无句柄）一并计入——关闭
+    /// 「记录未插入前并发 add 双双过闸」的超卖窗口（TOCTOU）。
     pub(super) fn active_slot_counts(&self) -> [u32; 3] {
         let tasks = self.tasks.lock();
+        let reservations = self.slot_reservations.lock();
         let mut counts = [0u32; 3];
         for rec in tasks.values() {
-            if rec.engine_tid.is_none() {
+            if rec.engine_tid.is_none() && !reservations.contains(&rec.task.id) {
                 continue;
             }
             if matches!(
@@ -380,39 +394,134 @@ impl DaemonState {
         counts
     }
 
-    /// add 路径配额闸门（S1-b）：返回 true = 有槽位，调用方继续 engine.add；
-    /// false = 配额已满，任务已落排队记录（Queued + 无句柄 + queue_wait 事件
-    /// + TaskCreated 发布），调用方直接返回 task_id。
+    /// add 路径配额闸门（S1-b + batch7-P1 预留槽位改造）：
+    /// - true = 有槽位，已同步插入【预留占位记录】（Queued + 无句柄 +
+    ///   slot_reservations 登记 + TaskCreated 发布），调用方继续 engine.add：
+    ///   成功 → [`Self::attach_reserved_handle`]，失败 →
+    ///   [`Self::rollback_slot_reservation`]。占位记录使 add await 期间任务
+    ///   对并发 add/槽位计数可见，根治在途窗口超卖（TOCTOU）。
+    /// - false = 配额已满，任务已落排队记录（Queued + 无句柄 + queue_wait 事件
+    ///   + TaskCreated 发布），调用方直接返回 task_id。
     ///
-    /// 调用时机：定时判定之后（定时任务不受此闸——到点由调度循环按当时配额激活）。
-    pub(super) fn gate_or_enqueue(&self, task: DownloadTask, kind: EngineKind) -> bool {
-        let Some(limit) = self.queue_limit_of(kind) else {
-            return true;
-        };
-        if self.active_slot_counts()[Self::slot_index(kind)] < limit {
-            return true;
+    /// 调用时机：定时判定之后（定时任务不受此闸——到点由调度循环按当时配额激活）；
+    /// engine_for 解析之后（引擎不可用直接报错，不占槽不入队）。
+    pub(super) fn gate_or_enqueue(&self, task: &DownloadTask, kind: EngineKind) -> bool {
+        if let Some(limit) = self.queue_limit_of(kind) {
+            if self.active_slot_counts()[Self::slot_index(kind)] >= limit {
+                let task_id = task.id.clone();
+                let mut rec = TaskRecord {
+                    seeding_since: None,
+                    task: task.clone(),
+                    engine_tid: None,
+                    engine_kind: kind,
+                    engine_status: None,
+                    events: vec![],
+                };
+                rec.push_event(
+                    "add",
+                    Some(format!(
+                        "queue_wait: {kind:?} 并发配额已满（{limit}），槽位空闲后自动递补"
+                    )),
+                );
+                self.tasks.lock().insert(task_id.clone(), rec);
+                self.autosave();
+                self.hub.publish(SchedulerEvent::TaskCreated {
+                    task_id: task_id.clone(),
+                });
+                return false;
+            }
         }
+        // batch7-P1：有槽位或不限配额 → 同步预留（占位记录 + 预留集登记）。
+        // 不限配额同样占位：attach 的 double-check 依赖占位记录存在
+        // （缺失 = 用户已移除，正确回滚），不可省略。
         let task_id = task.id.clone();
         let mut rec = TaskRecord {
             seeding_since: None,
-            task,
+            task: task.clone(),
             engine_tid: None,
             engine_kind: kind,
             engine_status: None,
             events: vec![],
         };
-        rec.push_event(
-            "add",
-            Some(format!(
-                "queue_wait: {kind:?} 并发配额已满（{limit}），槽位空闲后自动递补"
-            )),
-        );
+        rec.push_event("add", Some("slot_reserve: 引擎接入中".into()));
         self.tasks.lock().insert(task_id.clone(), rec);
+        self.slot_reservations.lock().insert(task_id.clone());
         self.autosave();
         self.hub.publish(SchedulerEvent::TaskCreated {
             task_id: task_id.clone(),
         });
-        false
+        true
+    }
+
+    /// engine.add 成功后句柄落位（batch7-P1）：预留记录 attach 句柄 + 状态
+    /// Downloading。double-check 竞态间隙的用户意图（同 activate_one 口径）：
+    /// - 记录缺失（用户在窗口内移除）/ 状态已变（用户暂停）/ 句柄已存在
+    ///   （resume 强制开始抢先激活）→ 尽力回滚本方引擎任务（不留孤儿），
+    ///   不覆盖用户意图；
+    /// - 正常 → attach + StateChanged(Queued→Downloading)。
+    ///
+    /// 预留集摘除恒先行（槽位计数立刻回归真实口径）。
+    pub(super) async fn attach_reserved_handle(
+        &self,
+        task_id: &str,
+        engine_tid: EngineTaskId,
+        kind: EngineKind,
+        expected_state: &TaskState,
+    ) {
+        self.slot_reservations.lock().remove(task_id);
+        let attached = {
+            let mut tasks = self.tasks.lock();
+            match tasks.get_mut(task_id) {
+                Some(rec) if rec.engine_tid.is_none() && rec.task.state == *expected_state => {
+                    rec.engine_tid = Some(engine_tid.clone());
+                    // batch3-P1 同口径：BT 无轮询纠偏 → 激活即 Downloading；
+                    // HTTP/FTP/SFTP 留 Queued，首轮轮询迁移（poll_engine_states
+                    // 既有语义：迁移事件/速率接入依赖该次转移，不可提前吞掉）。
+                    if kind == EngineKind::Bt {
+                        rec.task.state = TaskState::Downloading(kind);
+                    }
+                    rec.push_event("add", None);
+                    true
+                }
+                Some(rec) => {
+                    rec.push_event(
+                        "add",
+                        Some("引擎接入间隙意图变更（暂停/抢先激活/移除），引擎任务已回滚".into()),
+                    );
+                    false
+                }
+                None => false,
+            }
+        };
+        if attached {
+            self.autosave();
+            self.hub.publish(SchedulerEvent::StateChanged {
+                task_id: task_id.to_string(),
+                from: expected_state.clone(),
+                to: TaskState::Downloading(kind),
+            });
+        } else {
+            // 竞态间隙用户意图变更：尽力移除刚接入的引擎任务（不留孤儿）
+            if let Ok(e) = self.engine_for(kind) {
+                let _ = e.remove(&engine_tid, false).await;
+            }
+            self.autosave();
+        }
+    }
+
+    /// engine.add 失败回滚（batch7-P1）：摘预留标记 + 删除占位记录（对齐
+    /// 旧语义：add 失败 = 无记录，API 返回 Err）。句柄已存在（竞态抢先）
+    /// 则仅摘标记保留记录。
+    pub(super) fn rollback_slot_reservation(&self, task_id: &str) {
+        self.slot_reservations.lock().remove(task_id);
+        {
+            let mut tasks = self.tasks.lock();
+            let orphan = tasks.get(task_id).is_some_and(|r| r.engine_tid.is_none());
+            if orphan {
+                tasks.remove(task_id);
+            }
+        }
+        self.autosave();
     }
 
     /// 激活单个定时任务（E23）：调引擎 add 接入 + 记录句柄 + 事件。
@@ -513,7 +622,7 @@ impl DaemonState {
     /// - 否则 → S1-b queue_wait（add 时配额满落队），视为随时到期
     ///
     /// 激活统一过 S1-b 配额闸门：槽位不足则本轮跳过（队首优先）。递补排序 =
-    /// (queue_priority 升序, created_at 升序)——Task 46 qbit 队列位置对标：
+    /// (queue_priority 升序, added_at_ms 升序)——Task 46 qbit 队列位置对标：
     /// 值小者先补位，同值保持 FIFO（create 序，Instant 纳秒粒度同刻碰撞实际
     /// 不可能）。serve 以 1s 周期驱动（终态/暂停/移除释放槽位 → 下轮递补）；
     /// 测试可直接调用。返回激活成功的 task_id 列表（激活序）。
@@ -521,10 +630,21 @@ impl DaemonState {
         let now = now_unix();
         let due: Vec<(String, DownloadTask, EngineKind)> = {
             let tasks = self.tasks.lock();
-            let mut v: Vec<(String, DownloadTask, EngineKind, i32, std::time::Instant)> = tasks
+            let mut v: Vec<(
+                String,
+                DownloadTask,
+                EngineKind,
+                i32,
+                u64,
+                std::time::Instant,
+            )> = tasks
                 .iter()
                 .filter(|(_, rec)| {
-                    if rec.engine_tid.is_some() || rec.task.state != TaskState::Queued {
+                    if rec.engine_tid.is_some()
+                        || rec.task.state != TaskState::Queued
+                        // batch7-P1：add 在途占位记录不是递补候选（正在接入）
+                        || self.slot_reservations.lock().contains(&rec.task.id)
+                    {
                         return false;
                     }
                     let m = &rec.task.metadata;
@@ -545,13 +665,18 @@ impl DaemonState {
                         rec.task.clone(),
                         rec.engine_kind,
                         rec.task.queue_priority,
+                        rec.task.metadata.added_at_ms,
                         rec.task.created_at,
                     )
                 })
                 .collect();
-            // S1-b 递补序：优先级小者先，同值 FIFO（创建序）
-            v.sort_by_key(|(_, _, _, prio, created)| (*prio, *created));
-            v.into_iter().map(|(id, t, k, _, _)| (id, t, k)).collect()
+            // S1-b 递补序：优先级小者先，同值 FIFO（batch7：可持久化的
+            // added_at_ms 为主键——重启后恢复任务保有原始入队序；created_at
+            // 仅作运行期同毫秒 tie-break）
+            v.sort_by_key(|(_, _, _, prio, ms, created)| (*prio, *ms, *created));
+            v.into_iter()
+                .map(|(id, t, k, _, _, _)| (id, t, k))
+                .collect()
         };
         let mut counts = self.active_slot_counts();
         let mut activated = Vec::new();
@@ -796,6 +921,7 @@ impl DaemonState {
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
+                added_at_ms: now_unix_ms(),
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: self.resolve_start_at(start_at_unix),
@@ -811,47 +937,28 @@ impl DaemonState {
         if task.metadata.start_at_unix > now_unix() {
             return Ok(self.insert_scheduled_task(task, EngineKind::Bt));
         }
-        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
-        if !self.gate_or_enqueue(task.clone(), EngineKind::Bt) {
+        // S1-b 队列门控（batch7 预留槽位，同 HTTP 口径）：engine.add 成功
+        // attach / 失败回滚；顺序 flag 在 attach 前下发（句柄仍存活）。
+        let engine = self.engine_for(EngineKind::Bt)?;
+        if !self.gate_or_enqueue(&task, EngineKind::Bt) {
             return Ok(task_id);
         }
-
-        let engine_tid = self
-            .engine_for(EngineKind::Bt)?
-            .add(&task)
-            .await
-            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        let engine_tid = match engine.add(&task).await {
+            Ok(tid) => tid,
+            Err(e) => {
+                self.rollback_slot_reservation(&task_id);
+                return Err(DaemonError::Engine(e.to_string()));
+            }
+        };
         // 顺序下载立即下发（handle 级 flag，metadata 未就绪也可设；
         // 失败不回滚任务，恢复重放 + set_sequential 端点可补）。
         if sequential {
-            let engine = self.engine_for(EngineKind::Bt)?;
             if let Err(e) = engine.set_sequential(&engine_tid, true).await {
                 tracing::warn!("BT 任务 {task_id} 顺序下载 flag 下发失败: {e}");
             }
         }
-        let mut rec = TaskRecord {
-            seeding_since: None,
-            task,
-            engine_tid: Some(engine_tid),
-            engine_kind: EngineKind::Bt,
-            engine_status: None,
-            events: vec![],
-        };
-        rec.push_event("add", None);
-        // batch3-P1：记录态同步 Downloading——BT 无 HTTP 式 2s 轮询纠偏
-        //（轮询候选过滤只认 Downloading/Seeding），旧实现记录恒 Queued：
-        // GET /tasks 全程显示排队、/stats 聚合速率漏 BT、名称回填被推迟。
-        rec.task.state = TaskState::Downloading(EngineKind::Bt);
-        self.tasks.lock().insert(task_id.clone(), rec);
-        self.autosave();
-        self.hub.publish(SchedulerEvent::TaskCreated {
-            task_id: task_id.clone(),
-        });
-        self.hub.publish(SchedulerEvent::StateChanged {
-            task_id: task_id.clone(),
-            from: TaskState::Queued,
-            to: TaskState::Downloading(EngineKind::Bt),
-        });
+        self.attach_reserved_handle(&task_id, engine_tid, EngineKind::Bt, &task.state)
+            .await;
         Ok(task_id)
     }
 
@@ -942,6 +1049,7 @@ impl DaemonState {
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
+                added_at_ms: now_unix_ms(),
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: self.resolve_start_at(start_at_unix),
@@ -956,46 +1064,27 @@ impl DaemonState {
         if task.metadata.start_at_unix > now_unix() {
             return Ok(self.insert_scheduled_task(task, EngineKind::Bt));
         }
-        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
-        if !self.gate_or_enqueue(task.clone(), EngineKind::Bt) {
+        // S1-b 队列门控（batch7 预留槽位，同 magnet 口径）：engine.add 成功
+        // attach / 失败回滚；顺序 flag 在 attach 前下发（句柄仍存活）。
+        let engine = self.engine_for(EngineKind::Bt)?;
+        if !self.gate_or_enqueue(&task, EngineKind::Bt) {
             return Ok(task_id);
         }
-
-        let engine_tid = self
-            .engine_for(EngineKind::Bt)?
-            .add(&task)
-            .await
-            .map_err(|e| DaemonError::Engine(e.to_string()))?;
+        let engine_tid = match engine.add(&task).await {
+            Ok(tid) => tid,
+            Err(e) => {
+                self.rollback_slot_reservation(&task_id);
+                return Err(DaemonError::Engine(e.to_string()));
+            }
+        };
         // 顺序下载立即下发（同 magnet 路径：handle 级 flag，失败不回滚）。
         if sequential {
-            let engine = self.engine_for(EngineKind::Bt)?;
             if let Err(e) = engine.set_sequential(&engine_tid, true).await {
                 tracing::warn!("BT 任务 {task_id} 顺序下载 flag 下发失败: {e}");
             }
         }
-        let mut rec = TaskRecord {
-            seeding_since: None,
-            task,
-            engine_tid: Some(engine_tid),
-            engine_kind: EngineKind::Bt,
-            engine_status: None,
-            events: vec![],
-        };
-        rec.push_event("add", None);
-        // batch3-P1：记录态同步 Downloading——BT 无 HTTP 式 2s 轮询纠偏
-        //（轮询候选过滤只认 Downloading/Seeding），旧实现记录恒 Queued：
-        // GET /tasks 全程显示排队、/stats 聚合速率漏 BT、名称回填被推迟。
-        rec.task.state = TaskState::Downloading(EngineKind::Bt);
-        self.tasks.lock().insert(task_id.clone(), rec);
-        self.autosave();
-        self.hub.publish(SchedulerEvent::TaskCreated {
-            task_id: task_id.clone(),
-        });
-        self.hub.publish(SchedulerEvent::StateChanged {
-            task_id: task_id.clone(),
-            from: TaskState::Queued,
-            to: TaskState::Downloading(EngineKind::Bt),
-        });
+        self.attach_reserved_handle(&task_id, engine_tid, EngineKind::Bt, &task.state)
+            .await;
         Ok(task_id)
     }
 
@@ -1202,6 +1291,7 @@ impl DaemonState {
             metadata: TaskMetadata {
                 name: Some(meta.name.clone()),
                 added_at_unix: 0,
+                added_at_ms: now_unix_ms(),
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: 0,
@@ -1385,6 +1475,7 @@ impl DaemonState {
             metadata: TaskMetadata {
                 name,
                 added_at_unix: 0,
+                added_at_ms: now_unix_ms(),
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: self.resolve_start_at(start_at_unix),
@@ -1442,34 +1533,22 @@ impl DaemonState {
         if task.metadata.start_at_unix > now_unix() {
             return Ok(self.insert_scheduled_task(task, EngineKind::Http));
         }
-        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
-        if !self.gate_or_enqueue(task.clone(), EngineKind::Http) {
+        // S1-b 队列门控（batch7 预留槽位）：配额满 → 落排队记录；有槽位 →
+        // 同步预留占位（关闭 add 在途窗口超卖），engine.add 成功 attach /
+        // 失败回滚。
+        let engine = self.engine_for(EngineKind::Http)?;
+        if !self.gate_or_enqueue(&task, EngineKind::Http) {
             return Ok(task_id);
         }
-        let engine_tid = self
-            .engine_for(EngineKind::Http)?
-            .add(&task)
-            .await
-            .map_err(|e| DaemonError::Engine(e.to_string()))?;
-        let mut rec = TaskRecord {
-            seeding_since: None,
-            task,
-            engine_tid: Some(engine_tid),
-            engine_kind: EngineKind::Http,
-            engine_status: None,
-            events: vec![],
+        let engine_tid = match engine.add(&task).await {
+            Ok(tid) => tid,
+            Err(e) => {
+                self.rollback_slot_reservation(&task_id);
+                return Err(DaemonError::Engine(e.to_string()));
+            }
         };
-        rec.push_event("add", None);
-        self.tasks.lock().insert(task_id.clone(), rec);
-        self.autosave();
-        self.hub.publish(SchedulerEvent::TaskCreated {
-            task_id: task_id.clone(),
-        });
-        self.hub.publish(SchedulerEvent::StateChanged {
-            task_id: task_id.clone(),
-            from: TaskState::Queued,
-            to: TaskState::Downloading(EngineKind::Http),
-        });
+        self.attach_reserved_handle(&task_id, engine_tid, EngineKind::Http, &task.state)
+            .await;
         Ok(task_id)
     }
 
@@ -1571,6 +1650,7 @@ impl DaemonState {
             metadata: TaskMetadata {
                 name: if is_dir { None } else { name },
                 added_at_unix: 0,
+                added_at_ms: now_unix_ms(),
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: self.resolve_start_at(start_at_unix),
@@ -1585,32 +1665,26 @@ impl DaemonState {
         if task.metadata.start_at_unix > now_unix() {
             return Ok(self.insert_scheduled_task(task, EngineKind::Ftp));
         }
-        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
-        if !self.gate_or_enqueue(task.clone(), EngineKind::Ftp) {
+        // S1-b 队列门控（batch7 预留槽位，同 HTTP 口径）：engine.add 成功
+        // attach / 失败回滚；目录 files 同步改为就位后直接改写占位记录。
+        let engine = self.engine_for(EngineKind::Ftp)?;
+        if !self.gate_or_enqueue(&task, EngineKind::Ftp) {
             return Ok(task_id);
         }
-
-        let engine = self.engine_for(EngineKind::Ftp)?;
-        let engine_tid = engine
-            .add(&task)
-            .await
-            .map_err(|e| DaemonError::Engine(e.to_string()))?;
-        let mut rec = TaskRecord {
-            seeding_since: None,
-            task,
-            engine_tid: Some(engine_tid.clone()),
-            engine_kind: EngineKind::Ftp,
-            engine_status: None,
-            events: vec![],
+        let engine_tid = match engine.add(&task).await {
+            Ok(tid) => tid,
+            Err(e) => {
+                self.rollback_slot_reservation(&task_id);
+                return Err(DaemonError::Engine(e.to_string()));
+            }
         };
-        rec.push_event("add", None);
 
         // 目录任务：有限次 files 同步（FtpEngine::add 已同步 LIST，首轮通常即可命中）
         if is_dir {
             for _ in 0..8 {
                 if let Ok(st) = engine.status(&engine_tid).await {
                     if !st.files.is_empty() {
-                        rec.task.files = st
+                        let files = st
                             .files
                             .into_iter()
                             .map(|f| TaskFile {
@@ -1624,6 +1698,9 @@ impl DaemonState {
                                 engine: EngineKind::Ftp,
                             })
                             .collect();
+                        if let Some(rec) = self.tasks.lock().get_mut(&task_id) {
+                            rec.task.files = files;
+                        }
                         break;
                     }
                 }
@@ -1631,16 +1708,8 @@ impl DaemonState {
             }
         }
 
-        self.tasks.lock().insert(task_id.clone(), rec);
-        self.autosave();
-        self.hub.publish(SchedulerEvent::TaskCreated {
-            task_id: task_id.clone(),
-        });
-        self.hub.publish(SchedulerEvent::StateChanged {
-            task_id: task_id.clone(),
-            from: TaskState::Queued,
-            to: TaskState::Downloading(EngineKind::Ftp),
-        });
+        self.attach_reserved_handle(&task_id, engine_tid, EngineKind::Ftp, &task.state)
+            .await;
         Ok(task_id)
     }
 
@@ -1739,6 +1808,7 @@ impl DaemonState {
             metadata: TaskMetadata {
                 name,
                 added_at_unix: 0,
+                added_at_ms: now_unix_ms(),
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: self.resolve_start_at(start_at_unix),
@@ -1753,37 +1823,21 @@ impl DaemonState {
         if task.metadata.start_at_unix > now_unix() {
             return Ok(self.insert_scheduled_task(task, EngineKind::Sftp));
         }
-        // S1-b 队列门控：配额满 → 落排队记录（无句柄），由调度循环递补
-        //（Sftp 与 Ftp 共用 ftp 桶配额，见 slot_index 注释）
-        if !self.gate_or_enqueue(task.clone(), EngineKind::Sftp) {
+        // S1-b 队列门控（batch7 预留槽位，同 FTP 口径；Sftp 与 Ftp 共用 ftp 桶
+        // 配额，见 slot_index 注释）：engine.add 成功 attach / 失败回滚。
+        let engine = self.engine_for(EngineKind::Sftp)?;
+        if !self.gate_or_enqueue(&task, EngineKind::Sftp) {
             return Ok(task_id);
         }
-
-        let engine = self.engine_for(EngineKind::Sftp)?;
-        let engine_tid = engine
-            .add(&task)
-            .await
-            .map_err(|e| DaemonError::Engine(e.to_string()))?;
-        let mut rec = TaskRecord {
-            seeding_since: None,
-            task,
-            engine_tid: Some(engine_tid.clone()),
-            engine_kind: EngineKind::Sftp,
-            engine_status: None,
-            events: vec![],
+        let engine_tid = match engine.add(&task).await {
+            Ok(tid) => tid,
+            Err(e) => {
+                self.rollback_slot_reservation(&task_id);
+                return Err(DaemonError::Engine(e.to_string()));
+            }
         };
-        rec.push_event("add", None);
-
-        self.tasks.lock().insert(task_id.clone(), rec);
-        self.autosave();
-        self.hub.publish(SchedulerEvent::TaskCreated {
-            task_id: task_id.clone(),
-        });
-        self.hub.publish(SchedulerEvent::StateChanged {
-            task_id: task_id.clone(),
-            from: TaskState::Queued,
-            to: TaskState::Downloading(EngineKind::Sftp),
-        });
+        self.attach_reserved_handle(&task_id, engine_tid, EngineKind::Sftp, &task.state)
+            .await;
         Ok(task_id)
     }
 
@@ -2313,6 +2367,12 @@ impl DaemonState {
             }
         };
         if let Some((task, kind)) = pending {
+            // batch7-P1：add 在途占位（引擎正在接入）→ resume 无需也无法重复
+            // 激活，幂等成功返回（否则 activate_one 会二次 engine.add 产生
+            // 双引擎任务）。
+            if self.slot_reservations.lock().contains(id) {
+                return Ok(());
+            }
             if !matches!(
                 task.state,
                 TaskState::Queued | TaskState::Paused | TaskState::Failed
@@ -2932,7 +2992,7 @@ impl DaemonState {
     /// 队列优先级设置（Task 46，qbit 队列位置对标）：仅对排队中任务（Queued
     /// 且未接入引擎）有实际递补语义，但对任意任务均可设置（提前设定，等它
     /// 未来落队时生效——qbit 同语义）。`action` 相对移动基于**当前排队集**
-    /// 的 (queue_priority, created_at) 排序：
+    /// 的 (queue_priority, added_at_ms) 排序：
     /// - top/bottom：取队列极值 ∓1（队空 = 不变，返回原值）
     /// - up/down：与相邻任务交换 priority；相邻并列时越级 ±1（保证严格移动）
     ///
@@ -2956,17 +3016,25 @@ impl DaemonState {
                         .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
                     rec.task.queue_priority
                 };
-                // 排队集快照：Queued 无句柄任务，排序键 (priority, created_at)
-                let queue: Vec<(String, i32, std::time::Instant)> = {
+                // 排队集快照：Queued 无句柄任务，排序键 (priority, added_at_ms,
+                // created_at)（batch7：与递补排序键同口径，重启后 FIFO 保序）
+                let queue: Vec<(String, i32, u64, std::time::Instant)> = {
                     let tasks = self.tasks.lock();
-                    let mut v: Vec<(String, i32, std::time::Instant)> = tasks
+                    let mut v: Vec<(String, i32, u64, std::time::Instant)> = tasks
                         .iter()
                         .filter(|(_, r)| {
                             r.engine_tid.is_none() && r.task.state == TaskState::Queued
                         })
-                        .map(|(tid, r)| (tid.clone(), r.task.queue_priority, r.task.created_at))
+                        .map(|(tid, r)| {
+                            (
+                                tid.clone(),
+                                r.task.queue_priority,
+                                r.task.metadata.added_at_ms,
+                                r.task.created_at,
+                            )
+                        })
                         .collect();
-                    v.sort_by_key(|(_, p, c)| (*p, *c));
+                    v.sort_by_key(|(_, p, ms, c)| (*p, *ms, *c));
                     v
                 };
                 match act.as_str() {
@@ -2976,7 +3044,7 @@ impl DaemonState {
                         new_val = Some(
                             queue
                                 .iter()
-                                .map(|(_, p, _)| *p)
+                                .map(|(_, p, _, _)| *p)
                                 .min()
                                 .unwrap_or(cur)
                                 .saturating_sub(1),
@@ -2986,14 +3054,14 @@ impl DaemonState {
                         new_val = Some(
                             queue
                                 .iter()
-                                .map(|(_, p, _)| *p)
+                                .map(|(_, p, _, _)| *p)
                                 .max()
                                 .unwrap_or(cur)
                                 .saturating_add(1),
                         );
                     }
                     "up" | "down" => {
-                        let pos = queue.iter().position(|(tid, _, _)| tid == id);
+                        let pos = queue.iter().position(|(tid, _, _, _)| tid == id);
                         match pos {
                             None => {
                                 // 不在当前排队集（运行中/暂停等）：无相邻语义 → 按极值移动
@@ -3001,7 +3069,7 @@ impl DaemonState {
                                     Some(
                                         queue
                                             .iter()
-                                            .map(|(_, p, _)| *p)
+                                            .map(|(_, p, _, _)| *p)
                                             .min()
                                             .unwrap_or(cur)
                                             .saturating_sub(1),
@@ -3010,7 +3078,7 @@ impl DaemonState {
                                     Some(
                                         queue
                                             .iter()
-                                            .map(|(_, p, _)| *p)
+                                            .map(|(_, p, _, _)| *p)
                                             .max()
                                             .unwrap_or(cur)
                                             .saturating_add(1),
@@ -3018,7 +3086,7 @@ impl DaemonState {
                                 };
                             }
                             Some(i) if act == "up" && i > 0 => {
-                                // 越过前一个：±1 而非取同值——并列时 (priority, created_at)
+                                // 越过前一个：±1 而非取同值——并列时 (priority, added_at_ms)
                                 // 排序仍按创建序，同值不保证上移（本任务创建晚则原地）
                                 // batch5-P2：saturating（同 top/bottom 分支）——邻值
                                 // 为 i32::MIN/MAX 时原裸 ±1 溢出（debug panic / release 回绕）
@@ -4000,6 +4068,7 @@ impl HttpSink for FallbackSink {
             metadata: TaskMetadata {
                 name,
                 added_at_unix: 0,
+                added_at_ms: now_unix_ms(),
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: 0,

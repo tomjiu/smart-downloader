@@ -47,6 +47,7 @@ fn rec_with_retry(max: u32, st: TaskState) -> TaskRecord {
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
+                added_at_ms: 0,
                 tags: Vec::new(),
                 finished_at_unix: 0,
                 start_at_unix: 0,
@@ -263,6 +264,7 @@ async fn add_failure_schedules_retry_and_succeeds_after_recovery() {
                 metadata: TaskMetadata {
                     name: None,
                     added_at_unix: 0,
+                    added_at_ms: 0,
                     tags: Vec::new(),
                     finished_at_unix: 0,
                     start_at_unix: 0,
@@ -401,6 +403,7 @@ async fn resume_failed_without_handle_retries_manually() {
                 metadata: TaskMetadata {
                     name: None,
                     added_at_unix: 0,
+                    added_at_ms: 0,
                     tags: Vec::new(),
                     finished_at_unix: 0,
                     start_at_unix: 0,

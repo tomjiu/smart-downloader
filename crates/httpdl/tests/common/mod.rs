@@ -56,6 +56,7 @@ pub fn make_http_task_to(
         metadata: TaskMetadata {
             name: name.map(str::to_string),
             added_at_unix: 0,
+            added_at_ms: 0,
             tags: Vec::new(),
             finished_at_unix: 0,
             start_at_unix: 0,
@@ -192,6 +193,7 @@ pub fn make_ftp_task(id: &str, url: &str, dest_root: PathBuf, name: &str) -> Dow
         metadata: TaskMetadata {
             name: Some(name.to_string()),
             added_at_unix: 0,
+            added_at_ms: 0,
             tags: Vec::new(),
             finished_at_unix: 0,
             start_at_unix: 0,

@@ -58,6 +58,12 @@ pub struct FakeEngine {
     seeding_ratio_limit: parking_lot::Mutex<Option<f64>>,
     /// seeding_time_limit() 回显（分钟；None = 未启用）。
     seeding_time_limit: parking_lot::Mutex<Option<u32>>,
+    /// add() 人为延迟（batch7 并发超卖测试用；0 = 旧行为即时返回）。
+    add_delay_ms: std::sync::atomic::AtomicU64,
+    /// 已下发的 session 级封禁（ban_ip/ban_ip_range 记录，batch7 重试测试用）。
+    bans: parking_lot::Mutex<Vec<String>>,
+    /// ban 注入失败集合（命中条目回 Err，重试路径测试用）。
+    fail_bans: parking_lot::Mutex<std::collections::HashSet<String>>,
 }
 
 #[cfg(test)]
@@ -87,7 +93,44 @@ impl FakeEngine {
             max_conn: parking_lot::Mutex::new(Vec::new()),
             seeding_ratio_limit: parking_lot::Mutex::new(None),
             seeding_time_limit: parking_lot::Mutex::new(None),
+            add_delay_ms: std::sync::atomic::AtomicU64::new(0),
+            bans: parking_lot::Mutex::new(Vec::new()),
+            fail_bans: parking_lot::Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    /// 注入 add() 延迟（batch7 并发在途窗口测试用）。
+    pub fn set_add_delay_ms(&self, ms: u64) {
+        self.add_delay_ms
+            .store(ms, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 读取已下发的 session 级封禁（顺序记录）。
+    #[allow(dead_code)]
+    pub fn bans(&self) -> Vec<String> {
+        self.bans.lock().clone()
+    }
+
+    /// 注入 ban 失败（命中条目回 Err）。
+    #[allow(dead_code)]
+    pub fn fail_ban(&self, entry: &str) {
+        self.fail_bans.lock().insert(entry.to_string());
+    }
+
+    /// 解除 ban 失败注入。
+    #[allow(dead_code)]
+    pub fn unfail_ban(&self, entry: &str) {
+        self.fail_bans.lock().remove(entry);
+    }
+
+    async fn do_ban(&self, entry: &str) -> Result<(), smart_dl_core::types::EngineError> {
+        if self.fail_bans.lock().contains(entry) {
+            return Err(smart_dl_core::types::EngineError::Other(
+                "fake ban fail".into(),
+            ));
+        }
+        self.bans.lock().push(entry.to_string());
+        Ok(())
     }
 
     pub fn fail_url(&self, url: &str) {
@@ -233,6 +276,10 @@ impl DownloadEngine for FakeEngine {
             DownloadSource::TorrentFile(_) => format!("torrent:{}", task.id),
             _ => task.id.clone(),
         };
+        let delay = self.add_delay_ms.load(std::sync::atomic::Ordering::SeqCst);
+        if delay > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
         if self.fail_urls.lock().contains(&ident) {
             return Err(smart_dl_core::types::EngineError::Other("fake fail".into()));
         }
@@ -306,6 +353,23 @@ impl DownloadEngine for FakeEngine {
 
     fn seeding_time_limit(&self) -> Option<u32> {
         *self.seeding_time_limit.lock()
+    }
+
+    async fn ban_ip(&self, ip: &str) -> Result<(), smart_dl_core::types::EngineError> {
+        self.do_ban(ip).await
+    }
+
+    async fn unban_ip(&self, ip: &str) -> Result<(), smart_dl_core::types::EngineError> {
+        self.bans.lock().retain(|b| b != ip);
+        Ok(())
+    }
+
+    async fn ban_ip_range(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        self.do_ban(&format!("{start}-{end}")).await
     }
     async fn peers(
         &self,
@@ -418,6 +482,7 @@ impl DownloadEngine for FakeEngine {
 mod add_opts_tests;
 mod auto_retry_tests;
 mod b10_tests;
+mod bans_tests;
 mod batch_select_tests;
 mod bt_alert_tests;
 mod bt_name_backfill_tests;

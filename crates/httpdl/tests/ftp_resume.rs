@@ -21,6 +21,18 @@ fn seed_ledger(
     done: &[(u64, u64)],
     src: &[u8],
 ) {
+    seed_ledger_fp(part, total, min_split, done, src, None)
+}
+
+/// batch7：带指纹版本（last_modified 直写账本，MDTM 指纹回归用）。
+fn seed_ledger_fp(
+    part: &std::path::Path,
+    total: u64,
+    min_split: u64,
+    done: &[(u64, u64)],
+    src: &[u8],
+    last_modified: Option<&str>,
+) {
     std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -48,7 +60,7 @@ fn seed_ledger(
             total,
             min_split,
             etag: None,
-            last_modified: None,
+            last_modified: last_modified.map(|s| s.to_string()),
             done: done.to_vec(),
         },
     );
@@ -199,4 +211,166 @@ async fn corrupted_ledger_restarts() {
     assert_eq!(st.state, EngineState::Completed, "error: {:?}", st.error);
     let got = std::fs::read(dir.path().join("c.bin")).unwrap();
     assert_eq!(got, src, "损坏账本 → 重下为完整源内容");
+}
+
+// ==================== batch7：MDTM 远端指纹（G2 类 FTP 残留根治） ====================
+
+/// MDTM 指纹一致 → 账本照常续传（只拉缺失段）。
+#[tokio::test]
+async fn mdtm_fingerprint_match_resumes() {
+    let size = 64 * 1024;
+    let min_split = 16 * 1024u64;
+    let src = patterned(size);
+    let srv = FtpTestServer::start(FtpServerConfig {
+        size,
+        content: Some(src.clone()),
+        mdtm: Some("20260907120000".into()),
+        ..Default::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let part = dir.path().join("r.bin.part");
+    seed_ledger_fp(
+        &part,
+        size,
+        min_split,
+        &[(0, min_split - 1), (min_split, 2 * min_split - 1)],
+        &src,
+        Some("20260907120000"),
+    );
+
+    let engine = FtpEngine::new().with_min_split(min_split);
+    let task = make_ftp_task("r1m", &srv.url("/r.bin"), dir.path().to_path_buf(), "r.bin");
+    let tid = engine.add(&task).await.unwrap();
+    let st = wait_terminal(&engine, &tid).await;
+    assert_eq!(st.state, EngineState::Completed, "error: {:?}", st.error);
+
+    let got = std::fs::read(dir.path().join("r.bin")).unwrap();
+    assert_eq!(got, src, "MDTM 一致时账本续传文件必须完整");
+    let mut offsets = srv.rest_offsets.lock().clone();
+    offsets.sort();
+    assert_eq!(
+        offsets,
+        vec![2 * min_split, 3 * min_split],
+        "MDTM 一致必须只拉缺失段，实际 offsets: {offsets:?}"
+    );
+    // 账本快照必须带上指纹（后续轮次核对凭据）
+    let led = ledger::load(&ledger::ledger_path(&part));
+    assert!(led.is_none() || led.unwrap().last_modified == Some("20260907120000".into()));
+}
+
+/// MDTM 指纹变化（远端文件同长被替换）→ 账本作废整文件重下（G2 静默混合文件根治）。
+#[tokio::test]
+async fn mdtm_fingerprint_changed_invalidates_ledger() {
+    let size = 64 * 1024;
+    let min_split = 16 * 1024u64;
+    let src = patterned(size);
+    let srv = FtpTestServer::start(FtpServerConfig {
+        size,
+        content: Some(src.clone()),
+        mdtm: Some("20991231235959".into()), // 与账本指纹不同
+        ..Default::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let part = dir.path().join("r.bin.part");
+    seed_ledger_fp(
+        &part,
+        size,
+        min_split,
+        &[(0, min_split - 1), (min_split, 2 * min_split - 1)],
+        &src,
+        Some("20260907120000"), // 旧指纹
+    );
+
+    let engine = FtpEngine::new().with_min_split(min_split);
+    let task = make_ftp_task("r2m", &srv.url("/r.bin"), dir.path().to_path_buf(), "r.bin");
+    let tid = engine.add(&task).await.unwrap();
+    let st = wait_terminal(&engine, &tid).await;
+    assert_eq!(st.state, EngineState::Completed, "error: {:?}", st.error);
+
+    let mut offsets = srv.rest_offsets.lock().clone();
+    offsets.sort();
+    assert_eq!(
+        offsets,
+        vec![0, min_split, 2 * min_split, 3 * min_split],
+        "指纹失配必须全段重拉（作废旧账本），实际 offsets: {offsets:?}"
+    );
+}
+
+/// 服务器不支持 MDTM（502）+ 账本无指纹（旧档）→ 降级旧 size-only 语义，照常续传。
+#[tokio::test]
+async fn mdtm_unsupported_falls_back_to_size_only() {
+    let size = 64 * 1024;
+    let min_split = 16 * 1024u64;
+    let src = patterned(size);
+    let srv = FtpTestServer::start(FtpServerConfig {
+        size,
+        content: Some(src.clone()),
+        // mdtm: None → 502
+        ..Default::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let part = dir.path().join("r.bin.part");
+    seed_ledger(
+        &part,
+        size,
+        min_split,
+        &[(0, min_split - 1), (min_split, 2 * min_split - 1)],
+        &src,
+    );
+
+    let engine = FtpEngine::new().with_min_split(min_split);
+    let task = make_ftp_task("r3m", &srv.url("/r.bin"), dir.path().to_path_buf(), "r.bin");
+    let tid = engine.add(&task).await.unwrap();
+    let st = wait_terminal(&engine, &tid).await;
+    assert_eq!(st.state, EngineState::Completed, "error: {:?}", st.error);
+
+    let mut offsets = srv.rest_offsets.lock().clone();
+    offsets.sort();
+    assert_eq!(
+        offsets,
+        vec![2 * min_split, 3 * min_split],
+        "双 None（账本/探测）必须放行续传，实际 offsets: {offsets:?}"
+    );
+}
+
+/// 账本有指纹而服务器不再支持 MDTM（宁枉勿纵）：无法确认未变 → 作废重下。
+#[tokio::test]
+async fn mdtm_fingerprint_disappeared_restarts() {
+    let size = 64 * 1024;
+    let min_split = 16 * 1024u64;
+    let src = patterned(size);
+    let srv = FtpTestServer::start(FtpServerConfig {
+        size,
+        content: Some(src.clone()),
+        // mdtm: None → 探测 None
+        ..Default::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let part = dir.path().join("r.bin.part");
+    seed_ledger_fp(
+        &part,
+        size,
+        min_split,
+        &[(0, min_split - 1), (min_split, 2 * min_split - 1)],
+        &src,
+        Some("20260907120000"), // 账本有指纹
+    );
+
+    let engine = FtpEngine::new().with_min_split(min_split);
+    let task = make_ftp_task("r4m", &srv.url("/r.bin"), dir.path().to_path_buf(), "r.bin");
+    let tid = engine.add(&task).await.unwrap();
+    let st = wait_terminal(&engine, &tid).await;
+    assert_eq!(st.state, EngineState::Completed, "error: {:?}", st.error);
+
+    let mut offsets = srv.rest_offsets.lock().clone();
+    offsets.sort();
+    assert_eq!(
+        offsets,
+        vec![0, min_split, 2 * min_split, 3 * min_split],
+        "指纹消失必须全段重拉（宁枉勿纵），实际 offsets: {offsets:?}"
+    );
 }

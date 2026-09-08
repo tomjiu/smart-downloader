@@ -43,6 +43,7 @@ fn insert_completed(state: &DaemonState, id: &str, finished_at_unix: u64) {
             metadata: TaskMetadata {
                 name: None,
                 added_at_unix: 0,
+                added_at_ms: 0,
                 tags: Vec::new(),
                 finished_at_unix,
                 start_at_unix: 0,

@@ -21,6 +21,8 @@ impl DaemonState {
             disk_precheck_strict: false,
             config_snapshot: Mutex::new(None),
             pending_file_prio: Mutex::new(HashSet::new()),
+            slot_reservations: Mutex::new(HashSet::new()),
+            ban_replay_failed: Mutex::new(Vec::new()),
             global_limits: Mutex::new(GlobalLimits {
                 max_download_kb_s: 0,
                 max_upload_kb_s: 0,
@@ -380,18 +382,28 @@ impl DaemonState {
     }
 
     /// 启动封禁重放（Task 46；serve 在 with_storage 之后调用）：逐条下发引擎
-    /// session 级 ban（best-effort：单条失败仅 warn，不阻断启动）。
+    /// session 级 ban（best-effort：单条失败不再仅 warn 后整会话丢失——
+    /// batch7-P2 失败条目挂入 ban_replay_failed 待重试集，serve 30s tick
+    /// 重发至成功；引擎不可用场景全量入集而非整体放弃）。
     /// batch5：支持区间条目（"a-b" → ban_ip_range；Task 46 持久化格式扩展）。
     pub async fn replay_bans(&self) {
         let bans = self.bt_bans.lock().clone();
         if bans.is_empty() {
             return;
         }
-        let Ok(engine) = self.engine_for(EngineKind::Bt) else {
-            tracing::warn!("IP 封禁重放跳过：BT 引擎不可用（feature 未启用）");
-            return;
+        let engine = match self.engine_for(EngineKind::Bt) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    "IP 封禁重放暂缓：BT 引擎不可用（{e}）——{} 条挂入待重试集，30s tick 重发",
+                    bans.len()
+                );
+                *self.ban_replay_failed.lock() = bans.clone();
+                return;
+            }
         };
         let mut ok = 0usize;
+        let mut failed = Vec::new();
         for entry in &bans {
             let res = match entry.split_once('-') {
                 // 区间条目（batch5）："a-b"；split_once 对 IPv6 冒号无影响
@@ -401,10 +413,51 @@ impl DaemonState {
             };
             match res {
                 Ok(()) => ok += 1,
-                Err(e) => tracing::warn!("IP 封禁重放失败 {entry}: {e}"),
+                Err(e) => {
+                    tracing::warn!("IP 封禁重放失败 {entry}: {e}（挂入待重试集）");
+                    failed.push(entry.clone());
+                }
             }
         }
+        *self.ban_replay_failed.lock() = failed;
         tracing::info!("IP 封禁重放完成: {ok}/{} 条", bans.len());
+    }
+
+    /// ban 重放失败重试泵（batch7-P2；serve 30s tick 驱动）：待重试集空时
+    /// 零开销直返。全程持 ban_ops 串行锁（与 ban/unban/import 同纪律）——
+    /// 防止用户 unban 与重试下发交错（重试把已解封 IP 重新封回去）。
+    /// 已被用户从 bt_bans 移除的条目直接丢弃（不再下发）。重试仍失败 →
+    /// 留在集内下轮再试；引擎不可用 → 整轮保留。
+    pub async fn retry_pending_bans(&self) {
+        let pending = self.ban_replay_failed.lock().clone();
+        if pending.is_empty() {
+            return;
+        }
+        let Ok(engine) = self.engine_for(EngineKind::Bt) else {
+            return; // 引擎不可用：保留待重试集，下轮再试
+        };
+        let _gate = self.ban_ops.lock().await;
+        let mut remaining = Vec::new();
+        let mut ok = 0usize;
+        for entry in &pending {
+            // 用户可能已在待重试期间 unban：以权威表为准，不在表内即丢弃
+            if !self.bt_bans.lock().contains(entry) {
+                ok += 1; // 视作已收敛（无需下发）
+                continue;
+            }
+            let res = match entry.split_once('-') {
+                Some((a, b)) => engine.ban_ip_range(a, b).await,
+                None => engine.ban_ip(entry).await,
+            };
+            match res {
+                Ok(()) => ok += 1,
+                Err(_) => remaining.push(entry.clone()),
+            }
+        }
+        *self.ban_replay_failed.lock() = remaining;
+        if ok > 0 {
+            tracing::info!("IP 封禁待重试集处理完成: {ok}/{} 条", pending.len());
+        }
     }
 
     /// RSS bootstrap client 克隆（与 metalink bootstrap 同源 client；None = 测试装配）。

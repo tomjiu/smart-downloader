@@ -488,6 +488,8 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
                 if let Err(e) = st.tick_alt_limits().await {
                     tracing::warn!("备用限速评估失败（保留引擎侧旧值）: {e}");
                 }
+                // batch7-P2：ban 重放失败重试泵（待重试集空时零开销直返）
+                st.retry_pending_bans().await;
             }
         });
     }
