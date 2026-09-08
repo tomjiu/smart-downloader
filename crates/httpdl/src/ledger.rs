@@ -113,10 +113,25 @@ pub fn etag_sidecar_path(part: &Path) -> PathBuf {
 /// 原子写账本（tmp + rename）。失败仅告警（进度丢失的代价 = 下次重下，
 /// 不值得中断下载）。
 pub fn save(path: &Path, ledger: &Ledger) {
-    let tmp = path.with_extension("progress.tmp");
+    // batch8：唯一 tmp 名（纳秒后缀）+ 0600——固定 tmp 名下多 worker 并发
+    // save 互踩同一文件；世界可读账本暴露用户下载内容路径信息。对齐
+    // daemon write_tasks_atomic 配方。
+    let unique = format!(
+        "progress.tmp.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
+    let tmp = path.with_extension(unique);
     let write = || -> std::io::Result<()> {
         let json = serde_json::to_vec(ledger).map_err(std::io::Error::other)?;
         std::fs::write(&tmp, json)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
         std::fs::rename(&tmp, path)?;
         Ok(())
     };

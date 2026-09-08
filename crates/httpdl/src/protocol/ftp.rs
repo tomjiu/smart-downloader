@@ -511,6 +511,9 @@ fn dir_name_of(dir_path: &str, host: &str) -> String {
 /// 控制连接会话（单命令/响应流；B2：明文或 AUTH TLS 升级后同一口径）。
 struct FtpSession {
     reader: BufReader<BoxFtpIo>,
+    /// 控制连接对端 IP（batch8）：PASV 数据连接目标校验基准——恶意/被入侵
+    /// 服务器把数据连接导向内网第三方（数据面 SSRF）时拒绝。
+    peer_ip: std::net::IpAddr,
 }
 
 impl FtpSession {
@@ -522,6 +525,7 @@ impl FtpSession {
             .await
             .map_err(|_| "connect timeout".to_string())?
             .map_err(|e| e.to_string())?;
+        let peer_ip = tcp.peer_addr().map_err(|e| e.to_string())?.ip();
         // 升级前以裸 TcpStream 交互（banner + AUTH TLS 响应），升级后再装箱
         let mut reader = BufReader::new(tcp);
         let banner = read_response(&mut reader).await?;
@@ -544,10 +548,11 @@ impl FtpSession {
             if !prot.starts_with("200") {
                 return Err(format!("PROT P 被拒绝（仅支持私有数据连接）: {prot}"));
             }
-            Ok(FtpSession { reader })
+            Ok(FtpSession { reader, peer_ip })
         } else {
             Ok(FtpSession {
                 reader: BufReader::new(Box::new(reader.into_inner()) as BoxFtpIo),
+                peer_ip,
             })
         }
     }
@@ -699,6 +704,42 @@ fn parse_pasv(resp: &str) -> Result<SocketAddr, String> {
     )))
 }
 
+/// PASV 数据连接目标校验（batch8，P1 数据面 SSRF 根治）：
+/// 数据地址与控制连接同主机 → 放行；指向 loopback/私网/链路本地（RFC 1918/
+/// 4193、CGNAT、组播等）且不同主机 → 拒绝（恶意服务器把客户端导向内网
+/// 第三方写入攻击者可控字节的通道）；双公网不同主机 → 放行（NAT 后服务
+/// 器 PASV 应答外网地址的合法场景，curl --ftp-skip-pasv-ip 同款取舍）。
+fn validate_pasv_target(data_addr: SocketAddr, control_ip: std::net::IpAddr) -> Result<(), String> {
+    if data_addr.ip() == control_ip {
+        return Ok(());
+    }
+    let suspicious = |ip: std::net::IpAddr| -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                v4.is_loopback() || v4.is_link_local() || v4.is_private() || v4.is_unspecified()
+            }
+            std::net::IpAddr::V6(v6) => {
+                v6.is_loopback()
+                    || v6.is_unspecified()
+                    // fe80::/10 链路本地
+                    || (v6.segments()[0] & 0xffc0) == 0xfe80
+                    // RFC 4193 fc00::/7 唯一本地
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    // v4-mapped 按映射 v4 判定（::ffff:192.168.1.1 也算内网）
+                    || v6.to_ipv4_mapped().is_some_and(|v4| {
+                        v4.is_loopback() || v4.is_private() || v4.is_link_local()
+                    })
+            }
+        }
+    };
+    if suspicious(data_addr.ip()) {
+        return Err(format!(
+            "PASV 数据地址可疑（指向内网/回环且异于控制连接）: {data_addr}（控制对端 {control_ip}）"
+        ));
+    }
+    Ok(())
+}
+
 /// 下载一个段（独立连接：连接+登录+PASV+REST+RETR），写入 .part 段位置。
 #[allow(clippy::too_many_arguments)] // 参数即协议会话要素（E16 增 limiter），拆 struct 反而模糊
 async fn download_segment(
@@ -728,6 +769,7 @@ async fn download_segment(
     if !retr.starts_with('1') {
         return Err(retr);
     }
+    validate_pasv_target(data_addr, s.peer_ip)?;
     let data_tcp = tokio::time::timeout(FTP_CONNECT_TIMEOUT, TcpStream::connect(data_addr))
         .await
         .map_err(|_| "data connect timeout".to_string())?
@@ -1709,6 +1751,7 @@ async fn probe_list(
     if !resp.starts_with('1') {
         return Err(resp);
     }
+    validate_pasv_target(data_addr, s.peer_ip)?;
     let data_tcp = tokio::time::timeout(FTP_CONNECT_TIMEOUT, TcpStream::connect(data_addr))
         .await
         .map_err(|_| "data connect timeout".to_string())?
@@ -2005,5 +2048,42 @@ mod tests {
         assert_eq!(dir_name_of("/pub/files/", "h"), "files");
         assert_eq!(dir_name_of("/", "127.0.0.1:2121"), "127.0.0.1_2121");
         assert_eq!(dir_name_of("/..", "h"), "h");
+    }
+
+    /// batch8（P1）：PASV 数据地址校验——同主机放行；公网→公网放行（NAT
+    /// 场景）；控制公网 + 数据内网/回环 → 拒绝（数据面 SSRF）。
+    #[test]
+    fn validate_pasv_target_blocks_internal_redirect() {
+        use std::net::{IpAddr, SocketAddr};
+        let ctrl = IpAddr::V4("203.0.113.10".parse().unwrap());
+        // 同主机
+        assert!(validate_pasv_target(SocketAddr::from(([203, 0, 113, 10], 50000)), ctrl).is_ok());
+        // 公网 → 公网（NAT 合法场景）
+        assert!(validate_pasv_target(SocketAddr::from(([198, 51, 100, 7], 50000)), ctrl).is_ok());
+        // 公网控制 → 内网/回环/链路本地：拒绝
+        for bad in [
+            [192, 168, 1, 5],
+            [10, 0, 0, 3],
+            [172, 16, 0, 9],
+            [127, 0, 0, 1],
+            [169, 254, 1, 1],
+        ] {
+            assert!(
+                validate_pasv_target(SocketAddr::from((bad, 50000)), ctrl).is_err(),
+                "内网重定向必须拒绝: {bad:?}"
+            );
+        }
+        // 控制本身在内网（LAN FTP）→ 同主机数据放行
+        let lan = IpAddr::V4("192.168.1.5".parse().unwrap());
+        assert!(validate_pasv_target(SocketAddr::from(([192, 168, 1, 5], 50000)), lan).is_ok());
+        // 内网控制 → 其他内网主机：拒绝（LAN 内横向）
+        assert!(validate_pasv_target(SocketAddr::from(([192, 168, 1, 6], 50000)), lan).is_err());
+        // IPv6 数据地址（RFC 4193 fc00::/7）：非同主机拒绝
+        let ctrl6 = IpAddr::V6("2001:db8::1".parse().unwrap());
+        assert!(validate_pasv_target(
+            SocketAddr::from(([0xfc00, 0, 0, 0, 0, 0, 0, 1], 50000u16)),
+            ctrl6
+        )
+        .is_err());
     }
 }

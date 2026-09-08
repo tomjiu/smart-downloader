@@ -6,7 +6,31 @@
 
 ## [0.2.2] - 2026-09-08
 
-第七轮收尾批次（batch7）：batch6 遗留 5 项暂缓缺陷全部落地 + 回归测试。
+第七轮收尾批次（batch7）：batch6 遗留 5 项暂缓缺陷全部落地 + 回归测试；
+第八轮全仓安全审计批次（batch8）：4×P1 全修 + 5×P2 修复（详见
+[docs/SECURITY_AUDIT.md](docs/SECURITY_AUDIT.md)）。
+
+### 安全修复（batch8，P1 全部）
+- **空 token 击穿 fail-closed**（P1）：config `http_token = ""` 可同时骗过
+  非回环启动检查（视为已配置）又令鉴权全放行（注入时过滤成 None）——
+  resolve 双侧过滤空串，回归锚定
+- **DNS rebinding → tokenless 回环 RCE 链**（P1）：新增 Host/Origin 同源
+  守卫——tokenless 模式下 Host 必须回环（或 `[server] extra_allowed_hosts`
+  白名单），跨站 Origin（CSWSH/表单 CSRF）同口径 403；HTTP/1.0 无 Host
+  放行（CLI 兼容）；配置 token 后守卫自动关闭（反代域名不受影响）。
+  实弹：`Host: evil.com` → 403、正常访问 200
+- **FTP PASV 数据面 SSRF**（P1）：数据连接目标校验——内网/回环/链路本地
+  （含 v4-mapped）且异于控制对端 → 拒绝；双公网 NAT 场景放行（curl
+  同款取舍）；RETR/LIST 全覆盖
+- **SFTP host key 全接受**（P1）：TOFU——首录 `sftp_known_hosts.json`
+  （0600 原子写）+ 接受；失配拒绝（换钥 = MITM/重装，日志指明恢复方式）；
+  缺省内存 TOFU
+- `/settings` 代理凭据脱敏回显（P2，与 /config 同口径）；全局并发请求
+  上限 256（P2 slowloris 面）；provider 云端文件名 sanitize 后才 join
+  （P2 dest_root 外建目录面）；ftp:// 明文凭证显式告警（P2）；hook 子进程
+  剥离敏感环境变量（P3）；`.part.progress`/fastresume 唯一 tmp + 0600
+  （P3）；`is_loopback_addr` v4-mapped 语义判定（P3）；sanitize_rel 补
+  Windows 保留设备名与尾点尾空格（P3）
 
 ### 并发与竞态（同根因闭环）
 - **配额闸门 TOCTOU 根治（预留槽位改造）**：add 路径改「预留占位记录 + 引擎接入」

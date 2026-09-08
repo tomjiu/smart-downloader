@@ -39,6 +39,11 @@ pub struct ServerCfg {
     /// 兼容），**非回环监听拒绝启动**（fail-closed，防 0.0.0.0 裸奔）。
     /// 不参与热重载（避免认证态中途抖动）。敏感项：不出现在 `/config` 快照。
     pub http_token: Option<String>,
+    /// tokenless 模式 Host/Origin 同源守卫的额外放行名（batch8）：反向代理/
+    /// 本机域名场景（如 `myhost.local`）。仅 http_token 未配置时消费；
+    /// 大小写不敏感，剥端口比对。
+    #[serde(default)]
+    pub extra_allowed_hosts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -329,6 +334,7 @@ impl Default for Config {
             server: ServerCfg {
                 addr: "127.0.0.1:8787".into(),
                 http_token: None,
+                extra_allowed_hosts: Vec::new(),
             },
             download: DownloadCfg {
                 dest_root: PathBuf::from("./downloads"),
@@ -413,10 +419,28 @@ impl Config {
 
     /// 判定 addr 是否仅绑定回环地址（127.x/::1/localhost）。
     /// serve 启动检查用：非回环 + 无 http_token → 拒绝启动（V1 fail-closed）。
+    /// batch8：优先 SocketAddr/IpAddr 语义判定（含 v4-mapped 归一），字符串
+    /// 前缀判定保留为兜底——`[::ffff:127.0.0.1]` 等边缘写法不再漏判。
     pub fn is_loopback_addr(addr: &str) -> bool {
+        fn ip_loopback(ip: std::net::IpAddr) -> bool {
+            // v4-mapped IPv6（::ffff:a.b.c.d）按映射后的 v4 判定
+            match ip {
+                std::net::IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                    Some(v4) => v4.is_loopback(),
+                    None => v6.is_loopback(),
+                },
+                v4 => v4.is_loopback(),
+            }
+        }
+        if let Ok(sa) = addr.parse::<std::net::SocketAddr>() {
+            return ip_loopback(sa.ip());
+        }
         let host = addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr);
         let host = host.trim_start_matches('[').trim_end_matches(']');
-        host == "localhost" || host.starts_with("127.") || host == "::1" || host == "[::1]"
+        if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+            return ip_loopback(ip);
+        }
+        host.eq_ignore_ascii_case("localhost") || host.starts_with("127.") || host == "::1"
     }
 
     /// 序列化为 TOML 文本（S1 设置面持久化）。无默认值裁剪——全量字段
@@ -572,6 +596,33 @@ mod tests {
         assert!(Config::is_loopback_addr("[::1]:8787"));
         assert!(!Config::is_loopback_addr("0.0.0.0:8787"));
         assert!(!Config::is_loopback_addr("192.168.1.5:8787"));
+        // batch8：v4-mapped IPv6 回环按映射 v4 判定（字符串前缀法会漏判）
+        assert!(Config::is_loopback_addr("[::ffff:127.0.0.1]:8787"));
+        assert!(Config::is_loopback_addr("[::1]:1"));
+        assert!(!Config::is_loopback_addr("[::ffff:192.168.1.5]:8787"));
+    }
+
+    #[test]
+    fn extra_allowed_hosts_field_defaults_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.toml");
+        std::fs::write(&p, "[server]\naddr = \"127.0.0.1:8787\"\n").unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert!(
+            c.server.extra_allowed_hosts.is_empty(),
+            "serde default 必须空"
+        );
+        std::fs::write(
+            &p,
+            "[server]\nextra_allowed_hosts = [\"MyHost.local\", \" dev.box \"]\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        // 原样透传（归一在守卫比较点做——大小写不敏感 + trim）
+        assert_eq!(
+            c.server.extra_allowed_hosts,
+            vec!["MyHost.local".to_string(), " dev.box ".to_string()]
+        );
         assert!(!Config::is_loopback_addr(":::8787"));
     }
 

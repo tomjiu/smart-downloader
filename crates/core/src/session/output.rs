@@ -24,6 +24,23 @@ pub fn sanitize_rel(rel: &str) -> Result<PathBuf, OutputError> {
             _ => return Err(OutputError::UnsafePath(rel.into())),
         }
     }
+    // batch8（P3）：Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9，
+    // 含 `CON.txt` 形式）与末段尾点/尾空格——Windows 落盘成设备或产生
+    // 异常文件。仅校验最后一段（中间目录段同规则会拒合法远端目录名）。
+    if let Some(name) = pb.file_name().and_then(|n| n.to_str()) {
+        let stem = name.split('.').next().unwrap_or(name);
+        let upper = stem.to_ascii_uppercase();
+        const RESERVED: [&str; 22] = [
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+            "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        ];
+        if RESERVED.contains(&upper.as_str()) {
+            return Err(OutputError::UnsafePath(rel.into()));
+        }
+        if name.ends_with('.') || name.ends_with(' ') {
+            return Err(OutputError::UnsafePath(rel.into()));
+        }
+    }
     Ok(pb)
 }
 
@@ -209,6 +226,26 @@ mod sanitize_tests {
         assert!(sanitize_rel("/etc/passwd").is_err());
         #[cfg(windows)]
         assert!(sanitize_rel(r"C:\Windows\x").is_err());
+    }
+
+    #[test]
+    fn sanitize_rejects_windows_reserved_names() {
+        // batch8（P3）：Windows 保留设备名（含 `CON.txt` 形式）与尾点/尾空格
+        assert!(sanitize_rel("CON").is_err());
+        assert!(sanitize_rel("con.txt").is_err());
+        assert!(sanitize_rel("NUL").is_err());
+        assert!(sanitize_rel("Com1.bin").is_err());
+        assert!(sanitize_rel("lpt9").is_err());
+        assert!(sanitize_rel("a/CON.txt").is_err());
+        assert!(sanitize_rel("name.").is_err());
+        assert!(sanitize_rel("name ").is_err());
+        // 合法名不受影响（含保留名子串）
+        assert!(sanitize_rel("console.bin").is_ok());
+        assert!(sanitize_rel("my.lpt10.txt").is_ok());
+        assert!(
+            sanitize_rel("a/CON/ok.bin").is_ok(),
+            "仅末段校验，中间目录段放行"
+        );
     }
 
     #[test]

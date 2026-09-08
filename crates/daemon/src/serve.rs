@@ -155,6 +155,7 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
         .with_completion_action(&cfg.scheduler.completion_action)
         .with_limits_cfg(cfg.limits.clone())
         .with_queue_cfg(cfg.queue.clone())
+        .with_extra_allowed_hosts(cfg.server.extra_allowed_hosts.clone())
         .with_config_path(args.config.clone())
         .with_live_config(cfg.clone());
     #[cfg(not(feature = "bt"))]
@@ -174,6 +175,7 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
         .with_completion_action(&cfg.scheduler.completion_action)
         .with_limits_cfg(cfg.limits.clone())
         .with_queue_cfg(cfg.queue.clone())
+        .with_extra_allowed_hosts(cfg.server.extra_allowed_hosts.clone())
         .with_config_path(args.config.clone())
         .with_live_config(cfg.clone());
 
@@ -291,8 +293,15 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     // 4d-2. SFTP 引擎（feature `sftp`，C-S1；同用全局限速总阀门）
     #[cfg(feature = "sftp")]
     {
+        // batch8：主机密 TOFU 指纹库落盘到任务数据目录（与 tasks.json 同目录）
+        let kh = cfg
+            .storage
+            .tasks_path
+            .parent()
+            .map(|d| d.join("sftp_known_hosts.json"));
         let sftp_engine: Arc<dyn smart_dl_core::types::DownloadEngine> = Arc::new(
-            smart_dl_httpdl::SftpEngine::new_limited(cfg.download.max_download_kb_s),
+            smart_dl_httpdl::SftpEngine::new_limited(cfg.download.max_download_kb_s)
+                .with_known_hosts_path(kh),
         );
         state = state.with_sftp(sftp_engine);
         tracing::info!("SFTP 引擎已启用");
@@ -524,7 +533,11 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     // S2：清扫上次运行遗留的 magnet 抓取 scratch（kill -9/断电残骸，best-effort；
     // PID+mtime 双重保护，活跃抓取与并发实例不受影响）。
     http::cleanup_stale_magnet_scratch();
-    let app = http::router_with_ui(state_arc.clone(), args.ui_dir.clone());
+    // batch8（P2）：全局并发请求上限 256——server 层此前零并发约束
+    //（slowloris/海量 SSE-WS 空闲会话可耗尽资源）。限流在 layer 层计数
+    // 整个请求生命周期（SSE/WS 长连接在期占坑，256 与 qbit WebUI 同量级）。
+    let app = http::router_with_ui(state_arc.clone(), args.ui_dir.clone())
+        .layer(tower::limit::ConcurrencyLimitLayer::new(256));
     let listener = tokio::net::TcpListener::bind(&cfg.server.addr)
         .await
         .map_err(|e| ServeError::Bind(cfg.server.addr.clone(), e))?;
@@ -570,7 +583,12 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
 /// > config `[server] http_token`；值为 `auto` → 生成强随机临时 token
 /// > （uuid v4，122 位随机，getrandom 支撑），`generated=true` 由调用方负责打印。
 fn resolve_http_token(env_val: Option<String>, cfg_val: Option<String>) -> (Option<String>, bool) {
-    let raw = env_val.filter(|t| !t.is_empty()).or(cfg_val);
+    // batch8（P1）：cfg 空串同样视为未设——否则 `http_token = ""` + 非
+    // 回环地址可同时骗过 fail-closed 检查（Some = 已配置）又被
+    // with_http_token 过滤成 None（鉴权全放行），击穿 V1 不变量。
+    let raw = env_val
+        .filter(|t| !t.is_empty())
+        .or_else(|| cfg_val.filter(|t| !t.is_empty()));
     match raw.as_deref() {
         Some("auto") => (Some(uuid::Uuid::new_v4().simple().to_string()), true),
         _ => (raw, false),
@@ -652,6 +670,13 @@ mod tests {
         let (t, gen) = resolve_http_token(None, None);
         assert!(t.is_none());
         assert!(!gen);
+        // batch8（P1）：config 空串同样视为未设——`http_token = ""` 不得
+        // 同时骗过 fail-closed（Some = 已配置）又令鉴权全放行（None）
+        let (t, gen) = resolve_http_token(None, Some(String::new()));
+        assert!(t.is_none(), "config 空串必须过滤为 None");
+        assert!(!gen);
+        let (t, _) = resolve_http_token(Some(String::new()), Some(String::new()));
+        assert!(t.is_none());
     }
 
     #[test]

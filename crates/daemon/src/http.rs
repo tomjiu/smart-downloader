@@ -2624,6 +2624,18 @@ async fn auth_mw(
     req: axum::extract::Request,
     next: Next,
 ) -> axum::response::Response {
+    // batch8（P1，DNS rebinding/CSWSH 根治）：tokenless 模式下强制 Host/Origin
+    // 同源守卫——浏览器请求的 Host 必须是回环名（或 extra_allowed_hosts），
+    // evil.com→127.0.0.1 的 rebind 请求 Host=evil.com 直接 403；带 Origin 的
+    // 跨站请求（CSWSH/简单表单 CSRF）同口径拒绝。配置 token 后不启用
+    // （攻击者无凭据；反代域名 Host 合法性不受影响）。
+    if state.tokenless() && !request_from_local_origin(&req, &state.extra_allowed_hosts) {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({ "error": "forbidden: Host/Origin 不在本机白名单（tokenless 模式同源守卫）" })),
+        )
+            .into_response();
+    }
     let authorization = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -2652,6 +2664,42 @@ async fn auth_mw(
         Json(serde_json::json!({ "error": "unauthorized: 需要 Authorization: Bearer <token>" })),
     )
         .into_response()
+}
+
+/// Host/Origin 同源守卫判定（batch8）：HTTP/1.0 无 Host 放行（CLI/健康探针
+/// 兼容；浏览器恒带 Host，rebinding 链不可绕过）。Host 归一（剥端口/方括号/
+/// 小写）后必须命中回环名集合或 extra_allowed_hosts；Origin 头存在时其
+/// host 部分同口径（跨站 WS/表单在请求层闭合）。
+fn request_from_local_origin(req: &axum::extract::Request, extra: &[String]) -> bool {
+    fn host_allowed(raw: &str, extra: &[String]) -> bool {
+        let h = raw.trim().to_ascii_lowercase();
+        let host = h.rsplit_once(':').map(|(x, _)| x).unwrap_or(&h);
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        host == "localhost"
+            || host.starts_with("127.")
+            || host == "::1"
+            || extra.iter().any(|e| e.trim().to_ascii_lowercase() == host)
+    }
+    match req
+        .headers()
+        .get(header::HOST)
+        .and_then(|v| v.to_str().ok())
+    {
+        None => true, // HTTP/1.0：无 Host 头（浏览器不可达路径，rebinding 无效）
+        Some(h) if host_allowed(h, extra) => match req.headers().get(header::ORIGIN) {
+            None => true, // 同源 GET/CLI：无 Origin
+            Some(o) => o
+                .to_str()
+                .ok()
+                .and_then(|o| {
+                    o.strip_prefix("http://")
+                        .or_else(|| o.strip_prefix("https://"))
+                })
+                .map(|oh| host_allowed(oh, extra))
+                .unwrap_or(false), // null origin（沙箱 iframe）：拒
+        },
+        Some(_) => false, // Host 非本机：rebinding → 403
+    }
 }
 
 /// 最小 percent-decode（SSE query token 回退专用：UI 侧 encodeURIComponent）。

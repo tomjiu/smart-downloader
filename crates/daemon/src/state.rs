@@ -611,6 +611,9 @@ pub struct DaemonState {
     /// 自愈：占位记录重启后成为普通 queue_wait 任务，调度循环按既有语义
     /// 递补）。
     slot_reservations: Mutex<HashSet<TaskId>>,
+    /// tokenless 模式额外放行 Host 名（batch8）：Host/Origin 同源守卫白名单
+    /// 扩展（反代域名等）。仅 http_token 未配置时消费；启动注入，不热更。
+    pub(crate) extra_allowed_hosts: Vec<String>,
     /// ban 重放失败待重试集（batch7-P2）：replay_bans 单条失败（引擎瞬时
     /// 不可用/下发报错）不再仅 warn 后整会话丢失——挂入本集，由 serve
     /// 30s tick 经 retry_pending_bans 重发至成功。仅内存（重启自然重放）。
