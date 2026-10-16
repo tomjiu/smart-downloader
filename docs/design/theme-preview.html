@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Smart Downloader — 12 主题色板</title>
+<style>
+/* ══════════════════════════════════════════════════════════
+   12 主题定义(与 UI-DESIGN-SPEC.md 完全一致)
+   ══════════════════════════════════════════════════════════ */
+[data-theme="nord-dark"]{
+  --bg:#2e3440;--bg-2:#292f3a;--bg-3:#3b4252;
+  --fg:#eceff4;--fg-2:#d8dee9;--fg-3:#7b88a1;
+  --line:#434c5e;--line-2:#3b4252;--line-3:#4c566a;--hover:#363d4b;
+  --accent:#88c0d0;--accent-fg:#2e3440;--accent-bg:rgba(136,192,208,.14);
+  --ok:#a3be8c;--ok-bg:rgba(163,190,140,.14);
+  --warn:#ebcb8b;--warn-bg:rgba(235,203,139,.14);
+  --err:#bf616a;--err-bg:rgba(191,97,106,.16);
+  --info:#81a1c1;--info-bg:rgba(129,161,193,.14);
+  --track:#434c5e;--r:3px;
+}
+[data-theme="nord-light"]{
+  --bg:#eceff4;--bg-2:#e5e9f0;--bg-3:#ffffff;
+  --fg:#2e3440;--fg-2:#4c566a;--fg-3:#7b88a1;
+  --line:#d8dee9;--line-2:#e5e9f0;--line-3:#c2cbd8;--hover:#e3e8ef;
+  --accent:#5e81ac;--accent-fg:#ffffff;--accent-bg:rgba(94,129,172,.12);
+  --ok:#6a8f4f;--ok-bg:rgba(106,143,79,.12);
+  --warn:#b58900;--warn-bg:rgba(181,137,0,.12);
+  --err:#bf616a;--err-bg:rgba(191,97,106,.12);
+  --info:#5e81ac;--info-bg:rgba(94,129,172,.12);
+  --track:#d8dee9;--r:3px;
+}
+[data-theme="carbon-dark"]{
+  --bg:#161616;--bg-2:#1c1c1c;--bg-3:#262626;
+  --fg:#f4f4f4;--fg-2:#c6c6c6;--fg-3:#8d8d8d;
+  --line:#393939;--line-2:#2a2a2a;--line-3:#525252;--hover:#232323;
+  --accent:#0f62fe;--accent-fg:#ffffff;--accent-bg:rgba(15,98,254,.16);
+  --ok:#42be65;--ok-bg:rgba(66,190,101,.16);
+  --warn:#f1c21b;--warn-bg:rgba(241,194,27,.16);
+  --err:#fa4d56;--err-bg:rgba(250,77,86,.16);
+  --info:#4589ff;--info-bg:rgba(69,137,255,.16);
+  --track:#393939;--r:2px;
+}
+[data-theme="carbon-light"]{
+  --bg:#ffffff;--bg-2:#f4f4f4;--bg-3:#ffffff;
+  --fg:#161616;--fg-2:#525252;--fg-3:#8d8d8d;
+  --line:#e0e0e0;--line-2:#f4f4f4;--line-3:#c6c6c6;--hover:#f4f4f4;
+  --accent:#0f62fe;--accent-fg:#ffffff;--accent-bg:rgba(15,98,254,.10);
+  --ok:#24a148;--ok-bg:rgba(36,161,72,.10);
+  --warn:#f1c21b;--warn-bg:rgba(241,194,27,.20);
+  --err:#da1e28;--err-bg:rgba(218,30,40,.10);
+  --info:#0043ce;--info-bg:rgba(0,67,206,.10);
+  --track:#e0e0e0;--r:2px;
+}
+[data-theme="gruvbox-dark"]{
+  --bg:#282828;--bg-2:#1d2021;--bg-3:#3c3836;
+  --fg:#ebdbb2;--fg-2:#d5c4a1;--fg-3:#928374;
+  --line:#504945;--line-2:#3c3836;--line-3:#665c54;--hover:#32302f;
+  --accent:#83a598;--accent-fg:#282828;--accent-bg:rgba(131,165,152,.15);
+  --ok:#b8bb26;--ok-bg:rgba(184,187,38,.15);
+  --warn:#fabd2f;--warn-bg:rgba(250,189,47,.15);
+  --err:#fb4934;--err-bg:rgba(251,73,52,.16);
+  --info:#8ec07c;--info-bg:rgba(142,192,124,.15);
+  --track:#504945;--r:3px;
+}
+[data-theme="gruvbox-light"]{
+  --bg:#fbf1c7;--bg-2:#f2e5bc;--bg-3:#ebdbb2;
+  --fg:#3c3836;--fg-2:#504945;--fg-3:#928374;
+  --line:#d5c4a1;--line-2:#ebdbb2;--line-3:#bdae93;--hover:#f2e5bc;
+  --accent:#076678;--accent-fg:#fbf1c7;--accent-bg:rgba(7,102,120,.12);
+  --ok:#79740e;--ok-bg:rgba(121,116,14,.12);
+  --warn:#b57614;--warn-bg:rgba(181,118,20,.14);
+  --err:#9d0006;--err-bg:rgba(157,0,6,.12);
+  --info:#427b58;--info-bg:rgba(66,123,88,.12);
+  --track:#d5c4a1;--r:3px;
+}
+[data-theme="catppuccin-dark"]{
+  --bg:#1e1e2e;--bg-2:#181825;--bg-3:#313244;
+  --fg:#cdd6f4;--fg-2:#bac2de;--fg-3:#7f849c;
+  --line:#45475a;--line-2:#313244;--line-3:#585b70;--hover:#2a2a3c;
+  --accent:#89b4fa;--accent-fg:#1e1e2e;--accent-bg:rgba(137,180,250,.14);
+  --ok:#a6e3a1;--ok-bg:rgba(166,227,161,.14);
+  --warn:#f9e2af;--warn-bg:rgba(249,226,175,.14);
+  --err:#f38ba8;--err-bg:rgba(243,139,168,.16);
+  --info:#94e2d5;--info-bg:rgba(148,226,213,.14);
+  --track:#45475a;--r:5px;
+}
+[data-theme="catppuccin-light"]{
+  --bg:#eff1f5;--bg-2:#e6e9ef;--bg-3:#ffffff;
+  --fg:#4c4f69;--fg-2:#5c5f77;--fg-3:#8c8fa1;
+  --line:#ccd0da;--line-2:#e6e9ef;--line-3:#bcc0cc;--hover:#e6e9ef;
+  --accent:#1e66f5;--accent-fg:#ffffff;--accent-bg:rgba(30,102,245,.10);
+  --ok:#40a02b;--ok-bg:rgba(64,160,43,.10);
+  --warn:#df8e1d;--warn-bg:rgba(223,142,29,.12);
+  --err:#d20f39;--err-bg:rgba(210,15,57,.10);
+  --info:#179299;--info-bg:rgba(23,146,153,.10);
+  --track:#ccd0da;--r:5px;
+}
+[data-theme="solarized-dark"]{
+  --bg:#002b36;--bg-2:#00252e;--bg-3:#073642;
+  --fg:#eee8d5;--fg-2:#93a1a1;--fg-3:#657b83;
+  --line:#0d4a58;--line-2:#0a3d49;--line-3:#13505f;--hover:#04323d;
+  --accent:#268bd2;--accent-fg:#fdf6e3;--accent-bg:rgba(38,139,210,.16);
+  --ok:#859900;--ok-bg:rgba(133,153,0,.18);
+  --warn:#b58900;--warn-bg:rgba(181,137,0,.18);
+  --err:#dc322f;--err-bg:rgba(220,50,47,.18);
+  --info:#2aa198;--info-bg:rgba(42,161,152,.16);
+  --track:#0d4a58;--r:3px;
+}
+[data-theme="solarized-light"]{
+  --bg:#fdf6e3;--bg-2:#eee8d5;--bg-3:#ffffff;
+  --fg:#073642;--fg-2:#586e75;--fg-3:#93a1a1;
+  --line:#eee8d5;--line-2:#f5efdc;--line-3:#d9d2c0;--hover:#eee8d5;
+  --accent:#268bd2;--accent-fg:#fdf6e3;--accent-bg:rgba(38,139,210,.10);
+  --ok:#859900;--ok-bg:rgba(133,153,0,.12);
+  --warn:#b58900;--warn-bg:rgba(181,137,0,.14);
+  --err:#dc322f;--err-bg:rgba(220,50,47,.10);
+  --info:#2aa198;--info-bg:rgba(42,161,152,.10);
+  --track:#eee8d5;--r:3px;
+}
+[data-theme="mono-dark"]{
+  --bg:#1a1a1a;--bg-2:#151515;--bg-3:#242424;
+  --fg:#e8e8e8;--fg-2:#a8a8a8;--fg-3:#6e6e6e;
+  --line:#2e2e2e;--line-2:#242424;--line-3:#3d3d3d;--hover:#202020;
+  --accent:#e8a33d;--accent-fg:#1a1a1a;--accent-bg:rgba(232,163,61,.14);
+  --ok:#7fb069;--ok-bg:rgba(127,176,105,.14);
+  --warn:#d9a441;--warn-bg:rgba(217,164,65,.14);
+  --err:#c9564e;--err-bg:rgba(201,86,78,.16);
+  --info:#5a9fd4;--info-bg:rgba(90,159,212,.14);
+  --track:#2e2e2e;--r:2px;
+}
+[data-theme="mono-light"]{
+  --bg:#fafafa;--bg-2:#f0f0f0;--bg-3:#ffffff;
+  --fg:#1a1a1a;--fg-2:#5a5a5a;--fg-3:#8e8e8e;
+  --line:#e0e0e0;--line-2:#ededed;--line-3:#cccccc;--hover:#f0f0f0;
+  --accent:#b8721f;--accent-fg:#ffffff;--accent-bg:rgba(184,114,31,.10);
+  --ok:#4f7a3d;--ok-bg:rgba(79,122,61,.10);
+  --warn:#946a15;--warn-bg:rgba(148,106,21,.12);
+  --err:#a83e36;--err-bg:rgba(168,62,54,.10);
+  --info:#3d6f96;--info-bg:rgba(61,111,150,.10);
+  --track:#e0e0e0;--r:2px;
+}
+
+/* ══════════════════════════════════════════════════════════
+   页面壳(中性,不干扰主题展示)
+   ══════════════════════════════════════════════════════════ */
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background:#0d0d10;color:#e8e8ec;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  font-size:14px;line-height:1.5;padding-bottom:60px;
+}
+.topnav{
+  position:sticky;top:0;z-index:100;
+  background:rgba(13,13,16,.94);backdrop-filter:blur(12px);
+  border-bottom:1px solid #26262e;
+  padding:10px 20px;display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+}
+.topnav b{font-size:14px;margin-right:10px}
+.topnav button{
+  font:inherit;font-size:12px;padding:4px 10px;border-radius:3px;cursor:pointer;
+  background:#1a1a20;color:#9a9aa8;border:1px solid #2e2e38;transition:all .12s;
+}
+.topnav button:hover{color:#fff;background:#24242c;border-color:#3d3d48}
+.topnav button.on{background:#e8e8ec;color:#0d0d10;border-color:#e8e8ec;font-weight:600}
+.topnav .sp{flex:1}
+.topnav .hint{font-size:11.5px;color:#5a5a68}
+.wrap{max-width:1720px;margin:0 auto;padding:0 20px}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(520px,1fr));gap:20px;margin-top:24px}
+.card{
+  border:1px solid #26262e;border-radius:6px;overflow:hidden;background:#14141a;
+}
+.card-h{
+  padding:10px 14px;background:#17171d;border-bottom:1px solid #26262e;
+  display:flex;align-items:center;gap:9px;
+}
+.card-h h3{font-size:13.5px;font-weight:600}
+.card-h .badge{
+  font-size:10px;padding:1px 7px;border-radius:2px;
+  background:#23232c;color:#8a8a98;border:1px solid #33333e;
+}
+.card-h .badge.rec{background:#1d3a2a;color:#7ec87e;border-color:#2d5a40;font-weight:600}
+.card-h .sp{flex:1}
+.card-h .hex{font-size:10.5px;color:#5a5a68;font-family:ui-monospace,Consolas,monospace}
+
+/* ── 模拟界面 ── */
+.app{
+  background:var(--bg);color:var(--fg);font-size:12.5px;
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+}
+.bar{
+  display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  padding:8px 12px;background:var(--bg-2);border-bottom:1px solid var(--line);
+}
+.brand{font-weight:600;font-size:12.5px;display:flex;align-items:center;gap:6px}
+.brand i{width:6px;height:6px;border-radius:1px;background:var(--accent)}
+.seg{display:flex;border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+.seg span{padding:3px 9px;font-size:11px;color:var(--fg-2);border-right:1px solid var(--line)}
+.seg span:last-child{border-right:none}
+.seg span.on{background:var(--accent);color:var(--accent-fg);font-weight:600}
+.bar .sp{flex:1}
+.inp{
+  background:var(--bg-3);border:1px solid var(--line);border-radius:var(--r);
+  padding:3px 8px;font-size:11px;color:var(--fg);width:110px;font-family:inherit;
+}
+.stat{font-size:11px;font-variant-numeric:tabular-nums;display:flex;align-items:center;gap:4px}
+.stat.dn{color:var(--accent)}
+.stat.up{color:var(--ok)}
+.dot{width:5px;height:5px;border-radius:50%;background:var(--ok)}
+.btn{
+  border-radius:var(--r);padding:3px 10px;font-size:11px;font-family:inherit;
+  border:1px solid var(--line);background:var(--bg-3);color:var(--fg);font-weight:500;
+}
+.btn.pri{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+
+table{width:100%;border-collapse:collapse;font-size:11.5px}
+thead th{
+  text-align:left;font-weight:500;font-size:10.5px;color:var(--fg-3);
+  padding:6px 10px;background:var(--bg-2);border-bottom:1px solid var(--line);
+}
+tbody td{padding:6px 10px;border-bottom:1px solid var(--line-2);vertical-align:middle}
+.nm{max-width:210px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.num{font-variant-numeric:tabular-nums;text-align:right;font-family:ui-monospace,Consolas,monospace;font-size:10.5px;color:var(--fg-2)}
+
+.bdg{display:inline-flex;align-items:center;gap:4px;padding:1px 7px;border-radius:2px;font-size:10px;font-weight:600;white-space:nowrap}
+.bdg.dl{background:var(--accent-bg);color:var(--accent)}
+.bdg.sd{background:var(--ok-bg);color:var(--ok)}
+.bdg.pz{background:var(--warn-bg);color:var(--warn)}
+.bdg.dn{background:var(--ok-bg);color:var(--ok)}
+.bdg.er{background:var(--err-bg);color:var(--err)}
+.bdg.q{background:var(--bg-3);color:var(--fg-3)}
+
+.pg{display:flex;align-items:center;gap:6px;min-width:96px}
+.pg .tr{flex:1;height:4px;border-radius:2px;background:var(--track);overflow:hidden}
+.pg .fl{height:100%;border-radius:2px;background:var(--accent)}
+.pg .fl.sd{background:var(--ok)}
+.pg .fl.pz{background:var(--warn)}
+.pg .fl.er{background:var(--err)}
+.pg .pc{font-size:10px;font-variant-numeric:tabular-nums;color:var(--fg-2);width:28px;text-align:right}
+
+.sw-row{display:flex;border-top:1px solid #26262e}
+.sw{flex:1;padding:9px 4px;text-align:center;font-size:9.5px;font-family:ui-monospace,Consolas,monospace;line-height:1.5}
+.sw b{display:block;font-size:10px;font-weight:600;margin-bottom:2px}
+
+.foot{
+  display:flex;gap:12px;flex-wrap:wrap;align-items:center;
+  padding:6px 12px;background:var(--bg-2);border-top:1px solid var(--line);
+  font-size:10.5px;color:var(--fg-3);
+}
+.foot .sp{flex:1}
+</style>
+</head>
+<body>
+
+<div class="topnav">
+  <b>12 主题</b>
+  <button class="on" onclick="setAll('all')">全部</button>
+  <button onclick="setAll('dark')">仅暗色</button>
+  <button onclick="setAll('light')">仅浅色</button>
+  <span class="sp"></span>
+  <span class="hint">同一套表格，只换 token 变量 · 与 UI-DESIGN-SPEC.md 一致</span>
+</div>
+
+<div class="wrap"><div class="grid" id="grid"></div></div>
+
+<script>
+// 与规范文档一一对应的 12 主题
+const THEMES = [
+  {key:"nord-dark",      name:"Nord Dark",        note:"默认",       rec:true},
+  {key:"nord-light",     name:"Nord Light",       note:"北极亮"},
+  {key:"carbon-dark",    name:"Carbon Dark",      note:"企业级"},
+  {key:"carbon-light",   name:"Carbon Light",     note:"企业亮"},
+  {key:"gruvbox-dark",   name:"Gruvbox Dark",     note:"暖色复古"},
+  {key:"gruvbox-light",  name:"Gruvbox Light",    note:"暖色亮"},
+  {key:"catppuccin-dark",name:"Catppuccin Mocha", note:"现代柔和"},
+  {key:"catppuccin-light",name:"Catppuccin Latte",note:"柔和亮"},
+  {key:"solarized-dark", name:"Solarized Dark",   note:"科学对比"},
+  {key:"solarized-light",name:"Solarized Light",  note:"科学对比亮"},
+  {key:"mono-dark",      name:"极简灰 Dark",       note:"最克制"},
+  {key:"mono-light",     name:"极简灰 Light",      note:"最克制亮"},
+];
+
+// 演示用的任务数据（含 6 种状态）
+const TASKS = [
+  {n:"Castlevania - Belmont's Curse [FitGirl Repack]", s:"dl", sl:"下载中", p:67, cls:"",  r:"18.2 MB/s", sz:"4.1 GB",  eta:"1m 12s", act:"❚❚"},
+  {n:"ubuntu-24.04.2-desktop-amd64.iso",               s:"dl", sl:"下载中", p:23, cls:"",  r:"6.4 MB/s",  sz:"6.2 GB",  eta:"16m 40s",act:"❚❚"},
+  {n:"debian-12.9.0-amd64-netinst.iso",                s:"sd", sl:"做种中", p:100,cls:"sd",r:"↑ 890 KB/s",sz:"653 MB",  eta:"—",      act:"❚❚"},
+  {n:"archlinux-2026.03.01-x86_64.iso",                s:"pz", sl:"已暂停", p:45, cls:"pz",r:"—",         sz:"1.2 GB",  eta:"—",      act:"▶"},
+  {n:"fedora-workstation-42.iso",                      s:"dn", sl:"已完成", p:100,cls:"sd",r:"—",         sz:"2.4 GB",  eta:"—",      act:"⧉"},
+  {n:"broken-package-v2.tar.gz",                       s:"er", sl:"失败",   p:12, cls:"er",r:"—",         sz:"840 MB",  eta:"—",      act:"↻"},
+];
+
+function render(){
+  const grid = document.getElementById("grid");
+  grid.innerHTML = THEMES.map(t => `
+    <div class="card">
+      <div class="card-h">
+        <h3>${t.name}</h3>
+        ${t.rec ? '<span class="badge rec">默认</span>' : `<span class="badge">${t.note}</span>`}
+        <span class="sp"></span>
+        <span class="hex">data-theme="${t.key}"</span>
+      </div>
+      <div class="app" data-theme="${t.key}">
+        <div class="bar">
+          <div class="brand"><i></i>Smart Downloader</div>
+          <div class="seg"><span class="on">全部 6</span><span>下载中 2</span><span>已完成 3</span></div>
+          <div class="sp"></div>
+          <input class="inp" placeholder="搜索…" readonly>
+          <span class="stat dn">↓ 24.6 MB/s</span>
+          <span class="stat"><span class="dot"></span></span>
+          <button class="btn pri">＋ 新建</button>
+        </div>
+        <table>
+          <thead><tr>
+            <th style="width:38%">名称</th><th style="width:13%">状态</th>
+            <th style="width:20%">进度</th><th style="width:12%">速率</th>
+            <th style="width:10%">大小</th><th style="width:7%"></th>
+          </tr></thead>
+          <tbody>
+            ${TASKS.map(k => `<tr>
+              <td><div class="nm">${k.n}</div></td>
+              <td><span class="bdg ${k.s}">${k.sl}</span></td>
+              <td><div class="pg"><div class="tr"><div class="fl ${k.cls}" style="width:${k.p}%"></div></div><span class="pc">${k.p}%</span></div></td>
+              <td class="num">${k.r}</td>
+              <td class="num">${k.sz}</td>
+              <td class="num" style="color:var(--fg-3)">${k.act}</td>
+            </tr>`).join("")}
+          </tbody>
+        </table>
+        <div class="foot">
+          <span>共 6 个任务 · 2 下载中</span>
+          <span class="sp"></span>
+          <span>限速 不限 · 连接 48/200</span>
+        </div>
+        <div class="sw-row">
+          <div class="sw" style="background:var(--bg);color:var(--fg)"><b>bg</b>页面</div>
+          <div class="sw" style="background:var(--bg-3);color:var(--fg)"><b>bg-3</b>控件</div>
+          <div class="sw" style="background:var(--accent);color:var(--accent-fg)"><b>accent</b>强调</div>
+          <div class="sw" style="background:var(--ok);color:var(--bg)"><b>ok</b>成功</div>
+          <div class="sw" style="background:var(--warn);color:var(--bg)"><b>warn</b>警告</div>
+          <div class="sw" style="background:var(--err);color:var(--bg)"><b>err</b>错误</div>
+        </div>
+      </div>
+    </div>
+  `).join("");
+}
+
+function setAll(mode){
+  const cards = [...document.querySelectorAll(".card")];
+  const btns = [...document.querySelectorAll(".topnav button")];
+  btns.forEach(b => b.classList.remove("on"));
+  event.target.classList.add("on");
+  cards.forEach((c, i) => {
+    const k = THEMES[i].key;
+    c.style.display = (mode === "all" || k.includes(mode)) ? "" : "none";
+  });
+}
+
+render();
+</script>
+</body>
+</html>

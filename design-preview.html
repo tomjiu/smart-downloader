@@ -1,0 +1,866 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>下载器配色方案对比</title>
+<style>
+  /* ============================================================
+     全局:对比页自身的壳(中性,不干扰方案展示)
+     ============================================================ */
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:#101014;color:#e8e8ec;
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+    font-size:14px;line-height:1.5;
+    padding:0 0 80px;
+  }
+  /* 顶部导航 */
+  .topnav{
+    position:sticky;top:0;z-index:100;
+    background:rgba(16,16,20,.92);backdrop-filter:blur(12px);
+    border-bottom:1px solid #26262e;
+    padding:12px 24px;display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  }
+  .topnav b{font-size:15px;margin-right:12px;letter-spacing:.3px}
+  .topnav a{
+    color:#9a9aa8;text-decoration:none;padding:5px 12px;border-radius:4px;
+    font-size:13px;border:1px solid transparent;transition:all .12s;
+  }
+  .topnav a:hover{color:#fff;background:#1e1e26;border-color:#33333e}
+  .topnav .spacer{flex:1}
+  .topnav .hint{font-size:12px;color:#6a6a78}
+
+  .wrap{max-width:1560px;margin:0 auto;padding:0 24px}
+
+  /* 方案容器 */
+  .scheme{margin-top:36px;border:1px solid #26262e;border-radius:8px;overflow:hidden}
+  .scheme-head{
+    padding:16px 20px;background:#17171d;border-bottom:1px solid #26262e;
+    display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;
+  }
+  .scheme-head h2{font-size:17px;font-weight:600;letter-spacing:.2px}
+  .scheme-head .tag{
+    font-size:11px;padding:2px 8px;border-radius:3px;
+    background:#23232c;color:#8a8a98;border:1px solid #33333e;
+  }
+  .scheme-head .desc{font-size:12.5px;color:#8a8a98;flex:1;min-width:240px}
+  .scheme-body{padding:0}
+
+  /* 色板条 */
+  .palette{display:flex;border-bottom:1px solid #26262e}
+  .sw{flex:1;padding:14px 10px;text-align:center;font-size:10.5px;font-family:ui-monospace,Consolas,monospace;line-height:1.6}
+  .sw .name{font-weight:600;font-size:11px;margin-bottom:3px;opacity:.95}
+
+  /* ============================================================
+     模拟的下载器界面(用各方案自己的变量渲染)
+     ============================================================ */
+  .app{
+    font-size:13px;
+    background:var(--bg);
+    color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+  }
+  /* 工具栏 */
+  .bar{
+    display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    padding:9px 14px;background:var(--bg2);
+    border-bottom:1px solid var(--line);
+  }
+  .brand{font-weight:600;font-size:13.5px;color:var(--fg);letter-spacing:.2px}
+  .brand i{
+    display:inline-block;width:7px;height:7px;border-radius:2px;
+    background:var(--accent);margin-right:7px;vertical-align:middle;
+  }
+  .seg{display:flex;border:1px solid var(--line);border-radius:var(--r);overflow:hidden}
+  .seg span{
+    padding:4px 11px;font-size:12px;color:var(--fg2);cursor:pointer;
+    border-right:1px solid var(--line);
+  }
+  .seg span:last-child{border-right:none}
+  .seg span.on{background:var(--accent);color:var(--accent-fg);font-weight:500}
+  .bar .sp{flex:1}
+  .inp{
+    background:var(--bg3);border:1px solid var(--line);border-radius:var(--r);
+    padding:4px 9px;font-size:12px;color:var(--fg);min-width:150px;
+    font-family:inherit;
+  }
+  .inp::placeholder{color:var(--fg3)}
+  .btn{
+    border-radius:var(--r);padding:4px 12px;font-size:12px;cursor:pointer;
+    border:1px solid var(--line);background:var(--bg3);color:var(--fg);
+    font-family:inherit;font-weight:500;
+  }
+  .btn.pri{background:var(--accent);color:var(--accent-fg);border-color:var(--accent)}
+  .stat{font-size:12px;font-variant-numeric:tabular-nums;display:flex;align-items:center;gap:5px}
+  .stat.dn{color:var(--accent)}
+  .stat.up{color:var(--ok)}
+  .dot{width:6px;height:6px;border-radius:50%;background:var(--ok);display:inline-block}
+
+  /* 表格 */
+  table{width:100%;border-collapse:collapse;font-size:12.5px}
+  thead th{
+    text-align:left;font-weight:500;font-size:11.5px;
+    color:var(--fg3);padding:7px 12px;
+    background:var(--bg2);border-bottom:1px solid var(--line);
+    white-space:nowrap;letter-spacing:.2px;
+  }
+  tbody td{padding:8px 12px;border-bottom:1px solid var(--line2);vertical-align:middle}
+  tbody tr:hover{background:var(--hover)}
+  .nm{max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)}
+  .mono{font-variant-numeric:tabular-nums;font-family:ui-monospace,Consolas,monospace;font-size:11.5px;color:var(--fg2)}
+  .num{font-variant-numeric:tabular-nums;text-align:right;font-family:ui-monospace,Consolas,monospace;font-size:11.5px}
+
+  /* 状态徽章 */
+  .bdg{
+    display:inline-flex;align-items:center;gap:5px;
+    padding:2px 8px;border-radius:3px;font-size:11px;font-weight:500;
+    white-space:nowrap;
+  }
+  .bdg.dl{background:var(--accent-bg);color:var(--accent)}
+  .bdg.sd{background:var(--ok-bg);color:var(--ok)}
+  .bdg.pz{background:var(--warn-bg);color:var(--warn)}
+  .bdg.dn2{background:var(--ok-bg);color:var(--ok)}
+  .bdg.er{background:var(--err-bg);color:var(--err)}
+  .bdg.q{background:var(--bg3);color:var(--fg3)}
+
+  /* 进度条 */
+  .pg{display:flex;align-items:center;gap:8px;min-width:130px}
+  .pg .track{
+    flex:1;height:4px;border-radius:2px;background:var(--track);overflow:hidden;position:relative;
+  }
+  .pg .fill{height:100%;border-radius:2px;background:var(--accent);transition:width .4s}
+  .pg .fill.sd{background:var(--ok)}
+  .pg .fill.pz{background:var(--warn)}
+  .pg .fill.er{background:var(--err)}
+  .pg .fill.q{background:var(--fg3)}
+  .pg .pct{font-size:11px;font-variant-numeric:tabular-nums;color:var(--fg2);width:34px;text-align:right}
+
+  /* 操作按钮 */
+  .act{display:flex;gap:4px}
+  .ibtn{
+    width:24px;height:24px;border-radius:var(--r);border:1px solid var(--line);
+    background:transparent;color:var(--fg2);cursor:pointer;
+    display:grid;place-items:center;font-size:11px;
+  }
+  .ibtn:hover{background:var(--bg3);color:var(--fg);border-color:var(--line3)}
+
+  /* 底部状态栏 */
+  .foot{
+    display:flex;align-items:center;gap:16px;flex-wrap:wrap;
+    padding:7px 14px;background:var(--bg2);border-top:1px solid var(--line);
+    font-size:11.5px;color:var(--fg3);
+  }
+  .foot .sp{flex:1}
+
+  /* 说明脚注 */
+  .notes{
+    padding:14px 20px;background:#14141a;border-top:1px solid #26262e;
+    font-size:12.5px;color:#8a8a98;display:grid;
+    grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:8px 28px;
+  }
+  .notes b{color:#c8c8d4;font-weight:500}
+  .pro{color:#7ec87e}.con{color:#d99}
+
+  /* ============================================================
+     方案 1:Nord + Carbon 骨架
+     ============================================================ */
+  .nord{
+    --bg:#2e3440; --bg2:#292f3a; --bg3:#3b4252;
+    --fg:#eceff4; --fg2:#d8dee9; --fg3:#7b88a1;
+    --line:#434c5e; --line2:#3b4252; --line3:#4c566a;
+    --hover:#363d4b;
+    --accent:#88c0d0; --accent-fg:#2e3440; --accent-bg:rgba(136,192,208,.14);
+    --ok:#a3be8c; --ok-bg:rgba(163,190,140,.14);
+    --warn:#ebcb8b; --warn-bg:rgba(235,203,139,.14);
+    --err:#bf616a; --err-bg:rgba(191,97,106,.16);
+    --track:#434c5e;
+    --r:3px;
+  }
+  /* ============================================================
+     方案 2:IBM Carbon(企业级)
+     ============================================================ */
+  .carbon{
+    --bg:#161616; --bg2:#1c1c1c; --bg3:#262626;
+    --fg:#f4f4f4; --fg2:#c6c6c6; --fg3:#8d8d8d;
+    --line:#393939; --line2:#2a2a2a; --line3:#525252;
+    --hover:#232323;
+    --accent:#0f62fe; --accent-fg:#ffffff; --accent-bg:rgba(15,98,254,.16);
+    --ok:#42be65; --ok-bg:rgba(66,190,101,.16);
+    --warn:#f1c21b; --warn-bg:rgba(241,194,27,.16);
+    --err:#fa4d56; --err-bg:rgba(250,77,86,.16);
+    --track:#393939;
+    --r:2px;
+  }
+  /* ============================================================
+     方案 3:Gruvbox(暖色复古,低饱和)
+     ============================================================ */
+  .gruv{
+    --bg:#282828; --bg2:#1d2021; --bg3:#3c3836;
+    --fg:#ebdbb2; --fg2:#d5c4a1; --fg3:#928374;
+    --line:#504945; --line2:#3c3836; --line3:#665c54;
+    --hover:#32302f;
+    --accent:#83a598; --accent-fg:#282828; --accent-bg:rgba(131,165,152,.15);
+    --ok:#b8bb26; --ok-bg:rgba(184,187,38,.15);
+    --warn:#fabd2f; --warn-bg:rgba(250,189,47,.15);
+    --err:#fb4934; --err-bg:rgba(251,73,52,.16);
+    --track:#504945;
+    --r:3px;
+  }
+  /* ============================================================
+     方案 4:Catppuccin Mocha(现代柔和)
+     ============================================================ */
+  .cat{
+    --bg:#1e1e2e; --bg2:#181825; --bg3:#313244;
+    --fg:#cdd6f4; --fg2:#bac2de; --fg3:#7f849c;
+    --line:#45475a; --line2:#313244; --line3:#585b70;
+    --hover:#2a2a3c;
+    --accent:#89b4fa; --accent-fg:#1e1e2e; --accent-bg:rgba(137,180,250,.14);
+    --ok:#a6e3a1; --ok-bg:rgba(166,227,161,.14);
+    --warn:#f9e2af; --warn-bg:rgba(249,226,175,.14);
+    --err:#f38ba8; --err-bg:rgba(243,139,168,.16);
+    --track:#45475a;
+    --r:5px;
+  }
+  /* ============================================================
+     方案 5:Solarized Dark(科学对比度)
+     ============================================================ */
+  .sol{
+    --bg:#002b36; --bg2:#00252e; --bg3:#073642;
+    --fg:#eee8d5; --fg2:#93a1a1; --fg3:#657b83;
+    --line:#0d4a58; --line2:#0a3d49; --line3:#13505f;
+    --hover:#04323d;
+    --accent:#268bd2; --accent-fg:#fdf6e3; --accent-bg:rgba(38,139,210,.16);
+    --ok:#859900; --ok-bg:rgba(133,153,0,.18);
+    --warn:#b58900; --warn-bg:rgba(181,137,0,.18);
+    --err:#dc322f; --err-bg:rgba(220,50,47,.18);
+    --track:#0d4a58;
+    --r:3px;
+  }
+  /* ============================================================
+     方案 6:纯灰度 + 单一强调色(极简工具)
+     ============================================================ */
+  .mono{
+    --bg:#1a1a1a; --bg2:#151515; --bg3:#242424;
+    --fg:#e8e8e8; --fg2:#a8a8a8; --fg3:#6e6e6e;
+    --line:#2e2e2e; --line2:#242424; --line3:#3d3d3d;
+    --hover:#202020;
+    --accent:#e8a33d; --accent-fg:#1a1a1a; --accent-bg:rgba(232,163,61,.14);
+    --ok:#7fb069; --ok-bg:rgba(127,176,105,.14);
+    --warn:#d9a441; --warn-bg:rgba(217,164,65,.14);
+    --err:#c9564e; --err-bg:rgba(201,86,78,.16);
+    --track:#2e2e2e;
+    --r:2px;
+  }
+</style>
+</head>
+<body>
+
+<div class="topnav">
+  <b>下载器配色方案</b>
+  <a href="#nord">① Nord + Carbon</a>
+  <a href="#carbon">② IBM Carbon</a>
+  <a href="#gruv">③ Gruvbox</a>
+  <a href="#cat">④ Catppuccin</a>
+  <a href="#sol">⑤ Solarized</a>
+  <a href="#mono">⑥ 极简灰</a>
+  <span class="spacer"></span>
+  <span class="hint">同一套界面结构，只换配色变量</span>
+</div>
+
+<div class="wrap">
+
+<!-- ══════════════════════════════════════════════════════════ -->
+<!-- 方案 1:Nord + Carbon -->
+<!-- ══════════════════════════════════════════════════════════ -->
+<section class="scheme" id="nord">
+  <div class="scheme-head">
+    <h2>① Nord + Carbon 骨架</h2>
+    <span class="tag">推荐</span>
+    <div class="desc">北极冷色 + 企业级密度。低饱和不刺眼，长时间看不累，最不像 AI 生成。</div>
+  </div>
+  <div class="palette">
+    <div class="sw" style="background:#2e3440;color:#d8dee9"><div class="name">bg</div>#2e3440</div>
+    <div class="sw" style="background:#3b4252;color:#d8dee9"><div class="name">surface</div>#3b4252</div>
+    <div class="sw" style="background:#434c5e;color:#eceff4"><div class="name">line</div>#434c5e</div>
+    <div class="sw" style="background:#88c0d0;color:#2e3440"><div class="name">accent</div>#88c0d0</div>
+    <div class="sw" style="background:#a3be8c;color:#2e3440"><div class="name">ok</div>#a3be8c</div>
+    <div class="sw" style="background:#ebcb8b;color:#2e3440"><div class="name">warn</div>#ebcb8b</div>
+    <div class="sw" style="background:#bf616a;color:#2e3440"><div class="name">err</div>#bf616a</div>
+  </div>
+  <div class="scheme-body nord app">
+    <div class="bar">
+      <div class="brand"><i></i>Smart Downloader</div>
+      <div class="seg"><span class="on">全部 6</span><span>下载中 2</span><span>已完成 3</span><span>失败 1</span></div>
+      <div class="sp"></div>
+      <input class="inp" placeholder="搜索任务…">
+      <span class="stat dn">↓ 24.6 MB/s</span>
+      <span class="stat up">↑ 1.2 MB/s</span>
+      <span class="stat"><span class="dot"></span>已连接</span>
+      <button class="btn pri">＋ 新建</button>
+    </div>
+    <table>
+      <thead><tr>
+        <th style="width:34%">名称</th><th style="width:11%">状态</th>
+        <th style="width:20%">进度</th><th style="width:11%">速率</th>
+        <th style="width:11%">大小</th><th style="width:8%">剩余</th><th style="width:5%"></th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td><div class="nm">Castlevania - Belmont's Curse [FitGirl Repack]</div></td>
+          <td><span class="bdg dl">下载中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill" style="width:67%"></div></div><span class="pct">67%</span></div></td>
+          <td class="num" style="color:var(--accent)">18.2 MB/s</td>
+          <td class="num">4.1 GB</td><td class="num">1m 12s</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">ubuntu-24.04.2-desktop-amd64.iso</div></td>
+          <td><span class="bdg dl">下载中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill" style="width:23%"></div></div><span class="pct">23%</span></div></td>
+          <td class="num" style="color:var(--accent)">6.4 MB/s</td>
+          <td class="num">6.2 GB</td><td class="num">16m 40s</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">debian-12.9.0-amd64-netinst.iso</div></td>
+          <td><span class="bdg sd">做种中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill sd" style="width:100%"></div></div><span class="pct">100%</span></div></td>
+          <td class="num" style="color:var(--ok)">↑ 890 KB/s</td>
+          <td class="num">653 MB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">archlinux-2026.03.01-x86_64.iso</div></td>
+          <td><span class="bdg pz">已暂停</span></td>
+          <td><div class="pg"><div class="track"><div class="fill pz" style="width:45%"></div></div><span class="pct">45%</span></div></td>
+          <td class="num">—</td><td class="num">1.2 GB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">▶</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">fedora-workstation-42.iso</div></td>
+          <td><span class="bdg dn2">已完成</span></td>
+          <td><div class="pg"><div class="track"><div class="fill sd" style="width:100%"></div></div><span class="pct">100%</span></div></td>
+          <td class="num">—</td><td class="num">2.4 GB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">⧉</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">broken-package-v2.tar.gz</div></td>
+          <td><span class="bdg er">失败</span></td>
+          <td><div class="pg"><div class="track"><div class="fill er" style="width:12%"></div></div><span class="pct">12%</span></div></td>
+          <td class="num">—</td><td class="num">840 MB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">↻</button><button class="ibtn">✕</button></div></td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="foot">
+      <span>共 6 个任务 · 2 下载中</span>
+      <span>磁盘可用 <span class="mono">412 GB</span></span>
+      <span class="sp"></span>
+      <span>限速 不限 · 连接 48/200</span>
+    </div>
+  </div>
+  <div class="notes">
+    <div><b>气质</b> 冷、静、专业</div>
+    <div><b>圆角</b> 3px</div>
+    <div><b>适合</b> 长时间挂机 <span class="pro">✓</span></div>
+    <div><b>AI 味</b> 极低 <span class="pro">✓</span></div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════ -->
+<section class="scheme" id="carbon">
+  <div class="scheme-head">
+    <h2>② IBM Carbon</h2>
+    <span class="tag">企业级</span>
+    <div class="desc">IBM 官方设计系统。方正、务实、零装饰，为数据密集界面而生。</div>
+  </div>
+  <div class="palette">
+    <div class="sw" style="background:#161616;color:#c6c6c6"><div class="name">bg</div>#161616</div>
+    <div class="sw" style="background:#262626;color:#f4f4f4"><div class="name">surface</div>#262626</div>
+    <div class="sw" style="background:#393939;color:#f4f4f4"><div class="name">line</div>#393939</div>
+    <div class="sw" style="background:#0f62fe;color:#fff"><div class="name">accent</div>#0f62fe</div>
+    <div class="sw" style="background:#42be65;color:#161616"><div class="name">ok</div>#42be65</div>
+    <div class="sw" style="background:#f1c21b;color:#161616"><div class="name">warn</div>#f1c21b</div>
+    <div class="sw" style="background:#fa4d56;color:#161616"><div class="name">err</div>#fa4d56</div>
+  </div>
+  <div class="scheme-body carbon app">
+    <div class="bar">
+      <div class="brand"><i></i>Smart Downloader</div>
+      <div class="seg"><span class="on">全部 6</span><span>下载中 2</span><span>已完成 3</span><span>失败 1</span></div>
+      <div class="sp"></div>
+      <input class="inp" placeholder="搜索任务…">
+      <span class="stat dn">↓ 24.6 MB/s</span>
+      <span class="stat up">↑ 1.2 MB/s</span>
+      <span class="stat"><span class="dot"></span>已连接</span>
+      <button class="btn pri">＋ 新建</button>
+    </div>
+    <table>
+      <thead><tr>
+        <th style="width:34%">名称</th><th style="width:11%">状态</th>
+        <th style="width:20%">进度</th><th style="width:11%">速率</th>
+        <th style="width:11%">大小</th><th style="width:8%">剩余</th><th style="width:5%"></th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td><div class="nm">Castlevania - Belmont's Curse [FitGirl Repack]</div></td>
+          <td><span class="bdg dl">下载中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill" style="width:67%"></div></div><span class="pct">67%</span></div></td>
+          <td class="num" style="color:var(--accent)">18.2 MB/s</td>
+          <td class="num">4.1 GB</td><td class="num">1m 12s</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">ubuntu-24.04.2-desktop-amd64.iso</div></td>
+          <td><span class="bdg dl">下载中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill" style="width:23%"></div></div><span class="pct">23%</span></div></td>
+          <td class="num" style="color:var(--accent)">6.4 MB/s</td>
+          <td class="num">6.2 GB</td><td class="num">16m 40s</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">debian-12.9.0-amd64-netinst.iso</div></td>
+          <td><span class="bdg sd">做种中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill sd" style="width:100%"></div></div><span class="pct">100%</span></div></td>
+          <td class="num" style="color:var(--ok)">↑ 890 KB/s</td>
+          <td class="num">653 MB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">archlinux-2026.03.01-x86_64.iso</div></td>
+          <td><span class="bdg pz">已暂停</span></td>
+          <td><div class="pg"><div class="track"><div class="fill pz" style="width:45%"></div></div><span class="pct">45%</span></div></td>
+          <td class="num">—</td><td class="num">1.2 GB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">▶</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">fedora-workstation-42.iso</div></td>
+          <td><span class="bdg dn2">已完成</span></td>
+          <td><div class="pg"><div class="track"><div class="fill sd" style="width:100%"></div></div><span class="pct">100%</span></div></td>
+          <td class="num">—</td><td class="num">2.4 GB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">⧉</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">broken-package-v2.tar.gz</div></td>
+          <td><span class="bdg er">失败</span></td>
+          <td><div class="pg"><div class="track"><div class="fill er" style="width:12%"></div></div><span class="pct">12%</span></div></td>
+          <td class="num">—</td><td class="num">840 MB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">↻</button><button class="ibtn">✕</button></div></td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="foot">
+      <span>共 6 个任务 · 2 下载中</span>
+      <span>磁盘可用 <span class="mono">412 GB</span></span>
+      <span class="sp"></span>
+      <span>限速 不限 · 连接 48/200</span>
+    </div>
+  </div>
+  <div class="notes">
+    <div><b>气质</b> 方正、企业、克制</div>
+    <div><b>圆角</b> 2px</div>
+    <div><b>适合</b> 数据密集 <span class="pro">✓</span></div>
+    <div><b>AI 味</b> 极低 <span class="pro">✓</span></div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════ -->
+<section class="scheme" id="gruv">
+  <div class="scheme-head">
+    <h2>③ Gruvbox</h2>
+    <span class="tag">暖色复古</span>
+    <div class="desc">暖土色调，刻意降饱和。辨识度最高，但暖色不一定符合下载器用户预期。</div>
+  </div>
+  <div class="palette">
+    <div class="sw" style="background:#282828;color:#d5c4a1"><div class="name">bg</div>#282828</div>
+    <div class="sw" style="background:#3c3836;color:#ebdbb2"><div class="name">surface</div>#3c3836</div>
+    <div class="sw" style="background:#504945;color:#ebdbb2"><div class="name">line</div>#504945</div>
+    <div class="sw" style="background:#83a598;color:#282828"><div class="name">accent</div>#83a598</div>
+    <div class="sw" style="background:#b8bb26;color:#282828"><div class="name">ok</div>#b8bb26</div>
+    <div class="sw" style="background:#fabd2f;color:#282828"><div class="name">warn</div>#fabd2f</div>
+    <div class="sw" style="background:#fb4934;color:#282828"><div class="name">err</div>#fb4934</div>
+  </div>
+  <div class="scheme-body gruv app">
+    <div class="bar">
+      <div class="brand"><i></i>Smart Downloader</div>
+      <div class="seg"><span class="on">全部 6</span><span>下载中 2</span><span>已完成 3</span><span>失败 1</span></div>
+      <div class="sp"></div>
+      <input class="inp" placeholder="搜索任务…">
+      <span class="stat dn">↓ 24.6 MB/s</span>
+      <span class="stat up">↑ 1.2 MB/s</span>
+      <span class="stat"><span class="dot"></span>已连接</span>
+      <button class="btn pri">＋ 新建</button>
+    </div>
+    <table>
+      <thead><tr>
+        <th style="width:34%">名称</th><th style="width:11%">状态</th>
+        <th style="width:20%">进度</th><th style="width:11%">速率</th>
+        <th style="width:11%">大小</th><th style="width:8%">剩余</th><th style="width:5%"></th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td><div class="nm">Castlevania - Belmont's Curse [FitGirl Repack]</div></td>
+          <td><span class="bdg dl">下载中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill" style="width:67%"></div></div><span class="pct">67%</span></div></td>
+          <td class="num" style="color:var(--accent)">18.2 MB/s</td>
+          <td class="num">4.1 GB</td><td class="num">1m 12s</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">ubuntu-24.04.2-desktop-amd64.iso</div></td>
+          <td><span class="bdg dl">下载中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill" style="width:23%"></div></div><span class="pct">23%</span></div></td>
+          <td class="num" style="color:var(--accent)">6.4 MB/s</td>
+          <td class="num">6.2 GB</td><td class="num">16m 40s</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">debian-12.9.0-amd64-netinst.iso</div></td>
+          <td><span class="bdg sd">做种中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill sd" style="width:100%"></div></div><span class="pct">100%</span></div></td>
+          <td class="num" style="color:var(--ok)">↑ 890 KB/s</td>
+          <td class="num">653 MB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">archlinux-2026.03.01-x86_64.iso</div></td>
+          <td><span class="bdg pz">已暂停</span></td>
+          <td><div class="pg"><div class="track"><div class="fill pz" style="width:45%"></div></div><span class="pct">45%</span></div></td>
+          <td class="num">—</td><td class="num">1.2 GB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">▶</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">fedora-workstation-42.iso</div></td>
+          <td><span class="bdg dn2">已完成</span></td>
+          <td><div class="pg"><div class="track"><div class="fill sd" style="width:100%"></div></div><span class="pct">100%</span></div></td>
+          <td class="num">—</td><td class="num">2.4 GB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">⧉</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">broken-package-v2.tar.gz</div></td>
+          <td><span class="bdg er">失败</span></td>
+          <td><div class="pg"><div class="track"><div class="fill er" style="width:12%"></div></div><span class="pct">12%</span></div></td>
+          <td class="num">—</td><td class="num">840 MB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">↻</button><button class="ibtn">✕</button></div></td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="foot">
+      <span>共 6 个任务 · 2 下载中</span>
+      <span>磁盘可用 <span class="mono">412 GB</span></span>
+      <span class="sp"></span>
+      <span>限速 不限 · 连接 48/200</span>
+    </div>
+  </div>
+  <div class="notes">
+    <div><b>气质</b> 温润、复古、个性</div>
+    <div><b>圆角</b> 3px</div>
+    <div><b>适合</b> 喜欢暖色的用户</div>
+    <div><b>风险</b> 偏"复古"，可能显得旧 <span class="con">!</span></div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════ -->
+<section class="scheme" id="cat">
+  <div class="scheme-head">
+    <h2>④ Catppuccin Mocha</h2>
+    <span class="tag">现代柔和</span>
+    <div class="desc">当下流行的柔和配色。淡雅但不够"工具感"，圆角偏大。</div>
+  </div>
+  <div class="palette">
+    <div class="sw" style="background:#1e1e2e;color:#bac2de"><div class="name">bg</div>#1e1e2e</div>
+    <div class="sw" style="background:#313244;color:#cdd6f4"><div class="name">surface</div>#313244</div>
+    <div class="sw" style="background:#45475a;color:#cdd6f4"><div class="name">line</div>#45475a</div>
+    <div class="sw" style="background:#89b4fa;color:#1e1e2e"><div class="name">accent</div>#89b4fa</div>
+    <div class="sw" style="background:#a6e3a1;color:#1e1e2e"><div class="name">ok</div>#a6e3a1</div>
+    <div class="sw" style="background:#f9e2af;color:#1e1e2e"><div class="name">warn</div>#f9e2af</div>
+    <div class="sw" style="background:#f38ba8;color:#1e1e2e"><div class="name">err</div>#f38ba8</div>
+  </div>
+  <div class="scheme-body cat app">
+    <div class="bar">
+      <div class="brand"><i></i>Smart Downloader</div>
+      <div class="seg"><span class="on">全部 6</span><span>下载中 2</span><span>已完成 3</span><span>失败 1</span></div>
+      <div class="sp"></div>
+      <input class="inp" placeholder="搜索任务…">
+      <span class="stat dn">↓ 24.6 MB/s</span>
+      <span class="stat up">↑ 1.2 MB/s</span>
+      <span class="stat"><span class="dot"></span>已连接</span>
+      <button class="btn pri">＋ 新建</button>
+    </div>
+    <table>
+      <thead><tr>
+        <th style="width:34%">名称</th><th style="width:11%">状态</th>
+        <th style="width:20%">进度</th><th style="width:11%">速率</th>
+        <th style="width:11%">大小</th><th style="width:8%">剩余</th><th style="width:5%"></th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td><div class="nm">Castlevania - Belmont's Curse [FitGirl Repack]</div></td>
+          <td><span class="bdg dl">下载中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill" style="width:67%"></div></div><span class="pct">67%</span></div></td>
+          <td class="num" style="color:var(--accent)">18.2 MB/s</td>
+          <td class="num">4.1 GB</td><td class="num">1m 12s</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">ubuntu-24.04.2-desktop-amd64.iso</div></td>
+          <td><span class="bdg dl">下载中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill" style="width:23%"></div></div><span class="pct">23%</span></div></td>
+          <td class="num" style="color:var(--accent)">6.4 MB/s</td>
+          <td class="num">6.2 GB</td><td class="num">16m 40s</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">debian-12.9.0-amd64-netinst.iso</div></td>
+          <td><span class="bdg sd">做种中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill sd" style="width:100%"></div></div><span class="pct">100%</span></div></td>
+          <td class="num" style="color:var(--ok)">↑ 890 KB/s</td>
+          <td class="num">653 MB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">archlinux-2026.03.01-x86_64.iso</div></td>
+          <td><span class="bdg pz">已暂停</span></td>
+          <td><div class="pg"><div class="track"><div class="fill pz" style="width:45%"></div></div><span class="pct">45%</span></div></td>
+          <td class="num">—</td><td class="num">1.2 GB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">▶</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">fedora-workstation-42.iso</div></td>
+          <td><span class="bdg dn2">已完成</span></td>
+          <td><div class="pg"><div class="track"><div class="fill sd" style="width:100%"></div></div><span class="pct">100%</span></div></td>
+          <td class="num">—</td><td class="num">2.4 GB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">⧉</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">broken-package-v2.tar.gz</div></td>
+          <td><span class="bdg er">失败</span></td>
+          <td><div class="pg"><div class="track"><div class="fill er" style="width:12%"></div></div><span class="pct">12%</span></div></td>
+          <td class="num">—</td><td class="num">840 MB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">↻</button><button class="ibtn">✕</button></div></td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="foot">
+      <span>共 6 个任务 · 2 下载中</span>
+      <span>磁盘可用 <span class="mono">412 GB</span></span>
+      <span class="sp"></span>
+      <span>限速 不限 · 连接 48/200</span>
+    </div>
+  </div>
+  <div class="notes">
+    <div><b>气质</b> 柔和、现代、淡雅</div>
+    <div><b>圆角</b> 5px</div>
+    <div><b>流行度</b> 高，但偏"编辑器"气质</div>
+    <div><b>风险</b> 淡紫调，略接近 AI 配色 <span class="con">!</span></div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════ -->
+<section class="scheme" id="sol">
+  <div class="scheme-head">
+    <h2>⑤ Solarized Dark</h2>
+    <span class="tag">科学对比度</span>
+    <div class="desc">按 CIELAB 科学配比的对比度，护眼经典。但深青底色个性较强。</div>
+  </div>
+  <div class="palette">
+    <div class="sw" style="background:#002b36;color:#93a1a1"><div class="name">bg</div>#002b36</div>
+    <div class="sw" style="background:#073642;color:#eee8d5"><div class="name">surface</div>#073642</div>
+    <div class="sw" style="background:#0d4a58;color:#eee8d5"><div class="name">line</div>#0d4a58</div>
+    <div class="sw" style="background:#268bd2;color:#fdf6e3"><div class="name">accent</div>#268bd2</div>
+    <div class="sw" style="background:#859900;color:#fdf6e3"><div class="name">ok</div>#859900</div>
+    <div class="sw" style="background:#b58900;color:#fdf6e3"><div class="name">warn</div>#b58900</div>
+    <div class="sw" style="background:#dc322f;color:#fdf6e3"><div class="name">err</div>#dc322f</div>
+  </div>
+  <div class="scheme-body sol app">
+    <div class="bar">
+      <div class="brand"><i></i>Smart Downloader</div>
+      <div class="seg"><span class="on">全部 6</span><span>下载中 2</span><span>已完成 3</span><span>失败 1</span></div>
+      <div class="sp"></div>
+      <input class="inp" placeholder="搜索任务…">
+      <span class="stat dn">↓ 24.6 MB/s</span>
+      <span class="stat up">↑ 1.2 MB/s</span>
+      <span class="stat"><span class="dot"></span>已连接</span>
+      <button class="btn pri">＋ 新建</button>
+    </div>
+    <table>
+      <thead><tr>
+        <th style="width:34%">名称</th><th style="width:11%">状态</th>
+        <th style="width:20%">进度</th><th style="width:11%">速率</th>
+        <th style="width:11%">大小</th><th style="width:8%">剩余</th><th style="width:5%"></th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td><div class="nm">Castlevania - Belmont's Curse [FitGirl Repack]</div></td>
+          <td><span class="bdg dl">下载中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill" style="width:67%"></div></div><span class="pct">67%</span></div></td>
+          <td class="num" style="color:var(--accent)">18.2 MB/s</td>
+          <td class="num">4.1 GB</td><td class="num">1m 12s</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">ubuntu-24.04.2-desktop-amd64.iso</div></td>
+          <td><span class="bdg dl">下载中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill" style="width:23%"></div></div><span class="pct">23%</span></div></td>
+          <td class="num" style="color:var(--accent)">6.4 MB/s</td>
+          <td class="num">6.2 GB</td><td class="num">16m 40s</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">debian-12.9.0-amd64-netinst.iso</div></td>
+          <td><span class="bdg sd">做种中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill sd" style="width:100%"></div></div><span class="pct">100%</span></div></td>
+          <td class="num" style="color:var(--ok)">↑ 890 KB/s</td>
+          <td class="num">653 MB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">archlinux-2026.03.01-x86_64.iso</div></td>
+          <td><span class="bdg pz">已暂停</span></td>
+          <td><div class="pg"><div class="track"><div class="fill pz" style="width:45%"></div></div><span class="pct">45%</span></div></td>
+          <td class="num">—</td><td class="num">1.2 GB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">▶</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">fedora-workstation-42.iso</div></td>
+          <td><span class="bdg dn2">已完成</span></td>
+          <td><div class="pg"><div class="track"><div class="fill sd" style="width:100%"></div></div><span class="pct">100%</span></div></td>
+          <td class="num">—</td><td class="num">2.4 GB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">⧉</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">broken-package-v2.tar.gz</div></td>
+          <td><span class="bdg er">失败</span></td>
+          <td><div class="pg"><div class="track"><div class="fill er" style="width:12%"></div></div><span class="pct">12%</span></div></td>
+          <td class="num">—</td><td class="num">840 MB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">↻</button><button class="ibtn">✕</button></div></td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="foot">
+      <span>共 6 个任务 · 2 下载中</span>
+      <span>磁盘可用 <span class="mono">412 GB</span></span>
+      <span class="sp"></span>
+      <span>限速 不限 · 连接 48/200</span>
+    </div>
+  </div>
+  <div class="notes">
+    <div><b>气质</b> 深青、经典、护眼</div>
+    <div><b>圆角</b> 3px</div>
+    <div><b>适合</b> 长时间终端用户</div>
+    <div><b>风险</b> 青绿底色较个性 <span class="con">!</span></div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════ -->
+<section class="scheme" id="mono">
+  <div class="scheme-head">
+    <h2>⑥ 极简灰 + 琥珀强调</h2>
+    <span class="tag">最克制</span>
+    <div class="desc">纯中性灰阶 + 单一琥珀强调色。最"工具"，但可能显得冷硬。</div>
+  </div>
+  <div class="palette">
+    <div class="sw" style="background:#1a1a1a;color:#a8a8a8"><div class="name">bg</div>#1a1a1a</div>
+    <div class="sw" style="background:#242424;color:#e8e8e8"><div class="name">surface</div>#242424</div>
+    <div class="sw" style="background:#2e2e2e;color:#e8e8e8"><div class="name">line</div>#2e2e2e</div>
+    <div class="sw" style="background:#e8a33d;color:#1a1a1a"><div class="name">accent</div>#e8a33d</div>
+    <div class="sw" style="background:#7fb069;color:#1a1a1a"><div class="name">ok</div>#7fb069</div>
+    <div class="sw" style="background:#d9a441;color:#1a1a1a"><div class="name">warn</div>#d9a441</div>
+    <div class="sw" style="background:#c9564e;color:#1a1a1a"><div class="name">err</div>#c9564e</div>
+  </div>
+  <div class="scheme-body mono app">
+    <div class="bar">
+      <div class="brand"><i></i>Smart Downloader</div>
+      <div class="seg"><span class="on">全部 6</span><span>下载中 2</span><span>已完成 3</span><span>失败 1</span></div>
+      <div class="sp"></div>
+      <input class="inp" placeholder="搜索任务…">
+      <span class="stat dn">↓ 24.6 MB/s</span>
+      <span class="stat up">↑ 1.2 MB/s</span>
+      <span class="stat"><span class="dot"></span>已连接</span>
+      <button class="btn pri">＋ 新建</button>
+    </div>
+    <table>
+      <thead><tr>
+        <th style="width:34%">名称</th><th style="width:11%">状态</th>
+        <th style="width:20%">进度</th><th style="width:11%">速率</th>
+        <th style="width:11%">大小</th><th style="width:8%">剩余</th><th style="width:5%"></th>
+      </tr></thead>
+      <tbody>
+        <tr>
+          <td><div class="nm">Castlevania - Belmont's Curse [FitGirl Repack]</div></td>
+          <td><span class="bdg dl">下载中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill" style="width:67%"></div></div><span class="pct">67%</span></div></td>
+          <td class="num" style="color:var(--accent)">18.2 MB/s</td>
+          <td class="num">4.1 GB</td><td class="num">1m 12s</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">ubuntu-24.04.2-desktop-amd64.iso</div></td>
+          <td><span class="bdg dl">下载中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill" style="width:23%"></div></div><span class="pct">23%</span></div></td>
+          <td class="num" style="color:var(--accent)">6.4 MB/s</td>
+          <td class="num">6.2 GB</td><td class="num">16m 40s</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">debian-12.9.0-amd64-netinst.iso</div></td>
+          <td><span class="bdg sd">做种中</span></td>
+          <td><div class="pg"><div class="track"><div class="fill sd" style="width:100%"></div></div><span class="pct">100%</span></div></td>
+          <td class="num" style="color:var(--ok)">↑ 890 KB/s</td>
+          <td class="num">653 MB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">❚❚</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">archlinux-2026.03.01-x86_64.iso</div></td>
+          <td><span class="bdg pz">已暂停</span></td>
+          <td><div class="pg"><div class="track"><div class="fill pz" style="width:45%"></div></div><span class="pct">45%</span></div></td>
+          <td class="num">—</td><td class="num">1.2 GB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">▶</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">fedora-workstation-42.iso</div></td>
+          <td><span class="bdg dn2">已完成</span></td>
+          <td><div class="pg"><div class="track"><div class="fill sd" style="width:100%"></div></div><span class="pct">100%</span></div></td>
+          <td class="num">—</td><td class="num">2.4 GB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">⧉</button><button class="ibtn">✕</button></div></td>
+        </tr>
+        <tr>
+          <td><div class="nm">broken-package-v2.tar.gz</div></td>
+          <td><span class="bdg er">失败</span></td>
+          <td><div class="pg"><div class="track"><div class="fill er" style="width:12%"></div></div><span class="pct">12%</span></div></td>
+          <td class="num">—</td><td class="num">840 MB</td><td class="num">—</td>
+          <td><div class="act"><button class="ibtn">↻</button><button class="ibtn">✕</button></div></td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="foot">
+      <span>共 6 个任务 · 2 下载中</span>
+      <span>磁盘可用 <span class="mono">412 GB</span></span>
+      <span class="sp"></span>
+      <span>限速 不限 · 连接 48/200</span>
+    </div>
+  </div>
+  <div class="notes">
+    <div><b>气质</b> 冷静、工具、无个性</div>
+    <div><b>圆角</b> 2px</div>
+    <div><b>适合</b> 纯功能导向</div>
+    <div><b>风险</b> 可能偏单调 <span class="con">!</span></div>
+  </div>
+</section>
+
+</div>
+
+<script>
+  // 分段控件点击切换(纯展示)
+  document.querySelectorAll('.seg').forEach(seg=>{
+    seg.querySelectorAll('span').forEach(s=>{
+      s.onclick=()=>{
+        seg.querySelectorAll('span').forEach(x=>x.classList.remove('on'));
+        s.classList.add('on');
+      };
+    });
+  });
+</script>
+</body>
+</html>

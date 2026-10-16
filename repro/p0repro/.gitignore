@@ -1,0 +1,3 @@
+# repro/p0repro 是独立 crate（[workspace] 隔离），产物不入库
+target/
+Cargo.lock

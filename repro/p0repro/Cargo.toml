@@ -1,0 +1,15 @@
+[package]
+name = "p0repro"
+version = "0.1.0"
+edition = "2021"
+
+# 独立于主 workspace（复现用，不参与 CI 构建）
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+sha1 = "0.10"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
