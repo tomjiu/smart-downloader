@@ -10,9 +10,12 @@
 | 报告 | 范围 | 核心产出 |
 |------|------|----------|
 | [BACKEND-REVIEW-2026-10-16.md](BACKEND-REVIEW-2026-10-16.md) | daemon 核心 + httpdl | 第一轮：5 个 P0 |
-| [BACKEND-REVIEW-ROUND2.md](BACKEND-REVIEW-ROUND2.md) | 补齐 provider / core / daemon 未覆盖 | **12 个 P0**，6 个已实证复现 |
+| [BACKEND-REVIEW-ROUND2.md](BACKEND-REVIEW-ROUND2.md) | provider / core / daemon 未覆盖 | **12 个 P0** |
+| [BACKEND-REVIEW-ROUND3.md](BACKEND-REVIEW-ROUND3.md) | btcore 业务层 / provider 剩余 | P0-13 + 并发闸门失效等 |
 | [ARCHITECTURE-REVIEW.md](ARCHITECTURE-REVIEW.md) | 结构设计（7 crate + 文档体系） | 7 类结构问题 + 3 处依赖错误 |
 | [_AUDIT_CONTRADICTIONS.md](../research/xunlei/_AUDIT_CONTRADICTIONS.md) | `docs/research/xunlei/` 状态类文档 | 24 项文档矛盾（两层分裂） |
+
+**累计覆盖：约 49,000 / 52,000 行**（httpdl / daemon / provider / core 100%，btcore 业务层完成）
 
 **复现工程**：[`repro/p0repro/`](../../repro/p0repro)（独立 crate，`cargo test -- --nocapture`）
 
@@ -51,6 +54,22 @@
 `HttpEngine::peers()` 返回 `Ok(vec![])`（**撒谎而非报错**）。
 
 后果：生产代码 **33 处运行时 `EngineKind` 判断**，`ops.rs` 独占 14 处。
+
+### 6. 🔴 迅雷引擎 add 失败遗留孤儿任务
+
+`btcore/src/xunlei_engine.rs:213-220` —— `insert_task` 先于 `start_task`，
+后者失败时 daemon 拿到 `Err` 丢弃 `engine_tid`，但**引擎侧 `tasks` 表已插入**。
+
+`rollback_slot_reservation` **只清理 daemon 侧**，不碰引擎 → 孤儿任务
+**永不 stop、永不 delete、重启也不清理**，持续占带宽/磁盘。
+
+### 7. 🟡 provider 并发闸门恒真
+
+`provider/src/coordinator.rs:70` 的 `rt.busy < rt.concurrency_limit` ——
+**`busy` 在生产代码中恒为 0**（三个构造点全硬编码），全仓无递增点
+（只有 `mock.rs` 的 `set_busy()` 供测试）。
+
+「每 provider 并发上限 2」**从未生效** → 100 任务可同时打进同一 provider。
 
 ---
 
