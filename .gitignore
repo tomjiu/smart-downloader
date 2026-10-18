@@ -74,3 +74,4 @@ node_modules/
 # vcpkg 二进制缓存同理——均不入库（tauri 资源映射在 CI 构建期读取）
 desktop/src-tauri/native/
 .vcpkg-cache/
+libtorrent-rasterbar-dev_*.deb
