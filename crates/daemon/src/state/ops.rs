@@ -385,7 +385,16 @@ impl DaemonState {
     /// 「记录未插入前并发 add 双双过闸」的超卖窗口（TOCTOU）。
     pub(super) fn active_slot_counts(&self) -> [u32; 3] {
         let tasks = self.tasks.lock();
-        let reservations = self.slot_reservations.lock();
+        Self::active_slot_counts_locked(&tasks, &self.slot_reservations.lock())
+    }
+
+    /// [`Self::active_slot_counts`] 的已持锁变体（gate_or_enqueue 在同一
+    /// tasks 临界区内完成「计数检查 + 记录插入 + 预留登记」，消除检查与
+    /// 登记之间的并发窗口）。锁序与公开版一致：tasks → slot_reservations。
+    fn active_slot_counts_locked(
+        tasks: &std::collections::HashMap<TaskId, TaskRecord>,
+        reservations: &std::collections::HashSet<TaskId>,
+    ) -> [u32; 3] {
         let mut counts = [0u32; 3];
         for rec in tasks.values() {
             if rec.engine_tid.is_none() && !reservations.contains(&rec.task.id) {
@@ -418,9 +427,27 @@ impl DaemonState {
     /// 调用时机：定时判定之后（定时任务不受此闸——到点由调度循环按当时配额激活）；
     /// engine_for 解析之后（引擎不可用直接报错，不占槽不入队）。
     pub(super) fn gate_or_enqueue(&self, task: &DownloadTask, kind: EngineKind) -> bool {
-        if let Some(limit) = self.queue_limit_of(kind) {
-            if self.active_slot_counts()[Self::slot_index(kind)] >= limit {
-                let task_id = task.id.clone();
+        // 并发正确性修复（第三轮审查后 flaky 实证）：计数检查与记录插入/
+        // 预留登记必须在同一 tasks 临界区内完成。原实现三步分离：
+        //   ① active_slot_counts()（检查） ② tasks.insert（插入）
+        //   ③ slot_reservations.insert（登记）
+        // ①与②③之间存在窗口：并发 add B 在 A 已执行②未执行③时计数——A 的
+        // 占位记录 engine_tid=None 且不在预留集 → 被漏计 → B 过闸 → 超卖
+        // （slot_reservation_closes_inflight_oversell 5 次 2 次失败即此竞态）。
+        // 修复：持 tasks 锁完成「计数 + 插入 + 登记」三步原子化；
+        // autosave/publish 保持在锁外（Bug B：autosave 重入 tasks 锁自死锁）。
+        let task_id = task.id.clone();
+        let limit = self.queue_limit_of(kind);
+        let reserved = {
+            let mut tasks = self.tasks.lock();
+            let full = limit
+                .map(|l| {
+                    Self::active_slot_counts_locked(&tasks, &self.slot_reservations.lock())
+                        [Self::slot_index(kind)]
+                        >= l
+                })
+                .unwrap_or(false);
+            if full {
                 let mut rec = TaskRecord {
                     seeding_since: None,
                     task: task.clone(),
@@ -432,37 +459,35 @@ impl DaemonState {
                 rec.push_event(
                     "add",
                     Some(format!(
-                        "queue_wait: {kind:?} 并发配额已满（{limit}），槽位空闲后自动递补"
+                        "queue_wait: {kind:?} 并发配额已满（{}），槽位空闲后自动递补",
+                        limit.unwrap_or(0)
                     )),
                 );
-                self.tasks.lock().insert(task_id.clone(), rec);
-                self.autosave();
-                self.hub.publish(SchedulerEvent::TaskCreated {
-                    task_id: task_id.clone(),
-                });
-                return false;
+                tasks.insert(task_id.clone(), rec);
+                false
+            } else {
+                // batch7-P1：有槽位或不限配额 → 同步预留（占位记录 + 预留集
+                // 登记）。不限配额同样占位：attach 的 double-check 依赖占位
+                // 记录存在（缺失 = 用户已移除，正确回滚），不可省略。
+                let mut rec = TaskRecord {
+                    seeding_since: None,
+                    task: task.clone(),
+                    engine_tid: None,
+                    engine_kind: kind,
+                    engine_status: None,
+                    events: vec![],
+                };
+                rec.push_event("add", Some("slot_reserve: 引擎接入中".into()));
+                tasks.insert(task_id.clone(), rec);
+                self.slot_reservations.lock().insert(task_id.clone());
+                true
             }
-        }
-        // batch7-P1：有槽位或不限配额 → 同步预留（占位记录 + 预留集登记）。
-        // 不限配额同样占位：attach 的 double-check 依赖占位记录存在
-        // （缺失 = 用户已移除，正确回滚），不可省略。
-        let task_id = task.id.clone();
-        let mut rec = TaskRecord {
-            seeding_since: None,
-            task: task.clone(),
-            engine_tid: None,
-            engine_kind: kind,
-            engine_status: None,
-            events: vec![],
         };
-        rec.push_event("add", Some("slot_reserve: 引擎接入中".into()));
-        self.tasks.lock().insert(task_id.clone(), rec);
-        self.slot_reservations.lock().insert(task_id.clone());
         self.autosave();
         self.hub.publish(SchedulerEvent::TaskCreated {
             task_id: task_id.clone(),
         });
-        true
+        reserved
     }
 
     /// engine.add 成功后句柄落位（batch7-P1）：预留记录 attach 句柄 + 状态

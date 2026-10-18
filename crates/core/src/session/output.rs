@@ -24,12 +24,23 @@ pub fn sanitize_rel(rel: &str) -> Result<PathBuf, OutputError> {
             _ => return Err(OutputError::UnsafePath(rel.into())),
         }
     }
+    // P1-1 修复：裸 CurDir 路径（"." / "./"）——file_name() 为 None，
+    // 此前整块保留名/尾点校验被跳过，且 dest_root.join(".") 指向 root 自身：
+    // finalize 时 dest 是目录，metadata().len() 为目录长度，若恰等于
+    // expected_size 则走幂等短路 → remove_file(目录) 失败被吞 → 静默「成功」
+    // 但文件未落位。放行 CurDir 前导（"./x"）保持兼容，但无末段的裸 CurDir
+    // 一律拒绝（dest 必须指向具体文件）。
+    if pb.file_name().is_none() {
+        return Err(OutputError::UnsafePath(rel.into()));
+    }
     // batch8（P3）：Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9，
     // 含 `CON.txt` 形式）与末段尾点/尾空格——Windows 落盘成设备或产生
     // 异常文件。仅校验最后一段（中间目录段同规则会拒合法远端目录名）。
     if let Some(name) = pb.file_name().and_then(|n| n.to_str()) {
+        // P1-2 修复：Windows 设备名比较忽略尾随空格与点——"con .txt"
+        // 与 "con.txt" 在 Win32 语义上等价。stem 先 trim 再比对。
         let stem = name.split('.').next().unwrap_or(name);
-        let upper = stem.to_ascii_uppercase();
+        let upper = stem.trim_end_matches([' ', '.']).to_ascii_uppercase();
         const RESERVED: [&str; 22] = [
             "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
             "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
@@ -219,6 +230,26 @@ mod sanitize_tests {
         assert!(sanitize_rel("a/../../x").is_err());
         assert!(sanitize_rel("..").is_err());
         assert!(sanitize_rel("").is_err());
+    }
+
+    /// P1-1 回归：裸 CurDir 路径必须拒绝——dest 不得指向 dest_root 自身。
+    /// 修复前："." / "./" 被放行且 file_name() 为 None → 保留名校验整块被跳过。
+    #[test]
+    fn sanitize_rejects_bare_curdir() {
+        assert!(sanitize_rel(".").is_err(), "'.' 必须拒绝（dest=root 自身）");
+        assert!(sanitize_rel("./").is_err(), "'./' 必须拒绝");
+        // 前导 ./ + 正常文件名保持兼容
+        assert!(sanitize_rel("./x.bin").is_ok());
+    }
+
+    /// P1-2 回归：Windows 设备名比较忽略尾随空格——"con .txt" 必须拒绝。
+    #[test]
+    fn sanitize_rejects_reserved_name_with_trailing_space() {
+        assert!(sanitize_rel("con .txt").is_err(), "'con .txt' Win32 等价设备名");
+        assert!(sanitize_rel("COM1 .txt").is_err());
+        // 合法名不受影响
+        assert!(sanitize_rel("console .bin").is_ok());
+        assert!(sanitize_rel("my com1.txt").is_ok());
     }
 
     #[test]

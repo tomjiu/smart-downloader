@@ -373,14 +373,17 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     #[cfg(feature = "bt")]
     let (alert_handle, state_arc) = {
         let state_arc = Arc::new(state);
-        let handle = bt_core.map(|core| {
-            crate::bt_events::spawn_alert_loop(
-                state_arc.clone(),
-                core,
-                Duration::from_millis(500),
-                bt_typed.clone(),
-            )
-        });
+        // P0-3：spawn_alert_loop 收紧为必传 BtEngine（bt_core=Some ⟺
+        // bt_typed=Same 同块装配，unwrap 语义安全）
+        let handle = bt_typed
+            .clone()
+            .map(|bt| {
+                crate::bt_events::spawn_alert_loop(
+                    state_arc.clone(),
+                    bt,
+                    Duration::from_millis(500),
+                )
+            });
         (handle, state_arc)
     };
     #[cfg(not(feature = "bt"))]

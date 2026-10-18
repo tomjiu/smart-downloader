@@ -88,19 +88,23 @@ fn parse_minimal_single_file_torrent() {
 
 #[test]
 fn parse_multi_file() {
-    // 多文件 torrent 应被解析（files 列表含 2 个文件）
+    // 多文件 torrent 应被解析（files 列表含 2 个文件）。
+    // P0-1 回归修复：fixture 改用真实 bencode 字典序键序
+    // （files < name < piece length < pieces）——旧 fixture 把 piece length
+    // 手工写在 files 之前（非法键序），恰好绕开了除零缺陷，测试恒绿但线上必炸。
+    // 真实种子（mktorrent/libtorrent/Transmission）全部按字典序生成。
     let mut torrent = Vec::new();
     torrent.extend_from_slice(b"d4:infod"); // 顶层 + info dict
-    torrent.extend_from_slice(b"12:piece lengthi16384e"); // piece length
-    torrent.extend_from_slice(b"6:pieces20:"); // pieces (1 piece)
-    torrent.extend_from_slice(&[0u8; 20]);
-    torrent.extend_from_slice(b"4:name8:multidir"); // name
-    torrent.extend_from_slice(b"5:filesl"); // files list
+    torrent.extend_from_slice(b"5:filesl"); // files list（字典序首位）
                                             // 文件1: length=10, path=["a"]
     torrent.extend_from_slice(b"d6:lengthi10e4:pathl1:aee");
     // 文件2: length=20, path=["b"]
     torrent.extend_from_slice(b"d6:lengthi20e4:pathl1:bee");
     torrent.extend_from_slice(b"e"); // end files list
+    torrent.extend_from_slice(b"4:name8:multidir"); // name
+    torrent.extend_from_slice(b"12:piece lengthi16384e"); // piece length
+    torrent.extend_from_slice(b"6:pieces20:"); // pieces (1 piece)
+    torrent.extend_from_slice(&[0u8; 20]);
     torrent.extend_from_slice(b"ee"); // end info dict + top dict
 
     let meta = TorrentMeta::parse(&torrent).unwrap();
@@ -109,22 +113,77 @@ fn parse_multi_file() {
     assert_eq!(meta.files[0].size, 10);
     assert_eq!(meta.files[1].path, "b");
     assert_eq!(meta.files[1].size, 20);
+    // 偏移验证：文件1 起 0，占 1 piece；文件2 起 piece 0（10B + 16KiB 对齐后仍在 piece 0），占 1 piece
+    assert_eq!(meta.files[0].piece_offset, 0);
+    assert_eq!(meta.files[1].piece_offset, 0);
+}
+
+/// P0-1 直接回归：真实字典序多文件 torrent（files 在 piece length 之前）
+/// 不得除零 panic。修复前：`total_size / plen` 在 plen=0 时 panic。
+#[test]
+fn parse_multi_file_real_dict_order_no_panic() {
+    let mut torrent = Vec::new();
+    torrent.extend_from_slice(b"d4:infod");
+    torrent.extend_from_slice(b"5:filesl"); // files 最先（字典序）
+    torrent.extend_from_slice(b"d6:lengthi1000e4:pathl1:aee");
+    torrent.extend_from_slice(b"d6:lengthi2000e4:pathl1:bee");
+    torrent.extend_from_slice(b"e");
+    torrent.extend_from_slice(b"4:name4:root");
+    torrent.extend_from_slice(b"12:piece lengthi16384e");
+    torrent.extend_from_slice(b"6:pieces20:");
+    torrent.extend_from_slice(&[0u8; 20]);
+    torrent.extend_from_slice(b"ee");
+
+    let meta = TorrentMeta::parse(&torrent).expect("真实键序多文件 torrent 必须解析成功");
+    assert_eq!(meta.files.len(), 2);
+    assert_eq!(meta.piece_length, 16384);
+}
+
+/// piece_length 超上限（16 MiB）拒绝——防下游偏移计算溢出回绕。
+#[test]
+fn parse_rejects_oversized_piece_length() {
+    let mut torrent = Vec::new();
+    torrent.extend_from_slice(b"d4:infod");
+    torrent.extend_from_slice(b"6:lengthi100e");
+    torrent.extend_from_slice(b"4:name4:test");
+    torrent.extend_from_slice(b"12:piece lengthi16777217e"); // 16MiB + 1
+    torrent.extend_from_slice(b"6:pieces20:");
+    torrent.extend_from_slice(&[0u8; 20]);
+    torrent.extend_from_slice(b"ee");
+    assert!(TorrentMeta::parse(&torrent).is_err());
+}
+
+/// files 累计大小溢出 u64 拒绝（P0-11 同源防护，daemon 侧）。
+#[test]
+fn parse_rejects_files_total_overflow() {
+    let mut torrent = Vec::new();
+    torrent.extend_from_slice(b"d4:infod5:filesl");
+    torrent.extend_from_slice(b"d6:lengthi9223372036854775807e4:pathl1:aee");
+    torrent.extend_from_slice(b"d6:lengthi9223372036854775807e4:pathl1:bee");
+    torrent.extend_from_slice(b"d6:lengthi9223372036854775807e4:pathl1:cee");
+    torrent.extend_from_slice(b"e");
+    torrent.extend_from_slice(b"4:name4:root");
+    torrent.extend_from_slice(b"12:piece lengthi16384e");
+    torrent.extend_from_slice(b"6:pieces20:");
+    torrent.extend_from_slice(&[0u8; 20]);
+    torrent.extend_from_slice(b"ee");
+    assert!(TorrentMeta::parse(&torrent).is_err(), "累计溢出必须报错而非回绕");
 }
 
 #[test]
 fn precheck_total_multi_file_sums_files() {
     // 多文件 torrent：预检总量 = 各文件 size 之和（torrent_total_size 遇 files
-    // 返回 None，此处验证升级后 parse 路径生效）
+    // 返回 None，此处验证升级后 parse 路径生效）。
+    // fixture 采用真实字典序键序（P0-1 回归同步修正）。
     let mut torrent = Vec::new();
-    torrent.extend_from_slice(b"d4:infod");
-    torrent.extend_from_slice(b"12:piece lengthi16384e");
-    torrent.extend_from_slice(b"6:pieces20:");
-    torrent.extend_from_slice(&[0u8; 20]);
-    torrent.extend_from_slice(b"4:name8:multidir");
-    torrent.extend_from_slice(b"5:filesl");
+    torrent.extend_from_slice(b"d4:infod5:filesl");
     torrent.extend_from_slice(b"d6:lengthi10e4:pathl1:aee");
     torrent.extend_from_slice(b"d6:lengthi20e4:pathl1:bee");
     torrent.extend_from_slice(b"e");
+    torrent.extend_from_slice(b"4:name8:multidir");
+    torrent.extend_from_slice(b"12:piece lengthi16384e");
+    torrent.extend_from_slice(b"6:pieces20:");
+    torrent.extend_from_slice(&[0u8; 20]);
     torrent.extend_from_slice(b"ee");
     assert_eq!(torrent_precheck_total(&torrent), Some(30));
 }
@@ -190,16 +249,16 @@ mod xunlei_import_tests {
     #[tokio::test]
     async fn add_xunlei_import_task_requires_matching_xltds() {
         // 多文件 torrent（2 文件）传入 0 个 xltd → 数量不匹配
+        // fixture 采用真实字典序键序（P0-1 回归同步修正）
         let mut torrent = Vec::new();
-        torrent.extend_from_slice(b"d4:infod");
-        torrent.extend_from_slice(b"12:piece lengthi16384e");
-        torrent.extend_from_slice(b"6:pieces20:");
-        torrent.extend_from_slice(&[0u8; 20]);
-        torrent.extend_from_slice(b"4:name8:multidir");
-        torrent.extend_from_slice(b"5:filesl");
+        torrent.extend_from_slice(b"d4:infod5:filesl");
         torrent.extend_from_slice(b"d6:lengthi10e4:pathl1:aee");
         torrent.extend_from_slice(b"d6:lengthi20e4:pathl1:bee");
         torrent.extend_from_slice(b"e");
+        torrent.extend_from_slice(b"4:name8:multidir");
+        torrent.extend_from_slice(b"12:piece lengthi16384e");
+        torrent.extend_from_slice(b"6:pieces20:");
+        torrent.extend_from_slice(&[0u8; 20]);
         torrent.extend_from_slice(b"ee");
 
         let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
