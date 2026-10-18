@@ -11,7 +11,7 @@ use crate::ledger;
 use crate::range::{multi_source_ok, probe_range, Probe};
 use crate::rate::{RateLimiter, RateSample};
 use crate::segment_manager::DEFAULT_MIN_SPLIT;
-use crate::verify::{verify_file, verify_file_md5, verify_file_sha1};
+use crate::verify::{verify_file, verify_file_md5, verify_file_sha1, verify_nonempty_blocks};
 use parking_lot::{Mutex, RwLock};
 use smart_dl_core::identity::ContentIdentity;
 use smart_dl_core::session::output::OutputManager;
@@ -736,7 +736,13 @@ async fn download_loop(
                     (Some(expected), _, _) => verify_file(&part, expected),
                     (None, Some(expected), _) => verify_file_sha1(&part, expected),
                     (None, None, Some(expected)) => verify_file_md5(&part, expected),
-                    (None, None, None) => Ok(true),
+                    // P0-4 修复（防御纵深层）：无摘要时不再恒通过——块分配
+                    // 检测捕获「set_len 预分配 + 磁盘满/崩溃导致零写入」的
+                    // 空洞文件（完全稀疏 = blocks == 0 = 从未写入任何字节，
+                    // 长度检查因预分配天然相等而失效）。部分空洞由段级 fsync
+                    // 顺序保证（download.rs）防住。合法全零内容文件写入后
+                    // blocks > 0（write 总是分配块），不误报。
+                    (None, None, None) => verify_nonempty_blocks(&part),
                 };
                 match verify_result {
                     Ok(true) => {
@@ -841,21 +847,29 @@ async fn download_loop(
                             remove_part(&part);
                             continue;
                         }
-                        // 备用源与轮换池均耗尽（或未配置）→ 降级接受 + 告警（Q-B5）；
+                        // 备用源与轮换池均耗尽（或未配置）→ 文件落位但标记失败
+                        //（P2-19 修复：哈希不符是内容损坏的硬证据，标
+                        // Completed 会误导用户以为文件完好；Error 终态保留
+                        // 已落位文件 + 明示原因，用户可人工核验或 resume 重试。
                         // 告警点名当前生效算法（E25：sha256/sha1/md5 择一）
-                        let warn = if sha1.is_some() {
-                            "sha1 mismatch, accepted downgrade".to_string()
+                        let algo = if sha1.is_some() {
+                            "sha1"
                         } else if md5.is_some() {
-                            "md5 mismatch, accepted downgrade".to_string()
+                            "md5"
                         } else {
-                            "sha256 mismatch, accepted downgrade".to_string()
+                            "sha256"
                         };
+                        let reason = format!(
+                            "{algo} mismatch after all sources exhausted: \
+                             文件已落位但校验不符（疑似内容损坏），请人工核验: {}",
+                            dest.display()
+                        );
                         match finalize_part(&part, &dest, total) {
                             Ok(()) => {
                                 cleanup_old_parts(&dest, gen);
                                 // 落位完成 → 清理续传凭据（.part 已改名，etag 副文件 + 段账本删除）
                                 remove_credentials(&part);
-                                finish(&inner, &tid, EngineState::Completed, Some(warn));
+                                finish(&inner, &tid, EngineState::Error, Some(reason));
                                 return;
                             }
                             Err(e) => {
@@ -938,14 +952,45 @@ pub fn url_basename(url: &str) -> Option<String> {
     }
 }
 
-/// .part → 目标落位。换源/重下场景 dest 可能已有旧内容且大小相同
-/// （OutputManager::finalize_to 的幂等短路会直接 Ok 不覆盖）→ 先删 dest 强制落位。
+/// .part → 目标落位（Bug C + P2-17 双语义收敛）：
+/// - Bug C：dest 已有同大小旧内容（BT 抢先下完同名文件）时必须被 .part
+///   真实内容**覆盖**，不得走 OutputManager::finalize_to 的幂等短路
+///   （同大小 → 保留旧文件）。
+/// - P2-17：不得「先删 dest 再 rename」——rename 失败（跨卷）且 copy
+///   兜底也失败时旧文件已被删（数据丢失窗口）。
+/// 收敛方案：直接 rename——std::fs::rename 在 Unix 与 Windows
+/// （MOVEFILE_REPLACE_EXISTING）均原子覆盖已存在目标，既无预删窗口、
+/// 又天然覆盖旧内容；跨卷失败 → copy 覆盖 + 校验 + 删源（源 .part 在
+/// copy 成功前永不删除，双失败时旧 dest 与 .part 均完好）。
 fn finalize_part(part: &Path, dest: &Path, total: u64) -> Result<(), String> {
-    if let Err(e) = std::fs::remove_file(dest) {
-        tracing::warn!("finalize_part: 删除目标文件失败 {dest:?}: {e}");
+    // 幂等：part 已不存在且 dest 大小一致（完成信号重放）→ Ok
+    if !part.exists() {
+        if let Ok(md) = std::fs::metadata(dest) {
+            if md.len() == total {
+                return Ok(());
+            }
+        }
+        return Err(format!("part 缺失: {part:?}"));
     }
-    let om = OutputManager::new(PathBuf::from("."));
-    om.finalize_to(part, dest, total).map_err(|e| e.to_string())
+    let plen = std::fs::metadata(part).map_err(|e| e.to_string())?.len();
+    if plen != total {
+        return Err(format!("part 大小 {plen} != 期望 {total}"));
+    }
+    match std::fs::rename(part, dest) {
+        Ok(()) => Ok(()),
+        // 跨卷（EXDEV 等）→ copy 覆盖 + 长度校验 + 删源；失败保留 .part
+        Err(e) => {
+            std::fs::copy(part, dest).map_err(|e2| {
+                format!("rename {e} 后 copy fallback 也失败: {e2}（.part 与旧 dest 均保留）")
+            })?;
+            let dl = std::fs::metadata(dest).map_err(|e| e.to_string())?.len();
+            if dl != total {
+                return Err(format!("copy 后大小 {dl} != {total}"));
+            }
+            std::fs::remove_file(part).map_err(|e| e.to_string())?;
+            Ok(())
+        }
+    }
 }
 
 /// .part 路径：gen0 → `<dest>.part`（续传语义）；gen≥1 → `<dest>.<gen>.part`
@@ -974,12 +1019,14 @@ fn remove_part(part: &Path) {
     remove_credentials(part);
 }
 
-/// 审查修复（P1）：delete_data=true 的落盘清理——dest 本体 + 各代次 .part
-/// 加全部续传凭据（etag 副文件/段账本/HLS/DASH ledger）。换源残留的旧代次
-/// part 一并回收（gen0 常态 + 1..=3 防御性枚举，cleanup_old_parts 最多留一代）。
+/// 审查修复（P1 + batch10）：delete_data=true 的落盘清理——dest 本体 + 各代次
+/// .part 加全部续传凭据（etag 副文件/段账本/HLS/DASH ledger）。换源残留的旧
+/// 代次 part 一并回收。枚举上限 255（旧实现 0..=3 令 gen≥4 的 .part +
+/// .progress 永久泄漏——rotate_pool 多轮换源可到任意 gen；255 已远超实际
+/// 轮换深度，且逐次 exists() 探测开销可忽略）。
 fn delete_task_files(dest: &Path) {
     let _ = std::fs::remove_file(dest);
-    for g in 0..=3u64 {
+    for g in 0..=255u64 {
         let part = part_path_of(dest, g);
         if !part.exists() {
             continue;
@@ -1629,9 +1676,21 @@ impl DownloadEngine for HttpEngine {
         if t.stream != StreamKind::Plain {
             return Err(EngineError::Unsupported);
         }
-        let etag_changed = probe.etag.is_some() && t.etag.is_some() && probe.etag != t.etag;
+        // P0-5 修复：换源作废判定与段账本 resume（ledger::decide）同口径。
+        // 原实现仅「双方 ETag 均存在且不等」才作废——主流无 ETag CDN 上
+        // 恒 false，直接用旧源段账本续传新源（跨源混拼 = 静默数据损坏）。
+        // 新口径（宁枉勿纵，与 ledger::fingerprint_ok 决策矩阵一致）：
+        // - total 不一致 → 作废（源变小/变大即内容变化证据）
+        // - 任一指纹 saved 有而 fresh 无 → 作废（指纹消失，无法确认未变）
+        // - 双方指纹存在且不等 → 作废（内容变化证据）
+        // - saved 本就无该指纹 → 放行（无从核对；total 核对已把关）
+        let total_changed = probe.total.is_some_and(|pt| t.total != pt);
+        let etag_mismatch = !crate::ledger::fingerprint_ok(&t.etag, &probe.etag);
+        let lm_mismatch =
+            !crate::ledger::fingerprint_ok(&t.last_modified, &probe.last_modified);
+        let etag_changed = total_changed || etag_mismatch || lm_mismatch;
         if etag_changed {
-            // 新源内容变了 → 旧代次 .part 作废，重下（Q-B5：ETag 为准）。
+            // 新源内容变了 → 旧代次 .part 作废，重下（Q-B5：指纹为准）。
             // gen+1 → 新循环用 `<dest>.<gen>.part`，与旧循环写隔离。
             remove_part(&part_path_of(&t.dest, t.gen));
             t.done = 0;
@@ -1643,12 +1702,11 @@ impl DownloadEngine for HttpEngine {
         t.mirrors = urls.clone();
         // 新候选宇宙 → 轮换池重置（E3：旧池候选集合已过时）
         t.rotate_pool.clear();
-        if let Some(e) = &probe.etag {
-            t.etag = Some(e.clone());
-        }
-        // E26：Last-Modified 与 etag 同口径（探测有则更新，账本随写随持久化）
-        if let Some(lm) = &probe.last_modified {
-            t.last_modified = Some(lm.clone());
+        // E26：指纹随新源更新（无论是否作废——下轮 resume 以新源为准）
+        t.etag = probe.etag.clone();
+        t.last_modified = probe.last_modified.clone();
+        if let Some(pt) = probe.total {
+            t.total = pt;
         }
         let (spawn, new_gen, epoch) = if etag_changed {
             (true, t.gen, t.epoch)

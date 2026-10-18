@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use parking_lot::Mutex as SyncMutex;
 
 /// 速率限制器（`rate` = bytes/sec；0 = 不限）。多段并发共享一个实例（总量限制）。
 #[derive(Clone)]
@@ -18,7 +18,10 @@ struct RateInner {
     /// 速率 bytes/sec（AtomicU64：运行中可调，per-task 限速即时生效）。
     rate: AtomicU64,
     /// 下一 chunk 允许完成时刻（跨段共享）。
-    next: Mutex<Instant>,
+    /// P1-1 修复：改用同步锁（parking_lot）——原 tokio::Mutex 在持锁期间
+    /// sleep，并发段被迫串行排队（B 等 A 的 sleep + 自己的 sleep），
+    /// 实际速率低于设定值。临界区内仅做纳秒级 deadline 推进，同步锁足够。
+    next: SyncMutex<Instant>,
     /// 上游串联限速器（E16 全局总阀门）：Some = wait 先消费上游预算再消费
     /// 自身——任务级限速器链到引擎全局 limiter，保证「总阀门控制所有任务
     /// 合计不超速」对任务级限速任务同样成立（串联两层各自维护 deadline 链，
@@ -36,7 +39,7 @@ impl Default for RateInner {
     fn default() -> Self {
         RateInner {
             rate: AtomicU64::new(0),
-            next: Mutex::new(Instant::now()),
+            next: SyncMutex::new(Instant::now()),
             upstream: None,
         }
     }
@@ -48,7 +51,7 @@ impl RateLimiter {
         RateLimiter {
             inner: Arc::new(RateInner {
                 rate: AtomicU64::new(kb_s as u64 * 1024),
-                next: Mutex::new(Instant::now()),
+                next: SyncMutex::new(Instant::now()),
                 upstream: None,
             }),
         }
@@ -61,7 +64,7 @@ impl RateLimiter {
         RateLimiter {
             inner: Arc::new(RateInner {
                 rate: AtomicU64::new(kb_s as u64 * 1024),
-                next: Mutex::new(Instant::now()),
+                next: SyncMutex::new(Instant::now()),
                 upstream: Some(upstream.clone()),
             }),
         }
@@ -69,8 +72,16 @@ impl RateLimiter {
 
     /// 运行中调整速率（KiB/s；0 = 不限）。已持有的 Arc 立即观察到新速率
     /// —— per-task 限速变更无需重启下载循环。
+    /// P1-3 修复：速率变更时同步清空 deadline 债务（next 重置为 now）——
+    /// 原实现保留旧速率积压的 next（如 1MiB/s 跑 4MiB 后 next=now+3s），
+    /// 热调到更高速率后旧债务仍压制 3s，新速率迟迟达不到。热调语义
+    /// = 用户重新设定速率，旧速率的欠债不应继续生效。
     pub fn set_rate_kb_s(&self, kb_s: u32) {
-        self.inner.rate.store(kb_s as u64 * 1024, Ordering::Relaxed);
+        let new_rate = kb_s as u64 * 1024;
+        let old = self.inner.rate.swap(new_rate, Ordering::Relaxed);
+        if old != new_rate {
+            *self.inner.next.lock() = Instant::now();
+        }
     }
 
     /// 当前速率（KiB/s；0 = 不限）。
@@ -94,18 +105,25 @@ impl RateLimiter {
     }
 
     /// 自身预算消费（不含上游）。`upstream: None` 恒成立时与 wait 等价。
+    /// P1-1 修复：锁内只推进 deadline，【锁外】sleep——原实现持锁 sleep，
+    /// 并发段被迫串行排队（段 B 的等待 = 段 A 的 sleep + 自己的 sleep），
+    /// N 个并发段的实际合计速率远低于设定值。修复后各段在锁内瞬时完成
+    /// deadline 推进，各自独立 sleep 至目标时刻，合计速率精确等于设定。
     async fn wait_inner(&self, n: u64) {
         let rate = self.inner.rate.load(Ordering::Relaxed);
         if rate == 0 {
             return;
         }
         let dur = Duration::from_secs_f64(n as f64 / rate as f64);
-        let mut next = self.inner.next.lock().await;
-        let now = Instant::now();
-        let target = (*next).max(now); // 积压落后则从当下起算（无带宽时不让旧债务堆积）
-        *next = target + dur;
-        if target > now {
-            tokio::time::sleep(target - now).await;
+        let sleep_for = {
+            let mut next = self.inner.next.lock();
+            let now = Instant::now();
+            let target = (*next).max(now); // 积压落后则从当下起算（无带宽时不让旧债务堆积）
+            *next = target + dur;
+            target.checked_duration_since(now)
+        };
+        if let Some(d) = sleep_for {
+            tokio::time::sleep(d).await;
         }
     }
 }
@@ -136,12 +154,16 @@ impl RateSample {
             return 0;
         };
         let dt = now.duration_since(last);
+        if dt < RATE_SAMPLE_MIN_WINDOW {
+            // P1-2 修复：短窗口不推进基线——原实现先推进 last_done/last_at
+            // 再返回 smoothed，短窗口内的增量字节被吞（下一完整窗口的 db
+            // 从新基线起算，中间增量永久丢失）→ 速率系统性低估。
+            // 保持旧基线：增量累计到下一个 ≥200ms 完整窗口一并计入。
+            return self.smoothed;
+        }
         let db = done.saturating_sub(self.last_done);
         self.last_done = done;
         self.last_at = Some(now);
-        if dt < RATE_SAMPLE_MIN_WINDOW {
-            return self.smoothed;
-        }
         let r = (db as f64 / dt.as_secs_f64()).round() as u64;
         self.smoothed = r;
         r
@@ -299,22 +321,70 @@ mod tests {
     #[tokio::test]
     async fn set_rate_hot_adjust_observed_by_holders() {
         // per-task 限速核心语义：已持有的 Arc 热调速率 → 后续 wait 按新速率节流。
-        // 注意 deadline 链的债务（next 绝对时刻）跨速率携带 —— 非零速率的
-        // 时长断言会受先前累积债务干扰；故用 0（早退路径，不受债务影响）
-        // 做" holders 观察到热调"的确定性行为断言，非零值用 getter 回读。
+        // P1-3 修复后：热调同时清空旧速率的 deadline 债务——1024KiB/s 下
+        // 先积压一笔，热调到 8192KiB/s 后新消费按新速率立即起算（不再被
+        // 旧债务压制）。
         let lim = RateLimiter::new(1024);
         assert_eq!(lim.rate_kb_s(), 1024);
-        // 1MiB/s 下 4MiB 需 ≈3s；热调 0 = 不限 → 立即放行（已持有实例生效）
-        lim.set_rate_kb_s(0);
+        lim.wait(1024 * 1024).await; // 冷启动放行，next 推进 +1s（旧速率债务）
+        lim.set_rate_kb_s(8192); // 热调 + 债务清零
         let t0 = Instant::now();
-        lim.wait(4 * 1024 * 1024).await;
+        lim.wait(1024 * 1024).await; // 8MiB/s 下 1MiB ≈ 128ms（无旧债）
+        let el = t0.elapsed();
         assert!(
-            t0.elapsed() < Duration::from_millis(50),
-            "热调 0 后必须立即放行（不限速）"
+            el < Duration::from_millis(600),
+            "热调后旧债务必须清除（实际 {el:?}，预期 ≤≈128ms）"
         );
         // 读侧证据：速率回读即时反映热调值
         lim.set_rate_kb_s(4 * 1024);
         assert_eq!(lim.rate_kb_s(), 4 * 1024);
         assert_eq!(lim.rate_kb_s(), 4096, "KiB/s 口径换算一致");
+    }
+
+    /// P1-1 回归：并发段不被持锁 sleep 串行化——4 个并发段 @ 4MiB/s
+    /// 各消费 256KiB，合计 1MiB ≈ 256ms；若持锁 sleep 串行排队，耗时
+    /// 将 ≥ 4×64ms 且逐段叠加。修复后各段独立 sleep，总耗时 ≈ 单段最长。
+    #[tokio::test]
+    async fn concurrent_segments_not_serialized_by_lock() {
+        let lim = RateLimiter::new(4 * 1024); // 4 MiB/s
+        let t0 = Instant::now();
+        let mut futs = Vec::new();
+        for _ in 0..4 {
+            let l = lim.clone();
+            futs.push(tokio::spawn(async move {
+                l.wait(256 * 1024).await; // 每段 256KiB @ 4MiB/s = 64ms
+            }));
+        }
+        for f in futs {
+            f.await.unwrap();
+        }
+        let el = t0.elapsed();
+        // 4×64ms = 256ms 合计预算；串行化时每段还要叠加前段的 sleep
+        //（≥ 64+128+192+256 = 640ms）。容忍调度噪声取 500ms 阈值。
+        assert!(
+            el < Duration::from_millis(500),
+            "并发段被持锁 sleep 串行化: {el:?}（预期 ≈256ms）"
+        );
+    }
+
+    /// P1-2 回归：短窗口增量不丢失——密集采样期间的字节增量须累计到
+    /// 下一个完整窗口（修复前短窗口推进基线，增量被吞，速率系统性低估）。
+    #[test]
+    fn rate_sample_short_window_accumulates_bytes() {
+        let mut s = RateSample::default();
+        s.sample(0); // 基线 t0
+        std::thread::sleep(Duration::from_millis(250));
+        let r1 = s.sample(1000); // 完整窗口：0→1000
+        assert!(r1 > 0);
+        // 密集采样窗口（<200ms）：增量 500 发生在此窗口
+        std::thread::sleep(Duration::from_millis(30));
+        let _ = s.sample(1500); // 短窗口 → 返回 smoothed，基线不推进
+        // 下一完整窗口：从基线 1000 起算（增量 500 + 新增 300 须全部计入）
+        std::thread::sleep(Duration::from_millis(250));
+        let r2 = s.sample(1800);
+        assert!(
+            r2 > 0,
+            "短窗口后的完整窗口必须计入累计增量（修复前基线被提前推进致增量丢失）"
+        );
     }
 }

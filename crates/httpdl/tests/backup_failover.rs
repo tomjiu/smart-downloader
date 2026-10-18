@@ -86,10 +86,11 @@ async fn backup_also_bad_downgrades_with_warning() {
     );
     let tid = engine.add(&task).await.unwrap();
     let st = wait_terminal(&engine, &tid).await;
-    assert_eq!(st.state, EngineState::Completed, "备用源也失败 → 降级接受");
+    // P2-19：Error 终态（文件已落位但明示校验不符）
+    assert_eq!(st.state, EngineState::Error, "备用源也失败 → 校验不符不得标 Completed");
     assert!(
         st.error.as_deref().unwrap_or("").contains("md5"),
-        "备用源 md5 不匹配必须告警"
+        "备用源 md5 不匹配必须在错误信息点名"
     );
 }
 
@@ -164,10 +165,11 @@ async fn no_backup_keeps_legacy_downgrade_path() {
     );
     let tid = engine.add(&task).await.unwrap();
     let st = wait_terminal(&engine, &tid).await;
-    assert_eq!(st.state, EngineState::Completed);
+    // P2-19：Error 终态（原降级接受语义收敛）
+    assert_eq!(st.state, EngineState::Error, "校验不符不得标 Completed");
     assert!(
         st.error.as_deref().unwrap_or("").contains("sha256"),
-        "无备用源 → 保留原 sha256 降级告警"
+        "无备用源 → 保留原 sha256 校验失败语义"
     );
 }
 

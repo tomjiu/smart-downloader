@@ -63,13 +63,16 @@ async fn sha256_mismatch_redownloads_then_downgrades_with_warning() {
     );
     let tid = engine.add(&task).await.unwrap();
     let st = wait_terminal(&engine, &tid).await;
-    assert_eq!(st.state, EngineState::Completed, "降级接受仍算完成");
+    // P2-19 修复：哈希不符 → Error 终态（文件已落位但明示损坏，不再伪装 Completed）
+    assert_eq!(st.state, EngineState::Error, "校验不符不得标 Completed");
     assert!(
         st.error.as_deref().unwrap_or("").contains("sha256"),
-        "必须告警 sha256 不匹配"
+        "错误信息必须点名 sha256"
     );
     // 重下 1 次语义：verify 至少尝试过（请求数 > 段数）
     assert!(srv.request_count.load(std::sync::atomic::Ordering::SeqCst) > 2);
+    // 文件已落位（保留供人工核验）
+    assert!(dir.path().join("bad.bin").exists(), "落盘文件应保留供人工核验");
 }
 
 #[tokio::test]
@@ -203,10 +206,11 @@ async fn sha1_mismatch_redownloads_then_downgrades_with_sha1_warning() {
     );
     let tid = engine.add(&task).await.unwrap();
     let st = wait_terminal(&engine, &tid).await;
-    assert_eq!(st.state, EngineState::Completed, "降级接受仍算完成");
+    // P2-19：Error 终态 + 点名 sha1
+    assert_eq!(st.state, EngineState::Error, "校验不符不得标 Completed");
     assert!(
         st.error.as_deref().unwrap_or("").contains("sha1"),
-        "告警必须点名 sha1: {:?}",
+        "错误信息必须点名 sha1: {:?}",
         st.error
     );
     assert!(!st.error.as_deref().unwrap_or("").contains("md5"));
@@ -234,10 +238,11 @@ async fn md5_mismatch_downgrades_with_md5_warning() {
     );
     let tid = engine.add(&task).await.unwrap();
     let st = wait_terminal(&engine, &tid).await;
-    assert_eq!(st.state, EngineState::Completed, "降级接受仍算完成");
+    // P2-19：Error 终态 + 点名 md5
+    assert_eq!(st.state, EngineState::Error, "校验不符不得标 Completed");
     assert!(
         st.error.as_deref().unwrap_or("").contains("md5"),
-        "告警必须点名 md5: {:?}",
+        "错误信息必须点名 md5: {:?}",
         st.error
     );
 }

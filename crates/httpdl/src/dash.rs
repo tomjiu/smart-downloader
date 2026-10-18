@@ -1065,13 +1065,26 @@ fn load_ledger(path: &Path) -> Option<DashLedger> {
 }
 
 fn save_ledger(path: &Path, ld: &DashLedger) {
+    // P1-7 修复（batch8 漏改同步）：唯一 tmp 名（纳秒后缀）+ 0600——
+    // 固定 `.tmp` 名下多 worker 并发 save 互踩（ledger.rs 已修，此处漏改）。
     if let Ok(json) = serde_json::to_vec(ld) {
-        let tmp = {
-            let mut s = path.as_os_str().to_os_string();
-            s.push(".tmp");
-            PathBuf::from(s)
-        };
+        let unique = format!(
+            "dash.tmp.{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let tmp = path.with_extension(unique);
         if std::fs::write(&tmp, &json).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &tmp,
+                    std::fs::Permissions::from_mode(0o600),
+                );
+            }
             let _ = std::fs::rename(&tmp, path);
         }
     }
