@@ -463,6 +463,16 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
                 }
                 match toml::from_str::<Config>(&text) {
                     Ok(new_cfg) => {
+                        // 审查修复（batch10-F）：热重载与启动同校验口径——
+                        // 原实现裸解析绕过全部语义校验（负 share_ratio 等
+                        // 启动被拒的值热重载静默生效）。
+                        if let Err(e) = new_cfg.validate() {
+                            tracing::warn!(
+                                "配置热重载校验失败（保留旧配置）: {e}"
+                            );
+                            last = Some(text);
+                            continue;
+                        }
                         st.refresh_config(&new_cfg, &tasks);
                         // E16：限速总阀门随热重载生效（文件为准——与 dest_root
                         // 同口径）；值无变化时 apply 内部 no-op，无事件噪声。

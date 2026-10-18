@@ -412,30 +412,38 @@ impl Config {
         };
         let text = std::fs::read_to_string(p).map_err(|e| format!("读取配置 {p:?} 失败: {e}"))?;
         let cfg: Config = toml::from_str(&text).map_err(|e| format!("配置解析失败 {p:?}: {e}"))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// 语义校验（启动与热重载同口径——审查修复：热重载原走裸 toml::from_str
+    /// 绕过全部校验，`bt.max_share_ratio = -1.0` 启动被拒却热重载接受，
+    /// 负阈值使分享率达标记恒真 → 任务一进 Seeding 立刻暂停）。
+    pub fn validate(&self) -> Result<(), String> {
         // bt.encrypt 三态校验（fail-fast：未知值启动即报错，不等到引擎装配）。
         // 合法值口径须与 btcore::engine::parse_encrypt_policy 一致（btcore 是
         // feature 门控依赖，config 不能引用其类型，此处本地同步白名单）。
-        if !matches!(cfg.bt.encrypt.trim(), "disable" | "allow" | "require") {
+        if !matches!(self.bt.encrypt.trim(), "disable" | "allow" | "require") {
             return Err(format!(
                 "配置 bt.encrypt = {:?} 无效：仅支持 disable / allow / require",
-                cfg.bt.encrypt
+                self.bt.encrypt
             ));
         }
         // 做种分享率上限（qbit Share Ratio Limit）：负数/NaN/超上限 → 拒绝启动
-        if !(0.0..=9999.0).contains(&cfg.bt.max_share_ratio) {
+        if !(0.0..=9999.0).contains(&self.bt.max_share_ratio) {
             return Err(format!(
                 "配置 bt.max_share_ratio = {} 无效：须在 0.0..=9999.0（0 = 不启用）",
-                cfg.bt.max_share_ratio
+                self.bt.max_share_ratio
             ));
         }
         // 做种时长上限（分钟）：超上限 → 拒绝启动
-        if cfg.bt.max_seeding_time_min > 999_999 {
+        if self.bt.max_seeding_time_min > 999_999 {
             return Err(format!(
                 "配置 bt.max_seeding_time_min = {} 无效：须在 0..=999999（0 = 不启用）",
-                cfg.bt.max_seeding_time_min
+                self.bt.max_seeding_time_min
             ));
         }
-        Ok(cfg)
+        Ok(())
     }
 
     /// 判定 addr 是否仅绑定回环地址（127.x/::1/localhost）。

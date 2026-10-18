@@ -25,12 +25,25 @@ pub fn write_tasks_atomic(path: &Path, tasks: &[PersistedTask]) -> std::io::Resu
     let tmp = path.with_file_name(tmp_name);
     let write_guard = TmpWriteGuard { path: tmp.clone() };
     let res = (|| {
-        std::fs::write(&tmp, &json)?;
+        // 审计修复（batch10-F）：0600 先建后写（原 fs::write 后 chmod 存在
+        // 凭据可读窗口）+ 文件 fsync（原无 fsync：rename 先于数据落盘时
+        // 掉电后 tasks.json 0 字节 → 全部任务丢失——Config::save_to 有
+        // sync_all 而 tasks.json 更重要却漏了，审查模式 A 同构漏改）。
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut f, &json)?;
+        f.sync_all()?;
+        drop(f);
         std::fs::rename(&tmp, path)
     })();
     // rename 成功后 tmp 已不存在，drop guard 无操作；失败时清掉半写 tmp
@@ -80,12 +93,22 @@ pub fn write_bans_atomic(path: &Path, bans: &[String]) -> std::io::Result<()> {
     let tmp = path.with_file_name(tmp_name);
     let write_guard = TmpWriteGuard { path: tmp.clone() };
     let res = (|| {
-        std::fs::write(&tmp, &json)?;
+        // 审计修复（batch10-F）：0600 先建后写 + fsync（同 write_tasks_atomic）
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-        }
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut f, &json)?;
+        f.sync_all()?;
+        drop(f);
         std::fs::rename(&tmp, path)
     })();
     let renamed = res.is_ok();

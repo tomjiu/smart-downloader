@@ -494,18 +494,37 @@ pub async fn nas_proxy(State(_state): State<Arc<DaemonState>>, req: Request) -> 
 
 /// 写 token 预置文件（登录免扫码路径）。
 /// token 内容来自 L1 云登录（xluser OAuth）——格式校准列入假设区实测项。
+/// 审计修复（batch10-F，CWE-312）：0600 先建后写 + fsync——原实现
+/// File::create 默认 0644 落盘 OAuth token（凭据世界可读），且无 fsync
+/// （掉电丢登录态）。对齐 xunlei/auth.rs / quark/types.rs 统一配方。
 pub async fn put_auth_token(mgr: &NasManager, token_json: &str) -> Result<PathBuf, NasError> {
     let home = mgr.cfg.work_dir.join("data/.drive");
     tokio::fs::create_dir_all(&home)
         .await
         .map_err(|e| NasError::Io(format!("mkdir .drive: {e}")))?;
     let path = home.join("auth_token.json");
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)
+            .await
+            .map_err(|e| NasError::Io(format!("create token: {e}")))?
+    };
+    #[cfg(not(unix))]
     let mut f = tokio::fs::File::create(&path)
         .await
         .map_err(|e| NasError::Io(format!("create token: {e}")))?;
     f.write_all(token_json.as_bytes())
         .await
         .map_err(|e| NasError::Io(format!("write token: {e}")))?;
+    f.sync_all()
+        .await
+        .map_err(|e| NasError::Io(format!("sync token: {e}")))?;
     Ok(path)
 }
 
