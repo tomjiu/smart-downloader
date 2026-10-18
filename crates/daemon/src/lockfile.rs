@@ -7,7 +7,7 @@ use std::fs::{self, File, OpenOptions};
 #[cfg(test)]
 use std::io::Read;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Debug, thiserror::Error)]
 pub enum LockError {

@@ -13,7 +13,7 @@ members = [
 exclude = ["spike/cxx"]
 
 [workspace.package]
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 # 项目元数据：与 crates/xunlei-* 既有声明保持一致（双许可）。
 license = "MIT OR Apache-2.0"

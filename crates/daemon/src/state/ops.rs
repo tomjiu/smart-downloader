@@ -1297,10 +1297,15 @@ impl DaemonState {
             id: task_id.clone(),
             canonical_id: canonical,
             source: DownloadSource::TorrentFile(torrent),
+            // 审计修复（batch10）：补齐 ContentIdentity 新增的 md5/sha1 字段——
+            // xunlei-import 路径自 E25 扩展后未跟上（该 feature 组合编译失败，
+            // 上游预存问题）；导入场景无主源摘要（bitfield 进 fastresume）。
             identity: ContentIdentity::SingleFile {
                 size: total_size,
                 etag: None,
                 sha256: None,
+                md5: None,
+                sha1: None,
                 backup_md5: None,
             },
             dest_root: dest_root.clone(),

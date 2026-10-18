@@ -952,16 +952,19 @@ pub fn url_basename(url: &str) -> Option<String> {
     }
 }
 
-/// .part → 目标落位（Bug C + P2-17 双语义收敛）：
-/// - Bug C：dest 已有同大小旧内容（BT 抢先下完同名文件）时必须被 .part
-///   真实内容**覆盖**，不得走 OutputManager::finalize_to 的幂等短路
-///   （同大小 → 保留旧文件）。
-/// - P2-17：不得「先删 dest 再 rename」——rename 失败（跨卷）且 copy
-///   兜底也失败时旧文件已被删（数据丢失窗口）。
-/// 收敛方案：直接 rename——std::fs::rename 在 Unix 与 Windows
-/// （MOVEFILE_REPLACE_EXISTING）均原子覆盖已存在目标，既无预删窗口、
-/// 又天然覆盖旧内容；跨卷失败 → copy 覆盖 + 校验 + 删源（源 .part 在
-/// copy 成功前永不删除，双失败时旧 dest 与 .part 均完好）。
+/// `.part` → 目标落位（Bug C 与 P2-17 双语义收敛）。
+///
+/// Bug C：dest 已有同大小旧内容（BT 抢先下完同名文件）时必须被 `.part`
+/// 真实内容覆盖，不得走 `OutputManager::finalize_to` 的幂等短路（同大小
+/// 即保留旧文件）。
+///
+/// P2-17：不得先删 dest 再 rename——rename 失败（跨卷）且 copy 兜底也
+/// 失败时旧文件已被删（数据丢失窗口）。
+///
+/// 收敛方案：直接 rename。`std::fs::rename` 在 Unix 与 Windows
+/// （`MOVEFILE_REPLACE_EXISTING`）均原子覆盖已存在目标，既无预删窗口、
+/// 又天然覆盖旧内容；跨卷失败则 copy 覆盖 + 校验 + 删源（源 `.part` 在
+/// copy 成功前永不删除，双失败时旧 dest 与 `.part` 均完好）。
 fn finalize_part(part: &Path, dest: &Path, total: u64) -> Result<(), String> {
     // 幂等：part 已不存在且 dest 大小一致（完成信号重放）→ Ok
     if !part.exists() {

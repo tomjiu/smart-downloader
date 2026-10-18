@@ -183,7 +183,11 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     #[cfg(feature = "bt")]
     let mut bt_typed: Option<Arc<crate::bt::BtEngine>> = None;
     #[cfg(feature = "bt")]
-    let bt_core = {
+    // 注：块内副作用（apply_startup_conn / set_session_storage_allocate）
+    // 必须执行；返回的 core 句柄自 batch10-P0-3 起不再被 alert loop 消费
+    //（改用 bt_typed），下划线前缀仅消除未用告警。
+    #[allow(unused_variables)]
+    let bt_core: Option<Arc<smart_dl_btcore::BtCore>> = {
         if cfg.bt.enabled {
             let save = cfg.bt_save_path();
             std::fs::create_dir_all(&save)

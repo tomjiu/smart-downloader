@@ -2717,7 +2717,7 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "smart-dl-btcore"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "bindgen",
@@ -2733,7 +2733,7 @@ dependencies = [
 
 [[package]]
 name = "smart-dl-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "base64",
@@ -2750,7 +2750,7 @@ dependencies = [
 
 [[package]]
 name = "smart-dl-daemon"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2790,7 +2790,7 @@ dependencies = [
 
 [[package]]
 name = "smart-dl-httpdl"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "aes 0.8.4",
  "async-trait",
@@ -2820,7 +2820,7 @@ dependencies = [
 
 [[package]]
 name = "smart-dl-provider"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "async-trait",
  "axum",
@@ -3820,7 +3820,7 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 
 [[package]]
 name = "xunlei-convert"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "hex",
@@ -3833,7 +3833,7 @@ dependencies = [
 
 [[package]]
 name = "xunlei-ffi"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "libloading",
  "serde",
