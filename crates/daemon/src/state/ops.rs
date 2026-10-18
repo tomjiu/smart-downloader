@@ -29,14 +29,13 @@ impl DaemonState {
     /// 完成动作判定（Task 46）：action != none 且未触发过 → 全任务终态检查。
     /// 空任务表不触发（无意义）；非终态任务存在（含 Paused/Queued/Seeding）
     /// 阻塞触发——qbit 同语义（暂停/做种中均算未完成）。触发后置位 fired。
-    /// pub(crate)：lifecycle 的 set_completion_action 热更后补判（batch5-P2）。
+    /// pub(crate)：由「任务完成事件」触发（batch5-P2 的热更补判已随 P0-10
+    /// 修复移除——设置即执行是语义缺陷：全终态时配置 shutdown 会立刻关机）。
     ///
-    /// batch7-P1（TOCTOU 根治）：终态判定与 execute 同一 tasks 锁临界区——
-    /// 旧实现「锁内快照 → 锁外执行」，间隙里 RSS 规则/并发 add 可插入新
-    /// 任务，exit/shutdown 会把新任务一并杀掉。execute 为同步 fn（exit 内联
-    /// process::exit；power 动作仅 dispatch spawn_blocking，锁内停留亚毫秒），
-    /// 锁贯穿判定→执行无死锁风险；add 路径建任务必须先取同一把锁——
-    /// 判定与建任务自此互斥（与 F7-1 预留槽位同根因闭环）。
+    /// batch7-P1（TOCTOU 根治）：终态判定与 fired 置位在同一 tasks 锁临界区；
+    /// execute 的 exit 分支已改为独立线程延时退出（P1-8：原实现锁内
+    /// sleep 250ms 阻塞全部 API，与「锁内亚毫秒」的注释自相矛盾——
+    /// 审查模式 C），判定→执行间隙的新 add 由 fired 语义保证不重复触发。
     pub(crate) fn maybe_run_completion_action(&self) {
         let action = self.completion_action.lock().clone();
         if action == "none" || action.is_empty() {

@@ -596,20 +596,35 @@ impl DownloadEngine for BtEngine {
 
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError> {
         self.set_pause_intent(id, true); // Bug A：登记意图，metadata 复活时由 alert 循环压制
-        self.core
-            .pause(id)
-            .map_err(|e| EngineError::Other(core_err(&e)))?;
+        // P1-12 修复：FFI pause 失败回滚意图——原实现 `?` 返回后意图残留，
+        // 500ms 心跳的 enforce_pauses 对已失败任务持续 FFI 重压（僵尸条目
+        // 永不消除，且每次心跳都空打一轮 pause/status）。
+        if let Err(e) = self.core.pause(id) {
+            self.set_pause_intent(id, false); // 回滚：引擎未接受暂停，意图不得残留
+            return Err(EngineError::Other(core_err(&e)));
+        }
         // 暂停时保存进度（best-effort；无 metadata 等场景静默跳过）
         // batch3-P2：同步等待 RESUME（≤3s）→ spawn_blocking 不阻塞 tokio worker
+        // P1-13 修复：不再 `let _ =` 吞链——spawn panic（JoinError）与写盘失败
+        // 均记日志（best-effort 语义不变，但可观测）。
         let core = self.core.clone();
         let waiters = self.resume_waiters.clone();
         let save_path = self.save_path.clone();
         let loop_active = self.alert_loop_active.clone();
         let ih = id.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             save_fastresume_impl(&core, &waiters, &save_path, &loop_active, &ih)
         })
-        .await;
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("pause: fastresume 保存失败（续传凭据可能缺失）: {e}")
+            }
+            Err(join_err) => {
+                tracing::warn!("pause: fastresume 保存任务异常: {join_err}")
+            }
+        }
         Ok(())
     }
 
@@ -632,15 +647,25 @@ impl DownloadEngine for BtEngine {
         // 移除前显式保存 fastresume（重启后重新 add 同一 magnet → 回灌续传）。
         // 失败不阻断移除（best-effort）。
         // batch3-P2：同步等待 RESUME（≤3s）→ spawn_blocking 不阻塞 tokio worker
+        // P1-13 修复：不再 `let _ =` 吞链——spawn panic 与写盘失败均记日志。
         let core = self.core.clone();
         let waiters = self.resume_waiters.clone();
         let save_path = self.save_path.clone();
         let loop_active = self.alert_loop_active.clone();
         let ih = id.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             save_fastresume_impl(&core, &waiters, &save_path, &loop_active, &ih)
         })
-        .await;
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("remove: fastresume 保存失败（续传凭据可能缺失）: {e}")
+            }
+            Err(join_err) => {
+                tracing::warn!("remove: fastresume 保存任务异常: {join_err}")
+            }
+        }
         self.set_pause_intent(id, false);
         let r = self.core.remove(id, delete_data);
         let _ = r.map_err(|e| EngineError::Other(core_err(&e)))?;
