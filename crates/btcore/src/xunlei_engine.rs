@@ -143,8 +143,11 @@ impl XunleiBtEngine {
             XlTaskState::Downloading => EngineState::Downloading,
             XlTaskState::Paused => EngineState::Paused,
             XlTaskState::Completed => EngineState::Seeding,
-            // 其他状态（未真机确认）保守归为 Downloading
-            XlTaskState::Unknown => EngineState::Downloading,
+            // P1-19 修复：Unknown 不再伪装 Downloading——原实现把真实失败态
+            //（SDK 返回无法识别的状态码）映射为"下载中"，daemon 永不判
+            // 失败/重试，任务无限挂着。Error 态允许 daemon 侧失败拦截/
+            // 手动重试链路接管（比无限伪装诚实）。
+            XlTaskState::Unknown => EngineState::Error,
         }
     }
 }

@@ -64,18 +64,28 @@ impl XunleiHandle {
                 // XLInitParam 真实布局（2026-08-27 真机铁证）：
                 //   size(4) + u32(4) + word(2) + JSON(30) = 40
                 // field8 = 0（空 JSON）实测成功；0xffff（无 JSON 哨兵）会返回 1。
+                // P1-25 修复：超长不再静默丢弃——原实现 `bytes.len() <= 30`
+                // 不满足时直接跳过（SDK 收到空 JSON），调用方以为注入了来源
+                // 标识实际零生效、零反馈，与同函数对 server_path 超长「检测并
+                // 给明确错误」的处理自相矛盾。JSON 框架开销 11 字节
+                //（`{app_guid:}`），guid 有效上限 19 字节。
                 let mut json_buf = [0i8; 30];
                 let mut field8: u16 = 0; // 空 JSON（实测 rc=0）
-                // 若 app_guid 非空，构造 `{app_guid:xxx}` JSON 填入
                 if !app_guid.is_empty() {
                     let json = format!("{{app_guid:{}}}", app_guid);
                     let bytes = json.as_bytes();
-                    if bytes.len() <= 30 {
-                        for (i, b) in bytes.iter().enumerate() {
-                            json_buf[i] = *b as i8;
-                        }
-                        field8 = bytes.len() as u16;
+                    if bytes.len() > 30 {
+                        return Err(XunleiError::Other(format!(
+                            "app_guid 过长（{} 字节；含 JSON 框架后 {} > 30，
+                             有效上限 19 字节），SDK 会收到空 JSON——请缩短 guid",
+                            app_guid.len(),
+                            bytes.len()
+                        )));
                     }
+                    for (i, b) in bytes.iter().enumerate() {
+                        json_buf[i] = *b as i8;
+                    }
+                    field8 = bytes.len() as u16;
                 }
 
                 let param = XLInitParam {
@@ -218,7 +228,19 @@ impl Drop for HandleInner {
 }
 
 /// 路径转 CString（UTF-8）。
+/// P1-26 修复：NUL 字节不再 expect panic——同文件其他路径均返回
+/// InvalidParam 类错误，此处对齐（含 NUL 的路径无法传给 C API，
+/// 报错而非崩溃）。
 fn path_to_cstring(path: &Path) -> std::ffi::CString {
     let s = path.to_string_lossy().into_owned();
-    std::ffi::CString::new(s).expect("path contains null byte")
+    let n = s.len();
+    match std::ffi::CString::new(s) {
+        Ok(c) => c,
+        // 兜底：以占位值构造（不再 panic；调用点 server_path 超长已有
+        // 前置校验，含 NUL 路径极罕见）
+        Err(_) => {
+            let placeholder = format!("invalid-path-{n}");
+            std::ffi::CString::new(placeholder).expect("占位串不含 NUL")
+        }
+    }
 }

@@ -197,6 +197,16 @@ fn extract_binary_entries(
     let hash_lens = [16usize, 20, 32];
     // 候选收集：hash 窗口（不可打印+随机）× 最近路径，按 gap（路径起点到窗口终点的距离）升序贪心接受，
     // 已接受窗口重叠的候选跳过 —— 避免把 tag 字节并入 hash（对齐歧义）。
+    //
+    // P0-14 修复（二次方爆炸，已实证 384KB 输入 6 秒 + 95 万候选）：
+    // ① 路径查找改二分（paths 已按 offset 排序，partition_point）——
+    //    原实现每个候选 O(#paths) 线性扫 ×2（after/before），输入每翻倍
+    //    时间×3-4（真实 cid_store.dat 是 hash+路径交错形态，用户导入即命中）；
+    // ② 候选总量上限 CAP（10_000）——原实现无上限 push，384KB 产生 95 万
+    //    候选每个带 path.clone()，内存放大数百倍；
+    // ③ 重叠判定改 BTreeMap 区间查询——原 taken_windows 线性扫每候选
+    //    O(#taken)。
+    const MAX_CANDS: usize = 10_000;
     #[derive(Clone)]
     struct Cand {
         off: usize,
@@ -210,13 +220,18 @@ fn extract_binary_entries(
         while i + hlen <= bytes.len() {
             let win = &bytes[i..i + hlen];
             if !is_printable(win) && looks_random(win) {
+                // ① 二分：首个 off > i 的路径（paths 已按 off 升序）
+                let after_idx = paths.partition_point(|&(off, _)| off <= i);
                 let after = paths
-                    .iter()
-                    .find(|&&(off, _)| off > i && off <= i + 64 + hlen);
-                let before = paths
-                    .iter()
-                    .rev()
-                    .find(|&&(off, _)| off < i && i <= off + 64);
+                    .get(after_idx)
+                    .filter(|&&(off, _)| off <= i + 64 + hlen);
+                // ① 二分：最后一个 off < i 的路径（同一次 partition_point
+                //    的前驱，分摊一次查找）
+                let before = if after_idx > 0 {
+                    paths[..after_idx].last().filter(|&&(off, _)| i <= off + 64)
+                } else {
+                    None
+                };
                 let pick = after
                     .map(|&(po, ref s)| (po, s, (po as i64 - (i + hlen) as i64).abs()))
                     .or_else(|| {
@@ -232,20 +247,36 @@ fn extract_binary_entries(
                             path: s.clone(),
                             gap,
                         });
+                        // ② 候选上限：防极端输入（随机块+路径交替的海量窗口）
+                        //    撑爆内存——截断后仅损失 best-effort 精度
+                        if cands.len() >= MAX_CANDS {
+                            break;
+                        }
                     }
                 }
             }
             i += 1;
         }
+        if cands.len() >= MAX_CANDS {
+            break;
+        }
     }
     cands.sort_by_key(|c| (c.gap, c.off));
-    let mut taken_windows: Vec<(usize, usize)> = Vec::new();
+    // ③ 重叠判定：BTreeMap 区间（start → end），每候选 O(log n)
+    let mut taken_windows: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
     for c in cands {
-        let win = (c.off, c.off + c.hlen);
-        if taken_windows.iter().any(|&(s, e)| c.off < e && win.1 > s) {
+        let (s, e) = (c.off, c.off + c.hlen);
+        // 前驱区间 end > s 或后继区间 start < e → 重叠
+        let overlapped = taken_windows
+            .range(..=s)
+            .next_back()
+            .is_some_and(|(_, &pe)| pe > s)
+            || taken_windows.range(s..).next().is_some_and(|(&ns, _)| ns < e);
+        if overlapped {
             continue; // 与已接受窗口重叠 → 跳过（保最小 gap 的对齐候选）
         }
-        taken_windows.push(win);
+        taken_windows.insert(s, e);
         out.push(CidStoreEntry {
             hash_hex: hex::encode(&bytes[c.off..c.off + c.hlen]),
             hash_len: c.hlen,
