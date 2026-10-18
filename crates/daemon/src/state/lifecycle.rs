@@ -322,8 +322,10 @@ impl DaemonState {
     ///
     /// 锁序约定（docs/LOCK_MODEL.md）：顺序获取 `allowed_roots` → guard
     /// 语句尾即释放 → 按需获取 `default_dest_root`，两把锁任何路径不同时
-    /// 持有——全域锁模型维持「任何时刻至多持一把锁」强不变量（2026-09
-    /// 锁模型审计中唯一的多锁同持边，现已消除）。
+    /// 持有。（batch10 勘误：本函数的多锁边已消除，但 `autosave` 的
+    /// `persist_lock → tasks` 边经架构审查确认为历史审计盲区——全域
+    /// 「至多持一把锁」的表述已随 LOCK_MODEL.md §2 勘误为「除 autosave
+    /// 例外边外成立」。）
     pub(super) fn dest_roots(&self) -> Vec<PathBuf> {
         let g = self.allowed_roots.lock().clone();
         if g.is_empty() {

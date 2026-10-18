@@ -21,7 +21,6 @@ pub enum LockError {
 #[derive(Debug)]
 pub struct InstanceLock {
     file: File,
-    path: PathBuf,
 }
 
 impl InstanceLock {
@@ -39,10 +38,7 @@ impl InstanceLock {
                 // 记录当前 pid（截断重写；失败不阻断锁本身）
                 let _ = file.set_len(0);
                 let _ = writeln!(&file, "{}", std::process::id());
-                Ok(InstanceLock {
-                    file,
-                    path: path.to_path_buf(),
-                })
+                Ok(InstanceLock { file })
             }
             Err(_) => {
                 // Windows 排他锁会拒绝其他句柄读取 → pid 仅尽力（常见 0）

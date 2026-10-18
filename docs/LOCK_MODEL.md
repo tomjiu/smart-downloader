@@ -20,12 +20,18 @@ HTTP 层（http.rs/serve.rs/ws.rs 路由）与 main.rs **不直接持有任何�
 
 ## 2. 核心不变量（审计后确立）
 
-1. **任何时刻至多持一把锁**。全部临界区都是单锁作用域；跨锁操作一律
-   「取 A → 克隆所需数据 → 释放 → 再取 B」（参照 `dest_roots` 与
-   `resume` 的块作用域模式）。
+1. **任何时刻至多持一把锁（有两条例外，见 §2a）**。全部临界区都是单锁
+   作用域；跨锁操作一律「取 A → 克隆所需数据 → 释放 → 再取 B」（参照
+   `dest_roots` 与 `resume` 的块作用域模式）。
+   **例外（batch10 如实登记）**：`state/persistence.rs` 的 `autosave()`
+   存在 `persist_lock → tasks` 一条边（快照期间双锁同持）+ 持
+   `persist_lock` 期间的磁盘写。这是保序（写入序 = 状态序，防旧快照
+   后写覆盖新状态）的必要代价；锁序恒定无反向边，无死锁风险。
 2. **`autosave()` 只允许在锁外调用**。其内部经 `persisted_tasks()` 取
    `tasks` 锁（Bug B 修复模式，见 `apply_bt_alert` 注释）。违反 =
    同线程自死锁 → alert 循环挂死 → 全端点 hang。
+   （注：autosave 自身持 persist_lock 再取 tasks 是上述例外边，调用方
+   不得持 tasks/persist_lock 调用它。）
 3. **引擎 FFI/IO 只在锁外**。bt.rs 的 `apply_network`、`pause`、
    `status` 等调用全部发生在自身锁的 guard 释放之后；state.rs 持
    `tasks` 锁期间不调用任何引擎方法（`activate_one` 等调用点均在
@@ -56,10 +62,27 @@ HTTP 层（http.rs/serve.rs/ws.rs 路由）与 main.rs **不直接持有任何�
 - 自重入：**0 处**。Bug B 修复模式（autosave 锁外化）已全域生效，
   含 `apply_bt_alert`、19 个 add/set/pause/resume 入口。
 - `autosave` 持锁调用：**0 处**（19 个调用点全部锁外）。
-- 同时持锁：**唯一一条边** `dest_roots`（`allowed_roots` →
-  `default_dest_root`），无反向共存（无死锁风险）；已在同批 PR 中
-  消除（改为顺序获取），不变量 1 由「事实上如此」升级为「结构性保证」。
+- 同时持锁：两条已知边（batch10 勘误后如实登记）：
+  ① `dest_roots`（`allowed_roots` → `default_dest_root`）——已在同批
+    PR 中消除（改为顺序获取）；
+  ② `autosave`（`persist_lock` → `tasks`）——**架构审查（2026-10-16
+    §5.1）发现的历史审计盲区**：旧版审计工具用「变量最后一次真实使用
+    行」近似 guard 存活区间，而代码用 `_g` 命名（从不被引用 → 区间
+    判定为空）→ 该边被漏报，据此得出「不变量 1 结构性保证」的结论
+    **不成立**。真相：这条边自引入 persist_lock 起就存在（保序必需），
+    无反向边、无死锁，但不变量 1 应表述为「除 autosave 例外边外成立」。
 - 持锁跨 await：clippy 门禁通过。
+
+### 3a. 审计方法的已知盲区（方法论勘误）
+
+静态审计的启发式与 Rust 实际语义存在系统性偏差，记录如下以防复发：
+
+- **`_` 前缀命名的 guard** 永不被「使用」，按「最后一次真实使用行」
+  启发式其存活区间被判定为空，多锁同持边被漏报。需要被审计追踪的
+  guard 应使用可引用的命名（如 `_persist_guard`）；本仓 autosave 的
+  guard 已按此改名。
+- **「工具说没问题」≠「没问题」**：启发式结论须经人工抽检交叉验证
+  （尤其锁序图与不变量声明），本节即抽检发现工具盲区的实例。
 
 ## 4. 加锁/改锁规约（面向未来演进）
 

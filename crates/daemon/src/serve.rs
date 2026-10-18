@@ -436,12 +436,14 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     // 4d--. 定时任务调度循环（E23）：1s 周期把到期任务接入引擎
     //（start_at 未来不入引擎，Queued 等待；jitter 错峰同样由本循环到点激活）。
     // 无定时任务时空转（filter 后空集，无引擎调用）。
+    // 审计修复（P2-8）：先工作后 sleep——原首睡 1s 令恢复的到期任务
+    // 首轮延迟激活（重启竞态：恢复完成到激活多等一拍）。
     {
         let st = state_arc.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
                 let _ = st.activate_due_tasks().await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
     }

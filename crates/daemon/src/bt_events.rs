@@ -68,7 +68,8 @@ pub fn spawn_alert_loop(
         }
         let _reset = ResetOnDrop(guard.clone());
         loop {
-            tokio::time::sleep(interval).await;
+            // 审计修复（P2-8）：先工作后 sleep——原「先 sleep 后工作」在启动
+            // 后留下一个 interval 的盲区（恢复任务的终态 alert 延迟首轮）。
             let alerts = guard.pop_alerts_enforcing_pause(128);
             for alert in &alerts {
                 let Some(effect) = state.apply_bt_alert(alert) else {
@@ -94,6 +95,7 @@ pub fn spawn_alert_loop(
                     _ => {}
                 }
             }
+            tokio::time::sleep(interval).await;
         }
     })
 }
@@ -101,14 +103,15 @@ pub fn spawn_alert_loop(
 /// 子文件优先级重放循环：周期性收敛「恢复时 metadata 未就绪」挂起的优先级
 /// 任务（`DaemonState::replay_pending_file_priorities`）。pending 为空时为
 /// 纯空转检查（锁一次即返回），默认 2s 粒度对恢复场景足够。
+/// 审计修复（P2-8）：先工作后 sleep——恢复挂起的优先级任务首轮即收敛。
 pub fn spawn_file_priority_replay_loop(
     state: Arc<DaemonState>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(interval).await;
             state.replay_pending_file_priorities().await;
+            tokio::time::sleep(interval).await;
         }
     })
 }

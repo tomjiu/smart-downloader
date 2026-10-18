@@ -22,7 +22,8 @@ pub fn spawn_http_events(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            tokio::time::sleep(interval).await;
+            // 审计修复（P2-8）：先工作后 sleep——原首睡 interval 令恢复任务
+            // 的终态推进（Queued→Downloading/Completed）延迟首轮。
             for effect in state.poll_engine_states().await {
                 let hub = state.hub();
                 hub.publish(SchedulerEvent::StateChanged {
@@ -48,6 +49,7 @@ pub fn spawn_http_events(
             //（BT/HTTP/FTP/SFTP 速率快照都在 poll_engine_states 写入的
             // engine_status 缓存中，单点累加覆盖全部轮询引擎）
             state.accumulate_session_traffic(interval);
+            tokio::time::sleep(interval).await;
         }
     })
 }

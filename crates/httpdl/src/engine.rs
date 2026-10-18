@@ -14,7 +14,7 @@ use crate::segment_manager::DEFAULT_MIN_SPLIT;
 use crate::verify::{verify_file, verify_file_md5, verify_file_sha1, verify_nonempty_blocks};
 use parking_lot::{Mutex, RwLock};
 use smart_dl_core::identity::ContentIdentity;
-use smart_dl_core::session::output::OutputManager;
+
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
     Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
@@ -843,7 +843,7 @@ async fn download_loop(
                             t.error = None;
                             t.state = EngineState::Downloading;
                             drop(tasks);
-                            println!("ttpdl] {}: 校验失败，隔离试错轮换 → {cand}", tid);
+                            println!("[httpdl] {}: 校验失败，隔离试错轮换 → {cand}", tid);
                             remove_part(&part);
                             continue;
                         }
