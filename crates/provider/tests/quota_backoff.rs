@@ -158,15 +158,15 @@ async fn busy_slot_paired_across_fallback_lifecycle() {
 
     // 并发上限 1：单个在途兜底即关闸；files 必须非空（resolve 空表不会
     // 进入 transfer，busy 槽观察窗无从建立）
-    let p = MockProvider::new("busygate").with_concurrency(1).with_files(vec![
-        smart_dl_provider::ResolvedRemoteFile {
+    let p = MockProvider::new("busygate")
+        .with_concurrency(1)
+        .with_files(vec![smart_dl_provider::ResolvedRemoteFile {
             rel_path: "a.bin".into(),
             url: "http://127.0.0.1:1/a.bin".into(),
             size: 1,
             etag: None,
             expires_at: None,
-        },
-    ]);
+        }]);
     let coord = FallbackCoordinator::new(vec![Arc::new(p)], FallbackPolicy::default());
     assert_eq!(coord.select_provider().as_deref(), Some("busygate"));
 
@@ -238,9 +238,8 @@ async fn busy_slot_paired_across_fallback_lifecycle() {
     // provider——选择后获取并发槽失败 → 试尽 → NoProvider（闸门真正生效；
     // 原实现 busy 恒 0，100 个并发兜底可同时打进同一 provider）。
     let coord3 = coord_arc.clone();
-    let second = tokio::spawn(async move {
-        coord3.begin_fallback(&task2, 0.0, true, &sink2).await
-    });
+    let second =
+        tokio::spawn(async move { coord3.begin_fallback(&task2, 0.0, true, &sink2).await });
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         match second.is_finished() {
@@ -253,7 +252,10 @@ async fn busy_slot_paired_across_fallback_lifecycle() {
     }
     let second_result = second.await.expect("join");
     assert!(
-        matches!(second_result, Err(smart_dl_provider::ProviderError::NoProvider)),
+        matches!(
+            second_result,
+            Err(smart_dl_provider::ProviderError::NoProvider)
+        ),
         "并发满（limit=1 在途）时第二兜底必须 NoProvider，得到 {second_result:?}"
     );
 

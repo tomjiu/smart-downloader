@@ -155,9 +155,9 @@ impl TorrentMeta {
                 // P0-11 同源防护：累计偏移溢出即拒（防回绕后偏移错位）
                 let piece_offset = (total_size / plen) as usize;
                 let piece_count = length.div_ceil(plen) as usize;
-                total_size = total_size.checked_add(length).ok_or_else(|| {
-                    DaemonError::InvalidSource("files 累计大小溢出 u64".into())
-                })?;
+                total_size = total_size
+                    .checked_add(length)
+                    .ok_or_else(|| DaemonError::InvalidSource("files 累计大小溢出 u64".into()))?;
                 files.push(FileMeta {
                     path,
                     size: length,

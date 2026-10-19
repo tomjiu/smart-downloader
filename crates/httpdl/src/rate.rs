@@ -3,10 +3,10 @@
 //! deadline 向后推 n/rate 秒；落后于时钟（无带宽积压）时从当前时刻重新起算。
 //! 简化实现：速率 0 = 不限（no-op，零开销路径）。
 
+use parking_lot::Mutex as SyncMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use parking_lot::Mutex as SyncMutex;
 
 /// 速率限制器（`rate` = bytes/sec；0 = 不限）。多段并发共享一个实例（总量限制）。
 #[derive(Clone)]
@@ -379,7 +379,7 @@ mod tests {
         // 密集采样窗口（<200ms）：增量 500 发生在此窗口
         std::thread::sleep(Duration::from_millis(30));
         let _ = s.sample(1500); // 短窗口 → 返回 smoothed，基线不推进
-        // 下一完整窗口：从基线 1000 起算（增量 500 + 新增 300 须全部计入）
+                                // 下一完整窗口：从基线 1000 起算（增量 500 + 新增 300 须全部计入）
         std::thread::sleep(Duration::from_millis(250));
         let r2 = s.sample(1800);
         assert!(

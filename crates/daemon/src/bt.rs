@@ -596,9 +596,9 @@ impl DownloadEngine for BtEngine {
 
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError> {
         self.set_pause_intent(id, true); // Bug A：登记意图，metadata 复活时由 alert 循环压制
-        // P1-12 修复：FFI pause 失败回滚意图——原实现 `?` 返回后意图残留，
-        // 500ms 心跳的 enforce_pauses 对已失败任务持续 FFI 重压（僵尸条目
-        // 永不消除，且每次心跳都空打一轮 pause/status）。
+                                         // P1-12 修复：FFI pause 失败回滚意图——原实现 `?` 返回后意图残留，
+                                         // 500ms 心跳的 enforce_pauses 对已失败任务持续 FFI 重压（僵尸条目
+                                         // 永不消除，且每次心跳都空打一轮 pause/status）。
         if let Err(e) = self.core.pause(id) {
             self.set_pause_intent(id, false); // 回滚：引擎未接受暂停，意图不得残留
             return Err(EngineError::Other(core_err(&e)));

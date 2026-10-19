@@ -151,9 +151,7 @@ async fn no_fingerprint_cross_source_keeps_ledger_semantics() {
     let st = wait_terminal(&engine, &tid).await;
     assert_eq!(st.state, EngineState::Completed);
 
-    let requests_on_b_before = b
-        .request_count
-        .load(std::sync::atomic::Ordering::SeqCst);
+    let requests_on_b_before = b.request_count.load(std::sync::atomic::Ordering::SeqCst);
     // 换源到 B（无指纹 + URL 变化）：不得触发整档重下——
     // 已完成任务无重启迹象（状态不回到 Downloading、B 无段请求增量）
     engine
@@ -167,9 +165,7 @@ async fn no_fingerprint_cross_source_keeps_ledger_semantics() {
         EngineState::Completed,
         "无指纹换源不得作废已完成任务（fallback 续传生命线）"
     );
-    let requests_on_b_after = b
-        .request_count
-        .load(std::sync::atomic::Ordering::SeqCst);
+    let requests_on_b_after = b.request_count.load(std::sync::atomic::Ordering::SeqCst);
     // B 仅增加 update_sources 的探测请求（1 次），无下载段
     assert!(
         requests_on_b_after <= requests_on_b_before + 1,

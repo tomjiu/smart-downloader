@@ -87,7 +87,11 @@ async fn backup_also_bad_downgrades_with_warning() {
     let tid = engine.add(&task).await.unwrap();
     let st = wait_terminal(&engine, &tid).await;
     // P2-19：Error 终态（文件已落位但明示校验不符）
-    assert_eq!(st.state, EngineState::Error, "备用源也失败 → 校验不符不得标 Completed");
+    assert_eq!(
+        st.state,
+        EngineState::Error,
+        "备用源也失败 → 校验不符不得标 Completed"
+    );
     assert!(
         st.error.as_deref().unwrap_or("").contains("md5"),
         "备用源 md5 不匹配必须在错误信息点名"

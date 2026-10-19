@@ -78,11 +78,9 @@ impl fmt::Display for TorrentMetaError {
             TorrentMetaError::MissingField(k) => write!(f, "info dict 缺字段 {k}"),
             TorrentMetaError::BadType(k) => write!(f, "字段 {k} 类型不符"),
             TorrentMetaError::EmptyPath => write!(f, "files 条目 path 列表为空"),
-            TorrentMetaError::InvalidPieceLength(v) => write!(
-                f,
-                "piece length 取值非法（须 1..={}，得到 {v}）",
-                1 << 24
-            ),
+            TorrentMetaError::InvalidPieceLength(v) => {
+                write!(f, "piece length 取值非法（须 1..={}，得到 {v}）", 1 << 24)
+            }
             TorrentMetaError::BadPiecesLen(n) => {
                 write!(f, "pieces 长度 {n} 不是 20 的倍数")
             }

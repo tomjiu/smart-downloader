@@ -240,9 +240,9 @@ impl crate::RemoteProvider for XunleiProvider {
             let mut guard = self.auth.lock().await;
             // CAS：并发刷新已推进过锁内 state（token 与快照不同）→ 不回写
             //（避免旧快照覆盖更新的 token；本方刷新结果随落盘文件保留）。
-            let already_advanced = guard.as_ref().is_some_and(|g| {
-                g.access_token != old_access || g.captcha_token != old_captcha
-            });
+            let already_advanced = guard
+                .as_ref()
+                .is_some_and(|g| g.access_token != old_access || g.captcha_token != old_captcha);
             if !already_advanced {
                 *guard = Some(candidate);
             }

@@ -1696,10 +1696,8 @@ impl DownloadEngine for HttpEngine {
         let urls_changed = t.mirrors != urls;
         let total_changed = probe.total.is_some_and(|pt| t.total != pt);
         let etag_mismatch = !crate::ledger::fingerprint_ok(&t.etag, &probe.etag);
-        let lm_mismatch =
-            !crate::ledger::fingerprint_ok(&t.last_modified, &probe.last_modified);
-        let etag_changed =
-            total_changed || (urls_changed && (etag_mismatch || lm_mismatch));
+        let lm_mismatch = !crate::ledger::fingerprint_ok(&t.last_modified, &probe.last_modified);
+        let etag_changed = total_changed || (urls_changed && (etag_mismatch || lm_mismatch));
         if etag_changed {
             // 新源内容变了 → 旧代次 .part 作废，重下（Q-B5：指纹为准）。
             // gen+1 → 新循环用 `<dest>.<gen>.part`，与旧循环写隔离。

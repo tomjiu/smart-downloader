@@ -245,7 +245,10 @@ mod sanitize_tests {
     /// P1-2 回归：Windows 设备名比较忽略尾随空格——"con .txt" 必须拒绝。
     #[test]
     fn sanitize_rejects_reserved_name_with_trailing_space() {
-        assert!(sanitize_rel("con .txt").is_err(), "'con .txt' Win32 等价设备名");
+        assert!(
+            sanitize_rel("con .txt").is_err(),
+            "'con .txt' Win32 等价设备名"
+        );
         assert!(sanitize_rel("COM1 .txt").is_err());
         // 合法名不受影响
         assert!(sanitize_rel("console .bin").is_ok());

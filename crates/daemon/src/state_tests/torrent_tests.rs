@@ -167,7 +167,10 @@ fn parse_rejects_files_total_overflow() {
     torrent.extend_from_slice(b"6:pieces20:");
     torrent.extend_from_slice(&[0u8; 20]);
     torrent.extend_from_slice(b"ee");
-    assert!(TorrentMeta::parse(&torrent).is_err(), "累计溢出必须报错而非回绕");
+    assert!(
+        TorrentMeta::parse(&torrent).is_err(),
+        "累计溢出必须报错而非回绕"
+    );
 }
 
 #[test]

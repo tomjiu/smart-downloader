@@ -72,7 +72,10 @@ async fn sha256_mismatch_redownloads_then_downgrades_with_warning() {
     // 重下 1 次语义：verify 至少尝试过（请求数 > 段数）
     assert!(srv.request_count.load(std::sync::atomic::Ordering::SeqCst) > 2);
     // 文件已落位（保留供人工核验）
-    assert!(dir.path().join("bad.bin").exists(), "落盘文件应保留供人工核验");
+    assert!(
+        dir.path().join("bad.bin").exists(),
+        "落盘文件应保留供人工核验"
+    );
 }
 
 #[tokio::test]

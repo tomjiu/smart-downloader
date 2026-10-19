@@ -379,15 +379,9 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
         let state_arc = Arc::new(state);
         // P0-3：spawn_alert_loop 收紧为必传 BtEngine（bt_core=Some ⟺
         // bt_typed=Same 同块装配，unwrap 语义安全）
-        let handle = bt_typed
-            .clone()
-            .map(|bt| {
-                crate::bt_events::spawn_alert_loop(
-                    state_arc.clone(),
-                    bt,
-                    Duration::from_millis(500),
-                )
-            });
+        let handle = bt_typed.clone().map(|bt| {
+            crate::bt_events::spawn_alert_loop(state_arc.clone(), bt, Duration::from_millis(500))
+        });
         (handle, state_arc)
     };
     #[cfg(not(feature = "bt"))]
@@ -473,9 +467,7 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
                         // 原实现裸解析绕过全部语义校验（负 share_ratio 等
                         // 启动被拒的值热重载静默生效）。
                         if let Err(e) = new_cfg.validate() {
-                            tracing::warn!(
-                                "配置热重载校验失败（保留旧配置）: {e}"
-                            );
+                            tracing::warn!("配置热重载校验失败（保留旧配置）: {e}");
                             last = Some(text);
                             continue;
                         }

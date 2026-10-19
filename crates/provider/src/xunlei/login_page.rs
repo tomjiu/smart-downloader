@@ -120,10 +120,7 @@ fn guard_origin_ok(origin: &str) -> bool {
 ///   （直接打开 http://127.0.0.1:port/ 的导航请求无 Origin）。
 async fn local_origin_guard(req: Request, next: Next) -> axum::response::Response {
     let headers: &HeaderMap = req.headers();
-    match headers
-        .get(header::HOST)
-        .and_then(|v| v.to_str().ok())
-    {
+    match headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
         Some(h) if guard_host_ok(h) => {}
         // Host 缺失（HTTP/1.0 怪客户端）：登录页是浏览器场景，fail-closed
         _ => {
@@ -134,10 +131,7 @@ async fn local_origin_guard(req: Request, next: Next) -> axum::response::Respons
                 .into_response()
         }
     }
-    if let Some(o) = headers
-        .get(header::ORIGIN)
-        .and_then(|v| v.to_str().ok())
-    {
+    if let Some(o) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         if !guard_origin_ok(o) {
             return (
                 StatusCode::FORBIDDEN,
@@ -601,11 +595,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            r.status(),
-            StatusCode::FORBIDDEN,
-            "rebinding Host 必须拦截"
-        );
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "rebinding Host 必须拦截");
 
         // ③ 伪装回环前缀的主机名（127.evil.com）→ 403（同 P1-a 口径）
         let r = http

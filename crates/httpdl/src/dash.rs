@@ -1080,10 +1080,7 @@ fn save_ledger(path: &Path, ld: &DashLedger) {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &tmp,
-                    std::fs::Permissions::from_mode(0o600),
-                );
+                let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
             }
             let _ = std::fs::rename(&tmp, path);
         }

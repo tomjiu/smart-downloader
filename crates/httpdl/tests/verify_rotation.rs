@@ -141,7 +141,11 @@ async fn backup_failure_relays_into_rotation_pool() {
 
     let st = wait_terminal(&engine, &tid).await;
     // P2-19：Error 终态（全链路耗尽 + 校验不符）
-    assert_eq!(st.state, EngineState::Error, "全链路耗尽 → 校验不符不得标 Completed");
+    assert_eq!(
+        st.state,
+        EngineState::Error,
+        "全链路耗尽 → 校验不符不得标 Completed"
+    );
     assert!(
         st.error.as_deref().unwrap_or("").contains("md5"),
         "备用源 md5 校验链耗尽必须在错误信息点名 md5"

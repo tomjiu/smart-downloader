@@ -272,7 +272,10 @@ fn extract_binary_entries(
             .range(..=s)
             .next_back()
             .is_some_and(|(_, &pe)| pe > s)
-            || taken_windows.range(s..).next().is_some_and(|(&ns, _)| ns < e);
+            || taken_windows
+                .range(s..)
+                .next()
+                .is_some_and(|(&ns, _)| ns < e);
         if overlapped {
             continue; // 与已接受窗口重叠 → 跳过（保最小 gap 的对齐候选）
         }
@@ -485,5 +488,4 @@ mod tests {
         );
         assert_eq!(entries.len(), 0, "无随机块 → 无候选");
     }
-
 }
