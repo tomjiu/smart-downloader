@@ -2,6 +2,13 @@
 /// 设置视图（S1 设置面前端）：qBittorrent 式分组 + 即时生效 + 落盘反馈。
 /// 数据源：GET/PUT /settings；主题走 data-theme（tokens.css 12 主题）；
 /// 后端连接（地址/token）存 localStorage。
+/// 交互打磨批：
+/// - 移除死 class dl-enter（旧库残留，规范 G0-8 同族清理）
+/// - 主题预览卡色板改用目标主题真实 token（swatch 容器挂 data-theme，
+///   旧实现硬编码色与注释声明不符）
+/// - 保存条移至页尾 + sticky（长页滚动时始终可达）
+/// - Enter 保存（input 内，textarea 换行不受影响）；未保存离开页面前
+///   beforeunload 提醒
 
 import { Icon } from "./Icon";
 import { useCallback, useEffect, useMemo, useState } from "react";
@@ -108,6 +115,18 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
 
   const dirtyCount = useMemo(() => Object.keys(dirty).length, [dirty]);
 
+  /// 未保存修改离开页面提醒（beforeunload 标准行为；切视图不阻断——
+  /// dirty 状态在保存条上已可见）。
+  useEffect(() => {
+    if (dirtyCount === 0) return;
+    const h = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", h);
+    return () => window.removeEventListener("beforeunload", h);
+  }, [dirtyCount]);
+
   if (!s) {
     return (
       <div className="dl-card" style={{ color: "var(--fg-3)" }}>
@@ -117,7 +136,15 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
   }
 
   return (
-    <div className="dl-enter" style={{ display: "grid", gap: 16, maxWidth: 860 }}>
+    <div style={{ display: "grid", gap: 16, maxWidth: 860 }}
+      onKeyDown={(e) => {
+        // Enter 保存（仅单行 input；textarea 的 Enter 保留换行）
+        if (e.key === "Enter" && e.target instanceof HTMLInputElement && !busy && dirtyCount) {
+          e.preventDefault();
+          save();
+        }
+      }}
+    >
       {/* —— 带宽 —— */}
       <section className="dl-card">
         <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
@@ -406,31 +433,6 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
         </div>
       </section>
 
-      {/* —— 保存条 —— */}
-      <div className="dl-actions">
-        <span style={{ fontSize: 12, color: "var(--fg-3)" }}>
-          {s.meta.persist_path ? `配置文件：${s.meta.persist_path}` : "未指定 --config，保存仅运行时生效"}
-        </span>
-        <div style={{ flex: 1 }} />
-        <button
-          className="dl-btn dl-btn--ghost"
-          aria-label="重置设置"
-          disabled={busy || !dirtyCount}
-          onClick={() => load()}
-        >
-          <Icon name="sync" size={13} /> 重置
-        </button>
-        <button
-          className="dl-btn dl-btn--primary"
-          aria-label="保存设置"
-          disabled={busy || !dirtyCount}
-          onClick={save}
-        >
-          <Icon name="save" size={13} />
-          {dirtyCount ? `保存 ${dirtyCount} 项修改` : "保存"}
-        </button>
-      </div>
-
       {/* —— 外观 —— */}
       <section className="dl-card">
         <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
@@ -476,22 +478,52 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           <div className="dl-field-help">保存在本机浏览器存储；修改后自动生效（下次请求即走新地址）</div>
         </div>
       </section>
+
+      {/* —— 保存条（页尾 + sticky：长页滚动始终可达） —— */}
+      <div className="dl-actions dl-actions--sticky">
+        <span style={{ fontSize: 12, color: "var(--fg-3)" }}>
+          {s.meta.persist_path ? `配置文件：${s.meta.persist_path}` : "未指定 --config，保存仅运行时生效"}
+        </span>
+        <div style={{ flex: 1 }} />
+        <button
+          className="dl-btn dl-btn--ghost"
+          aria-label="放弃修改并重新加载"
+          disabled={busy || !dirtyCount}
+          onClick={() => load()}
+        >
+          <Icon name="sync" size={13} /> 重置
+        </button>
+        <button
+          className="dl-btn dl-btn--primary"
+          aria-label="保存设置"
+          disabled={busy || !dirtyCount}
+          onClick={save}
+        >
+          <Icon name="save" size={13} />
+          {dirtyCount ? `保存 ${dirtyCount} 项修改` : "保存"}
+        </button>
+      </div>
     </div>
   );
 }
 
-/// 主题预览卡：色板直接取自该主题的真实变量值（与 tokens.css 对齐的关键）。
+/// 主题预览卡：swatch 容器直接挂 data-theme={tk}，四色块取该主题的
+/// 真实 token 变量（--bg/--bg-2/--bg-3/--accent）——与 tokens.css 严格一致，
+/// 不再硬编码色值（旧实现与注释声明不符）。
 function ThemeCard({ tk, active, onPick }: { tk: ThemeKey; active: boolean; onPick: () => void }) {
   const meta = THEME_META[tk];
-  const swatch = meta.dark
-    ? ["#0b110e", "#151e1a", "#1a2420", meta.accent]
-    : ["#f7faf8", "#ffffff", "#eef6f3", meta.accent];
   return (
-    <button type="button" className={`dl-theme-card ${active ? "dl-theme-card--active" : ""}`} onClick={onPick}>
-      <div className="dl-theme-swatch" style={{ background: swatch[0] }}>
-        <i style={{ background: swatch[1], width: "38%", flex: "none" }} />
-        <i style={{ background: swatch[2] }} />
-        <i style={{ background: swatch[3], width: "14%", flex: "none" }} />
+    <button
+      type="button"
+      className={`dl-theme-card ${active ? "dl-theme-card--active" : ""}`}
+      aria-pressed={active}
+      onClick={onPick}
+    >
+      <div className="dl-theme-swatch" data-theme={tk}>
+        <i style={{ background: "var(--bg)", width: "38%", flex: "none" }} />
+        <i style={{ background: "var(--bg-2)" }} />
+        <i style={{ background: "var(--bg-3)" }} />
+        <i style={{ background: "var(--accent)", width: "14%", flex: "none" }} />
       </div>
       <div className="dl-theme-name">
         {active && <Icon name="check" size={12} style={{ color: meta.accent }} />}

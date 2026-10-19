@@ -1,10 +1,13 @@
 "use client";
 /// 统计视图：KPI 卡 + 引擎/状态分布 + 速率曲线。
+/// 交互打磨批：tone 变量名修正（--warning/--success 不存在 → --warn/--ok，
+/// 旧值无效回落 currentColor）；状态分布用中文标签（与表格徽章口径一致）。
 
 import type { Stats, TaskListItem } from "@/lib/daemon/types";
 import { fmtBytes, fmtSpeed } from "@/lib/daemon/format";
 import SpeedChart, { type SpeedPoint } from "./SpeedChart";
 import { Icon, type IconName } from "./Icon";
+import { stateLabel } from "./Common";
 
 function StatCard({
   icon,
@@ -22,7 +25,7 @@ function StatCard({
   fill?: number;
 }) {
   return (
-    <div className="dl-card dl-card" style={{ "--tone": tone } as React.CSSProperties}>
+    <div className="dl-card" style={{ "--tone": tone } as React.CSSProperties}>
       <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
         <div className="dl-stat-ico">
           <Icon name={icon} size={17} />
@@ -77,8 +80,8 @@ export default function StatsView({
       <div className="dl-grid dl-grid--stats">
         <StatCard icon="cloud-download" tone="var(--accent)" label="总下载速度" value={fmtSpeed(st.down_bytes_s)} sub={`会话累计 ${fmtBytes(st.session_down_bytes)}`} />
         <StatCard icon="arrow-up" tone="var(--info)" label="总上传速度" value={fmtSpeed(st.up_bytes_s)} sub={`会话累计 ${fmtBytes(st.session_up_bytes)}`} />
-        <StatCard icon="play" tone="var(--warning)" label="活跃任务" value={String(active)} sub={`共 ${st.total} 个任务`} fill={st.total ? (active / st.total) * 100 : 0} />
-        <StatCard icon="layers" tone="var(--success)" label="累计完成任务" value={String(doneCount)} sub={`列表共 ${tasks.length} 项`} fill={tasks.length ? (doneCount / tasks.length) * 100 : 0} />
+        <StatCard icon="play" tone="var(--warn)" label="活跃任务" value={String(active)} sub={`共 ${st.total} 个任务`} fill={st.total ? (active / st.total) * 100 : 0} />
+        <StatCard icon="layers" tone="var(--ok)" label="累计完成任务" value={String(doneCount)} sub={`列表共 ${tasks.length} 项`} fill={tasks.length ? (doneCount / tasks.length) * 100 : 0} />
       </div>
 
       <div className="dl-card">
@@ -129,7 +132,7 @@ export default function StatsView({
             <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
               {stateEntries.map(([k, n]) => (
                 <span key={k} className="dl-badge">
-                  {k}: {n}
+                  {stateLabel(k)}: {n}
                 </span>
               ))}
             </div>

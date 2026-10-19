@@ -41,6 +41,10 @@ export interface TaskSnapshot {
   limits?: { down_kb_s?: number | null; up_kb_s?: number | null };
   /** 定时启动（unix 秒；0 = 未调度） */
   start_at_unix?: number;
+  /** 实时速率（快照时点；UI 速率列的主数据源——SSE speed 事件后端尚无
+   *  生产者（events.rs 枚举存在但 ops.rs 不发布），快照 rates 是唯一
+   *  真实来源；SSE 若将来补齐则作为更新鲜的覆盖层） */
+  rates?: { down_bytes_s: number; up_bytes_s: number };
 }
 
 /// 事件流派生的任务级速率（Speed 事件）。

@@ -6,6 +6,11 @@
 /// 性能修复（审计 P1）：JSON.stringify 全量比较 → 浅层引用比较（长度 + 逐项
 /// 引用相等即可判断「新数据」——fetch 每次返回新对象，引用比较足够触发更新，
 /// 无需深比较语义；列表项字段级比较留给 React 渲染 diff）。
+/// 交互打磨批：
+/// - E8：loaded 标志区分「加载中」与「暂无任务」（首帧数据未到显示骨架）
+/// - 删除（单行/批量）走 ConfirmDialog 确认（危险操作不可裸触发）
+/// - 表头排序状态在此持有（排序后传表格渲染；Shift 范围选择按显示序）
+/// - toast 支持手动关闭；新建条 Esc 收起
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
@@ -16,18 +21,23 @@ import type {
   TaskSnapshot,
 } from "@/lib/daemon/types";
 import { client } from "@/lib/daemon/store";
-import TasksTable, { displayName, type TaskAction } from "./TasksTable";
+import TasksTable, {
+  displayName,
+  taskSortValue,
+  type TaskAction,
+  type TableSort,
+} from "./TasksTable";
 import StatsView from "./StatsView";
 import LogsView from "./LogsView";
 import RssView from "./RssView";
 import SettingsView from "./SettingsView";
 import TaskDetail from "./TaskDetail";
-import Toolbar, { type TaskFilterKey, type ViewKey } from "./Toolbar";
+import Toolbar, { TASK_FILTERS, type TaskFilterKey, type ViewKey } from "./Toolbar";
 import StatusBar from "./StatusBar";
+import { ConfirmDialog, TableSkeleton } from "./Common";
+import { Icon } from "./Icon";
 
 type SpeedPoint = { down: number; up: number };
-
-const RESUMABLE = ["Paused", "Queued", "Evaluating", "Failed", "Stopped"];
 
 function matchFilter(t: TaskListItem, f: TaskFilterKey): boolean {
   switch (f) {
@@ -62,6 +72,18 @@ export default function DlApp() {
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState(false);
   const [newUrl, setNewUrl] = useState("");
+  /// E8：首帧数据是否已到（区分「加载中」骨架与「暂无任务」空态）。
+  const [loaded, setLoaded] = useState(false);
+  /// 表头排序（null = 后端默认序）。
+  const [sort, setSort] = useState<TableSort>(null);
+  /// 危险操作确认（删除任务/批量删除）。
+  const [confirmState, setConfirmState] = useState<{
+    title: string;
+    body: string;
+    confirmText: string;
+    danger: boolean;
+    run: () => Promise<void>;
+  } | null>(null);
   const historyRef = useRef<SpeedPoint[]>([]);
   const [historyTick, setHistoryTick] = useState(0);
 
@@ -77,7 +99,10 @@ export default function DlApp() {
       client.listTasks().catch(() => null),
       client.stats().catch(() => null),
     ]);
-    if (t !== null) setTasks(t);
+    if (t !== null) {
+      setTasks(t);
+      setLoaded(true);
+    }
     if (s) {
       setStats(s);
       const h = historyRef.current;
@@ -141,7 +166,9 @@ export default function DlApp() {
         if (type === "completed") toast({ kind: "success", text: "任务完成" });
         if (type === "failed") toast({ kind: "error", text: "任务失败" });
         // 审计修复（40-e P2-22）：终态事件清理速率表条目
-        if (type === "completed" || type === "failed" || type === "removed") {
+        // （事件类型全集见 events.rs type_label——无 removed 变体，
+        // 删除场景由渲染侧 5s TTL 衰减兜底）
+        if (type === "completed" || type === "failed") {
           const tid = String(env.event.task_id ?? "");
           if (tid) {
             setRates((cur) => {
@@ -177,6 +204,17 @@ export default function DlApp() {
     });
   }, [tasks]);
 
+  /// 过滤分段计数（工具栏徽章）。
+  const counts = useMemo(() => {
+    const c = Object.fromEntries(TASK_FILTERS.map((f) => [f.key, 0])) as Record<TaskFilterKey, number>;
+    for (const t of tasks) {
+      for (const f of TASK_FILTERS) {
+        if (matchFilter(t, f.key)) c[f.key] += 1;
+      }
+    }
+    return c;
+  }, [tasks]);
+
   const shown = useMemo(
     () =>
       tasks.filter(
@@ -188,6 +226,20 @@ export default function DlApp() {
       ),
     [tasks, filter, query],
   );
+
+  /// 排序在过滤/搜索之后应用（显示序 = 用户所见序；Shift 范围选择按此序）。
+  const sorted = useMemo(() => {
+    if (!sort) return shown;
+    const dir = sort.dir === "asc" ? 1 : -1;
+    return [...shown].sort((a, b) => {
+      const va = taskSortValue(a, snapshots[a.task_id], rates[a.task_id], sort.key);
+      const vb = taskSortValue(b, snapshots[b.task_id], rates[b.task_id], sort.key);
+      if (typeof va === "string" || typeof vb === "string") {
+        return String(va).localeCompare(String(vb), "zh-Hans-CN") * dir;
+      }
+      return (va - vb) * dir;
+    });
+  }, [shown, sort, snapshots, rates]);
 
   const act = useCallback(
     async (fn: () => Promise<unknown>) => {
@@ -207,18 +259,40 @@ export default function DlApp() {
   const onAction = useCallback(
     (id: string, a: TaskAction) => {
       if (a === "remove") {
-        act(() => client.remove(id));
+        const name = displayName(tasks.find((t) => t.task_id === id) ?? { task_id: id });
+        setConfirmState({
+          title: "删除任务",
+          body: `确定删除「${name}」吗？任务记录将从列表移除（已下载文件默认保留）。`,
+          confirmText: "删除",
+          danger: true,
+          run: () => act(() => client.remove(id)),
+        });
         return;
       }
       act(() => (a === "resume" ? client.resume(id) : client.pause(id)));
     },
-    [act],
+    [act, tasks],
   );
 
   const onBatch = useCallback(
     (op: "pause" | "resume" | "remove") => {
       const ids = [...selected];
       if (ids.length === 0) return;
+      if (op === "remove") {
+        setConfirmState({
+          title: `批量删除 ${ids.length} 个任务`,
+          body: `确定删除选中的 ${ids.length} 个任务吗？任务记录将从列表移除（已下载文件默认保留）。`,
+          confirmText: `删除 ${ids.length} 项`,
+          danger: true,
+          run: async () => {
+            await act(async () => {
+              await client.batchTasks(ids, op);
+              setSelected(new Set());
+            });
+          },
+        });
+        return;
+      }
       act(async () => {
         await client.batchTasks(ids, op);
         setSelected(new Set());
@@ -253,20 +327,35 @@ export default function DlApp() {
 
   const toggleAll = useCallback(
     (on: boolean) => {
-      setSelected(on ? new Set(shown.map((t) => t.task_id)) : new Set());
+      setSelected(on ? new Set(sorted.map((t) => t.task_id)) : new Set());
     },
-    [shown],
+    [sorted],
   );
 
   const onSelectRow = useCallback(
     (id: string) => {
       setSelected((cur) => {
-        // 单击行 = 唯一选中（Shift/Ctrl 语义留给 checkbox）
+        // 单击行 = 唯一选中（Ctrl/Shift 语义在表格行内处理）
         return cur.size === 1 && cur.has(id) ? new Set() : new Set([id]);
       });
     },
     [],
   );
+
+  /// Shift 范围加选（不剔除——精确剔除用 checkbox 单点）。
+  const onSelectRange = useCallback((ids: string[]) => {
+    setSelected((cur) => {
+      const next = new Set(cur);
+      let changed = false;
+      for (const id of ids) {
+        if (!next.has(id)) {
+          next.add(id);
+          changed = true;
+        }
+      }
+      return changed ? next : cur;
+    });
+  }, []);
 
   return (
     <div className="dl-root">
@@ -275,6 +364,7 @@ export default function DlApp() {
         onView={setView}
         filter={filter}
         onFilter={setFilter}
+        counts={counts}
         query={query}
         onQuery={setQuery}
         stats={stats}
@@ -282,6 +372,7 @@ export default function DlApp() {
         selectedCount={selected.size}
         onBatch={onBatch}
         onNew={() => setAdding((v) => !v)}
+        adding={adding}
         busy={busy}
       />
 
@@ -290,7 +381,7 @@ export default function DlApp() {
           {view === "tasks" && (
             <>
               {adding && (
-                <div className="dl-card dl-add-bar">
+                <div className="dl-card dl-add-bar" id="dl-add-bar">
                   <input
                     className="dl-input dl-add-input"
                     placeholder="http(s):// · ftp(s):// · sftp:// · magnet:?xt=… · .m3u8 · .meta4"
@@ -298,28 +389,41 @@ export default function DlApp() {
                     value={newUrl}
                     autoFocus
                     onChange={(e) => setNewUrl(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && add()}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") add();
+                      if (e.key === "Escape") {
+                        e.stopPropagation();
+                        setAdding(false);
+                      }
+                    }}
                   />
-                  <button className="dl-btn dl-btn--primary" disabled={busy} onClick={add}>
+                  <button className="dl-btn dl-btn--primary" disabled={busy || !newUrl.trim()} onClick={add}>
                     添加
                   </button>
                   {/* Batch A 槽位：torrent 文件 / metalink / headers / sha256
                       （POST /tasks 全字段）—— 后续批次填 */}
                 </div>
               )}
-              <TasksTable
-                tasks={shown}
-                snapshots={snapshots}
-                rates={rates}
-                selected={selected}
-                onToggleSelect={toggleSelect}
-                onToggleAll={toggleAll}
-                onSelect={onSelectRow}
-                onOpen={setDetail}
-                onAction={onAction}
-                busy={busy}
-                query={query}
-              />
+              {!loaded ? (
+                <TableSkeleton />
+              ) : (
+                <TasksTable
+                  tasks={sorted}
+                  snapshots={snapshots}
+                  rates={rates}
+                  selected={selected}
+                  onToggleSelect={toggleSelect}
+                  onToggleAll={toggleAll}
+                  onSelect={onSelectRow}
+                  onSelectRange={onSelectRange}
+                  onOpen={setDetail}
+                  onAction={onAction}
+                  busy={busy}
+                  query={query}
+                  sort={sort}
+                  onSort={setSort}
+                />
+              )}
             </>
           )}
           {view === "stats" && (
@@ -339,10 +443,34 @@ export default function DlApp() {
         <TaskDetail id={detail} onClose={() => setDetail(null)} onChanged={refresh} />
       )}
 
+      {confirmState && (
+        <ConfirmDialog
+          title={confirmState.title}
+          body={confirmState.body}
+          confirmText={confirmState.confirmText}
+          danger={confirmState.danger}
+          onConfirm={() => {
+            const run = confirmState.run;
+            setConfirmState(null);
+            run().catch((e) => toast({ kind: "error", text: `操作失败：${String(e)}` }));
+          }}
+          onCancel={() => setConfirmState(null)}
+        />
+      )}
+
       <div className="dl-toasts" role="status" aria-live="polite">
         {toasts.map((t) => (
           <div key={t.id} className={`dl-toast dl-toast--${t.kind}`}>
-            {t.text}
+            <span className="dl-toast-text">{t.text}</span>
+            <button
+              type="button"
+              className="dl-toast-close"
+              aria-label="关闭提示"
+              title="关闭提示"
+              onClick={() => setToasts((cur) => cur.filter((x) => x.id !== t.id))}
+            >
+              <Icon name="close" size={12} />
+            </button>
           </div>
         ))}
       </div>

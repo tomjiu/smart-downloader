@@ -1,14 +1,22 @@
 "use client";
 /// 任务详情抽屉：进度/文件 + 任务级限速 / 顺序下载 / 代理 + 快捷操作。
 /// Issue #115 Phase 1：旧库 class 清零；name 可空兜底（P0-2）。
+/// 交互打磨批：
+/// - Esc 关闭（document 级监听，仅抽屉挂载期间存在）
+/// - 打开时初始聚焦「关闭」按钮（键盘用户不被丢在页尾）
+/// - 操作反馈分色：成功 info / 失败 err（旧实现同色误导）
+/// - 限速输入 placeholder 回显当前值（snapshot.limits；旧实现看不出已设限速）
+/// - 子文件 >30 截断时明示总数（不再静默截断）
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { TaskSnapshot } from "@/lib/daemon/types";
 import { client } from "@/lib/daemon/store";
 import { fmtBytes, fmtPct } from "@/lib/daemon/format";
 import { StateBadge, TaskProgress } from "./Common";
 import { Icon } from "./Icon";
 import { displayName } from "./TasksTable";
+
+const FILES_SHOWN = 30;
 
 export default function TaskDetail({
   id,
@@ -25,7 +33,8 @@ export default function TaskDetail({
   const [proxy, setProxy] = useState("");
   const [seq, setSeq] = useState(false);
   const [conn, setConn] = useState("");
-  const [msg, setMsg] = useState<string | null>(null);
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     let alive = true;
@@ -35,7 +44,7 @@ export default function TaskDetail({
         if (!alive) return;
         setTask(t);
         // 审查修复（P2）：顺序下载开关回读快照字段——原实现恒初始化 false，
-        // 已开启的任务显示“已关闭”且首点误发 true。
+        // 已开启的任务显示"已关闭"且首点误发 true。
         setSeq(Boolean(t.sequential));
       } catch {
         /* 抽屉期间任务可能被移除 */
@@ -49,25 +58,38 @@ export default function TaskDetail({
     };
   }, [id]);
 
+  /// Esc 关闭 + 初始聚焦（键盘可达性）。
+  useEffect(() => {
+    closeRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        onClose();
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, [onClose]);
+
   const run = async (fn: () => Promise<unknown>, ok: string) => {
     try {
       await fn();
-      setMsg(ok);
+      setMsg({ ok: true, text: ok });
       onChanged();
     } catch (e) {
-      setMsg(String(e));
+      setMsg({ ok: false, text: String(e) });
     }
   };
 
   return (
     <>
       <div className="dl-overlay" onClick={onClose} />
-      <div className="dl-drawer" role="dialog" aria-label="任务详情">
+      <div className="dl-drawer" role="dialog" aria-modal="true" aria-label="任务详情">
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
           <Icon name="file" size={16} className="dl-drawer-ico" />
           <b style={{ fontSize: 15 }}>任务详情</b>
           <div style={{ flex: 1 }} />
-          <button className="dl-btn dl-btn--ghost" onClick={onClose} aria-label="关闭">
+          <button ref={closeRef} className="dl-btn dl-btn--ghost" onClick={onClose} aria-label="关闭（Esc）" title="关闭（Esc）">
             <Icon name="close" size={13} />
           </button>
         </div>
@@ -103,7 +125,7 @@ export default function TaskDetail({
                 <input
                   className="dl-input"
                   aria-label="任务下载限速"
-                  placeholder="0 = 不限"
+                  placeholder={task.limits?.down_kb_s ? `当前 ${task.limits.down_kb_s}` : "0 = 不限"}
                   value={down}
                   onChange={(e) => setDown(e.target.value)}
                 />
@@ -111,7 +133,7 @@ export default function TaskDetail({
                 <input
                   className="dl-input"
                   aria-label="任务上传限速"
-                  placeholder="0 = 不限"
+                  placeholder={task.limits?.up_kb_s ? `当前 ${task.limits.up_kb_s}` : "0 = 不限"}
                   value={up}
                   onChange={(e) => setUp(e.target.value)}
                 />
@@ -148,6 +170,7 @@ export default function TaskDetail({
                 <label className="dl-field-label">顺序下载</label>
                 <button
                   className={`dl-btn dl-btn--ghost ${seq ? "dl-btn--primary" : ""}`}
+                  aria-pressed={seq}
                   onClick={() => {
                     const next = !seq;
                     setSeq(next);
@@ -181,13 +204,14 @@ export default function TaskDetail({
                     <input
                       className="dl-input"
                       aria-label="任务连接数上限"
-                      placeholder={task.max_connections != null ? String(task.max_connections) : "0 = 内核默认"}
+                      placeholder={task.max_connections != null ? `当前 ${task.max_connections}` : "0 = 内核默认"}
                       value={conn}
                       onChange={(e) => setConn(e.target.value.replace(/[^0-9]/g, ""))}
                     />
                     <div />
                     <button
                       className="dl-btn"
+                      disabled={!conn}
                       onClick={() => {
                         if (!conn) return;
                         run(() => client.taskConnections(task.task_id, Number(conn) || 0), conn === "0" ? "已复位内核默认" : "连接数上限已应用");
@@ -223,7 +247,7 @@ export default function TaskDetail({
                   子文件 <span className="dl-badge">{task.files.length}</span>
                 </b>
                 <div style={{ display: "grid", gap: 8 }}>
-                  {task.files.slice(0, 30).map((f) => (
+                  {task.files.slice(0, FILES_SHOWN).map((f) => (
                     <div key={f.path}>
                       <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, gap: 8 }}>
                         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
@@ -242,12 +266,17 @@ export default function TaskDetail({
                     </div>
                   ))}
                 </div>
+                {task.files.length > FILES_SHOWN && (
+                  <div className="dl-field-help" style={{ marginTop: 10 }}>
+                    共 {task.files.length} 个子文件，仅显示前 {FILES_SHOWN} 项
+                  </div>
+                )}
               </div>
             )}
 
             {msg && (
-              <div className="dl-alert">
-                {msg}
+              <div className={`dl-alert ${msg.ok ? "" : "dl-alert--error"}`} role="status">
+                {msg.text}
               </div>
             )}
           </div>

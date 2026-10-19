@@ -1,11 +1,14 @@
 "use client";
-/// 通用小件：状态徽章 / 进度条 / 速率胶囊 / 空态。
+/// 通用小件：状态徽章 / 进度条 / 速率胶囊 / 空态 / 确认对话框 / 表格骨架。
 /// Issue #115 Phase 1：全部改用 dl-* token 体系（旧库 class 已清零）。
+/// 交互打磨批：ConfirmDialog（危险操作确认，alertdialog 语义 + Esc +
+/// 初始焦点取消按钮）；TableSkeleton（E8：首帧数据未到时不再误报「暂无任务」）。
 
+import { useEffect, useRef } from "react";
 import { fmtBytes, fmtPct, fmtSpeed } from "@/lib/daemon/format";
 import { Icon } from "./Icon";
 
-const STATE_TONE: Record<string, { label: string; badge: string; bar: string }> = {
+export const STATE_TONE: Record<string, { label: string; badge: string; bar: string }> = {
   Downloading: { label: "下载中", badge: "dl-badge--primary", bar: "run" },
   Seeding: { label: "做种中", badge: "dl-badge--info", bar: "run" },
   Transferring: { label: "传输中", badge: "dl-badge--primary", bar: "run" },
@@ -17,6 +20,10 @@ const STATE_TONE: Record<string, { label: string; badge: string; bar: string }> 
   Stopped: { label: "已停止", badge: "", bar: "paused" },
   Failed: { label: "失败", badge: "dl-badge--error", bar: "error" },
 };
+
+export function stateLabel(state: string): string {
+  return STATE_TONE[state]?.label ?? state;
+}
 
 export function StateBadge({ state }: { state: string }) {
   const meta = STATE_TONE[state] ?? { label: state, badge: "", bar: "" };
@@ -96,5 +103,99 @@ export function SizeText({ task }: { task: { done: number; total: number } }) {
     <span style={{ fontVariantNumeric: "tabular-nums", color: "var(--fg-2)" }}>
       {fmtBytes(task.done)} / {fmtBytes(task.total)} · {fmtPct(task.done, task.total)}
     </span>
+  );
+}
+
+/// E8：表格加载骨架（首帧数据未到）。静态灰条（克制：无 shimmer 动画）。
+export function TableSkeleton({ rows = 8 }: { rows?: number }) {
+  return (
+    <div className="dl-table-wrap" aria-busy="true" aria-live="polite">
+      <div className="dl-skel-colgroup" aria-hidden="true">
+        <span style={{ width: "4%" }} />
+        <span style={{ width: "34%" }} />
+        <span style={{ width: "10%" }} />
+        <span style={{ width: "22%" }} />
+        <span style={{ width: "10%" }} />
+        <span style={{ width: "10%" }} />
+        <span style={{ width: "8%" }} />
+      </div>
+      <span className="dl-skel-hint" role="status">正在加载任务列表…</span>
+      {Array.from({ length: rows }, (_, i) => (
+        <div className="dl-skel-row" key={i} aria-hidden="true">
+          <span style={{ width: "4%" }} />
+          <span style={{ width: "34%", height: 10 }} />
+          <span style={{ width: "10%", height: 10 }} />
+          <span style={{ width: "22%", height: 4 }} />
+          <span style={{ width: "10%", height: 10 }} />
+          <span style={{ width: "10%", height: 10 }} />
+          <span style={{ width: "8%", height: 10 }} />
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/// 危险/不可逆操作确认（删除任务、删除订阅、批量删除等）。
+/// - role="alertdialog" + aria-modal，Esc 取消
+/// - 初始焦点落在「取消」（安全默认；Tab 一格到确认）
+/// - danger = 确认按钮红态；overlay 纯色半透明（规范 §1.5.7）
+export function ConfirmDialog({
+  title,
+  body,
+  confirmText,
+  danger,
+  onConfirm,
+  onCancel,
+}: {
+  title: string;
+  body: string;
+  confirmText: string;
+  danger?: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    cancelRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        onCancel();
+      }
+    };
+    document.addEventListener("keydown", onKey, true);
+    return () => document.removeEventListener("keydown", onKey, true);
+  }, [onCancel]);
+  return (
+    <>
+      <div className="dl-overlay" onClick={onCancel} />
+      <div
+        className="dl-confirm"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="dl-confirm-title"
+        aria-describedby="dl-confirm-body"
+      >
+        <div className="dl-confirm-title" id="dl-confirm-title">
+          <Icon name={danger ? "error" : "pass"} size={15} className={`dl-confirm-ico ${danger ? "is-danger" : ""}`} />
+          {title}
+        </div>
+        <div className="dl-confirm-body" id="dl-confirm-body">
+          {body}
+        </div>
+        <div className="dl-confirm-actions">
+          <button ref={cancelRef} type="button" className="dl-btn" onClick={onCancel}>
+            取消
+          </button>
+          <button
+            type="button"
+            className={`dl-btn ${danger ? "dl-btn--danger-solid" : "dl-btn--primary"}`}
+            onClick={onConfirm}
+          >
+            {confirmText}
+          </button>
+        </div>
+      </div>
+    </>
   );
 }

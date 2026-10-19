@@ -1,5 +1,7 @@
 "use client";
 /// 日志视图：事件流渲染（类型徽章 + 摘要）。
+/// 交互打磨批：类型 tab 补 aria-pressed；头部计数（总数/过滤后）；
+/// 过滤无匹配时给出明确空态文案。
 
 import { useMemo, useState } from "react";
 import type { SchedulerEventEnvelope } from "@/lib/daemon/types";
@@ -43,25 +45,36 @@ export default function LogsView({ events }: { events: SchedulerEventEnvelope[] 
 
   return (
     <div>
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12, alignItems: "center" }}>
         <button
           className={`dl-tab ${!type ? "dl-tab--active" : ""}`}
+          aria-pressed={!type}
           onClick={() => setType("")}
         >
           全部
+          <span className="dl-tab-count">{events.length}</span>
         </button>
         {types.map((t) => (
           <button
             key={t}
             className={`dl-tab ${type === t ? "dl-tab--active" : ""}`}
+            aria-pressed={type === t}
             onClick={() => setType(t)}
           >
             {t}
           </button>
         ))}
+        <div style={{ flex: 1 }} />
+        <span style={{ fontSize: 11, color: "var(--fg-3)", whiteSpace: "nowrap" }}>
+          显示 {shown.length} / {events.length} 条（保留最近 500 条）
+        </span>
       </div>
       {shown.length === 0 ? (
-        <EmptyState icon="output" title="暂无事件" hint="事件流经 SSE 实时推送" />
+        <EmptyState
+          icon="output"
+          title={type ? "该类型暂无事件" : "暂无事件"}
+          hint={type ? "切换到其他类型试试" : "事件流经 SSE 实时推送"}
+        />
       ) : (
         <div className="dl-card" style={{ padding: 0, overflow: "hidden" }}>
           {shown.map((env, i) => (

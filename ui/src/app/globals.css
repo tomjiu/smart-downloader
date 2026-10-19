@@ -909,3 +909,258 @@ body {
   color: var(--accent);
   flex: none;
 }
+
+/* ════════════════════════════════════════════════════════════
+   交互打磨批（Issue #115 Phase 1 补强）
+   ════════════════════════════════════════════════════════════ */
+
+/* ── 分段计数徽章（过滤/批量；qBittorrent 风格）── */
+.dl-seg-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 14px;
+  padding: 0 4px;
+  border-radius: 99px;
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  background: var(--bg-3);
+  color: var(--fg-3);
+}
+.dl-seg-item .dl-seg-count {
+  margin-left: 2px;
+}
+.dl-seg-item.is-on .dl-seg-count {
+  background: rgba(0, 0, 0, 0.18);
+  color: var(--accent-fg);
+}
+.dl-seg-item:disabled .dl-seg-count {
+  opacity: 0.45;
+}
+
+/* ── 排序表头（可聚焦按钮；aria-sort 视觉由方向图标承载）── */
+.dl-th-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.dl-th-sort:hover {
+  color: var(--fg);
+}
+.dl-th-sort:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  border-radius: var(--radius-sm);
+}
+.dl-th-sort-ico {
+  color: var(--accent);
+  flex: none;
+}
+.dl-th-num .dl-th-sort {
+  /* 数字列右对齐时按钮跟随右对齐 */
+  margin-left: auto;
+}
+
+/* ── 搜索清除按钮 ── */
+.dl-search-clear {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-3);
+  cursor: pointer;
+}
+.dl-search-clear:hover {
+  background: var(--bg-3);
+  color: var(--fg);
+}
+.dl-search-clear:active {
+  background: var(--bg-2);
+}
+.dl-search-clear:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 0;
+}
+
+/* ── 确认对话框（危险操作；浮层阴影规范 §1.5.7）── */
+.dl-confirm {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 95;
+  width: min(400px, calc(100vw - 32px));
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.16);
+  padding: var(--space-4);
+  animation: dl-fade 160ms ease-out both;
+}
+.dl-confirm-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  margin-bottom: var(--space-3);
+}
+.dl-confirm-ico {
+  color: var(--info);
+  flex: none;
+}
+.dl-confirm-ico.is-danger {
+  color: var(--err);
+}
+.dl-confirm-body {
+  font-size: var(--fs);
+  color: var(--fg-2);
+  line-height: 1.5;
+  word-break: break-all;
+  margin-bottom: var(--space-4);
+}
+.dl-confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+.dl-btn--danger-solid {
+  background: var(--err);
+  border-color: var(--err);
+  color: #ffffff;
+  font-weight: 600;
+}
+.dl-btn--danger-solid:hover {
+  background: var(--err);
+  border-color: var(--err);
+  filter: brightness(1.08);
+}
+
+/* ── toast 关闭 ── */
+.dl-toast {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+.dl-toast-text {
+  flex: 1;
+  min-width: 0;
+  word-break: break-all;
+}
+.dl-toast-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex: none;
+  margin: -1px -2px 0 0;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-3);
+  cursor: pointer;
+}
+.dl-toast-close:hover {
+  background: var(--bg-3);
+  color: var(--fg);
+}
+.dl-toast-close:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 0;
+}
+
+/* ── 表格加载骨架（E8：静态灰条，无 shimmer——克制优先）── */
+.dl-skel-hint {
+  display: block;
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--fs-sm);
+  color: var(--fg-3);
+}
+.dl-skel-colgroup,
+.dl-skel-row {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  padding: 0 var(--space-4);
+}
+.dl-skel-colgroup {
+  height: 30px;
+  border-bottom: 1px solid var(--line);
+}
+.dl-skel-colgroup span {
+  height: 8px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-3);
+}
+.dl-skel-row {
+  height: var(--row-h);
+  border-bottom: 1px solid var(--line-2);
+}
+.dl-skel-row span {
+  height: 12px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-3);
+}
+.dl-skel-colgroup span,
+.dl-skel-row span {
+  opacity: 0.7;
+}
+
+/* ── 设置页 sticky 保存条（长页滚动始终可达）── */
+.dl-actions--sticky {
+  position: sticky;
+  bottom: 0;
+  z-index: 5;
+  background: var(--bg);
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  margin-top: var(--space-2);
+}
+
+/* ── 日志 tab 计数 ── */
+.dl-tab-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 14px;
+  padding: 0 4px;
+  margin-left: 4px;
+  border-radius: 99px;
+  font-size: 10px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  background: var(--bg-3);
+  color: var(--fg-3);
+}
+.dl-tab--active .dl-tab-count {
+  background: var(--accent-bg);
+  color: var(--accent);
+}
+
+/* ── checkbox 键盘可达性（六态补全）── */
+.dl-td-check input:focus-visible,
+.dl-th-check input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}

@@ -1,11 +1,16 @@
 "use client";
 /// RSS 订阅视图（batch5，qbit RSS Downloader 对标）：订阅管理 + 规则
 /// 管理（含 use_regex / episode_filter / 每 feed 间隔）+ 条目命中情况。
+/// 交互打磨批：--border 变量名修正（不存在 → --line-2，旧值渲染为
+/// currentColor 黑线）；删除订阅/规则走 ConfirmDialog；条目 50 截断明示。
 
 import { useCallback, useEffect, useState } from "react";
 import type { RssFeed, RssItem, RssRule } from "@/lib/daemon/types";
 import { client } from "@/lib/daemon/store";
 import { Icon } from "./Icon";
+import { ConfirmDialog } from "./Common";
+
+const ITEMS_SHOWN = 50;
 
 function Section({
   title,
@@ -42,6 +47,12 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
   const [rRegex, setRRegex] = useState(false);
   const [rEpisode, setREpisode] = useState("");
   const [busy, setBusy] = useState(false);
+  /// 删除确认（订阅/规则，不可逆）。
+  const [confirmState, setConfirmState] = useState<{
+    title: string;
+    body: string;
+    run: () => Promise<void>;
+  } | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -144,7 +155,7 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
           feeds.map((f) => (
             <div
               key={f.id}
-              style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", borderBottom: "1px solid var(--border)" }}
+              style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", borderBottom: "1px solid var(--line-2)" }}
             >
               <b style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 320 }}>{f.title}</b>
               <span className="dl-badge">{f.item_count} 条</span>
@@ -157,11 +168,11 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
                 min={0}
                 aria-label={`订阅 ${f.title} 刷新间隔（秒）`}
                 defaultValue={f.interval_override_secs ?? 0}
+                key={`${f.id}:${f.interval_override_secs ?? 0}`}
                 title="刷新间隔（秒；0 = 跟随全局），失焦保存"
-                onMouseOver={(e) => ((e.target as HTMLInputElement).dataset.v = (e.target as HTMLInputElement).value)}
-                onFocus={(e) => ((e.target as HTMLInputElement).dataset.v = e.target.value)}
+                onFocus={(e) => (e.target.dataset.v = e.target.value)}
                 onBlur={(e) => {
-                  const el = e.target as HTMLInputElement;
+                  const el = e.target;
                   const next = Number(el.value) || 0;
                   if (String(next) !== (el.dataset.v ?? "")) {
                     run(() => client.rssUpdateFeed(f.id, next), `订阅间隔已更新为 ${next}s`);
@@ -171,7 +182,14 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
               <button
                 className="dl-btn dl-btn--ghost"
                 aria-label={`删除订阅 ${f.title}`}
-                onClick={() => run(() => client.rssRemoveFeed(f.id), "订阅已删除")}
+                title={`删除订阅 ${f.title}（需确认）`}
+                onClick={() =>
+                  setConfirmState({
+                    title: "删除订阅",
+                    body: `确定删除订阅「${f.title}」吗？已缓存的条目与未匹配项将一并移除。`,
+                    run: () => run(() => client.rssRemoveFeed(f.id), "订阅已删除"),
+                  })
+                }
               >
                 <Icon name="close" size={13} />
               </button>
@@ -230,7 +248,7 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
             {rules.map((r) => (
               <div
                 key={r.id}
-                style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: "1px solid var(--border)", flexWrap: "wrap" }}
+                style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: "1px solid var(--line-2)", flexWrap: "wrap" }}
               >
                 <b>{r.name}</b>
                 {r.use_regex && <span className="dl-badge">正则</span>}
@@ -243,7 +261,14 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
                 <button
                   className="dl-btn dl-btn--ghost"
                   aria-label={`删除规则 ${r.name}`}
-                  onClick={() => run(() => client.rssRemoveRule(r.id), "规则已删除")}
+                  title={`删除规则 ${r.name}（需确认）`}
+                  onClick={() =>
+                    setConfirmState({
+                      title: "删除规则",
+                      body: `确定删除规则「${r.name}」吗？后续匹配的条目将不再自动建任务。`,
+                      run: () => run(() => client.rssRemoveRule(r.id), "规则已删除"),
+                    })
+                  }
                 >
                   <Icon name="close" size={13} />
                 </button>
@@ -274,22 +299,44 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
         {items.length === 0 ? (
           <div style={{ color: "var(--fg-3)", fontSize: 12 }}>暂无条目</div>
         ) : (
-          items.slice(0, 50).map((i) => (
-            <div
-              key={i.guid}
-              style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 0", borderBottom: "1px solid var(--border)" }}
-            >
-              <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13 }}>{i.title}</span>
-              <div style={{ flex: 1 }} />
-              {i.task_id ? (
-                <span className="dl-badge dl-badge--success">已建任务 {i.task_id}</span>
-              ) : (
-                <span className="dl-badge">未匹配</span>
-              )}
-            </div>
-          ))
+          <>
+            {items.slice(0, ITEMS_SHOWN).map((i) => (
+              <div
+                key={i.guid}
+                style={{ display: "flex", alignItems: "center", gap: 10, padding: "5px 0", borderBottom: "1px solid var(--line-2)" }}
+              >
+                <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13 }}>{i.title}</span>
+                <div style={{ flex: 1 }} />
+                {i.task_id ? (
+                  <span className="dl-badge dl-badge--success">已建任务 {i.task_id}</span>
+                ) : (
+                  <span className="dl-badge">未匹配</span>
+                )}
+              </div>
+            ))}
+            {items.length > ITEMS_SHOWN && (
+              <div className="dl-field-help" style={{ marginTop: 10 }}>
+                共 {items.length} 条，仅显示前 {ITEMS_SHOWN} 条
+              </div>
+            )}
+          </>
         )}
       </Section>
+
+      {confirmState && (
+        <ConfirmDialog
+          title={confirmState.title}
+          body={confirmState.body}
+          confirmText="删除"
+          danger
+          onConfirm={() => {
+            const run = confirmState.run;
+            setConfirmState(null);
+            run();
+          }}
+          onCancel={() => setConfirmState(null)}
+        />
+      )}
     </div>
   );
 }
