@@ -1,11 +1,14 @@
 "use client";
 /// 任务详情抽屉：进度/文件 + 任务级限速 / 顺序下载 / 代理 + 快捷操作。
+/// Issue #115 Phase 1：旧库 class 清零；name 可空兜底（P0-2）。
 
 import { useEffect, useState } from "react";
 import type { TaskSnapshot } from "@/lib/daemon/types";
 import { client } from "@/lib/daemon/store";
 import { fmtBytes, fmtPct } from "@/lib/daemon/format";
 import { StateBadge, TaskProgress } from "./Common";
+import { Icon } from "./Icon";
+import { displayName } from "./TasksTable";
 
 export default function TaskDetail({
   id,
@@ -59,28 +62,29 @@ export default function TaskDetail({
   return (
     <>
       <div className="dl-overlay" onClick={onClose} />
-      <div className="dl-drawer dl-enter" role="dialog" aria-label="任务详情">
+      <div className="dl-drawer" role="dialog" aria-label="任务详情">
         <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
-          <span className="qoder-icon qoder-icon--file" style={{ color: "var(--accent)", fontSize: 18 }} />
-          <b style={{ fontSize: 16 }}>任务详情</b>
+          <Icon name="file" size={16} className="dl-drawer-ico" />
+          <b style={{ fontSize: 15 }}>任务详情</b>
           <div style={{ flex: 1 }} />
-          <button className="qoder-btn qoder-btn--ghost" onClick={onClose} aria-label="关闭">
-            <span className="qoder-icon qoder-icon--close" />
+          <button className="dl-btn dl-btn--ghost" onClick={onClose} aria-label="关闭">
+            <Icon name="close" size={13} />
           </button>
         </div>
 
         {!task ? (
-          <div style={{ color: "var(--text-tertiary)" }}>加载中…（任务可能已移除）</div>
+          <div style={{ color: "var(--fg-3)" }}>加载中…（任务可能已移除）</div>
         ) : (
           <div style={{ display: "grid", gap: 14 }}>
             <div>
-              <div style={{ fontWeight: 700, marginBottom: 6, wordBreak: "break-all" }}>{task.name}</div>
+              {/* P0-2 修复：name 可空兜底（绝不渲染 null） */}
+              <div style={{ fontWeight: 600, marginBottom: 6, wordBreak: "break-all" }}>
+                {displayName(task)}
+              </div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                 <StateBadge state={task.state} />
-                {task.engine && <span className="qoder-badge qoder-badge--default">{task.engine}</span>}
-                <span className="qoder-badge qoder-badge--default">
-                  {fmtPct(task.done, task.total)}
-                </span>
+                {task.engine && <span className="dl-badge">{task.engine}</span>}
+                <span className="dl-badge">{fmtPct(task.done, task.total)}</span>
               </div>
             </div>
 
@@ -97,7 +101,7 @@ export default function TaskDetail({
               <div className="dl-form-grid">
                 <label className="dl-field-label">下载限速 (KiB/s)</label>
                 <input
-                  className="qoder-input"
+                  className="dl-input"
                   aria-label="任务下载限速"
                   placeholder="0 = 不限"
                   value={down}
@@ -105,7 +109,7 @@ export default function TaskDetail({
                 />
                 <label className="dl-field-label">上传限速 (KiB/s)</label>
                 <input
-                  className="qoder-input"
+                  className="dl-input"
                   aria-label="任务上传限速"
                   placeholder="0 = 不限"
                   value={up}
@@ -113,7 +117,7 @@ export default function TaskDetail({
                 />
                 <div />
                 <button
-                  className="qoder-btn qoder-btn--primary"
+                  className="dl-btn dl-btn--primary"
                   onClick={() =>
                     run(
                       () => {
@@ -143,14 +147,14 @@ export default function TaskDetail({
 
                 <label className="dl-field-label">顺序下载</label>
                 <button
-                  className={`qoder-btn qoder-btn--ghost ${seq ? "dl-nav-item--active" : ""}`}
+                  className={`dl-btn dl-btn--ghost ${seq ? "dl-btn--primary" : ""}`}
                   onClick={() => {
                     const next = !seq;
                     setSeq(next);
                     run(() => client.taskSequential(task.task_id, next), next ? "已开启顺序下载" : "已关闭");
                   }}
                 >
-                  <span className={`qoder-icon qoder-icon--${seq ? "check" : "circle-slash"}`} />
+                  <Icon name={seq ? "check" : "close"} size={13} />
                   {seq ? "开启中" : "已关闭"}
                 </button>
 
@@ -159,14 +163,14 @@ export default function TaskDetail({
                     <label className="dl-field-label">首尾块优先（边下边播）</label>
                     <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                       <button
-                        className="qoder-btn qoder-btn--ghost"
+                        className="dl-btn dl-btn--ghost"
                         aria-label="开启首尾块优先"
                         onClick={() => run(() => client.taskPieceFirstLast(task.task_id, 7), "已提升首尾块优先级")}
                       >
-                        <span className="qoder-icon qoder-icon--check" /> 开启
+                        <Icon name="check" size={13} /> 开启
                       </button>
                       <button
-                        className="qoder-btn qoder-btn--ghost"
+                        className="dl-btn dl-btn--ghost"
                         aria-label="恢复默认块优先级"
                         onClick={() => run(() => client.taskPieceFirstLast(task.task_id, 0), "已恢复默认块优先级")}
                       >
@@ -175,7 +179,7 @@ export default function TaskDetail({
                     </div>
                     <label className="dl-field-label">连接数上限</label>
                     <input
-                      className="qoder-input"
+                      className="dl-input"
                       aria-label="任务连接数上限"
                       placeholder={task.max_connections != null ? String(task.max_connections) : "0 = 内核默认"}
                       value={conn}
@@ -183,7 +187,7 @@ export default function TaskDetail({
                     />
                     <div />
                     <button
-                      className="qoder-btn"
+                      className="dl-btn"
                       onClick={() => {
                         if (!conn) return;
                         run(() => client.taskConnections(task.task_id, Number(conn) || 0), conn === "0" ? "已复位内核默认" : "连接数上限已应用");
@@ -197,7 +201,7 @@ export default function TaskDetail({
 
                 <label className="dl-field-label">任务代理</label>
                 <input
-                  className="qoder-input"
+                  className="dl-input"
                   aria-label="任务代理"
                   placeholder="http(s)/socks4/socks5://host:port，留空清除"
                   value={proxy}
@@ -205,7 +209,7 @@ export default function TaskDetail({
                 />
                 <div />
                 <button
-                  className="qoder-btn"
+                  className="dl-btn"
                   onClick={() => run(() => client.taskProxy(task.task_id, proxy || null), "代理已更新（新连接生效）")}
                 >
                   更新代理
@@ -216,7 +220,7 @@ export default function TaskDetail({
             {task.files && task.files.length > 0 && (
               <div className="dl-card">
                 <b style={{ display: "block", marginBottom: 10 }}>
-                  子文件 <span className="qoder-badge qoder-badge--default">{task.files.length}</span>
+                  子文件 <span className="dl-badge">{task.files.length}</span>
                 </b>
                 <div style={{ display: "grid", gap: 8 }}>
                   {task.files.slice(0, 30).map((f) => (
@@ -225,7 +229,7 @@ export default function TaskDetail({
                         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                           {f.path}
                         </span>
-                        <span style={{ flex: "none", fontVariantNumeric: "tabular-nums", color: "var(--text-tertiary)" }}>
+                        <span style={{ flex: "none", fontVariantNumeric: "tabular-nums", color: "var(--fg-3)" }}>
                           {fmtBytes(f.done)} / {fmtBytes(f.size)}
                         </span>
                       </div>
@@ -242,8 +246,8 @@ export default function TaskDetail({
             )}
 
             {msg && (
-              <div className="qoder-alert qoder-alert--info">
-                <div className="qoder-alert-content">{msg}</div>
+              <div className="dl-alert">
+                {msg}
               </div>
             )}
           </div>
@@ -256,8 +260,8 @@ export default function TaskDetail({
 function Row({ k, v, danger }: { k: string; v: string; danger?: boolean }) {
   return (
     <div style={{ display: "flex", justifyContent: "space-between", gap: 10, padding: "3px 0" }}>
-      <span style={{ color: "var(--text-tertiary)" }}>{k}</span>
-      <span style={{ color: danger ? "var(--error)" : undefined, wordBreak: "break-all", textAlign: "right" }}>
+      <span style={{ color: "var(--fg-3)" }}>{k}</span>
+      <span style={{ color: danger ? "var(--err)" : undefined, wordBreak: "break-all", textAlign: "right" }}>
         {v}
       </span>
     </div>

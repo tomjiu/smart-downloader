@@ -38,10 +38,13 @@ function Warn($id, $msg, $detail) {
 function Head($t) { Write-Host "`n$t" -ForegroundColor Cyan }
 
 # 收集源文件（排除构建产物与依赖）
+# Issue #115 顺手修（跨平台）：排除正则原为 Windows 分隔符（\out\），
+# Linux 上 /out/ 构建产物会被误扫（渐变/间距检查误报）。改为同时
+# 匹配 / 与 \ 两种分隔符。
 function Get-SourceFiles($patterns) {
     if (-not (Test-Path $ui)) { return @() }
     Get-ChildItem $ui -Recurse -File -Include $patterns -ErrorAction SilentlyContinue |
-        Where-Object { $_.FullName -notmatch 'node_modules|\\\.next\\|\\out\\|\\public\\qoder-ui\\' }
+        Where-Object { $_.FullName -notmatch 'node_modules|[/\\]\.next[/\\]|[/\\]out[/\\]|[/\\]public[/\\]qoder-ui[/\\]' }
 }
 
 Write-Host "`n=== Smart Downloader UI 规范检查 ===" -ForegroundColor White
@@ -97,17 +100,23 @@ if (-not $themeSource) {
         Fail "G0-3" "主题定义仅 $($themes.Count) 个（需 12）" ($themes -join ", ")
     }
 
+    # Issue #115 催修（脚本 bug 1）：0 个主题时空集合 all() 恒真 → 假 PASS。
+    # 先断言主题集合非空，再逐个校验 token。
     $need = @('--bg','--fg','--accent','--ok','--warn','--err','--line','--track')
     $bad = @()
-    foreach ($t in $themes) {
-        $m = [regex]::Match($themeSource, "\[data-theme=`"$([regex]::Escape($t))`"\]\s*\{[^}]*\}")
-        if ($m.Success) {
-            $miss = $need | Where-Object { $m.Value -notmatch [regex]::Escape($_) }
-            if ($miss) { $bad += "$t 缺 $($miss -join ',')" }
-        } else { $bad += "$t 解析失败" }
+    if ($themes.Count -eq 0) {
+        Fail "G0-4" "无主题可校验（空集合假 PASS 修复）" "主题定义数为 0"
+    } else {
+        foreach ($t in $themes) {
+            $m = [regex]::Match($themeSource, "\[data-theme=`"$([regex]::Escape($t))`"\]\s*\{[^}]*\}")
+            if ($m.Success) {
+                $miss = $need | Where-Object { $m.Value -notmatch [regex]::Escape($_) }
+                if ($miss) { $bad += "$t 缺 $($miss -join ',')" }
+            } else { $bad += "$t 解析失败" }
+        }
+        if ($bad.Count -gt 0) { Fail "G0-4" "主题 token 不完整" ($bad -join "; ") }
+        else { Ok "G0-4" "全部 $($themes.Count) 主题 token 完整" }
     }
-    if ($bad.Count -gt 0) { Fail "G0-4" "主题 token 不完整" ($bad -join "; ") }
-    else { Ok "G0-4" "全部主题 token 完整" }
 }
 
 # G0-5 无 transition: all
@@ -215,9 +224,12 @@ if ($Stage -in @("p1", "p2", "all")) {
     else { Fail "D10" "缺 prefers-reduced-motion" "" }
 
     # D5 focus-visible
+    # Issue #115 催修（脚本 bug 2）：0 处时仅 WARN 会漏放「完全没做键盘可达」
+    # 的 PR——规范 §1.5.2 要求全部可交互元素覆盖，0 处即 FAIL。
     $fv = ([regex]::Matches($allCss, ':focus-visible')).Count
     if ($fv -ge 3) { Ok "D5" "focus-visible $fv 处" }
-    else { Warn "D5" "focus-visible 仅 $fv 处，确认覆盖所有可交互元素" "" }
+    elseif ($fv -gt 0) { Warn "D5" "focus-visible 仅 $fv 处，确认覆盖所有可交互元素" "" }
+    else { Fail "D5" "focus-visible 0 处（键盘可达性缺失）" "规范 §1.5.2 要求全部可交互元素覆盖" }
 
     # D7 过渡时长
     $slow = @()

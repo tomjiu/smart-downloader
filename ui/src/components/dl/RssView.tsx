@@ -5,6 +5,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { RssFeed, RssItem, RssRule } from "@/lib/daemon/types";
 import { client } from "@/lib/daemon/store";
+import { Icon } from "./Icon";
 
 function Section({
   title,
@@ -19,7 +20,7 @@ function Section({
     <section className="dl-card">
       <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
         {title}
-        {count != null && <span className="qoder-badge qoder-badge--default">{count}</span>}
+        {count != null && <span className="dl-badge">{count}</span>}
       </h3>
       {children}
     </section>
@@ -109,19 +110,19 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
   };
 
   return (
-    <div className="dl-enter" style={{ display: "grid", gap: 16, maxWidth: 860 }}>
+    <div className="" style={{ display: "grid", gap: 16, maxWidth: 860 }}>
       {/* —— 订阅源 —— */}
       <Section title="订阅源" count={feeds.length}>
         <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
           <input
-            className="qoder-input"
+            className="dl-input"
             style={{ flex: 1 }}
             placeholder="RSS/Atom 订阅 URL（https://…）"
             value={feedUrl}
             onChange={(e) => setFeedUrl(e.target.value)}
           />
           <button
-            className="qoder-btn qoder-btn--primary"
+            className="dl-btn dl-btn--primary"
             disabled={busy || !feedUrl.trim()}
             onClick={() =>
               run(() => client.rssAddFeed(feedUrl.trim()), "订阅已添加").then(() => setFeedUrl(""))
@@ -130,15 +131,15 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
             添加订阅
           </button>
           <button
-            className="qoder-btn qoder-btn--ghost"
+            className="dl-btn dl-btn--ghost"
             disabled={busy}
             onClick={() => run(() => client.rssRefresh(), "已刷新全部订阅（规则自动建任务）")}
           >
-            <span className="qoder-icon qoder-icon--sync" /> 全部刷新
+            <Icon name="sync" size={13} /> 全部刷新
           </button>
         </div>
         {feeds.length === 0 ? (
-          <div style={{ color: "var(--text-tertiary)", fontSize: 12 }}>暂无订阅；daemon 需启用 [rss] auto_refresh 才会自动刷新</div>
+          <div style={{ color: "var(--fg-3)", fontSize: 12 }}>暂无订阅；daemon 需启用 [rss] auto_refresh 才会自动刷新</div>
         ) : (
           feeds.map((f) => (
             <div
@@ -146,11 +147,11 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
               style={{ display: "flex", alignItems: "center", gap: 10, padding: "6px 0", borderBottom: "1px solid var(--border)" }}
             >
               <b style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 320 }}>{f.title}</b>
-              <span className="qoder-badge qoder-badge--default">{f.item_count} 条</span>
-              <span className="qoder-badge qoder-badge--warning">{f.pending_count} 待匹配</span>
+              <span className="dl-badge">{f.item_count} 条</span>
+              <span className="dl-badge dl-badge--warning">{f.pending_count} 待匹配</span>
               <div style={{ flex: 1 }} />
               <input
-                className="qoder-input"
+                className="dl-input"
                 style={{ width: 120 }}
                 type="number"
                 min={0}
@@ -168,11 +169,11 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
                 }}
               />
               <button
-                className="qoder-btn qoder-btn--ghost"
+                className="dl-btn dl-btn--ghost"
                 aria-label={`删除订阅 ${f.title}`}
                 onClick={() => run(() => client.rssRemoveFeed(f.id), "订阅已删除")}
               >
-                <span className="qoder-icon qoder-icon--close" />
+                <Icon name="close" size={13} />
               </button>
             </div>
           ))
@@ -183,13 +184,13 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
       <Section title="自动下载规则" count={rules.length}>
         <div className="dl-form-grid">
           <label className="dl-field-label">规则名 *</label>
-          <input className="qoder-input" value={rName} onChange={(e) => setRName(e.target.value)} />
+          <input className="dl-input" value={rName} onChange={(e) => setRName(e.target.value)} />
           <label className="dl-field-label">必须包含（每行一条{rRegex ? "，正则" : ""}）*</label>
-          <textarea className="qoder-input" rows={2} value={rMust} onChange={(e) => setRMust(e.target.value)} />
+          <textarea className="dl-input" rows={2} value={rMust} onChange={(e) => setRMust(e.target.value)} />
           <label className="dl-field-label">不得包含（每行一条）</label>
-          <textarea className="qoder-input" rows={2} value={rMustNot} onChange={(e) => setRMustNot(e.target.value)} />
+          <textarea className="dl-input" rows={2} value={rMustNot} onChange={(e) => setRMustNot(e.target.value)} />
           <label className="dl-field-label">限定订阅</label>
-          <select className="qoder-input" value={rFeed} onChange={(e) => setRFeed(e.target.value)}>
+          <select className="dl-input" value={rFeed} onChange={(e) => setRFeed(e.target.value)}>
             <option value="">全部订阅</option>
             {feeds.map((f) => (
               <option key={f.id} value={f.id}>
@@ -199,28 +200,28 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
           </select>
           <label className="dl-field-label">集数过滤</label>
           <input
-            className="qoder-input"
+            className="dl-input"
             placeholder="如 1x02;1x04-1x06 或 S02E01（留空不过滤）"
             value={rEpisode}
             onChange={(e) => setREpisode(e.target.value)}
           />
           <label className="dl-field-label">落盘目录</label>
-          <input className="qoder-input" placeholder="留空 = 默认目录" value={rDest} onChange={(e) => setRDest(e.target.value)} />
+          <input className="dl-input" placeholder="留空 = 默认目录" value={rDest} onChange={(e) => setRDest(e.target.value)} />
           <label className="dl-field-label">关键词按正则解释</label>
           <button
             type="button"
-            className={`qoder-btn qoder-btn--ghost ${rRegex ? "dl-nav-item--active" : ""}`}
+            className={`dl-btn dl-btn--ghost ${rRegex ? "dl-btn--primary" : ""}`}
             style={{ borderRadius: 99, padding: "4px 14px", minWidth: 92 }}
             onClick={() => setRRegex(!rRegex)}
             aria-pressed={rRegex}
             aria-label="使用正则表达式"
           >
-            <span className={`qoder-icon qoder-icon--${rRegex ? "check" : "circle-slash"}`} />
+            <Icon name={rRegex ? "check" : "close"} size={13} />
             {rRegex ? "正则" : "子串"}
           </button>
         </div>
         <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
-          <button className="qoder-btn qoder-btn--primary" disabled={busy} onClick={addRule}>
+          <button className="dl-btn dl-btn--primary" disabled={busy} onClick={addRule}>
             创建规则
           </button>
         </div>
@@ -232,19 +233,19 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
                 style={{ display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: "1px solid var(--border)", flexWrap: "wrap" }}
               >
                 <b>{r.name}</b>
-                {r.use_regex && <span className="qoder-badge qoder-badge--default">正则</span>}
-                {r.episode_filter && <span className="qoder-badge qoder-badge--default">集数 {r.episode_filter}</span>}
-                <span style={{ fontSize: 12, color: "var(--text-tertiary)", overflow: "hidden", textOverflow: "ellipsis" }}>
+                {r.use_regex && <span className="dl-badge">正则</span>}
+                {r.episode_filter && <span className="dl-badge">集数 {r.episode_filter}</span>}
+                <span style={{ fontSize: 12, color: "var(--fg-3)", overflow: "hidden", textOverflow: "ellipsis" }}>
                   {(r.must_contain.length ? `含 [${r.must_contain.join(", ")}]` : "") +
                     (r.must_not_contain.length ? ` 斥 [${r.must_not_contain.join(", ")}]` : "")}
                 </span>
                 <div style={{ flex: 1 }} />
                 <button
-                  className="qoder-btn qoder-btn--ghost"
+                  className="dl-btn dl-btn--ghost"
                   aria-label={`删除规则 ${r.name}`}
                   onClick={() => run(() => client.rssRemoveRule(r.id), "规则已删除")}
                 >
-                  <span className="qoder-icon qoder-icon--close" />
+                  <Icon name="close" size={13} />
                 </button>
               </div>
             ))}
@@ -256,7 +257,7 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
       <Section title="条目" count={items.length}>
         <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
           <select
-            className="qoder-input"
+            className="dl-input"
             style={{ maxWidth: 260 }}
             value={feedFilter ?? ""}
             onChange={(e) => setFeedFilter(e.target.value ? Number(e.target.value) : null)}
@@ -271,7 +272,7 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
           </select>
         </div>
         {items.length === 0 ? (
-          <div style={{ color: "var(--text-tertiary)", fontSize: 12 }}>暂无条目</div>
+          <div style={{ color: "var(--fg-3)", fontSize: 12 }}>暂无条目</div>
         ) : (
           items.slice(0, 50).map((i) => (
             <div
@@ -281,9 +282,9 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
               <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontSize: 13 }}>{i.title}</span>
               <div style={{ flex: 1 }} />
               {i.task_id ? (
-                <span className="qoder-badge qoder-badge--success">已建任务 {i.task_id}</span>
+                <span className="dl-badge dl-badge--success">已建任务 {i.task_id}</span>
               ) : (
-                <span className="qoder-badge qoder-badge--default">未匹配</span>
+                <span className="dl-badge">未匹配</span>
               )}
             </div>
           ))

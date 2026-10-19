@@ -42,11 +42,10 @@ export default function LogsView({ events }: { events: SchedulerEventEnvelope[] 
   const types = useMemo(() => Array.from(new Set(events.map((e) => e.event.type))), [events]);
 
   return (
-    <div className="dl-enter">
+    <div>
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
         <button
-          className={`qoder-btn qoder-btn--ghost ${!type ? "dl-nav-item--active" : ""}`}
-          style={{ borderRadius: 99, padding: "4px 12px" }}
+          className={`dl-tab ${!type ? "dl-tab--active" : ""}`}
           onClick={() => setType("")}
         >
           全部
@@ -54,8 +53,7 @@ export default function LogsView({ events }: { events: SchedulerEventEnvelope[] 
         {types.map((t) => (
           <button
             key={t}
-            className={`qoder-btn qoder-btn--ghost ${type === t ? "dl-nav-item--active" : ""}`}
-            style={{ borderRadius: 99, padding: "4px 12px" }}
+            className={`dl-tab ${type === t ? "dl-tab--active" : ""}`}
             onClick={() => setType(t)}
           >
             {t}
@@ -74,18 +72,18 @@ export default function LogsView({ events }: { events: SchedulerEventEnvelope[] 
                 gap: 10,
                 alignItems: "baseline",
                 padding: "8px 14px",
-                borderBottom: "1px solid var(--border-subtle)",
+                borderBottom: "1px solid var(--line-2)",
                 fontSize: 13,
-                background: i % 2 ? "var(--bg-surface)" : "transparent",
+                background: i % 2 ? "var(--bg-3)" : "transparent",
               }}
             >
-              <span style={{ color: "var(--text-tertiary)", fontVariantNumeric: "tabular-nums", flex: "none" }}>
+              <span style={{ color: "var(--fg-3)", fontVariantNumeric: "tabular-nums", flex: "none" }}>
                 #{env.seq}
               </span>
-              <span className="qoder-badge qoder-badge--default" style={{ flex: "none" }}>
+              <span className="dl-badge" style={{ flex: "none" }}>
                 {String(env.event.type)}
               </span>
-              <span style={{ color: "var(--text-secondary)", overflow: "hidden", textOverflow: "ellipsis" }}>
+              <span style={{ color: "var(--fg-2)", overflow: "hidden", textOverflow: "ellipsis" }}>
                 {summarize(env)}
               </span>
             </div>

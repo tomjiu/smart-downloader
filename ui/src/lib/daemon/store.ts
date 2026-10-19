@@ -88,13 +88,45 @@ export class DaemonClient {
   remove(id: string, deleteData = false) {
     return req(`/tasks/${id}?delete_data=${deleteData}`, { method: "DELETE" });
   }
-  taskLogs(id: string): Promise<{ logs: { ts: string; level: string; message: string }[] }> {
+  /// P1 修复（Issue #115）：对齐后端实际返回（state/ops.rs task_logs——
+  /// { task_id, state, source, error, events: [{ at_ms, op, detail }] }）。
+  /// 旧形状 { logs: [{ ts, level, message }] } 从未与后端对过，接上即错。
+  taskLogs(id: string): Promise<{
+    task_id: string;
+    state: string;
+    source: unknown;
+    error: string | null;
+    events: { at_ms: number; op: string; detail: string | null }[];
+  }> {
     return req(`/tasks/${id}/logs`);
   }
+  /// P0-1 修复（Issue #115）：字段名对齐 http.rs LimitReq
+  /// （down_kb_s / up_kb_s）。旧字段名 max_download_kb_s / max_upload_kb_s
+  /// 被 serde 双 #[serde(default)] Option 静默丢弃 → 双 None → 空操作返 200，
+  /// UI 显示「限速已应用」但限速从未生效（AddTaskReq 的 down_kb_s 是对的，
+  /// 仅此处写错）。
   taskLimit(id: string, down?: number, up?: number) {
     return req(`/tasks/${id}/limit`, {
       method: "POST",
-      body: JSON.stringify({ max_download_kb_s: down, max_upload_kb_s: up }),
+      body: JSON.stringify({ down_kb_s: down, up_kb_s: up }),
+    });
+  }
+  /// 批量操作（Issue #115 Phase 1 接入；后端 POST /tasks/batch）。
+  /// 契约对齐 http.rs BatchTaskReq：{ action, ids, delete_data } ——
+  /// 注意 action 是字段名（非 op），合法值 pause / resume / remove；
+  /// remove 可附 delete_data；响应恒 200 + 逐项结果（单项失败不短路）。
+  batchTasks(
+    ids: string[],
+    action: "pause" | "resume" | "remove",
+    opts?: { deleteData?: boolean },
+  ): Promise<unknown> {
+    return req(`/tasks/batch`, {
+      method: "POST",
+      body: JSON.stringify({
+        action,
+        ids,
+        delete_data: opts?.deleteData ?? false,
+      }),
     });
   }
   taskSequential(id: string, on: boolean) {
