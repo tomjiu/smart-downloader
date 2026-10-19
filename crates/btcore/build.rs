@@ -212,7 +212,26 @@ fn main() {
             cand
         });
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=static=lt_kernel");
+    // FFI 静态库存在性探测（batch10-G 后置修复）：daemon 的 nas feature 转发
+    // btcore/nas（reqwest 栈，不引用任何 lt_* FFI 符号），在无 libtorrent 环境
+    //（CI rust job 的 `test daemon (ftp,nas)`）下也必须可编译链接。链接指令
+    // 改为按实际存在发射——库缺失时仅告警跳过；若目标确有 FFI 符号引用，
+    // 链接期会得到明确的 undefined reference，配合本告警可快速定位。
+    // 存在性按三种命名探测：Windows cmake 产物 lt_kernel.lib /
+    // bt-linux-setup.sh 产物 liblt_kernel.a / 裸 ar 命名 lt_kernel.a。
+    let lt_kernel_found = ["lt_kernel.lib", "liblt_kernel.a", "lt_kernel.a"]
+        .iter()
+        .any(|n| lib_dir.join(n).exists());
+    if lt_kernel_found {
+        println!("cargo:rustc-link-lib=static=lt_kernel");
+    } else {
+        println!(
+            "cargo:warning=lt_kernel 静态库未找到（{}），跳过 FFI 链接指令；\
+             引用 lt_* 符号的目标将在链接期报 undefined reference \
+             （构建 FFI 内核见 scripts/ci/bt-linux-setup.sh 或 ffi/ 文档）",
+            lib_dir.display()
+        );
+    }
 
     // vcpkg 动态库导入库：逐个链接（与 ffi cmake 的 LibtorrentRasterbar 传递依赖一致）
     let vcpkg_lib = env::var("LT_VCPKG_LIB_DIR")

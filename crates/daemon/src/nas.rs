@@ -505,7 +505,8 @@ pub async fn put_auth_token(mgr: &NasManager, token_json: &str) -> Result<PathBu
     let path = home.join("auth_token.json");
     #[cfg(unix)]
     let mut f = {
-        use std::os::unix::fs::OpenOptionsExt;
+        // tokio 的 OpenOptions::mode() 为固有方法（cfg(unix)），无需导入
+        // std::os::unix::fs::OpenOptionsExt（batch10-F 引入时误加，unused import）。
         tokio::fs::OpenOptions::new()
             .write(true)
             .create(true)

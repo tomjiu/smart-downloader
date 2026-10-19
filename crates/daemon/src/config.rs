@@ -6,7 +6,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// 安全修复（P1-b）：子表手写 Default 与本处 derive Default 单源——
+/// 此前 Config::default() 与子表 derive Default 双源漂移，导致
+/// 「部分表 TOML」解析时其余字段退化为零值（addr=""/dest_root=""/
+/// bt.enabled=false 等）。子表 Default 修正后此处 derive 即复用子表实现。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub server: ServerCfg,
@@ -374,32 +378,6 @@ impl Default for StorageCfg {
     fn default() -> Self {
         Self {
             tasks_path: PathBuf::from("./tasks.json"),
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        // 安全修复（P1-b）：全部子表手写 Default 与本函数单源——
-        // 此前 Config::default() 与子表 derive Default 双源漂移，导致
-        // 「部分表 TOML」解析时其余字段退化为零值（addr=""/dest_root=""/
-        // bt.enabled=false 等）。子表 Default 修正后此处直接复用。
-        Config {
-            server: ServerCfg::default(),
-            download: DownloadCfg::default(),
-            bt: BtCfg::default(),
-            limits: LimitsCfg::default(),
-            queue: QueueCfg::default(),
-            rss: RssCfg::default(),
-            xunlei: XunleiCfg::default(),
-            provider: ProviderCfg::default(),
-            provider_xunlei: ProviderXunleiCfg::default(),
-            webhook: WebhookCfg::default(),
-            cleanup: CleanupCfg::default(),
-            post_download: PostDownloadCfg::default(),
-            scheduler: SchedulerCfg::default(),
-            lock: LockCfg::default(),
-            storage: StorageCfg::default(),
         }
     }
 }
