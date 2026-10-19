@@ -1,8 +1,11 @@
 "use client";
-/// 应用壳（Issue #115 Phase 1 重写）：工具栏(44px) + 内容(flex:1) + 状态栏(28px)。
+/// 应用壳（2026-10-19 布局重设计）：侧栏(216px 可折叠) + 右列
+/// [视图工具栏(48px) + 内容(flex:1) + 状态栏(28px)]。
+/// 信息架构：导航归侧栏（结构性），动作归工具栏（上下文性）。
 /// - 数据轮询：列表 + stats（1s）+ 任务详情快照（1s 并发，表格进度/ETA 数据源）
 /// - SSE 事件流：速率 / 完成 / 失败 toast
-/// - 视图切换在工具栏分段（无侧栏）
+/// - 快捷键：Ctrl/Cmd+1..5 切视图、/ 聚焦搜索（Slack/GitHub 惯例）
+/// - 侧栏折叠：localStorage["dl.side"] 持久化；≤900px 初始自动图标栏
 /// 性能修复（审计 P1）：JSON.stringify 全量比较 → 浅层引用比较（长度 + 逐项
 /// 引用相等即可判断「新数据」——fetch 每次返回新对象，引用比较足够触发更新，
 /// 无需深比较语义；列表项字段级比较留给 React 渲染 diff）。
@@ -33,6 +36,7 @@ import RssView from "./RssView";
 import SettingsView from "./SettingsView";
 import TaskDetail from "./TaskDetail";
 import Toolbar, { TASK_FILTERS, type TaskFilterKey, type ViewKey } from "./Toolbar";
+import Sidebar from "./Sidebar";
 import StatusBar from "./StatusBar";
 import { ConfirmDialog, TableSkeleton } from "./Common";
 import { Icon } from "./Icon";
@@ -58,6 +62,9 @@ function matchFilter(t: TaskListItem, f: TaskFilterKey): boolean {
 
 export default function DlApp() {
   const [view, setView] = useState<ViewKey>("tasks");
+  /// 侧栏折叠（2026-10-19：localStorage 持久化；未存过且窄屏 → 图标栏）。
+  const [sideCollapsed, setSideCollapsed] = useState(false);
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [tasks, setTasks] = useState<TaskListItem[]>([]);
   const [snapshots, setSnapshots] = useState<Record<string, TaskSnapshot>>({});
   const [rates, setRates] = useState<Record<string, TaskRate>>({});
@@ -91,6 +98,43 @@ export default function DlApp() {
     const id = Date.now() + Math.random();
     setToasts((cur) => [...cur, { id, ...t }]);
     setTimeout(() => setToasts((cur) => cur.filter((x) => x.id !== id)), 4200);
+  }, []);
+
+  /// 侧栏初始折叠态：用户持久化选择优先；未存过 → ≤900px 视口自动图标栏
+  /// （一次性判断，不在 resize 时反复切换——不打架用户选择；VS Code 同样策略）。
+  const toggleSide = useCallback(() => {
+    setSideCollapsed((cur) => {
+      localStorage.setItem("dl.side", cur ? "0" : "1");
+      return !cur;
+    });
+  }, []);
+
+  useEffect(() => {
+    const saved = localStorage.getItem("dl.side");
+    if (saved === "1" || saved === "0") setSideCollapsed(saved === "1");
+    else if (window.innerWidth <= 900) setSideCollapsed(true);
+  }, []);
+
+  /// 全局快捷键（Slack/GitHub 惯例）：Ctrl/Cmd+1..5 切视图、/ 聚焦搜索。
+  /// 输入控件内不拦截（除 Ctrl 组合——数字组合在输入框内无编辑语义冲突）。
+  useEffect(() => {
+    const ORDER: ViewKey[] = ["tasks", "stats", "rss", "logs", "settings"];
+    const isTyping = (t: EventTarget | null) =>
+      t instanceof HTMLElement &&
+      (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key >= "1" && e.key <= "5") {
+        e.preventDefault();
+        setView(ORDER[Number(e.key) - 1]);
+        return;
+      }
+      if (e.key === "/" && !isTyping(e.target)) {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
   }, []);
 
   const refresh = useCallback(async () => {
@@ -204,7 +248,7 @@ export default function DlApp() {
     });
   }, [tasks]);
 
-  /// 过滤分段计数（工具栏徽章）。
+  /// 过滤分段计数（侧栏导航项徽章）。
   const counts = useMemo(() => {
     const c = Object.fromEntries(TASK_FILTERS.map((f) => [f.key, 0])) as Record<TaskFilterKey, number>;
     for (const t of tasks) {
@@ -359,25 +403,33 @@ export default function DlApp() {
 
   return (
     <div className="dl-root">
-      <Toolbar
+      <Sidebar
         view={view}
         onView={setView}
         filter={filter}
         onFilter={setFilter}
         counts={counts}
-        query={query}
-        onQuery={setQuery}
         stats={stats}
         connected={connected}
-        selectedCount={selected.size}
-        onBatch={onBatch}
-        onNew={() => setAdding((v) => !v)}
-        adding={adding}
-        busy={busy}
+        collapsed={sideCollapsed}
+        onToggleCollapsed={toggleSide}
       />
 
-      <div className="dl-body">
-        <main className="dl-main">
+      <div className="dl-shell">
+        <Toolbar
+          view={view}
+          query={query}
+          onQuery={setQuery}
+          selectedCount={selected.size}
+          onBatch={onBatch}
+          onNew={() => setAdding((v) => !v)}
+          adding={adding}
+          busy={busy}
+          searchInputRef={searchInputRef}
+        />
+
+        <div className="dl-body">
+          <main className="dl-main">
           {view === "tasks" && (
             <>
               {adding && (
@@ -434,10 +486,11 @@ export default function DlApp() {
           {view === "settings" && <SettingsView onToast={toast} />}
           {/* historyTick 驱动曲线重绘 */}
           <span hidden>{historyTick}</span>
-        </main>
-      </div>
+          </main>
+        </div>
 
-      <StatusBar tasks={tasks} stats={stats} selectedCount={selected.size} />
+        <StatusBar tasks={tasks} stats={stats} selectedCount={selected.size} />
+      </div>
 
       {detail && (
         <TaskDetail id={detail} onClose={() => setDetail(null)} onChanged={refresh} />

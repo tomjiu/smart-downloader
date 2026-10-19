@@ -31,7 +31,9 @@ export type IconName =
   | "kebab-horizontal"
   | "pass"
   | "error"
-  | "search";
+  | "search"
+  | "panel-left"
+  | "chevron-left";
 
 const PATHS: Record<IconName, React.ReactNode> = {
   "arrow-down": <path d="M12 4v14m0 0l-5-5m5 5l5-5" />,
@@ -129,6 +131,14 @@ const PATHS: Record<IconName, React.ReactNode> = {
       <path d="M14.5 14.5L20 20" />
     </>
   ),
+  /* 2026-10-19 布局重设计：侧栏折叠开关（panel）与方向指示 */
+  "panel-left": (
+    <>
+      <rect x="3" y="4" width="18" height="16" rx="1" />
+      <path d="M9 4v16" />
+    </>
+  ),
+  "chevron-left": <path d="M14 6l-6 6 6 6" />,
 };
 
 export function Icon({

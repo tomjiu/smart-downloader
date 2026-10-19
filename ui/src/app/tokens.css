@@ -16,7 +16,12 @@
 
   --row-h: 32px;
   --row-h-touch: 44px;
-  --toolbar-h: 44px;
+  /* 2026-10-19 布局重设计：侧栏 + 视图工具栏（qBittorrent / Linear 模式）。
+   * 三级表面色阶：侧栏/表头 --bg-2（下沉）→ 画布 --bg → 卡片/按钮 --bg-3（上浮），
+   * 区域间一律 1px --line 强边框分界（修复「组件颜色分界不明显」）。 */
+  --side-w: 216px;
+  --side-rail-w: 56px;
+  --toolbar-h: 48px;
   --status-h: 28px;
 
   --space-1: 4px;
