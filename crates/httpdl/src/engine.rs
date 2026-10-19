@@ -1686,12 +1686,20 @@ impl DownloadEngine for HttpEngine {
         // - total 不一致 → 作废（源变小/变大即内容变化证据）
         // - 任一指纹 saved 有而 fresh 无 → 作废（指纹消失，无法确认未变）
         // - 双方指纹存在且不等 → 作废（内容变化证据）
-        // - saved 本就无该指纹 → 放行（无从核对；total 核对已把关）
+        // - saved 本就无该指纹 → 放行（无从核对；total 核对已把关——
+        //   兜底换链场景（M6 fallback 刷新直链指向同一云文件）依赖此
+        //   放行保住续传，字面「无法证明即作废」会令其整档重下）
+        // 幂等保护（整合批补充）：URL 表未变（同表重放/仅重探测）时，
+        // 「指纹消失」不作废——同 URL 重探测遇服务器临时不发 ETag
+        //（中间盒剥离/配置漂移）不该触发整档重下；URL 表已变时维持
+        // 上述宁枉勿纵口径。
+        let urls_changed = t.mirrors != urls;
         let total_changed = probe.total.is_some_and(|pt| t.total != pt);
         let etag_mismatch = !crate::ledger::fingerprint_ok(&t.etag, &probe.etag);
         let lm_mismatch =
             !crate::ledger::fingerprint_ok(&t.last_modified, &probe.last_modified);
-        let etag_changed = total_changed || etag_mismatch || lm_mismatch;
+        let etag_changed =
+            total_changed || (urls_changed && (etag_mismatch || lm_mismatch));
         if etag_changed {
             // 新源内容变了 → 旧代次 .part 作废，重下（Q-B5：指纹为准）。
             // gen+1 → 新循环用 `<dest>.<gen>.part`，与旧循环写隔离。

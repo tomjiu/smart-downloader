@@ -427,4 +427,63 @@ mod tests {
         assert_eq!(analyze_cid_store(&[1, 2, 3]).1.len(), 0);
         assert_eq!(analyze_cid_store(&[]).0.file_size, 0);
     }
+
+    /// P0-14 回归（整合批）：真实 cid_store.dat 形态（随机 hash 块 + 路径串
+    /// 交替）必须线性时间完成——原实现三处线性扫描叠加呈二次方爆炸，
+    /// 384KB 输入实测 6s（repro/p0repro round5 实证：输入每翻倍耗时 ×3-4）。
+    /// 512KB 输入修复后应为亚秒级；2s 上限给 debug 构建留 20 倍余量。
+    #[test]
+    fn hash_path_alternating_linear_time() {
+        let mut buf: Vec<u8> = Vec::with_capacity(512 * 1024);
+        let mut rng: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || -> u64 {
+            // xorshift64（测试确定性，无需密码学质量）
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        while buf.len() < 512 * 1024 {
+            // 32 字节随机块（hash 形态：不可打印 + 高熵）
+            let h = next().to_le_bytes();
+            let h2 = next().to_le_bytes();
+            buf.extend_from_slice(&h);
+            buf.extend_from_slice(&h2);
+            buf.extend_from_slice(&h);
+            buf.extend_from_slice(&h2);
+            // 路径串（可打印 + 路径特征字符）
+            buf.extend_from_slice(
+                format!("/home/user/dl/file_{}.rar\n", next() % 99999).as_bytes(),
+            );
+        }
+        let t0 = std::time::Instant::now();
+        let (_report, entries) = analyze_cid_store(&buf);
+        let el = t0.elapsed();
+        assert!(
+            el < std::time::Duration::from_secs(2),
+            "512KB hash+路径交替输入必须在 2s 内完成（P0-14 二次方回归），实际 {el:?}"
+        );
+        assert!(!entries.is_empty(), "hash+路径交替形态应产出候选条目");
+    }
+
+    /// P0-14 回归（整合批）：纯可打印大输入（无随机块）快速完成——对照组，
+    /// 锁定「复杂度由随机块×路径邻近配对驱动，而非输入大小本身」。
+    #[test]
+    fn printable_only_large_input_fast() {
+        let mut buf: Vec<u8> = Vec::with_capacity(512 * 1024);
+        let mut i = 0u64;
+        while buf.len() < 512 * 1024 {
+            buf.extend_from_slice(format!("path segment {} /dir/file.txt ", i).as_bytes());
+            i += 1;
+        }
+        let t0 = std::time::Instant::now();
+        let (_r, entries) = analyze_cid_store(&buf);
+        let el = t0.elapsed();
+        assert!(
+            el < std::time::Duration::from_secs(2),
+            "纯可打印输入应快速: {el:?}"
+        );
+        assert_eq!(entries.len(), 0, "无随机块 → 无候选");
+    }
+
 }
