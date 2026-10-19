@@ -8,7 +8,26 @@
  * - 克制优先：无渐变按钮/辉光/玻璃拟态/错峰动画；阴影仅用于浮层
  * - 密度优先：行高 --row-h: 32px，表格内边距水平 12px
  * - 六态覆盖：default/hover/active/focus-visible/disabled/selected
+ * - 字重扎实化（2026-10-19 二轮，用户反馈「UI 太轻/字糊在背景上」）：
+ *   内置 Inter 可变字体接管拉丁字形；交互件字重 ≥600；表头/侧栏
+ *   提亮至 --fg-2/--fg；上浮件（按钮/输入）叠加 1px 内嵌高光线
+ *   （inset hairline，GitHub/Bootstrap 模式）——明度差小的主题里
+ *   边界依然分明，不引入辉光/渐变（克制原则不变）。
  */
+
+/* ── 内置字体（Latin 可变字重 100-900，48KB；CJK 走系统栈，见 tokens.css）──
+ * unicode-range 限定拉丁字形：中文按字体栈回退到苹方/雅黑/Noto，
+ * 两端字重匹配，消除 Segoe UI/DejaVu 在 12-13px 下的细弱观感。 */
+@font-face {
+  font-family: "InterVar";
+  src: url("/fonts/inter-latin-wght.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6,
+    U+02DA, U+02DC, U+2000-206F, U+2074, U+20AC, U+2122, U+2191, U+2193,
+    U+2212, U+2215, U+FEFF, U+FFFD;
+}
 
 /* ── 基础 ── */
 *,
@@ -68,25 +87,29 @@ body {
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  min-height: 30px;
   padding: 4px 12px;
   border-radius: var(--radius);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-3);
   background: var(--bg-3);
   color: var(--fg);
   font: inherit;
   font-size: var(--fs-sm);
-  font-weight: 500;
+  font-weight: 600;
   cursor: pointer;
   white-space: nowrap;
+  /* 上浮件边界三保险：硬边框 + 明度差 + 1px 内嵌高光线 */
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--fg) 7%, transparent);
   transition: background-color var(--dur-fast) ease-out,
     border-color var(--dur-fast) ease-out, color var(--dur-fast) ease-out;
 }
 .dl-btn:hover {
-  background: var(--hover);
-  border-color: var(--line-3);
+  background: color-mix(in srgb, var(--bg-3) 92%, var(--fg));
+  border-color: color-mix(in srgb, var(--line-3) 65%, var(--fg));
 }
 .dl-btn:active {
   background: var(--bg-2);
+  box-shadow: none;
   transform: translateY(1px);
 }
 .dl-btn:focus-visible {
@@ -124,8 +147,9 @@ body {
 .dl-input {
   /* 下沉字段：画布色（GitHub 模式——输入件比所在卡片暗一档） */
   background: var(--bg);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-3);
   border-radius: var(--radius);
+  min-height: 30px;
   padding: 4px 8px;
   font: inherit;
   font-size: var(--fs-sm);
@@ -162,7 +186,7 @@ body {
   font-weight: 600;
   white-space: nowrap;
   background: var(--bg-3);
-  color: var(--fg-2);
+  color: var(--fg);
 }
 .dl-badge--primary { background: var(--accent-bg); color: var(--accent); }
 .dl-badge--info { background: var(--info-bg); color: var(--info); }
@@ -198,7 +222,7 @@ body {
   }
 }
 .dl-field-label {
-  font-weight: 500;
+  font-weight: 600;
   font-size: var(--fs);
 }
 .dl-field-help {
@@ -314,7 +338,7 @@ body {
   font-size: var(--fs-sm);
   font-variant-numeric: tabular-nums;
   background: var(--bg-3);
-  color: var(--fg-2);
+  color: var(--fg);
 }
 .dl-pill--down { color: var(--accent); background: var(--accent-bg); }
 .dl-pill--up { color: var(--ok); background: var(--ok-bg); }
@@ -400,22 +424,85 @@ body {
   box-shadow: 0 0 0 2px var(--accent-bg);
 }
 .dl-theme-swatch {
-  height: 48px;
+  /* 迷你窗口预览（2026-10-19 重设计）：每张主题卡渲染目标主题的
+   * 真实层级切片——标题栏/侧栏（--bg-2）→ 画布（--bg）→ 按钮
+   * （--bg-3 + --line-3 边框）→ 强调块（--accent）→ 正文行
+   * （--fg-2/--fg-3）。容器挂 data-theme={tk}，全部颜色取自该主题
+   * token，预览内部自洽——修复「四色块像一坨灰、配色与背景不适配」。
+   * 留白框（8px 卡片色边距 + 目标主题 --line 边框）：浅色主题预览
+   * 不再与浅色卡片底融合，深色预览也有明确容器边界。 */
+  display: block;
   position: relative;
-  display: flex;
-  align-items: stretch;
+  height: 64px;
+  margin: 8px 8px 0;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
 }
 .dl-theme-swatch i {
-  flex: 1;
+  position: absolute;
+}
+.dl-theme-swatch .dl-ts-bar {
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 10px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+}
+.dl-theme-swatch .dl-ts-side {
+  top: 11px;
+  left: 0;
+  bottom: 0;
+  width: 26%;
+  background: var(--bg-2);
+  border-right: 1px solid var(--line);
+}
+.dl-theme-swatch .dl-ts-btn {
+  top: 24px;
+  left: calc(26% + 10px);
+  width: 36px;
+  height: 13px;
+  background: var(--bg-3);
+  border: 1px solid var(--line-3);
+  border-radius: 2px;
+  /* 与真实按钮同款 1px 内嵌高光线（预览即实况） */
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--fg) 7%, transparent);
+}
+.dl-theme-swatch .dl-ts-acc {
+  top: 24px;
+  left: calc(26% + 54px);
+  width: 18px;
+  height: 13px;
+  background: var(--accent);
+  border-radius: 2px;
+}
+.dl-theme-swatch .dl-ts-l1 {
+  top: 45px;
+  left: calc(26% + 10px);
+  width: 42%;
+  height: 5px;
+  border-radius: 2px;
+  background: var(--fg-2);
+}
+.dl-theme-swatch .dl-ts-l2 {
+  top: 54px;
+  left: calc(26% + 10px);
+  width: 28%;
+  height: 5px;
+  border-radius: 2px;
+  background: var(--fg-3);
 }
 .dl-theme-name {
   padding: 6px 10px;
   font-size: var(--fs-sm);
-  font-weight: 500;
+  font-weight: 600;
   display: flex;
   align-items: center;
   gap: 6px;
   border-top: 1px solid var(--line);
+  margin: 6px 0 0;
 }
 
 /* ── 抽屉（浮层：唯一允许阴影的位置之一）── */
@@ -498,10 +585,10 @@ body {
   border: none;
   border-bottom: 2px solid transparent;
   background: transparent;
-  color: var(--fg-2);
+  color: var(--fg);
   font: inherit;
   font-size: var(--fs-sm);
-  font-weight: 500;
+  font-weight: 600;
   cursor: pointer;
   transition: color var(--dur-fast) ease-out, border-color var(--dur-fast) ease-out;
 }
@@ -525,12 +612,13 @@ body {
 }
 .dl-table-lite thead th {
   text-align: left;
-  font-weight: 500;
+  font-weight: 600;
+  letter-spacing: 0.03em;
   font-size: var(--fs-xs);
-  color: var(--fg-3);
+  color: var(--fg-2);
   padding: 6px 10px;
   background: var(--bg-2);
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--line-3);
 }
 .dl-table-lite tbody td {
   padding: 6px 10px;
@@ -551,6 +639,15 @@ body {
     animation-duration: 0.01ms !important;
     transition-duration: 0.01ms !important;
   }
+}
+
+/* ── 滚动条（细 + 主题化；Chromium 121+ / Firefox）── */
+html,
+.dl-side-nav,
+.dl-table-wrap,
+.dl-drawer {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-3) transparent;
 }
 
 /* ════════════════════════════════════════════════════════════
@@ -641,6 +738,8 @@ body {
 }
 .dl-side-group {
   font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: 0.04em;
   color: var(--fg-3);
   padding: 12px 8px 4px;
   white-space: nowrap;
@@ -667,9 +766,10 @@ body {
   border: none;
   border-radius: var(--radius);
   background: transparent;
-  color: var(--fg-2);
+  color: var(--fg);
   font: inherit;
   font-size: var(--fs-sm);
+  font-weight: 500;
   text-align: left;
   cursor: pointer;
   white-space: nowrap;
@@ -837,32 +937,37 @@ body {
   gap: 4px;
   flex: none;
 }
-/* 动作按钮：上浮面 --bg-3 + --line-3 硬边框（修复「按钮像纯文本」） */
+/* 动作按钮：上浮面 --bg-3 + --line-3 硬边框 + 内嵌高光线
+ * （2026-10-19 二轮：文字提亮 --fg、字重 600、hover 变亮——
+ * 上浮件 hover 应更亮而非更暗，修复「按钮与画布糊在一起」） */
 .dl-tool-btn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  height: 28px;
-  padding: 0 10px;
+  height: 30px;
+  padding: 0 11px;
   border: 1px solid var(--line-3);
   border-radius: var(--radius);
   background: var(--bg-3);
-  color: var(--fg-2);
+  color: var(--fg);
   font: inherit;
   font-size: var(--fs-sm);
-  font-weight: 500;
+  font-weight: 600;
   cursor: pointer;
   white-space: nowrap;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--fg) 7%, transparent);
   transition: background-color var(--dur-fast) ease-out, color var(--dur-fast) ease-out,
     border-color var(--dur-fast) ease-out;
 }
 .dl-tool-btn:hover:not(:disabled) {
-  background: var(--hover);
-  border-color: var(--line-3);
+  background: color-mix(in srgb, var(--bg-3) 92%, var(--fg));
+  border-color: color-mix(in srgb, var(--line-3) 65%, var(--fg));
   color: var(--fg);
 }
 .dl-tool-btn:active:not(:disabled) {
   background: var(--bg-2);
+  box-shadow: none;
+  transform: translateY(1px);
 }
 .dl-tool-btn:focus-visible {
   outline: 2px solid var(--accent);
@@ -895,12 +1000,14 @@ body {
   display: flex;
   align-items: center;
   gap: 6px;
+  min-height: 30px;
   background: var(--bg-3);
-  border: 1px solid var(--line);
+  border: 1px solid var(--line-3);
   border-radius: var(--radius);
   padding: 0 8px;
   color: var(--fg-3);
   flex: none;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, var(--fg) 7%, transparent);
 }
 .dl-toolbar-search:focus-within {
   border-color: var(--accent);
@@ -932,7 +1039,7 @@ body {
   align-items: center;
   gap: 6px;
   font-size: var(--fs-xs);
-  color: var(--fg-3);
+  color: var(--fg-2);
   white-space: nowrap;
   flex: none;
 }
@@ -985,7 +1092,7 @@ body {
   background: var(--bg-2);
   border-top: 1px solid var(--line);
   font-size: var(--fs-xs);
-  color: var(--fg-3);
+  color: var(--fg-2);
   white-space: nowrap;
   overflow: hidden;
 }
@@ -1020,13 +1127,14 @@ body {
 }
 .dl-table thead th {
   text-align: left;
-  font-weight: 500;
+  font-weight: 600;
+  letter-spacing: 0.03em;
   font-size: var(--fs-xs);
-  color: var(--fg-3);
+  color: var(--fg-2);
   padding: 0 10px;
   height: 30px;
   background: var(--bg-2);
-  border-bottom: 1px solid var(--line);
+  border-bottom: 1px solid var(--line-3);
   position: sticky;
   top: 0;
   z-index: 1;
@@ -1139,7 +1247,7 @@ body {
   padding: 4px 6px;
   border: none;
   background: transparent;
-  color: var(--fg-2);
+  color: var(--fg);
 }
 .dl-act-btn:hover {
   background: var(--bg-3);

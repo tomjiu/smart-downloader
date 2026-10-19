@@ -507,9 +507,11 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
   );
 }
 
-/// 主题预览卡：swatch 容器直接挂 data-theme={tk}，四色块取该主题的
-/// 真实 token 变量（--bg/--bg-2/--bg-3/--accent）——与 tokens.css 严格一致，
-/// 不再硬编码色值（旧实现与注释声明不符）。
+/// 主题预览卡：swatch 容器挂 data-theme={tk}，渲染目标主题的**迷你窗口
+/// 预览**（标题栏/侧栏 --bg-2 → 画布 --bg → 按钮 --bg-3+--line-3 边框 →
+/// 强调块 --accent → 正文行 --fg-2/--fg-3）——全部取该主题真实 token，
+/// 预览内部自洽（每个颜色都落在它所属主题的画布上），修复
+/// 「四色块条像一坨分不清的灰、配色与背景不适配」。几何见 globals.css。
 function ThemeCard({ tk, active, onPick }: { tk: ThemeKey; active: boolean; onPick: () => void }) {
   const meta = THEME_META[tk];
   return (
@@ -519,11 +521,13 @@ function ThemeCard({ tk, active, onPick }: { tk: ThemeKey; active: boolean; onPi
       aria-pressed={active}
       onClick={onPick}
     >
-      <div className="dl-theme-swatch" data-theme={tk}>
-        <i style={{ background: "var(--bg)", width: "38%", flex: "none" }} />
-        <i style={{ background: "var(--bg-2)" }} />
-        <i style={{ background: "var(--bg-3)" }} />
-        <i style={{ background: "var(--accent)", width: "14%", flex: "none" }} />
+      <div className="dl-theme-swatch" data-theme={tk} aria-hidden="true">
+        <i className="dl-ts-bar" />
+        <i className="dl-ts-side" />
+        <i className="dl-ts-btn" />
+        <i className="dl-ts-acc" />
+        <i className="dl-ts-l1" />
+        <i className="dl-ts-l2" />
       </div>
       <div className="dl-theme-name">
         {active && <Icon name="check" size={12} style={{ color: meta.accent }} />}
