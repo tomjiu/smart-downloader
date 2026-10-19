@@ -9,6 +9,7 @@
 | 文件 | 锁 | 类型 | 保护对象 |
 |------|-----|------|---------|
 | state.rs | `tasks` | std Mutex | 任务记录主表 `HashMap<TaskId, TaskRecord>`（主锁，临界区最多） |
+| state.rs | `slot_reservations` | parking_lot Mutex | 队列预留集 `HashSet<TaskId>`（add 在途占位，与 `tasks` 存在锁序边，见 §2b） |
 | state.rs | `default_dest_root` / `allowed_roots` | std Mutex | 默认下载目录 / dest 白名单 |
 | state.rs | `config_snapshot` / `pending_file_prio` / `global_limits` | std Mutex | 配置快照 / 文件优先级待重放集 / 全局限速 |
 | state.rs | `webhook_url` / `post_move_to` / `post_hook` / `cleanup` | std Mutex | 完成通知与后处理配置 |
@@ -27,6 +28,40 @@ HTTP 层（http.rs/serve.rs/ws.rs 路由）与 main.rs **不直接持有任何�
    存在 `persist_lock → tasks` 一条边（快照期间双锁同持）+ 持
    `persist_lock` 期间的磁盘写。这是保序（写入序 = 状态序，防旧快照
    后写覆盖新状态）的必要代价；锁序恒定无反向边，无死锁风险。
+   **例外 2（slot_reservations 边，见 §2b）**：`tasks → slot_reservations`
+   是仓库内唯一被允许「持 tasks 期间取 slot_reservations」的锁序边。
+
+### 2b. 全局锁序：`tasks → slot_reservations`（PR #114 催修 P0-2 确立）
+
+`tasks` 与 `slot_reservations` 在队列门控路径上**经常同时持有**（§2
+的「至多持一把锁」对此二锁不成立，如实登记）。为杜绝 ABBA 反向环，
+确立全局锁序：
+
+**凡两把锁同时（或先后于同一临界区序列内）出现的场合，必须先取
+`tasks`，后取 `slot_reservations`；禁止任何反向顺序。**
+
+既有合法边（全部 `tasks → slot_reservations`）：
+
+| 调用点 | 说明 |
+|--------|------|
+| `ops.rs` `active_slot_counts` / `active_slot_counts_locked` | 槽位计数：持 tasks 读预留集 |
+| `ops.rs` `gate_or_enqueue` | 过闸计数 + 登记（同一 tasks 临界区） |
+| `ops.rs` 递补候选筛选（`activate_due_tasks` 内） | 持 tasks 遍历读预留集 |
+| `ops.rs` `attach_reserved_handle` | 摘除 + 句柄落位（同一 tasks 临界区，PR #114 催修后） |
+| `ops.rs` `rollback_slot_reservation` | 摘除 + orphan 删除（同一 tasks 临界区，PR #114 催修后） |
+
+**催修背景**：修复前 `attach_reserved_handle` / `rollback_slot_reservation`
+采用「先单独锁 slot_res 摘除（语句级释放）→ 再锁 tasks」的写法——语义
+上即反向锁序，与 gate/递补/计数路径方向相反；且摘除与落位之间存在
+外部可见瞬态（预留已摘 + 句柄未落位），并发 gate 计数会把该任务漏计，
+产生短暂超卖窗口。修复 = 把摘除并入 tasks 临界区：锁序统一 + 「摘除 +
+落位/回滚」原子化。
+
+**附带收益**：合并临界区后，「预留已摘 + 句柄未落位」的瞬态对外不可见
+（读者须持 tasks 锁才能看到 slot_res 摘除效果），超卖窗口归零。
+
+`slot_reservations` 的**单独**使用（不与 tasks 组合）不受锁序约束，
+如 `resume` 在途幂等检查的 `contains`。
 2. **`autosave()` 只允许在锁外调用**。其内部经 `persisted_tasks()` 取
    `tasks` 锁（Bug B 修复模式，见 `apply_bt_alert` 注释）。违反 =
    同线程自死锁 → alert 循环挂死 → 全端点 hang。
@@ -98,6 +133,10 @@ HTTP 层（http.rs/serve.rs/ws.rs 路由）与 main.rs **不直接持有任何�
    带后缀区分（`tasks_a`/`tasks_b`）。
 5. 触碰锁面的 PR 须在描述中声明：改了哪些临界区、是否引入多锁同持、
    是否调用 autosave/FFI，并复跑审计脚本比对。
+6. `tasks` 与 `slot_reservations` 同时出现的场合必须遵守 §2b 锁序
+   （`tasks → slot_reservations`）。回归锚定：并发压测
+   `concurrent_gate_attach_rollback_no_deadlock`
+   （state_tests/queue_gate_tests.rs，60s 超时兜底）。
 
 ## 5. 残余风险声明（记录在案，非锁债）
 

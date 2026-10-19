@@ -170,6 +170,40 @@ fn looks_like_hash(s: &str) -> bool {
     (s.len() == 32 || s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// 路径近邻查找（P0-14 二分化，PR #114 催修校准）：
+/// paths 需按 off 升序。两函数与 main 原线性实现【逐点等价】
+///（等价性回归测试见 tests::neighbor_lookup_matches_linear_reference）：
+/// - `find_after` ≡ `find(|&(off,_)| off > i && off <= i + 64 + hlen)`
+/// - `find_before` ≡ `rev().find(|&(off,_)| off < i && i <= off + 64)`
+///
+/// 等价性依据（单调性）：
+/// - after：`off <= i + 64 + hlen` 随 off 单调递减 → 首个 `off > i` 的条目
+///   不满足窗口时，其后条目同样不满足；
+/// - before：`i <= off + 64`（即 `off >= i - 64`）随 off 单调递增 → 最后一个
+///   `off < i` 的条目不满足窗口时，更早的条目同样不满足。
+///
+/// 催修复现的缺陷（已修）：before 若复用 `partition_point(off <= i)` 的前驱，
+/// 在存在 `off == i` 条目时会把【窗口自身】当相邻路径（hash↔path 配对错乱）。
+/// 必须用独立的 `partition_point(off < i)`。
+fn find_after(paths: &[(usize, String)], i: usize, hlen: usize) -> Option<(usize, &str)> {
+    let gt_i = paths.partition_point(|&(off, _)| off <= i);
+    paths
+        .get(gt_i)
+        .filter(|&&(off, _)| off <= i + 64 + hlen)
+        .map(|&(off, ref s)| (off, s.as_str()))
+}
+
+fn find_before(paths: &[(usize, String)], i: usize) -> Option<(usize, &str)> {
+    let lt_i = paths.partition_point(|&(off, _)| off < i);
+    if lt_i > 0 {
+        Some(&paths[lt_i - 1])
+            .filter(|&&(off, _)| i <= off + 64)
+            .map(|&(off, ref s)| (off, s.as_str()))
+    } else {
+        None
+    }
+}
+
 /// 二进制形态（TLV 或裸启发式）：hash 块 × 相邻路径串 配对。
 ///
 /// `tlv_mode=true`（XDLCTX 同族）时要求 hash 块前有可读 tag 字节；
@@ -221,21 +255,14 @@ fn extract_binary_entries(
             let win = &bytes[i..i + hlen];
             if !is_printable(win) && looks_random(win) {
                 // ① 二分：首个 off > i 的路径（paths 已按 off 升序）
-                let after_idx = paths.partition_point(|&(off, _)| off <= i);
-                let after = paths
-                    .get(after_idx)
-                    .filter(|&&(off, _)| off <= i + 64 + hlen);
-                // ① 二分：最后一个 off < i 的路径（同一次 partition_point
-                //    的前驱，分摊一次查找）
-                let before = if after_idx > 0 {
-                    paths[..after_idx].last().filter(|&&(off, _)| i <= off + 64)
-                } else {
-                    None
-                };
+                let after = find_after(&paths, i, hlen);
+                // ① 二分：最后一个严格 off < i 的路径（独立 partition_point，
+                //    见 find_before 文档注释——催修复现的 off == i 自匹配缺陷）
+                let before = find_before(&paths, i);
                 let pick = after
-                    .map(|&(po, ref s)| (po, s, (po as i64 - (i + hlen) as i64).abs()))
+                    .map(|(po, s)| (po, s, (po as i64 - (i + hlen) as i64).abs()))
                     .or_else(|| {
-                        before.map(|&(po, ref s)| (po, s, (i as i64 - (po + s.len()) as i64).abs()))
+                        before.map(|(po, s)| (po, s, (i as i64 - (po + s.len()) as i64).abs()))
                     });
                 if let Some((_po, s, gap)) = pick {
                     let tag_ok = !tlv_mode
@@ -244,7 +271,7 @@ fn extract_binary_entries(
                         cands.push(Cand {
                             off: i,
                             hlen,
-                            path: s.clone(),
+                            path: s.to_string(),
                             gap,
                         });
                         // ② 候选上限：防极端输入（随机块+路径交替的海量窗口）
@@ -487,5 +514,84 @@ mod tests {
             "纯可打印输入应快速: {el:?}"
         );
         assert_eq!(entries.len(), 0, "无随机块 → 无候选");
+    }
+
+    /// PR #114 催修 P0-1 回归：单条路径 off == 窗口起点 i 时，
+    /// before 必须是 None——不能把【窗口自身】当前驱。
+    /// 原缺陷写法（复用 partition_point(off <= i) 的前驱）会返回 Some((51, "p0"))。
+    #[test]
+    fn before_neighbor_requires_strictly_less_offset() {
+        let paths = vec![(51usize, "p0".to_string())];
+        // off == i：不是严格小于 → None
+        assert_eq!(find_before(&paths, 51), None);
+        // i 在窗口内前方（i <= off + 64 且 i > off）→ 命中
+        assert_eq!(find_before(&paths, 52), Some((51, "p0")));
+        assert_eq!(find_before(&paths, 115), Some((51, "p0")));
+        // i 超出窗口（i > off + 64）→ None
+        assert_eq!(find_before(&paths, 116), None);
+        // i 在 off 之前 → after 侧负责，before 为 None
+        assert_eq!(find_before(&paths, 50), None);
+    }
+
+    /// PR #114 催修 P0-1 回归：二分近邻查找与 main 原线性实现【逐点等价】
+    /// （随机属性测试——审查者 repro round10.rs 同口径：多 seed × 多密度，
+    /// 覆盖 off == i / off 重叠窗口 / 窗口边界 i-64 / i+64+hlen 等分支）。
+    /// 原缺陷写法在 off == i 存在时把窗口自身当前驱（实测 243/8889 不一致）。
+    #[test]
+    fn neighbor_lookup_matches_linear_reference() {
+        // main 原线性实现（等价性基准，逐字复刻）
+        let lin_after = |paths: &[(usize, String)], i: usize, hlen: usize| {
+            paths
+                .iter()
+                .find(|&&(off, _)| off > i && off <= i + 64 + hlen)
+                .map(|&(off, ref s)| (off, s.clone()))
+        };
+        let lin_before = |paths: &[(usize, String)], i: usize| {
+            paths
+                .iter()
+                .rev()
+                .find(|&&(off, _)| off < i && i <= off + 64)
+                .map(|&(off, ref s)| (off, s.clone()))
+        };
+        let bin_after =
+            |paths: &[(usize, String)], i: usize, hlen: usize| -> Option<(usize, String)> {
+                find_after(paths, i, hlen).map(|(off, s)| (off, s.to_string()))
+            };
+        let bin_before = |paths: &[(usize, String)], i: usize| -> Option<(usize, String)> {
+            find_before(paths, i).map(|(off, s)| (off, s.to_string()))
+        };
+
+        for seed in [0xdead_beefu64, 0x1234_5678u64, 0xcafe_babeu64, 42, 1] {
+            let mut rng = seed;
+            let mut next = || -> u64 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            for _case in 0..40 {
+                // 路径集：off 落在窄域（高密度触发 off == i 与重叠窗口）
+                let n = 1 + (next() % 24) as usize;
+                let mut paths: Vec<(usize, String)> = (0..n)
+                    .map(|k| ((next() % 200) as usize, format!("p{k}_{}", next() % 1000)))
+                    .collect();
+                paths.sort_by_key(|&(off, _)| off);
+                // 检查点：密集扫 [0, 300) 全量 + hash 三种长度
+                for i in 0..300usize {
+                    for &hlen in &[16usize, 20, 32] {
+                        assert_eq!(
+                            bin_after(&paths, i, hlen),
+                            lin_after(&paths, i, hlen),
+                            "after 不等价: seed={seed:#x} i={i} hlen={hlen} paths={paths:?}"
+                        );
+                        assert_eq!(
+                            bin_before(&paths, i),
+                            lin_before(&paths, i),
+                            "before 不等价: seed={seed:#x} i={i} paths={paths:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

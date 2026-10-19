@@ -496,7 +496,13 @@ impl DaemonState {
     ///   不覆盖用户意图；
     /// - 正常 → attach + StateChanged(Queued→Downloading)。
     ///
-    /// 预留集摘除恒先行（槽位计数立刻回归真实口径）。
+    /// 预留集摘除与句柄落位在同一 tasks 临界区内完成（PR #114 催修 P0-2：
+    /// 统一全局锁序 tasks → slot_reservations，见 docs/LOCK_MODEL.md）。
+    /// 原写法「先单独锁 slot_res 摘除、再锁 tasks」语义上即反向锁序——
+    /// 与 gate_or_enqueue/递补筛选（持 tasks 取 slot_res）方向相反；
+    /// 且存在外部可见瞬态（预留已摘 + 句柄未落位），并发 gate 计数会把
+    /// 该任务漏计 → 短暂超卖窗口。合并进同一临界区后：锁序统一 +
+    /// 「摘除+落位」原子化，瞬态对外不可见。
     pub(super) async fn attach_reserved_handle(
         &self,
         task_id: &str,
@@ -504,9 +510,9 @@ impl DaemonState {
         kind: EngineKind,
         expected_state: &TaskState,
     ) {
-        self.slot_reservations.lock().remove(task_id);
         let attached = {
             let mut tasks = self.tasks.lock();
+            self.slot_reservations.lock().remove(task_id);
             match tasks.get_mut(task_id) {
                 Some(rec) if rec.engine_tid.is_none() && rec.task.state == *expected_state => {
                     rec.engine_tid = Some(engine_tid.clone());
@@ -548,10 +554,12 @@ impl DaemonState {
     /// engine.add 失败回滚（batch7-P1）：摘预留标记 + 删除占位记录（对齐
     /// 旧语义：add 失败 = 无记录，API 返回 Err）。句柄已存在（竞态抢先）
     /// 则仅摘标记保留记录。
+    /// 锁序同 attach_reserved_handle：tasks → slot_reservations（同一临界区，
+    /// PR #114 催修 P0-2 统一锁序）。
     pub(super) fn rollback_slot_reservation(&self, task_id: &str) {
-        self.slot_reservations.lock().remove(task_id);
         {
             let mut tasks = self.tasks.lock();
+            self.slot_reservations.lock().remove(task_id);
             let orphan = tasks.get(task_id).is_some_and(|r| r.engine_tid.is_none());
             if orphan {
                 tasks.remove(task_id);
