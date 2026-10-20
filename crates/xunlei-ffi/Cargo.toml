@@ -1,12 +1,12 @@
 [package]
 name = "xunlei-ffi"
-version = "0.2.1"
+version.workspace = true
 edition = "2021"
 authors = ["smart-downloader"]
 description = "Thunder DownloadSDK FFI bindings for Windows-only BT/P2SP acceleration"
 license = "MIT OR Apache-2.0"
 publish.workspace = true
-repository = "https://github.com/example/smart-downloader"
+repository = "https://github.com/tomjiu/smart-downloader"
 
 [features]
 default = ["win32"]

@@ -115,3 +115,62 @@ async fn update_sources_unknown_task_is_error() {
         Err(smart_dl_core::types::EngineError::NotFound)
     ));
 }
+
+/// P0-5 语义锁定（整合批）：无指纹源（服务器不发 ETag/Last-Modified）之间
+/// 换源**不作废段账本**——「saved 本就无该指纹 → 放行」是兜底换链场景
+///（M6 fallback 刷新直链指向同一云文件）的续传生命线：字面执行
+/// 「无法证明相同即作废」会令其整档重下。本测试锁死该放行语义，
+/// 防后续「修复」静默破坏 fallback 续传。total 核对仍把关内容变化。
+#[tokio::test]
+async fn no_fingerprint_cross_source_keeps_ledger_semantics() {
+    let size = MB;
+    // 两源同内容（patterned）、均无 ETag（HttpServerConfig 默认 None）
+    let a = HttpTestServer::start(HttpServerConfig {
+        size,
+        patterned_content: true,
+        ..Default::default()
+    })
+    .await;
+    let b = HttpTestServer::start(HttpServerConfig {
+        size,
+        patterned_content: true,
+        ..Default::default()
+    })
+    .await;
+    let expected = sha256_of(&patterned(size));
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = HttpEngine::new(reqwest::Client::new());
+    let task = make_http_task_to(
+        "s4",
+        &a.url("/file"),
+        dir.path().to_path_buf(),
+        Some("h.bin"),
+    );
+    let tid = engine.add(&task).await.unwrap();
+    let st = wait_terminal(&engine, &tid).await;
+    assert_eq!(st.state, EngineState::Completed);
+
+    let requests_on_b_before = b.request_count.load(std::sync::atomic::Ordering::SeqCst);
+    // 换源到 B（无指纹 + URL 变化）：不得触发整档重下——
+    // 已完成任务无重启迹象（状态不回到 Downloading、B 无段请求增量）
+    engine
+        .update_sources(&tid, vec![b.url("/file")])
+        .await
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let st2 = engine.status(&tid).await.unwrap();
+    assert_eq!(
+        st2.state,
+        EngineState::Completed,
+        "无指纹换源不得作废已完成任务（fallback 续传生命线）"
+    );
+    let requests_on_b_after = b.request_count.load(std::sync::atomic::Ordering::SeqCst);
+    // B 仅增加 update_sources 的探测请求（1 次），无下载段
+    assert!(
+        requests_on_b_after <= requests_on_b_before + 1,
+        "无指纹换源不得触发段重下（B 请求数 {requests_on_b_before} → {requests_on_b_after}）"
+    );
+    let got = std::fs::read(dir.path().join("h.bin")).unwrap();
+    assert_eq!(sha256_of(&got), expected);
+}

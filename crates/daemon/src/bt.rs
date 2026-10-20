@@ -232,17 +232,32 @@ impl BtEngine {
     }
 
     /// 暂停意图登记（true=登记并采样当前 done 基线；false=清除）。
+    /// P0-2 修复：先取 status 再拿锁——原实现持 pause_intents 锁跨
+    /// `core.status()`（libtorrent FFI 同步阻塞），而 enforce_pauses 在
+    /// 500ms alert 心跳线程抢同一把锁，心跳线程是唯一 alert 消费者，
+    /// 被占住则整轮停摆 → 其它任务 fastresume 集体 3s 超时。
+    /// 此路径从 HTTP handler 同步调用，占的是 tokio worker，危害放大。
     pub fn set_pause_intent(&self, id: &str, intended: bool) {
-        let mut m = self.pause_intents.lock();
-        if intended {
-            let done = self
-                .core
-                .status(id)
-                .map(|s| s.downloaded.max(0) as u64)
-                .unwrap_or(0);
-            m.insert(id.to_string(), done);
+        // 锁外完成 FFI 调用（两行顺序调换，语义不变：采样与登记之间即使
+        // done 前进，基线偏小只会导致多保留一段重传，不会丢数据）
+        let sampled = if intended {
+            Some(
+                self.core
+                    .status(id)
+                    .map(|s| s.downloaded.max(0) as u64)
+                    .unwrap_or(0),
+            )
         } else {
-            m.remove(id);
+            None
+        };
+        let mut m = self.pause_intents.lock();
+        match sampled {
+            Some(done) => {
+                m.insert(id.to_string(), done);
+            }
+            None => {
+                m.remove(id);
+            }
         }
     }
 
@@ -284,6 +299,14 @@ impl BtEngine {
     pub fn mark_alert_loop_active(&self) {
         self.alert_loop_active
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// P0-3 配套：alert 循环终止（abort/退出）时复位——save_fastresume
+    /// 检测到复位后立即回到自 poll 模式，不再空等已死的分发者（每任务 3s）。
+    /// 由 bt_events 循环 future 的 RAII Drop 调用（abort 亦触发 Drop）。
+    pub fn clear_alert_loop_active(&self) {
+        self.alert_loop_active
+            .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// .fastresume 文件路径（按 infohash 命名——避开文件名转义问题，且 magnet 无需
@@ -392,10 +415,18 @@ fn save_fastresume_impl(
     // batch3-P1：常驻 alert 消费者存在 → 纯等分发（不自行 pop，双消费者互吞
     // 是本批修的缺陷）；无消费者（单元测试直连 BtEngine）→ 自行 pop 兜底，
     // 与旧行为一致（此时 ring 无其他消费者，无互吞问题）。
-    let poll_ring = !loop_active.load(std::sync::atomic::Ordering::SeqCst);
+    // P0-3 修复：poll_ring 改为【每轮重新采样】——原实现在循环外一次性采样，
+    // 若采样时旗标仍 false（常驻循环尚未置位），本函数会在整个 3s 窗口内
+    // 持续 pop 整个 ring，而循环体只处理本任务 Resume —— 其它任务的终态
+    // alert（State/Error/Finished）被直接丢弃 → 任务永久卡 Downloading。
+    // 每轮重采样后：一旦常驻循环置位，本函数立即让位切回分发模式；
+    // 同时 pop 到的 alerts 先过 dispatch（其他任务的 Resume 等待者也能收到）。
     while std::time::Instant::now() < deadline {
+        let poll_ring = !loop_active.load(std::sync::atomic::Ordering::SeqCst);
         if poll_ring {
             if let Ok(alerts) = core.pop_alerts(256) {
+                // 其他并发保存者的 Resume 等待者也能收到分发（消除互吞）
+                dispatch_resume_alerts(waiters, &alerts);
                 for a in alerts {
                     if a.kind == smart_dl_btcore::AlertKind::Resume && a.is_resume_ready() {
                         if let Ok(r) = core.take_resume_data(ih) {
@@ -580,20 +611,35 @@ impl DownloadEngine for BtEngine {
 
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError> {
         self.set_pause_intent(id, true); // Bug A：登记意图，metadata 复活时由 alert 循环压制
-        self.core
-            .pause(id)
-            .map_err(|e| EngineError::Other(core_err(&e)))?;
+                                         // P1-12 修复：FFI pause 失败回滚意图——原实现 `?` 返回后意图残留，
+                                         // 500ms 心跳的 enforce_pauses 对已失败任务持续 FFI 重压（僵尸条目
+                                         // 永不消除，且每次心跳都空打一轮 pause/status）。
+        if let Err(e) = self.core.pause(id) {
+            self.set_pause_intent(id, false); // 回滚：引擎未接受暂停，意图不得残留
+            return Err(EngineError::Other(core_err(&e)));
+        }
         // 暂停时保存进度（best-effort；无 metadata 等场景静默跳过）
         // batch3-P2：同步等待 RESUME（≤3s）→ spawn_blocking 不阻塞 tokio worker
+        // P1-13 修复：不再 `let _ =` 吞链——spawn panic（JoinError）与写盘失败
+        // 均记日志（best-effort 语义不变，但可观测）。
         let core = self.core.clone();
         let waiters = self.resume_waiters.clone();
         let save_path = self.save_path.clone();
         let loop_active = self.alert_loop_active.clone();
         let ih = id.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             save_fastresume_impl(&core, &waiters, &save_path, &loop_active, &ih)
         })
-        .await;
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("pause: fastresume 保存失败（续传凭据可能缺失）: {e}")
+            }
+            Err(join_err) => {
+                tracing::warn!("pause: fastresume 保存任务异常: {join_err}")
+            }
+        }
         Ok(())
     }
 
@@ -616,15 +662,25 @@ impl DownloadEngine for BtEngine {
         // 移除前显式保存 fastresume（重启后重新 add 同一 magnet → 回灌续传）。
         // 失败不阻断移除（best-effort）。
         // batch3-P2：同步等待 RESUME（≤3s）→ spawn_blocking 不阻塞 tokio worker
+        // P1-13 修复：不再 `let _ =` 吞链——spawn panic 与写盘失败均记日志。
         let core = self.core.clone();
         let waiters = self.resume_waiters.clone();
         let save_path = self.save_path.clone();
         let loop_active = self.alert_loop_active.clone();
         let ih = id.clone();
-        let _ = tokio::task::spawn_blocking(move || {
+        match tokio::task::spawn_blocking(move || {
             save_fastresume_impl(&core, &waiters, &save_path, &loop_active, &ih)
         })
-        .await;
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!("remove: fastresume 保存失败（续传凭据可能缺失）: {e}")
+            }
+            Err(join_err) => {
+                tracing::warn!("remove: fastresume 保存任务异常: {join_err}")
+            }
+        }
         self.set_pause_intent(id, false);
         let r = self.core.remove(id, delete_data);
         let _ = r.map_err(|e| EngineError::Other(core_err(&e)))?;

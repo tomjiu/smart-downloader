@@ -74,12 +74,14 @@ impl DaemonState {
     }
 
     /// 完成动作热更（settings PUT/refresh_config 路径）。
+    /// P0-10 修复：仅登记，不补判执行——原实现 batch5-P2 补判语义是
+    /// 「设置时若全部任务已终态则立即执行」，副作用是设置即执行：用户
+    /// 在任务全终态时正常配置 shutdown（为下一批任务做准备）会立刻关机
+    /// 而非等下一个任务完成。正确语义（qbit 对标）：完成动作只由「任务
+    /// 完成事件」触发，配置变更仅登记。全终态后设置的动作等未来完成
+    /// 事件（无则不触发——预期行为）。
     pub(crate) fn set_completion_action(&self, action: &str) {
         *self.completion_action.lock() = normalize_completion_action(action);
-        // batch5-P2（热更补判）：原实现只在任务完成事件触发判定——若全部任务
-        // 已终态后才改配置/热重载启用 shutdown/exit，永远不会再有完成事件，
-        // 新设动作静默失效。注入后补判一次（空表/未全终态时内部自复位）。
-        self.maybe_run_completion_action();
     }
 
     /// 注入 HTTP 任务默认落盘目录（dest 未指定时使用；serve 从 `[download] dest_root` 传入）。
@@ -320,8 +322,10 @@ impl DaemonState {
     ///
     /// 锁序约定（docs/LOCK_MODEL.md）：顺序获取 `allowed_roots` → guard
     /// 语句尾即释放 → 按需获取 `default_dest_root`，两把锁任何路径不同时
-    /// 持有——全域锁模型维持「任何时刻至多持一把锁」强不变量（2026-09
-    /// 锁模型审计中唯一的多锁同持边，现已消除）。
+    /// 持有。（batch10 勘误：本函数的多锁边已消除，但 `autosave` 的
+    /// `persist_lock → tasks` 边经架构审查确认为历史审计盲区——全域
+    /// 「至多持一把锁」的表述已随 LOCK_MODEL.md §2 勘误为「除 autosave
+    /// 例外边外成立」。）
     pub(super) fn dest_roots(&self) -> Vec<PathBuf> {
         let g = self.allowed_roots.lock().clone();
         if g.is_empty() {
@@ -642,10 +646,15 @@ pub(crate) fn execute_completion_action(action: &str) {
     tracing::info!("全部任务已终态，执行完成动作: {action}");
     match action {
         "exit" => {
-            // batch5-P2：真给日志一帧落盘窗口（原注释称有窗口实则立即
-            // exit）；短眠后退出（桌面端壳会随 sidecar 退出联动收尾）。
-            std::thread::sleep(std::time::Duration::from_millis(250));
-            std::process::exit(0);
+            // P1-8 修复：独立线程延时退出——原实现在调用方（maybe_run_
+            // completion_action）的 tasks 锁临界区内 sleep 250ms + exit，
+            // 阻塞全部 API（add/list/pause 全部挂起），与「锁内亚毫秒」
+            // 的设计注释自相矛盾（审查模式 C：注释与实现脱节）。
+            // 独立线程给日志一帧落盘窗口后退出（桌面端壳随 sidecar 联动收尾）。
+            std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                std::process::exit(0);
+            });
         }
         "shutdown" | "sleep" | "hibernate" => {
             // batch5-P2：system_power_action 同步阻塞（systemctl 可能慢），

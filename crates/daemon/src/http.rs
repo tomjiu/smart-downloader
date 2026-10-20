@@ -2587,6 +2587,10 @@ macro_rules! router_base {
                     .post(security_ban)
                     .delete(security_unban),
             )
+            // 审计修复（P2-1）：DELETE 带 body 违反 HTTP 语义（规范无定义，
+            // AI/多数客户端不发 DELETE body）——新增 POST /security/bans/unban
+            // 同 handler（body 语义正常）；DELETE 路由保留兼容既有调用方。
+            .route("/security/bans/unban", post(security_unban))
             // batch5：IP 段批量导入（DAT/P2P 文本；部分成功语义）
             .route("/security/bans/import", post(security_ban_import))
             .route("/tasks/:id/trackers", get(task_trackers_list))
@@ -2685,7 +2689,10 @@ fn request_from_local_origin(req: &axum::extract::Request, extra: &[String]) -> 
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
     {
-        None => true, // HTTP/1.0：无 Host 头（浏览器不可达路径，rebinding 无效）
+        // 审计修复（P2-3）：Host 缺失改 fail-closed——原 None => true 放行。
+        // HTTP/1.1 强制 Host（hyper 亦要求），正常客户端必带；缺失仅出现于
+        // 手改报文的攻击探针（rebinding 场景下无 Host 反而绕过校验）。
+        None => false,
         Some(h) if host_allowed(h, extra) => match req.headers().get(header::ORIGIN) {
             None => true, // 同源 GET/CLI：无 Origin
             Some(o) => o

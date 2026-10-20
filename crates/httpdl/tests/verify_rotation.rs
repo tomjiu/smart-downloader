@@ -97,14 +97,15 @@ async fn rotation_pool_exhausts_then_downgrades() {
         .unwrap();
 
     let st = wait_terminal(&engine, &tid).await;
+    // P2-19：Error 终态（候选耗尽 + 校验不符，文件已落位但明示损坏）
     assert_eq!(
         st.state,
-        EngineState::Completed,
-        "候选耗尽 → 降级接受仍算完成"
+        EngineState::Error,
+        "候选耗尽 → 校验不符不得标 Completed"
     );
     assert!(
         st.error.as_deref().unwrap_or("").contains("sha256"),
-        "降级必须告警 sha256 不匹配"
+        "校验失败信息必须点名 sha256 不匹配"
     );
     assert!(
         count(&srv_a) > 0 && count(&srv_b) > 0 && count(&srv_c) > 0,
@@ -139,10 +140,15 @@ async fn backup_failure_relays_into_rotation_pool() {
         .unwrap();
 
     let st = wait_terminal(&engine, &tid).await;
-    assert_eq!(st.state, EngineState::Completed, "全链路耗尽 → 降级接受");
+    // P2-19：Error 终态（全链路耗尽 + 校验不符）
+    assert_eq!(
+        st.state,
+        EngineState::Error,
+        "全链路耗尽 → 校验不符不得标 Completed"
+    );
     assert!(
         st.error.as_deref().unwrap_or("").contains("md5"),
-        "备用源 md5 校验链耗尽必须告警 md5"
+        "备用源 md5 校验链耗尽必须在错误信息点名 md5"
     );
     assert!(
         count(&srv_a) > 0 && count(&srv_b) > 0 && count(&srv_bk) > 0,

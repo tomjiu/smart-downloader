@@ -17,7 +17,10 @@ xunlei-import = ["dep:xunlei-convert", "bt"]
 # 隐含 bt（验收命令 `--features bt webseed` 对空格分隔/测试名过滤两种解析均兼容）。
 webseed = ["bt"]
 # NAS 版迅雷引擎托管（xllite/pan-cli，Linux-only；附录 E-2026-08-30）。
-nas = []
+# 审计修复（batch10-G，架构审查问题 2③）：转发 btcore 校准版 nas_remote
+#（A2-A5 已校准的 551 行实现）——原 `nas = []` 空转发令 daemon 只编译自身
+# 的骨架版 nas_remote（端点全假设区），校准版永远不可达。
+nas = ["smart-dl-btcore/nas"]
 # FTP 引擎（D12：并入 httpdl，feature-gated）。
 ftp = ["smart-dl-httpdl/ftp"]
 # SFTP 引擎（C-S1：russh + russh-sftp，纯 Rust 栈；与 ftp 平行门控）。
