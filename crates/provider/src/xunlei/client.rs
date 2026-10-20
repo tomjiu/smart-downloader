@@ -9,7 +9,6 @@ use crate::xunlei::sign::{captcha_sign_with, device_id_32};
 use crate::xunlei::tier::{Tier, TIER_WEB};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde::Deserialize;
-use sha1::Digest as _;
 
 /// pan 网盘场景的 client_id（取链/captcha/refresh/登录用）。
 pub const CLIENT_ID: &str = "Xqp0kJBXWhwaTpB6";
@@ -98,110 +97,22 @@ pub(crate) fn normalize_phone(phone: &str) -> String {
 ///
 /// 返回 40 位小写十六进制 info-hash；解析失败返回 Err。
 pub fn bencode_info_hash(torrent: &[u8]) -> Result<String, String> {
-    let info = find_info_dict(torrent).ok_or_else(|| "torrent 中未找到 info 字典".to_string())?;
-    let digest = sha1::Sha1::digest(info);
+    // TD-1 统一：定位走 core::bencode::locate_dict_value（结构感知，含
+    // MAX_DEPTH + checked_add 防护）。旧实现是朴素字节搜索（字面量
+    // "4:info" 全文匹配 + 跳过空白——bencode 无空白语义），announce URL
+    // 等字符串内容含 "4:info"+'d' 字样时会错误定位 → 错误 infohash。
+    let (start, end) = smart_dl_core::bencode::locate_dict_value(torrent, b"info")
+        .ok_or_else(|| "torrent 中未找到 info 字典".to_string())?;
+    if torrent.get(start) != Some(&b'd') {
+        return Err("info 字段不是字典".to_string());
+    }
+    let digest = sha1::Sha1::digest(&torrent[start..=end]);
     Ok(hex_encode(&digest))
 }
 
-/// 在 bencode 字节流中定位 `info` 字典字节区间 [start,end)（含 `d` 不含对应 `e`）。
-fn find_info_dict(torrent: &[u8]) -> Option<&[u8]> {
-    // 找 "4:info" 标记
-    let marker = b"4:info";
-    let mut i = 0;
-    while i + marker.len() <= torrent.len() {
-        if &torrent[i..i + marker.len()] == marker {
-            let mut p = i + marker.len();
-            // 跳过前导空白
-            while p < torrent.len()
-                && (torrent[p] == b' '
-                    || torrent[p] == b'\n'
-                    || torrent[p] == b'\r'
-                    || torrent[p] == b'\t')
-            {
-                p += 1;
-            }
-            if p < torrent.len() && torrent[p] == b'd' {
-                if let Some(end) = matching_end(torrent, p) {
-                    return Some(&torrent[p..=end]);
-                }
-            }
-        }
-        i += 1;
-    }
-    None
-}
-
-/// 从 `b'd'` 起始位置找到配对的 `e`，返回其下标（含）。
-fn matching_end(buf: &[u8], start: usize) -> Option<usize> {
-    if buf.get(start)? != &b'd' {
-        return None;
-    }
-    let mut depth = 0i32;
-    let mut i = start;
-    while i < buf.len() {
-        match buf[i] {
-            b'd' | b'l' => depth += 1,
-            b'e' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            // 字符串以 "<len>:" 表达，跳过 "<len>:" 后整段
-            c if c.is_ascii_digit() => {
-                let mut j = i;
-                while j < buf.len() && buf[j].is_ascii_digit() {
-                    j += 1;
-                }
-                if j < buf.len() && buf[j] == b':' {
-                    let mut len: usize = 0;
-                    let mut ok = true;
-                    for &digit in &buf[i..j] {
-                        len = match len
-                            .checked_mul(10)
-                            .and_then(|v| v.checked_add((digit - b'0') as usize))
-                        {
-                            Some(v) => v,
-                            None => {
-                                ok = false;
-                                break;
-                            }
-                        };
-                    }
-                    // 安全修复（H-3 同型）：len 本身已 checked 解析（可达 usize::MAX），
-                    // j+1+len 裸加法回绕会绕过界检查 → i 回跳死循环。改 checked 链。
-                    let next = j.checked_add(1).and_then(|k| k.checked_add(len));
-                    match next {
-                        Some(v) if ok && v <= buf.len() => i = v,
-                        _ => return None,
-                    }
-                    continue;
-                } else {
-                    return None;
-                }
-            }
-            // 整数 'i...e'：跳到配对的 'e' 后继续（不计入字典/列表深度）
-            b'i' => {
-                let mut j = i + 1;
-                while j < buf.len() && buf[j] != b'e' {
-                    j += 1;
-                }
-                if j < buf.len() && buf[j] == b'e' {
-                    i = j + 1;
-                    continue;
-                } else {
-                    return None;
-                }
-            }
-            // 其余字节视为非法 bencode
-            _ => return None,
-        }
-        i += 1;
-    }
-    None
-}
-
 /// 字节转小写十六进制（无依赖，便于单测）。
+use sha1::Digest as _;
+
 pub fn hex_encode(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -1419,6 +1330,33 @@ mod tests {
     fn bencode_info_hash_rejects_missing_info() {
         let not_torrent = b"d4:name3:abce";
         assert!(bencode_info_hash(not_torrent).is_err());
+    }
+
+    /// TD-1 回归（旧实现的缺陷）：announce URL 等**字符串内容**含
+    /// "4:info" + 'd' 字样时，朴素字节搜索会错误定位 → 错误 infohash。
+    /// 结构感知定位必须跳过字符串内容、命中顶层真键。
+    #[test]
+    fn bencode_info_hash_ignores_info_marker_inside_strings() {
+        // announce = "http://t/xx4:infod"（30 字节，内容含 "4:info"+'d'）
+        let announce: &[u8] = b"http://t/xx4:infod";
+        let mut torrent = Vec::new();
+        torrent.extend_from_slice(b"d8:announce");
+        torrent.extend_from_slice(announce.len().to_string().as_bytes());
+        torrent.push(b':');
+        torrent.extend_from_slice(announce);
+        torrent.extend_from_slice(b"4:infod4:name3:abc12:piece lengthi1e6:pieces0:ee");
+        // 期望 = SHA1(真 info dict)，与 known_vector 相同内容
+        let info_bytes = b"d4:name3:abc12:piece lengthi1e6:pieces0:e";
+        let expected = hex_encode(&sha1::Sha1::digest(info_bytes));
+        let got = bencode_info_hash(&torrent).expect("必须定位顶层真 info 键");
+        assert_eq!(got, expected);
+    }
+
+    /// info 值不是 dict → 报错（旧实现同样拒绝，保持契约）。
+    #[test]
+    fn bencode_info_hash_rejects_non_dict_info() {
+        let torrent = b"d4:infoi42ee";
+        assert!(bencode_info_hash(torrent).is_err());
     }
 
     #[test]

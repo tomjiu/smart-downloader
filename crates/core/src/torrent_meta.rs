@@ -93,113 +93,8 @@ impl fmt::Display for TorrentMetaError {
 
 impl std::error::Error for TorrentMetaError {}
 
-/// 在原始字节中定位顶层 `info` dict 的 span（含首尾字节），返回 (start, end_inclusive)。
-/// 只做最小扫描（dict 内键 `4:info` 后紧随的值），不做完整解析。
-fn locate_info_span(b: &[u8]) -> Option<(usize, usize)> {
-    // 顶层 dict 起点
-    if b.first() != Some(&b'd') {
-        return None;
-    }
-    let mut i = 1usize;
-    while i < b.len() {
-        if b[i] == b'e' {
-            return None; // dict 结束前没遇到 info
-        }
-        // 读键（bencode 字符串）
-        let (key, next) = read_str(b, i)?;
-        i = next;
-        if key == b"info" {
-            // 值的起点就是 i，找配对结束
-            let end = dict_span_end(b, i)?;
-            return Some((i, end));
-        }
-        // 跳过该键的值（配对扫描）
-        i = skip_value(b, i)?;
-    }
-    None
-}
-
-/// 从 `pos` 读 bencode 字符串，返回 (字节, 下一位移)。
-fn read_str(b: &[u8], pos: usize) -> Option<(Vec<u8>, usize)> {
-    let colon = b[pos..].iter().position(|&c| c == b':')? + pos;
-    let len: usize = std::str::from_utf8(&b[pos..colon]).ok()?.parse().ok()?;
-    let start = colon + 1;
-    let end = start.checked_add(len)?;
-    if end > b.len() {
-        return None;
-    }
-    Some((b[start..end].to_vec(), end))
-}
-
-/// 跳过 `pos` 处的一个完整 bencode 值，返回值结束后的位移（不含）。
-fn skip_value(b: &[u8], pos: usize) -> Option<usize> {
-    match *b.get(pos)? {
-        b'i' => {
-            let e = b[pos..].iter().position(|&c| c == b'e')? + pos;
-            Some(e + 1)
-        }
-        b'l' | b'd' => {
-            // 嵌套容器统一 depth 扫描：容器头 +1、'e' -1；字符串按 len:bytes 整体跳过
-            let mut depth = 0i64;
-            let mut i = pos;
-            while i < b.len() {
-                let c = b[i];
-                if c == b'l' || c == b'd' {
-                    depth += 1;
-                    i += 1;
-                } else if c == b'e' {
-                    depth -= 1;
-                    i += 1;
-                    if depth == 0 {
-                        return Some(i);
-                    }
-                } else if c == b'i' {
-                    let e = b[i..].iter().position(|&x| x == b'e')? + i;
-                    i = e + 1;
-                } else if c.is_ascii_digit() {
-                    // 字符串：len:bytes
-                    let (_, next) = read_str(b, i)?;
-                    i = next;
-                } else {
-                    return None;
-                }
-            }
-            None
-        }
-        c if c.is_ascii_digit() => {
-            let (_, next) = read_str(b, pos)?;
-            Some(next)
-        }
-        _ => None,
-    }
-}
-
-/// dict 从 `pos`（'d'）开始的配对结束字节位（含 'e'）。
-/// 注意：dict 内部的字符串键/值都走 read_str/skip_value，'e' 只在此层消费——
-/// 但嵌套 dict/list 会递增 depth，故按统一 depth 扫描（与 skip_value 同构）。
-fn dict_span_end(b: &[u8], pos: usize) -> Option<usize> {
-    if b.get(pos) != Some(&b'd') {
-        return None;
-    }
-    skip_value(b, pos).map(|end| end - 1) // 含 'e'
-}
-
 fn bytes_to_string(v: &[u8]) -> String {
     String::from_utf8_lossy(v).into_owned()
-}
-
-fn as_int(v: &Value) -> Option<i64> {
-    match v {
-        Value::Int(i) => Some(*i),
-        _ => None,
-    }
-}
-
-fn as_bytes(v: &Value) -> Option<&[u8]> {
-    match v {
-        Value::Bytes(b) => Some(b),
-        _ => None,
-    }
 }
 
 /// 收集 announce-list（嵌套 list of list of str）+ announce，去重保序。
@@ -210,14 +105,14 @@ fn collect_trackers(top: &Value) -> Vec<String> {
             out.push(s);
         }
     };
-    if let Some(a) = top.dict_get(b"announce").and_then(as_bytes) {
+    if let Some(a) = top.dict_get(b"announce").and_then(Value::as_bytes) {
         push(bytes_to_string(a));
     }
     if let Some(Value::List(rows)) = top.dict_get(b"announce-list") {
         for row in rows {
             if let Value::List(tiers) = row {
                 for t in tiers {
-                    if let Some(u) = as_bytes(t) {
+                    if let Some(u) = t.as_bytes() {
                         push(bytes_to_string(u));
                     }
                 }
@@ -239,7 +134,7 @@ fn collect_web_seeds(top: &Value) -> Vec<String> {
         }
         Some(Value::List(items)) => {
             for it in items {
-                if let Some(b) = as_bytes(it) {
+                if let Some(b) = it.as_bytes() {
                     let s = bytes_to_string(b);
                     if !s.is_empty() && !out.contains(&s) {
                         out.push(s);
@@ -260,7 +155,7 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentSummary, TorrentMetaError> {
     }
 
     // infohash = SHA1(info dict 原始字节)
-    let (s, e) = locate_info_span(bytes).ok_or(TorrentMetaError::MissingInfo)?;
+    let (s, e) = bencode::locate_dict_value(bytes, b"info").ok_or(TorrentMetaError::MissingInfo)?;
     let mut hasher = Sha1::new();
     hasher.update(&bytes[s..=e]);
     let infohash_v1: String = hasher
@@ -276,25 +171,25 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentSummary, TorrentMetaError> {
 
     let name_v = info
         .dict_get(b"name")
-        .and_then(as_bytes)
+        .and_then(Value::as_bytes)
         .ok_or(TorrentMetaError::MissingField("name"))?;
     let name = bytes_to_string(name_v);
-    let piece_len = as_int(
-        info.dict_get(b"piece length")
-            .ok_or(TorrentMetaError::MissingField("piece length"))?,
-    )
-    .ok_or(TorrentMetaError::BadType("piece length"))?;
+    let piece_len = info
+        .dict_get(b"piece length")
+        .ok_or(TorrentMetaError::MissingField("piece length"))?
+        .as_int()
+        .ok_or(TorrentMetaError::BadType("piece length"))?;
     // P0-12 修复：取值校验（原实现仅校验类型，0/-5 被静默接受）。
     // 上限 16 MiB 与 libtorrent 一致；越界值会在下游偏移计算中溢出回绕。
     const MAX_PIECE_LEN: i64 = 1 << 24;
     if !(1..=MAX_PIECE_LEN).contains(&piece_len) {
         return Err(TorrentMetaError::InvalidPieceLength(piece_len));
     }
-    let pieces = as_bytes(
-        info.dict_get(b"pieces")
-            .ok_or(TorrentMetaError::MissingField("pieces"))?,
-    )
-    .ok_or(TorrentMetaError::BadType("pieces"))?;
+    let pieces = info
+        .dict_get(b"pieces")
+        .ok_or(TorrentMetaError::MissingField("pieces"))?
+        .as_bytes()
+        .ok_or(TorrentMetaError::BadType("pieces"))?;
     // 与 daemon 侧（bt_alerts.rs）口径统一：余数不得静默丢弃。
     if pieces.len() % 20 != 0 {
         return Err(TorrentMetaError::BadPiecesLen(pieces.len()));
@@ -303,7 +198,7 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentSummary, TorrentMetaError> {
 
     let mut files = Vec::new();
     if let Some(len) = info.dict_get(b"length") {
-        let size = as_int(len).ok_or(TorrentMetaError::BadType("length"))?;
+        let size = len.as_int().ok_or(TorrentMetaError::BadType("length"))?;
         files.push(TorrentFileMeta {
             path: name.clone(),
             size: size.max(0) as u64,
@@ -313,12 +208,11 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentSummary, TorrentMetaError> {
             let Value::Dict(_) = entry else {
                 return Err(TorrentMetaError::BadType("files[]"));
             };
-            let size = as_int(
-                entry
-                    .dict_get(b"length")
-                    .ok_or(TorrentMetaError::MissingField("files[].length"))?,
-            )
-            .ok_or(TorrentMetaError::BadType("files[].length"))?;
+            let size = entry
+                .dict_get(b"length")
+                .ok_or(TorrentMetaError::MissingField("files[].length"))?
+                .as_int()
+                .ok_or(TorrentMetaError::BadType("files[].length"))?;
             let Value::List(parts) = entry
                 .dict_get(b"path")
                 .ok_or(TorrentMetaError::MissingField("files[].path"))?
@@ -330,7 +224,7 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentSummary, TorrentMetaError> {
             }
             let segs: Vec<String> = parts
                 .iter()
-                .filter_map(|p| as_bytes(p).map(bytes_to_string))
+                .filter_map(|p| p.as_bytes().map(bytes_to_string))
                 .collect();
             files.push(TorrentFileMeta {
                 path: segs.join("/"),
@@ -358,11 +252,11 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentSummary, TorrentMetaError> {
         web_seeds: collect_web_seeds(&top),
         comment: top
             .dict_get(b"comment")
-            .and_then(as_bytes)
+            .and_then(Value::as_bytes)
             .map(bytes_to_string),
         created_by: top
             .dict_get(b"created by")
-            .and_then(as_bytes)
+            .and_then(Value::as_bytes)
             .map(bytes_to_string),
     })
 }
@@ -519,7 +413,7 @@ mod tests {
         let bytes = single_file_torrent();
         let s = parse_torrent(&bytes).unwrap();
         // 用独立实现交叉验证（daemon 侧算法的等价重放）
-        let (start, end) = locate_info_span(&bytes).unwrap();
+        let (start, end) = bencode::locate_dict_value(&bytes, b"info").unwrap();
         let mut h = Sha1::new();
         h.update(&bytes[start..=end]);
         let expect: String = h.finalize().iter().map(|x| format!("{x:02x}")).collect();
@@ -587,7 +481,7 @@ mod tests {
     fn locate_span_handles_nested_and_trailing_keys() {
         // info 之前有嵌套 list 值、之后还有别的键——定位须精确
         let bytes = multi_file_torrent();
-        let (s, e) = locate_info_span(&bytes).unwrap();
+        let (s, e) = bencode::locate_dict_value(&bytes, b"info").unwrap();
         // span 应以 'd' 开头 'e' 结尾且可独立解码
         assert_eq!(bytes[s], b'd');
         assert_eq!(bytes[e], b'e');

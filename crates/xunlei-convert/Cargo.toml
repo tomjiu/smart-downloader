@@ -20,6 +20,9 @@ sha1 = { workspace = true }
 thiserror = { workspace = true }
 anyhow = "1"
 hex = "0.4"
+# TD-1（bencode 统一）：fastresume 编解码委托 core::bencode——
+# 也是架构审查问题 2① 的补全（convert 真正需要的 smart-dl-core 此前未声明）。
+smart-dl-core = { path = "../core" }
 
 [dev-dependencies]
 tempfile = "3"

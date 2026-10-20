@@ -19,6 +19,35 @@ impl Value {
             _ => None,
         }
     }
+
+    /// Type-checked accessors（TD-1 统一：消散各 crate 私有的 as_int/as_bytes）。
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Value::Bytes(b) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn as_list(&self) -> Option<&[Value]> {
+        match self {
+            Value::List(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    pub fn as_dict(&self) -> Option<&[(Vec<u8>, Value)]> {
+        match self {
+            Value::Dict(d) => Some(d),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -112,6 +141,100 @@ pub fn decode(data: &[u8]) -> Result<Value, DecodeError> {
         return Err(DecodeError::InvalidByte(data[pos], pos));
     }
     Ok(v)
+}
+
+// ============ span 定位器（TD-1 统一：infohash 原始字节哈希专用） ============
+//
+// 背景：infohash = SHA1(info dict 的**原始字节**)——重编码不保证逐字节一致，
+// 因此 infohash 工作流必须定位原始 span 而非走 `decode` 物化。此前全仓有
+// 4 份结构同构但实现各异的私扫描器（core/torrent_meta、daemon/bt_alerts、
+// xunlei-convert/fastresume、provider/xunlei/client——后者甚至是朴素字节
+// 搜索，非结构感知），本节是唯一权威实现。
+//
+// 防护与 `decode` 同款：MAX_DEPTH 递归上限 + 长度字段 checked_add（H-3）。
+
+/// 在**顶层 dict** 中定位 `key` 对应值的原始字节区间。
+///
+/// 返回 `(start, end)`：`start` = 值首字节下标；`end` = 值**末字节**下标
+/// （闭区间，`&data[start..=end]` 即该值的完整 bencode 编码）。对 dict/list
+/// `end` 是闭合 `e` 的下标；对 int 是其 `e`；对 str 是内容末字节。
+///
+/// 典型用法：`locate_dict_value(torrent, b"info")` → SHA1 该 span 得 v1
+/// infohash。键匹配只在**顶层**进行（嵌套 dict 中的同名键不会被误匹配——
+/// 跳过值时是结构感知的，字符串内容中的 `4:info` 字样不会形成假阳性）。
+///
+/// 输入非法（非 dict 顶层 / 截断 / 超深嵌套 / 超长字段）一律返回 `None`。
+pub fn locate_dict_value(data: &[u8], key: &[u8]) -> Option<(usize, usize)> {
+    if data.first() != Some(&b'd') {
+        return None;
+    }
+    let mut pos = 1usize;
+    while pos < data.len() && data[pos] != b'e' {
+        // dict 键必须是字符串
+        if !data[pos].is_ascii_digit() {
+            return None;
+        }
+        let (content_start, content_end) = str_content_span(data, pos)?;
+        let after_key = content_end;
+        if &data[content_start..content_end] == key {
+            let after_value = skip_value_span(data, after_key, 0)?;
+            // after_value = 值后第一个下标；末字节 = after_value - 1
+            let end = after_value.checked_sub(1)?;
+            return Some((after_key, end));
+        }
+        pos = skip_value_span(data, after_key, 0)?;
+    }
+    None
+}
+
+/// `pos` 处的 bencode 字符串 `len:bytes` → (内容起始, 内容结束)（左闭右开）。
+/// H-3 防护：`colon + 1 + len` 全程 checked_add，回绕/越界 → None。
+fn str_content_span(data: &[u8], pos: usize) -> Option<(usize, usize)> {
+    let colon = data[pos..]
+        .iter()
+        .position(|&b| b == b':')
+        .map(|p| p + pos)?;
+    let len: usize = std::str::from_utf8(&data[pos..colon]).ok()?.parse().ok()?;
+    let start = colon.checked_add(1)?;
+    let end = start.checked_add(len)?;
+    if end > data.len() {
+        return None;
+    }
+    Some((start, end))
+}
+
+/// 跳过 `pos` 处的一个完整 bencode 值，返回值结束后的下标（开区间）。
+/// 递归深度上限 MAX_DEPTH（V4 同款：恶意超深嵌套 → None 而非栈溢出）。
+fn skip_value_span(data: &[u8], pos: usize, depth: usize) -> Option<usize> {
+    if depth > MAX_DEPTH {
+        return None;
+    }
+    match data.get(pos)? {
+        b'd' => {
+            let mut p = pos + 1;
+            while p < data.len() && data[p] != b'e' {
+                if !data[p].is_ascii_digit() {
+                    return None; // dict 键必须是字符串
+                }
+                let (_, key_end) = str_content_span(data, p)?;
+                p = skip_value_span(data, key_end, depth + 1)?;
+            }
+            Some(p + 1)
+        }
+        b'l' => {
+            let mut p = pos + 1;
+            while p < data.len() && data[p] != b'e' {
+                p = skip_value_span(data, p, depth + 1)?;
+            }
+            Some(p + 1)
+        }
+        b'i' => {
+            let e = data[pos..].iter().position(|&c| c == b'e')? + pos;
+            Some(e + 1)
+        }
+        c if c.is_ascii_digit() => str_content_span(data, pos).map(|(_, end)| end),
+        _ => None,
+    }
 }
 
 fn decode_at(data: &[u8], pos: usize) -> Result<(Value, usize), DecodeError> {
@@ -390,5 +513,129 @@ mod tests {
         let mut data2 = b"18446744073709551595:".to_vec();
         data2.extend_from_slice(b"payload");
         assert!(matches!(decode(&data2), Err(DecodeError::UnexpectedEof(_))));
+    }
+
+    // ============ locate_dict_value（TD-1 统一 span 定位器） ============
+
+    /// 顶层 info dict 定位：span 必须是 info 值的完整原始编码。
+    #[test]
+    fn locate_info_dict_basic() {
+        // d 8:announce 15:http://tracker/ 4:info d...e e
+        let data = b"d8:announce15:http://tracker/4:infod4:name8:testfile6:lengthi1024eee";
+        let (start, end) = locate_dict_value(data, b"info").expect("locate info");
+        assert_eq!(&data[start..=end], b"d4:name8:testfile6:lengthi1024ee");
+        // 起点是 'd'，终点是配对 'e'
+        assert_eq!(data[start], b'd');
+        assert_eq!(data[end], b'e');
+    }
+
+    /// 键不存在 → None。
+    #[test]
+    fn locate_missing_key() {
+        let data = b"d3:foo3:bare";
+        assert!(locate_dict_value(data, b"info").is_none());
+        assert!(locate_dict_value(data, b"fo").is_none()); // 前缀不匹配
+    }
+
+    /// 非顶层 dict（list/str/int）→ None。
+    #[test]
+    fn locate_requires_top_level_dict() {
+        assert!(locate_dict_value(b"li1ee", b"info").is_none());
+        assert!(locate_dict_value(b"4:spam", b"info").is_none());
+        assert!(locate_dict_value(b"i42e", b"info").is_none());
+        assert!(locate_dict_value(b"", b"info").is_none());
+    }
+
+    /// **核心回归（provider/client.rs 旧实现的缺陷）**：
+    /// 字符串内容里出现 `4:info` + `d` 字样（如 announce URL 含 "4:infod"）
+    /// 不得形成假阳性——旧实现是朴素字节搜索，会错误定位并产出错误 infohash。
+    /// 结构感知扫描跳过字符串内容，只匹配顶层真键。
+    #[test]
+    fn locate_no_false_positive_inside_string_content() {
+        // announce 的字符串内容含 "4:infod"；顶层真 info 在其后。
+        // 朴素扫描会在 announce 内容里命中 "4:info"+'d' → 错误 span。
+        let announce = b"http://evil.example.com/xx4:infodyyyy";
+        let mut data = Vec::new();
+        data.extend_from_slice(b"d8:announce");
+        data.extend_from_slice(announce.len().to_string().as_bytes());
+        data.push(b':');
+        data.extend_from_slice(announce);
+        data.extend_from_slice(b"4:infod4:name4:file6:lengthi1ee");
+        data.push(b'e');
+        let (start, end) = locate_dict_value(&data, b"info").expect("locate real info");
+        assert_eq!(&data[start..=end], b"d4:name4:file6:lengthi1ee");
+    }
+
+    /// 嵌套 dict 中的 info 键（非顶层）不被匹配。
+    #[test]
+    fn locate_only_top_level() {
+        // 顶层 foo 的值是 dict，内含 info 键；顶层无 info。
+        let data = b"d3:food4:infoi1eee";
+        assert!(locate_dict_value(data, b"info").is_none());
+    }
+
+    /// 值为标量（int/str）时返回其完整编码区间。
+    #[test]
+    fn locate_scalar_values() {
+        let data = b"d3:bari42e3:foo3:baze";
+        let (s, e) = locate_dict_value(data, b"bar").unwrap();
+        assert_eq!(&data[s..=e], b"i42e");
+        let (s, e) = locate_dict_value(data, b"foo").unwrap();
+        // str 值的 span 是其完整编码（含长度前缀）
+        assert_eq!(&data[s..=e], b"3:baz");
+    }
+
+    /// 截断/畸形输入 → None（不 panic）。
+    #[test]
+    fn locate_truncated_and_malformed() {
+        assert!(locate_dict_value(b"d4:info", b"info").is_none()); // 值截断
+        assert!(locate_dict_value(b"d4:infod4:name", b"info").is_none()); // 嵌套截断
+        assert!(locate_dict_value(b"d", b"info").is_none()); // 空 dict
+        assert!(locate_dict_value(b"di1ei2ee", b"info").is_none()); // 非字符串键
+                                                                    // 超长字符串字段（H-3）：checked_add 回绕/越界 → None
+        let mut evil = b"d4:info18446744073709551615:".to_vec();
+        evil.extend_from_slice(b"xxxx");
+        assert!(locate_dict_value(&evil, b"info").is_none());
+    }
+
+    /// 超深嵌套（V4 同款）：MAX_DEPTH 上限 → None 而非栈溢出。
+    #[test]
+    fn locate_excessive_nesting_rejected() {
+        let mut data = b"d4:info".to_vec();
+        data.extend(std::iter::repeat_n(b'l', 100_000));
+        data.extend(std::iter::repeat_n(b'e', 100_000));
+        data.push(b'e');
+        assert!(locate_dict_value(&data, b"info").is_none());
+    }
+
+    /// 定位 span 后用 decode 解析该 span，与整档 decode 的子树一致
+    /// （infohash 工作流的标准组合：locate → SHA1 / locate → decode 走树）。
+    #[test]
+    fn locate_then_decode_matches_subtree() {
+        let data = b"d8:announce8:tracker/4:infod4:name8:testfile12:piece lengthi16384eee";
+        let (start, end) = locate_dict_value(data, b"info").unwrap();
+        let sub = decode(&data[start..=end]).unwrap();
+        let full = decode(data).unwrap();
+        assert_eq!(sub, *full.dict_get(b"info").unwrap());
+    }
+
+    /// Value 类型检查访问器。
+    #[test]
+    fn value_accessors() {
+        let v = decode(b"d1:ali1ee1:bi2e1:c3:xyz1:dli9eee").unwrap();
+        assert_eq!(v.as_int(), None);
+        assert_eq!(v.as_bytes(), None);
+        assert_eq!(v.as_list(), None);
+        assert_eq!(v.as_dict().map(|d| d.len()), Some(4));
+        assert_eq!(
+            v.dict_get(b"a").unwrap().as_list().unwrap()[0].as_int(),
+            Some(1)
+        );
+        assert_eq!(v.dict_get(b"b").unwrap().as_int(), Some(2));
+        assert_eq!(
+            v.dict_get(b"c").unwrap().as_bytes(),
+            Some(b"xyz".as_slice())
+        );
+        assert_eq!(v.dict_get(b"d").unwrap().as_list().unwrap().len(), 1);
     }
 }
