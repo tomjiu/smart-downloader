@@ -261,6 +261,12 @@ async fn ws_receives_progress_events() {
 
 ## 3. 🔴 `QuarkProvider` —— 实现了但从不装配
 
+> **✅ 已修复（2026-10-20，PR #119）**：`[provider_quark]` 配置段 +
+> `assemble_providers()` 装配（顺手把 mock/xunlei/quark 三内联块抽出可单测）
+> + `/providers` 透出 + 测试 ×7（config/serve/e2e 三层）。cookie 持久化
+> 安全：provider 侧 save_auth 已是 0600 原子写（P1-6 在位，原文担忧已消）。
+> 范围边界：HTTP cookie 登录端点未含（新 API 面需专门设计，另议）。
+
 ### 现状
 
 ```rust
