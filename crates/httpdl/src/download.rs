@@ -517,7 +517,8 @@ async fn download_segment_streaming(
     // 交付长度正确但内容全零的文件且状态 Completed。WAL 语义要求
     // 数据先于账本落盘。sync_data（不含 metadata：段内 seek+write
     // 不改文件大小，set_len 已在循环外完成）。
-    f.sync_data().map_err(|e| format!("segment fsync: {e}"))?;
+    f.sync_data()
+        .map_err(|e| SegmentError::Transport(format!("segment fsync: {e}")))?;
     Ok(())
 }
 
