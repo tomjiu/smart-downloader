@@ -2795,6 +2795,7 @@ dependencies = [
  "aes 0.8.4",
  "async-trait",
  "axum",
+ "base64",
  "cbc 0.1.2",
  "futures",
  "md-5",

@@ -64,6 +64,9 @@ pub struct HttpServerConfig {
     pub last_modified: Option<&'static str>,
     /// 前 N 次请求回 429（按请求计数）。
     pub retry_429: u32,
+    /// 前 N 次「非探测」请求回 429（Range ≠ bytes=0-0；段级退避 e2e 用：
+    /// 探测（bytes=0-0）豁免，429 只落在段请求上，引擎 add 不被探测失败拦截）。
+    pub retry_429_segments: u32,
     /// 这些 Range 起点 → 404（模拟中途断流/mirror 失效）。
     pub fail_ranges: Vec<u64>,
     /// 与 fail_ranges 配合：Range 长度 < 该值才放行（模拟"大段失败、拆半后可下载"）。
@@ -90,6 +93,7 @@ impl Default for HttpServerConfig {
             etag: Some("etag-1"),
             last_modified: None,
             retry_429: 0,
+            retry_429_segments: 0,
             fail_ranges: vec![],
             fail_ranges_min_len: None,
             bad_first: 0,
@@ -124,10 +128,13 @@ impl HttpTestServer {
             .route("/file", get(handler))
             .route("/404", get(|| async { StatusCode::NOT_FOUND }))
             .with_state(ServerState {
-                cfg,
+                cfg: cfg.clone(),
                 body,
                 range_starts: range_starts.clone(),
                 request_count: request_count.clone(),
+                segment_429_left: Arc::new(std::sync::atomic::AtomicU32::new(
+                    cfg.retry_429_segments,
+                )),
             });
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -153,6 +160,8 @@ struct ServerState {
     body: Vec<u8>,
     range_starts: Arc<Mutex<Vec<u64>>>,
     request_count: Arc<AtomicUsize>,
+    /// retry_429_segments 剩余额度（仅非探测请求消费）。
+    segment_429_left: Arc<std::sync::atomic::AtomicU32>,
 }
 
 async fn handler(State(st): State<ServerState>, headers: HeaderMap) -> Response {
@@ -162,6 +171,30 @@ async fn handler(State(st): State<ServerState>, headers: HeaderMap) -> Response 
     let req_no = st.request_count.fetch_add(1, Ordering::SeqCst);
     if (req_no as u32) < st.cfg.retry_429 {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
+    }
+    // 段级 429（探测豁免）：Range ≠ bytes=0-0 的请求才消费额度；
+    // 响应带 Retry-After: 1（退避 e2e 同时验证服务器指定等待的解析链）。
+    let is_probe = headers
+        .get(header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|r| r.trim() == "bytes=0-0")
+        .unwrap_or(false);
+    if !is_probe
+        && st.cfg.retry_429_segments > 0
+        && st
+            .segment_429_left
+            .try_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |v| if v > 0 { Some(v - 1) } else { None },
+            )
+            .is_ok()
+    {
+        return Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header(header::RETRY_AFTER, "1")
+            .body(axum::body::Body::empty())
+            .unwrap();
     }
 
     let mut builder = Response::builder();

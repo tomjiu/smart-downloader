@@ -3662,20 +3662,64 @@ impl DaemonState {
         self.remove_with(id, false).await
     }
 
-    /// 删除任务 + 数据处置开关（E7）：`delete_data = true` 时引擎侧同步删除
-    /// 已下载数据（BT 删种子数据 / HTTP 删落盘文件）。引擎删除失败不阻塞
-    /// 记录移除（引擎 remove 本就是尽力而为——任务可能已不在引擎侧）。
+    /// 删除任务（Issue #120 P0 修复：先停引擎、后删记录，错误传播）。
+    ///
+    /// 旧实现三连静默：①先删记录（UI 立即消失，此后失败无迹可寻）→
+    /// ②`engine_for` Err 静默跳过（引擎未装配时引擎侧任务继续跑）→
+    /// ③`engine.remove` Err 静默吞掉（无日志无事件）→ 恒返回 `Ok`。
+    /// 用户侧表现即「删了还在下」：`.part` 持续增长、磁盘不释放、重启后
+    /// 记录已删无法恢复但文件残留。
+    ///
+    /// 新顺序（记录保留到引擎确认停止之后，失败可重试）：
+    /// 1. 锁内取记录快照（不删）——失败时任务仍在列表；
+    /// 2. `engine_for` 失败 → Err（引擎不可用 ≠ 放弃停止责任）；
+    /// 3. `engine.remove` 失败 → Err 传播；**NotFound 例外**：引擎侧已无
+    ///    此任务（会话重启/已退役）= 停止目标已达成，放行记录清理。
+    ///    HTTP 引擎的 remove 内部先置 pause 旗标（在飞段尽快收尾退出），
+    ///    无需额外 pause 调用；
+    /// 4. 引擎确认停止后才删记录 + autosave。
+    ///
+    /// 并发幂等：锁外 await 期间同 id 的并发 remove_with 各自走引擎
+    /// remove（引擎侧幂等/NotFound），末尾记录删除无条件执行（二次删
+    /// no-op）——与自动清扫（Err 分支跳过）与批量删除（逐项 Err 收集）
+    /// 两个既有 `Result` 消费方契约一致。
     pub async fn remove_with(&self, id: &str, delete_data: bool) -> Result<(), DaemonError> {
-        let rec = self
-            .tasks
-            .lock()
-            .remove(id)
-            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
-        if let Some(tid) = rec.engine_tid {
-            if let Ok(engine) = self.engine_for(rec.engine_kind) {
-                let _ = engine.remove(&tid, delete_data).await;
+        enum StopPlan {
+            /// 无引擎句柄（provider 兜底完成 / 恢复失败记录）——直接清记录。
+            NoEngine,
+            /// 停引擎（engine 句柄 + 引擎侧任务 id）。
+            Stop {
+                engine: std::sync::Arc<dyn DownloadEngine>,
+                tid: crate::state::EngineTaskId,
+            },
+        }
+        let plan = {
+            let tasks = self.tasks.lock();
+            let Some(rec) = tasks.get(id) else {
+                return Err(DaemonError::NotFound(id.to_string()));
+            };
+            match rec.engine_tid.clone() {
+                Some(tid) => {
+                    let engine = self.engine_for(rec.engine_kind).map_err(|e| {
+                        DaemonError::Engine(format!("引擎不可用，无法停止任务 {id}: {e}"))
+                    })?;
+                    StopPlan::Stop { engine, tid }
+                }
+                None => StopPlan::NoEngine,
+            }
+        }; // ← tasks 锁在此释放（引擎 await 不跨锁）
+        if let StopPlan::Stop { engine, tid } = plan {
+            match engine.remove(&tid, delete_data).await {
+                Ok(()) => {}
+                Err(smart_dl_core::types::EngineError::NotFound) => {
+                    tracing::warn!("任务 {id} 引擎侧已不存在（NotFound），继续清理记录");
+                }
+                Err(e) => {
+                    return Err(DaemonError::Engine(format!("停止引擎任务失败 {id}: {e}")));
+                }
             }
         }
+        self.tasks.lock().remove(id);
         self.autosave();
         Ok(())
     }
@@ -3899,6 +3943,22 @@ impl DaemonState {
                 // metadata.name 空缺 → 幂等回填 + 事件（E9 同语义：一次成功
                 // 后 name 非 None 自然停）。快照缓存照旧整体入缓存。
                 let seeding_since = self.cache_bt_poll(&id, &st);
+                // D36 补线（BT）：速率/进度事件——alert 流只管状态迁移，
+                // 速率快照此前仅存缓存不出事件。做种只发 Speed（up_rate 对
+                // UI/统计有意义；进度恒满无信息量）。置于执法前：达标暂停
+                // 轮次不追发（Paused 后的 Speed 是噪声）。
+                self.hub.publish(SchedulerEvent::Speed {
+                    task_id: id.clone(),
+                    down_rate: st.down_rate,
+                    up_rate: st.up_rate,
+                });
+                if st.state != EngineState::Seeding {
+                    self.hub.publish(SchedulerEvent::Progress {
+                        task_id: id.clone(),
+                        done: st.total_done,
+                        total: st.total,
+                    });
+                }
                 // F3/Task 39 执法：share_ratio（E33 all-time 口径，与快照字段
                 // 同源）+ 做种时长（seeding_since 起算）。仅 Seeding 态触发；
                 // 达阈值 → 完整 pause 语义（记录同步 Paused + autosave + 广播，
@@ -3959,6 +4019,23 @@ impl DaemonState {
             }
             if advanced.is_some() {
                 self.autosave(); // 锁外落盘：终态/推进落盘（修复 Bug B 重入自死锁）
+            }
+            // D36 补线：Speed/Progress 事件生产者（原为全仓库零生产者的设计缺口
+            // ——Throttler 1s 合并、UI SSE 路由、快照跳号补拉均已就位，唯独
+            // 没人发事件；UI 速率列只能依赖 2s 快照轮询）。引擎报 Downloading
+            // 的活跃轮次发双事件（终态/失败轮次不发：避免 Completed 之后
+            // 还追发 Speed{0}）。锁外发布：hub 自带锁，不与 tasks 锁嵌套。
+            if st.state == EngineState::Downloading {
+                self.hub.publish(SchedulerEvent::Speed {
+                    task_id: id.clone(),
+                    down_rate: st.down_rate,
+                    up_rate: st.up_rate,
+                });
+                self.hub.publish(SchedulerEvent::Progress {
+                    task_id: id.clone(),
+                    done: st.total_done,
+                    total: st.total,
+                });
             }
             // 仅真迁移产生 effect（to==from 的纯回填轮次不广播）；
             // E30：to 取拦截后的实际目标（重试安排 = Queued，非引擎报的 Failed）

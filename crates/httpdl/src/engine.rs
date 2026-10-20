@@ -222,15 +222,21 @@ impl HttpEngine {
             }
             return;
         }
-        // 任务级限速优先，未登记回退全局（跨段共享口径不变）；登记条目
-        // 已在 set_limits 时串联全局上游（E16），此处直接取用即可。
-        let limiter = self
-            .inner
-            .limiters
-            .lock()
-            .get(&tid)
-            .cloned()
-            .unwrap_or_else(|| self.limiter.clone());
+        // 任务级限速「登记式取用」（修复：运行中首次设限不热调）：未登记
+        // 任务以「不限速(0) + 串联全局上游」条目占位——本循环持有的 Arc 与
+        // set_limits 热调分支（Some → set_rate_kb_s）操作同一实例。旧实现
+        // 未登记时回退捕获全局 Arc，运行中首次 set_limits 的 insert 产物
+        // 无人消费，限速要等下一次 spawn（pause→resume / 恢复重放第二轮）
+        // 才生效——恢复重放 add→set_limits 立即下发即中招：重启后限速任务
+        // 实际不限速跑到底。E16 串联语义不变：占位条目 rate=0 仅受全局
+        // 上游约束，与直接持全局 Arc 行为一致（零任务级限速、零额外开销）。
+        let limiter = {
+            let mut limiters = self.inner.limiters.lock();
+            limiters
+                .entry(tid.clone())
+                .or_insert_with(|| Arc::new(RateLimiter::new_chained(0, &self.limiter)))
+                .clone()
+        };
         let inner = self.inner.clone();
         let inner_mon = self.inner.clone();
         let tid_mon = tid.clone();
@@ -329,13 +335,16 @@ impl HttpEngine {
                 }
             })
         };
-        let limiter = self
-            .inner
-            .limiters
-            .lock()
-            .get(&tid)
-            .cloned()
-            .unwrap_or_else(|| self.limiter.clone());
+        // 任务级限速「登记式取用」：与 spawn_download 同口径（修复运行中
+        // 首次设限不热调——详见 spawn_download 处注释）。流式循环（HLS/DASH）
+        // 与分段循环共享同一不变量：循环持有的 Arc 可被 set_limits 热调。
+        let limiter = {
+            let mut limiters = self.inner.limiters.lock();
+            limiters
+                .entry(tid.clone())
+                .or_insert_with(|| Arc::new(RateLimiter::new_chained(0, &self.limiter)))
+                .clone()
+        };
         let inner = self.inner.clone();
         let inner_mon = self.inner.clone();
         let tid_mon = tid.clone();
@@ -1070,21 +1079,41 @@ impl DownloadEngine for HttpEngine {
     }
 
     async fn add(&self, task: &DownloadTask) -> Result<EngineTaskId, EngineError> {
-        let (url, headers, backup_url, proxy) = match &task.source {
+        let (url, mut headers, backup_url, proxy, auth) = match &task.source {
             DownloadSource::Http {
                 url,
                 headers,
                 backup_url,
                 proxy,
+                auth,
                 ..
             } => (
                 url.clone(),
                 headers.clone(),
                 backup_url.clone(),
                 proxy.clone(),
+                auth.clone(),
             ),
             _ => return Err(EngineError::Other("source is not http".to_string())),
         };
+        // 契约修复（Issue #121 契约矩阵 #5 战果）：source.auth 此前在上方
+        // 解构的 `..` 中被丢弃——daemon 的 AddTaskReq.username/password →
+        // Auth::Basic 进 source 后全链零消费，探测/段下载不带 Authorization
+        // 头，Basic auth 下载端到端坏死（401 挑战服务器恒拒）。转成标准头
+        // 注入任务头集：probe 与段循环全链携带（H-8 同名 range 头跳过逻辑
+        // 不受影响——Authorization 不冲突；引擎侧 headers 为内存态，凭据
+        // 持久化仍走 source.auth 原字段，无新增落盘面）。
+        match &auth {
+            Some(smart_dl_core::types::Auth::Basic(u, p)) => {
+                use base64::Engine as _;
+                let cred = base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"));
+                headers.push(("Authorization".to_string(), format!("Basic {cred}")));
+            }
+            Some(smart_dl_core::types::Auth::Bearer(t)) => {
+                headers.push(("Authorization".to_string(), format!("Bearer {t}")));
+            }
+            None => {}
+        }
         // E5 任务级代理：探测/下载全链均走任务专用 client（Some(proxy) 时）。
         // 任务级代理的意义正是「只有代理可达源」——探测若用共享 client 直连，
         // 代理专属源会在 add 时误判死亡。client 构建失败 → 任务拒绝（daemon
@@ -1470,7 +1499,10 @@ impl DownloadEngine for HttpEngine {
 
     /// 任务级下载限速（trait 扩展）。任务专属 limiter 登记进 limiters 表，
     /// 已持有的 Arc 热调速率 → 运行中的 chunk 立即按新速率节流，无需重启循环。
-    /// 仅 down 方向有意义：up 请求被显式拒绝（HTTP/FTP 无上传概念）。
+    /// 不变量：spawn 时已登记占位条目（见 spawn_download），故运行中任务的
+    /// set_limits 恒走热调分支；insert 分支仅覆盖「spawn 前设限」的交错
+    /// 窗口（add 同步段内无此窗口，防御性保留）。仅 down 方向有意义：up
+    /// 请求被显式拒绝（HTTP/FTP 无上传概念）。
     async fn set_limits(
         &self,
         id: &EngineTaskId,
@@ -1496,10 +1528,12 @@ impl DownloadEngine for HttpEngine {
         }
         let mut limiters = self.inner.limiters.lock();
         match limiters.get(id) {
-            Some(lim) => lim.set_rate_kb_s(kb), // 已有限速器 → 原地热调
+            Some(lim) => lim.set_rate_kb_s(kb), // 已有限速器 → 原地热调（运行中循环可见）
             None => {
                 // E16：任务级 limiter 串联引擎全局（上游）——总阀门对任务级
-                // 限速任务同样生效（任务级不限 ≠ 绕过总阀门）。
+                // 限速任务同样生效（任务级不限 ≠ 绕过总阀门）。正常时序下
+                // spawn 已登记占位条目（本分支不可达）；防御性保留 spawn 前
+                // 设限的交错窗口。
                 limiters.insert(
                     id.clone(),
                     Arc::new(RateLimiter::new_chained(kb, &self.limiter)),

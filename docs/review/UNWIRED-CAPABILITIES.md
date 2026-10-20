@@ -26,6 +26,13 @@
 
 ## 1. 🔴 `retry.rs` —— 重试退避整块未接线
 
+> **✅ 已修复（2026-10-20，PR #122）**：`SegmentError` 枚举（状态码 +
+> Retry-After 不再被 String 抹平）+ 根段退避阶梯（Retry-After 优先钳 60s，
+> 否则 1/2/4s + jitter）+ **429 永不拆半**（正反馈放大源头）。总时延有界
+> 设计：退避只在根段、拆半子段单发（防退避×拆半树 2^depth 等待放大——
+> task_proxy e2e 暴露后修正）。测试 ×10（单测 8 + e2e 2，含请求计数精确
+> 有界断言；旧代码判别已验证）。
+
 ### 现状
 
 ```bash
@@ -168,6 +175,11 @@ async fn http_429_is_retried_and_succeeds() {
 
 ## 2. 🔴 `SchedulerEvent::Progress` / `Speed` —— 生产代码零发布
 
+> **✅ 已修复（2026-10-20，PR #117）**：`poll_engine_states` 活跃轮次现在发布
+> Speed/Progress（HTTP 族 Downloading 双发；BT 下载双发、做种仅 Speed；终态
+> 轮次不发）+ 回归测试 ×5。Step 1 落地。Step 2（BT alert 流 500ms 侧补发）
+> 与 Step 3（轮询间隔 2s→500ms）为后续优化，未含在该 PR。
+
 ### 现状
 
 我写脚本严格排除 `#[cfg(test)]` 后验证：
@@ -253,6 +265,12 @@ async fn ws_receives_progress_events() {
 ---
 
 ## 3. 🔴 `QuarkProvider` —— 实现了但从不装配
+
+> **✅ 已修复（2026-10-20，PR #119）**：`[provider_quark]` 配置段 +
+> `assemble_providers()` 装配（顺手把 mock/xunlei/quark 三内联块抽出可单测）
+> + `/providers` 透出 + 测试 ×7（config/serve/e2e 三层）。cookie 持久化
+> 安全：provider 侧 save_auth 已是 0600 原子写（P1-6 在位，原文担忧已消）。
+> 范围边界：HTTP cookie 登录端点未含（新 API 面需专门设计，另议）。
 
 ### 现状
 
@@ -355,6 +373,13 @@ NormalizedSource::XunleiShare(u) => {
 ---
 
 ## 5. 🟡 `web_seeds` —— 解析完整，传空
+
+> **✅ 已修复（2026-10-20，PR #118）**：bt.rs add 路径按源提取（.torrent
+> url-list / magnet ws=）并注入三个内核入口。**作用面修正**：magnet ws= 与
+> 2.0.x 的 url-list 实际由 libtorrent 原生兜底（parse_magnet_uri 读 ws、
+> 全文件 ctor 读 url-list）；本修复的关键价值在 **2.1**——info-section ctor
+> 丢弃顶层 url-list，daemon 侧提取是唯一路径。e2e：零 tracker 零 peer、
+> HTTP 服务器唯一数据源，完成 + 请求计数 > 0 + 内容逐字节一致。
 
 ### 现状
 

@@ -319,3 +319,159 @@ fn share_ratio_rules() {
     assert_eq!(share_ratio(1, 3), Some(0.333), "1/3 舍入到 3 位小数");
     assert_eq!(share_ratio(2, 3), Some(0.667), "2/3 进位到 3 位小数");
 }
+
+/// D36 补线回归：轮询器发布 Speed/Progress 事件（原为全仓库零生产者的
+/// 设计缺口——Throttler/SSE 路由/前端监听均已就位，唯独没人发事件，
+/// UI 速率列只能依赖 2s 快照轮询兜底）。
+#[tokio::test]
+async fn poll_emits_speed_and_progress_events() {
+    let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+    let state = DaemonState::new(fake.clone(), vec![]);
+    let tid = state
+        .add_http_task("https://example.com/f.bin".into(), None)
+        .await
+        .unwrap();
+    fake.set_status_state(EngineState::Downloading);
+    fake.set_status_rates(1000, 50);
+
+    state.poll_engine_states().await;
+
+    let envs = state.hub().read_after(0, 100);
+    let has_speed = envs.iter().any(|e| {
+        matches!(
+            &e.event,
+            SchedulerEvent::Speed { task_id, down_rate, up_rate }
+                if task_id == &tid && *down_rate == 1000 && *up_rate == 50
+        )
+    });
+    assert!(
+        has_speed,
+        "活跃轮次应发布 Speed(1000,50)，实际事件: {:?}",
+        envs.iter().map(|e| &e.event).collect::<Vec<_>>()
+    );
+    let has_progress = envs.iter().any(|e| {
+        matches!(
+            &e.event,
+            SchedulerEvent::Progress { task_id, .. } if task_id == &tid
+        )
+    });
+    assert!(has_progress, "活跃轮次应发布 Progress");
+}
+
+/// 稳态轮次（to==from 不迁移）也持续发事件——速率快照类事件不依赖
+/// 状态迁移，每轮照发（下游 Throttler 按 1s 合并去噪）。
+#[tokio::test]
+async fn steady_rounds_keep_emitting_speed() {
+    let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+    let state = DaemonState::new(fake.clone(), vec![]);
+    let tid = state
+        .add_http_task("https://example.com/f.bin".into(), None)
+        .await
+        .unwrap();
+    fake.set_status_state(EngineState::Downloading);
+    fake.set_status_rates(500, 0);
+
+    state.poll_engine_states().await;
+    state.poll_engine_states().await;
+
+    let count = state
+        .hub()
+        .read_after(0, 100)
+        .iter()
+        .filter(|e| matches!(&e.event, SchedulerEvent::Speed { task_id, .. } if task_id == &tid))
+        .count();
+    assert_eq!(count, 2, "两轮轮询应各发一条 Speed（合并是下游职责）");
+}
+
+/// 终态轮次不追发速率/进度事件：Completed 之后再来 Speed{0} 是噪声，
+/// 会与 UI 的「完成后速率衰减」显示竞争。
+#[tokio::test]
+async fn terminal_round_emits_no_speed_progress() {
+    let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+    let state = DaemonState::new(fake.clone(), vec![]);
+    let tid = state
+        .add_http_task("https://example.com/f.bin".into(), None)
+        .await
+        .unwrap();
+    fake.set_status_state(EngineState::Completed);
+    fake.set_status_rates(999, 0);
+
+    state.poll_engine_states().await;
+
+    let envs = state.hub().read_after(0, 100);
+    assert!(
+        envs.iter()
+            .all(|e| !matches!(&e.event, SchedulerEvent::Speed { task_id, .. } if task_id == &tid)),
+        "终态轮次不得追发 Speed"
+    );
+    assert!(
+        envs.iter().all(
+            |e| !matches!(&e.event, SchedulerEvent::Progress { task_id, .. } if task_id == &tid)
+        ),
+        "终态轮次不得追发 Progress"
+    );
+}
+
+/// BT 下载中轮次：Speed + Progress 双发（alert 流只管状态迁移，速率快照
+/// 仅由轮询观察）。
+#[tokio::test]
+async fn bt_downloading_poll_emits_speed_and_progress() {
+    let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+    let state = DaemonState::new(fake.clone(), vec![]);
+    insert_bt_rec_with(
+        &state,
+        "t-dl-ev",
+        "DEF888",
+        TaskState::Downloading(EngineKind::Bt),
+    );
+    fake.set_status_state(EngineState::Downloading);
+    fake.set_status_rates(2000, 100);
+
+    state.poll_engine_states().await;
+
+    let envs = state.hub().read_after(0, 100);
+    assert!(
+        envs.iter().any(|e| matches!(
+            &e.event,
+            SchedulerEvent::Speed { task_id, down_rate, .. }
+                if task_id == "t-dl-ev" && *down_rate == 2000
+        )),
+        "BT 下载中应发布 Speed"
+    );
+    assert!(
+        envs.iter().any(|e| matches!(
+            &e.event,
+            SchedulerEvent::Progress { task_id, .. } if task_id == "t-dl-ev"
+        )),
+        "BT 下载中应发布 Progress"
+    );
+}
+
+/// BT 做种轮次：只发 Speed（up_rate 对统计有意义；进度恒满无信息量）。
+#[tokio::test]
+async fn bt_seeding_poll_emits_speed_only() {
+    let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+    let state = DaemonState::new(fake.clone(), vec![]);
+    insert_bt_rec_with(&state, "t-seed-ev", "ABC999", TaskState::Seeding);
+    fake.set_status_state(EngineState::Seeding);
+    fake.set_status_rates(0, 800);
+
+    state.poll_engine_states().await;
+
+    let envs = state.hub().read_after(0, 100);
+    assert!(
+        envs.iter().any(|e| matches!(
+            &e.event,
+            SchedulerEvent::Speed { task_id, down_rate, up_rate }
+                if task_id == "t-seed-ev" && *down_rate == 0 && *up_rate == 800
+        )),
+        "做种任务应发布 Speed(up=800)"
+    );
+    assert!(
+        envs.iter().all(|e| !matches!(
+            &e.event,
+            SchedulerEvent::Progress { task_id, .. } if task_id == "t-seed-ev"
+        )),
+        "做种任务不得发布 Progress（恒满无信息量）"
+    );
+}
