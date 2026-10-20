@@ -419,8 +419,15 @@ impl DownloadEngine for NasRemoteEngine {
             .map(parse_speed_bps)
             .unwrap_or(0);
         let progress = t.get("progress").and_then(|p| p.as_f64()).unwrap_or(0.0);
-        // progress 语义未定案（0-100 疑似百分比，A4 观测）：仅当落在 [0,100] 视为百分比
-        let (done, total) = if (0.0..=100.0).contains(&progress) {
+        // P2-22 修复（审查第三轮）：progress 语义未定案（0-100 百分比 /
+        // 0-1 比例两说，A4 观测）——归一化到百分比再映射 done/total =
+        // pct/100（进度显示正确）。已知残留：total=100 是**合成值**（该
+        // API 无字节数来源，UI 大小列显示 "100 B" 属已知妥协——复活路径
+        // 校准时若确认字段语义，应改为透传真实 size）。非法值（负/超界/
+        // NaN）→ (0, 0)。
+        let (done, total) = if (0.0..=1.0).contains(&progress) {
+            (progress * 100.0, 100.0)
+        } else if (0.0..=100.0).contains(&progress) {
             (progress, 100.0)
         } else {
             (0.0, 0.0)
