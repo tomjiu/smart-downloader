@@ -38,6 +38,9 @@ pub struct FakeEngine {
     resumed: parking_lot::Mutex<Vec<String>>,
     /// 已下发的 remove 调用（(engine_tid, delete_data)，E7 数据处置断言用）。
     removed: parking_lot::Mutex<Vec<(String, bool)>>,
+    /// remove() 可编程结果（None = 成功旧行为；Some(e) = 恒返回该错误——
+    /// Issue #120 remove_with 错误传播测试用）。
+    remove_result: parking_lot::Mutex<Option<smart_dl_core::types::EngineError>>,
     /// 已下发的 set_task_proxy 调用（(engine_tid, proxy)，E8 热改断言用）。
     proxy_sets: parking_lot::Mutex<Vec<(String, Option<String>)>>,
     /// status().name 可编程回显（E9 名字回填测试用；None = 不透出）。
@@ -83,6 +86,7 @@ impl FakeEngine {
             paused: parking_lot::Mutex::new(Vec::new()),
             resumed: parking_lot::Mutex::new(Vec::new()),
             removed: parking_lot::Mutex::new(Vec::new()),
+            remove_result: parking_lot::Mutex::new(None),
             proxy_sets: parking_lot::Mutex::new(Vec::new()),
             status_name: parking_lot::Mutex::new(None),
             status_rates: parking_lot::Mutex::new((0, 0)),
@@ -216,6 +220,11 @@ impl FakeEngine {
         self.resumed.lock().clone()
     }
 
+    /// 编程 remove() 恒返回某错误（Issue #120 错误传播测试：引擎停止失败模拟）。
+    pub fn set_remove_result(&self, r: Option<smart_dl_core::types::EngineError>) {
+        *self.remove_result.lock() = r;
+    }
+
     /// 设置 status() 返回的文件级进度（FTP 目录 files 同步测试注入用）。
     // 跨 feature 门测试共享的 mock 观测器：部分 feature 组合下无调用点。
     // （模块外置前经 pub mod state 的 crate 根可达性豁免 dead_code，现显式化。）
@@ -324,6 +333,9 @@ impl DownloadEngine for FakeEngine {
         id: &EngineTaskId,
         delete_data: bool,
     ) -> Result<(), smart_dl_core::types::EngineError> {
+        if let Some(e) = &*self.remove_result.lock() {
+            return Err(e.clone());
+        }
         self.removed.lock().push((id.to_string(), delete_data));
         Ok(())
     }
@@ -499,6 +511,7 @@ mod persist_tests;
 mod post_download_tests;
 mod queue_gate_tests;
 mod rate_cache_tests;
+mod remove_hardening_tests;
 mod scheduled_tests;
 mod seeding_limit_tests;
 mod sftp_tests;
