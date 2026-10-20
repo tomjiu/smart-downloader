@@ -11,7 +11,10 @@ export type IconName =
   | "cloud-download"
   | "file"
   | "file-directory"
+  | "battery"
   | "globe"
+  | "shield"
+  | "zap"
   | "graph"
   | "layers"
   | "list-unordered"
@@ -38,6 +41,9 @@ export type IconName =
 const PATHS: Record<IconName, React.ReactNode> = {
   "arrow-down": <path d="M12 4v14m0 0l-5-5m5 5l5-5" />,
   "arrow-up": <path d="M12 20V6m0 0l-5 5m5-5l5 5" />,
+  battery: (
+    <path d="M3 9V7h3l1.5-2h6L15 7h3v2M3 9v8h15V9M3 9h15M8 13h2m2 0h2" />
+  ),
   check: <path d="M4 12.5l5 5L20 6.5" />,
   close: <path d="M6 6l12 12M18 6L6 18" />,
   "cloud-download": (
@@ -109,6 +115,7 @@ const PATHS: Record<IconName, React.ReactNode> = {
       <path d="M12 2v3m0 14v3M4.2 4.2l2.1 2.1m11.4 11.4l2.1 2.1M2 12h3m14 0h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1" />
     </>
   ),
+  shield: <path d="M12 3l8 3v6c0 4.4-3.4 7.9-8 9-4.6-1.1-8-4.6-8-9V6l8-3zM9 12l2 2 4-4" />,
   speed: (
     <>
       <path d="M4 16a8 8 0 1116 0" />
@@ -116,6 +123,7 @@ const PATHS: Record<IconName, React.ReactNode> = {
     </>
   ),
   sync: <path d="M20 11a8 8 0 10-2.3 5.7M20 5v6h-6" />,
+  zap: <path d="M13 2L4 14h6l-1 8 9-12h-6l1-8z" />,
   trash: <path d="M4 7h16M9 7V4h6v3m-8 0l1 13h8l1-13M10 11v6m4-6v6" />,
   "kebab-horizontal": <path d="M6 12h.01M12 12h.01M18 12h.01" />,
   pass: <path d="M4 13l4 4L20 7" />,

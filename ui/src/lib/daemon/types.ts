@@ -124,7 +124,12 @@ export interface Settings {
   };
   post_download: { move_to: string; hook: string };
   webhook: { url: string };
-  scheduler: { start_jitter_seconds: number };
+  scheduler: {
+    start_jitter_seconds: number;
+    /** 全部任务终态后的动作（Task 46）：none/exit/shutdown/sleep/hibernate；
+     * 每进程会话最多触发一次；空任务表不触发。 */
+    completion_action: string;
+  };
   queue: {
     max_active_bt: number;
     max_active_http: number;

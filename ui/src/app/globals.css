@@ -50,8 +50,18 @@ body {
 }
 
 /* ── 应用壳：侧栏(216px/56px) + 右列[工具栏(48px) + 内容 + 状态栏(28px)] ── */
+/* P0-2/3/4 修复（Issue #127）：pane 滚动模式（VS Code / qBittorrent 同款）——
+   外壳定高不滚，滚动只落在 .dl-main 内容区自身。旧实现 .dl-root 只设
+   min-height（不封顶）→ 内容超一屏时整个文档滚 → 侧栏跟着滚走、
+   position:fixed 状态栏压住内容尾部、侧栏底部「设置」按钮滚出视口。
+   关键三处：.dl-root 定高 + overflow:hidden；.dl-shell/.dl-body 补
+   min-height:0（flex 子项默认 min-height:auto 会被内容撑开）；.dl-main
+   overflow-y:auto 滚动落地。侧栏自身（.dl-side-nav flex:1 +
+   min-height:0 + overflow-y:auto）本就正确。 */
 .dl-root {
-  min-height: 100vh;
+  height: 100vh;
+  height: 100dvh; /* 移动端地址栏收展不跳动 */
+  overflow: hidden;
   display: flex;
   flex-direction: row;
   background: var(--bg);
@@ -60,19 +70,25 @@ body {
 .dl-shell {
   flex: 1;
   min-width: 0;
+  min-height: 0; /* 允许收缩（flex 子项默认 min-height:auto 被内容撑开） */
   display: flex;
   flex-direction: column;
+  overflow: hidden;
 }
 .dl-body {
   display: flex;
   flex: 1;
   min-height: 0;
+  overflow: hidden;
 }
 .dl-main {
   flex: 1;
   min-width: 0;
+  min-height: 0;
   padding: var(--space-4) var(--space-5) var(--space-5);
+  overflow-y: auto; /* 滚动落在内容区自身 */
   overflow-x: hidden;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
 }

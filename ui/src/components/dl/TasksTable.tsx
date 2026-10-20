@@ -13,7 +13,7 @@
 /// - 键盘：↑/↓ 行间移动焦点；Enter 开详情；Space 选中
 /// - 速率过期衰减：SSE 断连后 5s 无新事件的速率显示 —（不再残留旧值）
 
-import { useMemo, useRef } from "react";
+import { memo, useCallback, useMemo, useRef } from "react";
 import type { TaskListItem, TaskRate, TaskSnapshot } from "@/lib/daemon/types";
 import { fmtBytes, fmtEta, fmtSpeed } from "@/lib/daemon/format";
 import { Icon } from "./Icon";
@@ -110,48 +110,84 @@ export default function TasksTable({
   if (checkRef.current) checkRef.current.indeterminate = someOn;
 
   /// 行渲染数据——速率双源合并：
-  /// 1) SSE speed 事件（新鲜时优先；后端暂无生产者，见 types.ts 注释）
-  /// 2) 快照 rates（/tasks/:id 2s 轮询，速率列的现役主数据源）
-  /// SSE 源带 5s TTL 衰减（断连残留清零）；列表轮询 1s 一拍驱动重算。
+  /// 1) SSE speed 事件（新鲜时优先）
+  /// 2) 快照 rates（/tasks/:id 2s 轮询）
+  /// SSE 源带 5s TTL 衰减（断连残留清零；DlApp 的过期清理 interval 驱动
+  /// rates 变化 → 本 memo 重算）。回落合并不在此处做（旧实现为回落路径
+  /// 每次新建对象，击穿行级 memo）——行内计算（P1-5-B）。
   const now = Date.now();
   const rows = useMemo(
     () =>
       tasks.map((t) => {
-        const snap = snapshots[t.task_id];
         const r = rates[t.task_id];
-        const sseRate = r && now - r.ts < RATE_TTL_MS ? r : undefined;
-        const rate =
-          sseRate ??
-          (snap?.rates
-            ? { down: snap.rates.down_bytes_s, up: snap.rates.up_bytes_s, ts: now }
-            : undefined);
-        return { t, snap, rate };
+        const sse = r && now - r.ts < RATE_TTL_MS ? r : undefined;
+        return { t, snap: snapshots[t.task_id], sse };
       }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [tasks, snapshots, rates],
   );
 
   const indexOf = (id: string) => rows.findIndex((r) => r.t.task_id === id);
+  void indexOf; // 保留给排序/调试用途（行点击已改用 idx 直传）
 
-  /** 行键盘：↑/↓ 移焦点（tbody 子序 = 渲染序）；Enter 开详情；Space 选中。 */
-  const onRowKeyDown = (e: React.KeyboardEvent<HTMLTableRowElement>, idx: number, id: string) => {
-    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
-      e.preventDefault();
-      const tbody = e.currentTarget.parentElement;
-      if (!tbody) return;
-      const next = tbody.children[idx + (e.key === "ArrowDown" ? 1 : -1)] as HTMLElement | undefined;
-      next?.focus();
-      return;
-    }
-    if (e.key === "Enter") {
-      onOpen(id);
-      return;
-    }
-    if (e.key === " ") {
-      e.preventDefault();
-      onSelect(id);
-    }
-  };
+  /// P1-5-B（Issue #127）：行级交互 handlers 稳定化——经 ref 间接层读取
+  /// 最新回调（DlApp 传入的内联箭头函数每秒变身份，直接透传会击穿行级
+  /// memo）。包装后身份恒定，TaskRow 的浅比较只对数据 props 生效。
+  const cbRef = useRef({
+    toggle: onToggleSelect,
+    select: onSelect,
+    range: onSelectRange,
+    open: onOpen,
+    action: onAction,
+  });
+  cbRef.current = { toggle: onToggleSelect, select: onSelect, range: onSelectRange, open: onOpen, action: onAction };
+  const rowsRef = useRef(rows);
+  rowsRef.current = rows;
+  const rowHandlers = useMemo(
+    () => ({
+      /** 行点击：Shift=范围加选 / Ctrl=切换 / 单击=唯一选中 */
+      click: (e: React.MouseEvent, idx: number, id: string) => {
+        if (e.shiftKey) {
+          const anchor = anchorRef.current;
+          if (anchor != null && anchor.idx >= 0 && idx >= 0) {
+            const [a, b] = anchor.idx <= idx ? [anchor.idx, idx] : [idx, anchor.idx];
+            cbRef.current.range(rowsRef.current.slice(a, b + 1).map((r) => r.t.task_id));
+            return;
+          }
+        }
+        anchorRef.current = { id, idx };
+        if (e.metaKey || e.ctrlKey) cbRef.current.toggle(id);
+        else cbRef.current.select(id);
+      },
+      /** checkbox 切换（同步锚点） */
+      check: (idx: number, id: string) => {
+        anchorRef.current = { id, idx };
+        cbRef.current.toggle(id);
+      },
+      open: (id: string) => cbRef.current.open(id),
+      action: (id: string, a: TaskAction) => cbRef.current.action(id, a),
+      /** 行键盘：↑/↓ 移焦点（tbody 子序 = 渲染序）；Enter 开详情；Space 选中 */
+      key: (e: React.KeyboardEvent<HTMLTableRowElement>, idx: number, id: string) => {
+        if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+          e.preventDefault();
+          const tbody = e.currentTarget.parentElement;
+          if (!tbody) return;
+          const next = tbody.children[idx + (e.key === "ArrowDown" ? 1 : -1)] as HTMLElement | undefined;
+          next?.focus();
+          return;
+        }
+        if (e.key === "Enter") {
+          cbRef.current.open(id);
+          return;
+        }
+        if (e.key === " ") {
+          e.preventDefault();
+          cbRef.current.select(id);
+        }
+      },
+    }),
+    [],
+  );
 
   if (tasks.length === 0) {
     // E1：0 任务空状态（表头不显示）
@@ -221,130 +257,144 @@ export default function TasksTable({
           </tr>
         </thead>
         <tbody>
-          {rows.map(({ t, snap, rate }, i) => {
-            const isSel = selected.has(t.task_id);
-            const done = snap?.done ?? 0;
-            const total = snap?.total ?? 0;
-            // E5：total=0（未知）→ 0% 而非 NaN%
-            const pct = total > 0 ? (done / total) * 100 : 0;
-            const down = rate?.down ?? 0;
-            const up = rate?.up ?? 0;
-            const resumable = RESUMABLE.includes(t.state);
-            return (
-              <tr
-                key={t.task_id}
-                className={isSel ? "is-selected" : ""}
-                onClick={(e) => {
-                  if (e.shiftKey) {
-                    // Shift：以上次锚点为起点范围加选
-                    const anchor = anchorRef.current;
-                    const cur = indexOf(t.task_id);
-                    if (anchor != null && anchor.idx >= 0 && cur >= 0) {
-                      const [a, b] = anchor.idx <= cur ? [anchor.idx, cur] : [cur, anchor.idx];
-                      onSelectRange(rows.slice(a, b + 1).map((r) => r.t.task_id));
-                      return;
-                    }
-                  }
-                  if (e.metaKey || e.ctrlKey) {
-                    anchorRef.current = { id: t.task_id, idx: i };
-                    onToggleSelect(t.task_id);
-                    return;
-                  }
-                  anchorRef.current = { id: t.task_id, idx: i };
-                  onSelect(t.task_id);
-                }}
-                onDoubleClick={() => onOpen(t.task_id)}
-                tabIndex={0}
-                onKeyDown={(e) => onRowKeyDown(e, i, t.task_id)}
-              >
-                <td
-                  className="dl-td-check"
-                  onClick={(e) => e.stopPropagation()}
-                  onDoubleClick={(e) => e.stopPropagation()}
-                >
-                  <input
-                    type="checkbox"
-                    aria-label={`选择 ${displayName(t)}`}
-                    checked={isSel}
-                    onChange={() => {
-                      anchorRef.current = { id: t.task_id, idx: i };
-                      onToggleSelect(t.task_id);
-                    }}
-                  />
-                </td>
-                <td
-                  className="dl-td-name"
-                  title={displayName(t)}
-                  onDoubleClick={(e) => {
-                    e.stopPropagation();
-                    onOpen(t.task_id);
-                  }}
-                >
-                  {displayName(t)}
-                </td>
-                <td>
-                  <StateBadge state={t.state} />
-                </td>
-                <td>
-                  <div className="dl-td-progress">
-                    <span
-                      className={`dl-bar dl-bar--${barTone(t.state)}`}
-                      style={{ width: `${pct}%` }}
-                    />
-                    <span className="dl-td-pct">
-                      {total > 0 ? `${Math.round(pct)}%` : "—"}
-                    </span>
-                  </div>
-                </td>
-                <td className="dl-td-num">
-                  {down > 0 ? (
-                    <span className="dl-td-speed">
-                      <Icon name="arrow-down" size={11} /> {fmtSpeed(down)}
-                      {up > 0 && (
-                        <>
-                          {" "}
-                          <Icon name="arrow-up" size={11} /> {fmtSpeed(up)}
-                        </>
-                      )}
-                    </span>
-                  ) : (
-                    <span className="dl-td-dim">—</span>
-                  )}
-                </td>
-                <td className="dl-td-num">
-                  {snap && total > 0 ? `${fmtBytes(done)} / ${fmtBytes(total)}` : "—"}
-                </td>
-                <td className="dl-td-num dl-td-eta">
-                  {total > 0 ? fmtEta(done, total, down) : "—"}
-                </td>
-                <td className="dl-td-act" onClick={(e) => e.stopPropagation()}>
-                  <button
-                    className="dl-btn dl-btn--ghost dl-act-btn"
-                    disabled={busy}
-                    aria-label={resumable ? "恢复" : "暂停"}
-                    title={resumable ? "恢复" : "暂停"}
-                    onClick={() => onAction(t.task_id, resumable ? "resume" : "pause")}
-                  >
-                    <Icon name={resumable ? "play" : "pause"} size={13} />
-                  </button>
-                  <button
-                    className="dl-btn dl-btn--ghost dl-act-btn dl-act-del"
-                    disabled={busy}
-                    aria-label="删除"
-                    title="删除（需确认）"
-                    onClick={() => onAction(t.task_id, "remove")}
-                  >
-                    <Icon name="trash" size={13} />
-                  </button>
-                </td>
-              </tr>
-            );
-          })}
+          {rows.map(({ t, snap, sse }, i) => (
+            <TaskRow
+              key={t.task_id}
+              t={t}
+              snap={snap}
+              sse={sse}
+              isSel={selected.has(t.task_id)}
+              idx={i}
+              busy={busy}
+              h={rowHandlers}
+            />
+          ))}
         </tbody>
       </table>
     </div>
   );
 }
+
+/// P1-5-B（Issue #127）：行组件 memo——数据 props 全部引用稳定
+/// （DlApp 侧任务/快照引用复用；SSE 速率对象按事件存在），内容未变的行
+/// 在整树重渲染时被浅比较跳过（1000 任务 × 每秒轮询 → 仅变更行重渲染）。
+/// 速率合并移入行内：SSE 新鲜值优先，否则回落快照 rates——旧实现在外层
+/// useMemo 里为回落路径每次新建对象，会击穿 memo。
+type RowHandlers = {
+  click: (e: React.MouseEvent, idx: number, id: string) => void;
+  check: (idx: number, id: string) => void;
+  open: (id: string) => void;
+  action: (id: string, a: TaskAction) => void;
+  key: (e: React.KeyboardEvent<HTMLTableRowElement>, idx: number, id: string) => void;
+};
+
+const TaskRow = memo(function TaskRow({
+  t, snap, sse, isSel, idx, busy, h,
+}: {
+  t: TaskListItem;
+  snap?: TaskSnapshot;
+  sse?: TaskRate;
+  isSel: boolean;
+  idx: number;
+  busy: boolean;
+  h: RowHandlers;
+}) {
+  const done = snap?.done ?? 0;
+  const total = snap?.total ?? 0;
+  // E5：total=0（未知）→ 0% 而非 NaN%
+  const pct = total > 0 ? (done / total) * 100 : 0;
+  const down = sse?.down ?? snap?.rates?.down_bytes_s ?? 0;
+  const up = sse?.up ?? snap?.rates?.up_bytes_s ?? 0;
+  const resumable = RESUMABLE.includes(t.state);
+  const id = t.task_id;
+  return (
+    <tr
+      className={isSel ? "is-selected" : ""}
+      onClick={(e) => h.click(e, idx, id)}
+      onDoubleClick={() => h.open(id)}
+      tabIndex={0}
+      onKeyDown={(e) => h.key(e, idx, id)}
+    >
+      <td
+        className="dl-td-check"
+        onClick={(e) => e.stopPropagation()}
+        onDoubleClick={(e) => e.stopPropagation()}
+      >
+        <input
+          type="checkbox"
+          aria-label={`选择 ${displayName(t)}`}
+          checked={isSel}
+          onChange={() => h.check(idx, id)}
+        />
+      </td>
+      <td
+        className="dl-td-name"
+        title={displayName(t)}
+        onDoubleClick={(e) => {
+          e.stopPropagation();
+          h.open(id);
+        }}
+      >
+        {displayName(t)}
+      </td>
+      <td>
+        <StateBadge state={t.state} />
+      </td>
+      <td>
+        <div className="dl-td-progress">
+          <span
+            className={`dl-bar dl-bar--${barTone(t.state)}`}
+            style={{ width: `${pct}%` }}
+          />
+          <span className="dl-td-pct">
+            {total > 0 ? `${Math.round(pct)}%` : "—"}
+          </span>
+        </div>
+      </td>
+      <td className="dl-td-num">
+        {down > 0 ? (
+          <span className="dl-td-speed">
+            <Icon name="arrow-down" size={11} /> {fmtSpeed(down)}
+            {up > 0 && (
+              <>
+                {" "}
+                <Icon name="arrow-up" size={11} /> {fmtSpeed(up)}
+              </>
+            )}
+          </span>
+        ) : (
+          <span className="dl-td-dim">—</span>
+        )}
+      </td>
+      <td className="dl-td-num">
+        {snap && total > 0 ? `${fmtBytes(done)} / ${fmtBytes(total)}` : "—"}
+      </td>
+      <td className="dl-td-num dl-td-eta">
+        {total > 0 ? fmtEta(done, total, down) : "—"}
+      </td>
+      <td className="dl-td-act" onClick={(e) => e.stopPropagation()}>
+        <button
+          className="dl-btn dl-btn--ghost dl-act-btn"
+          disabled={busy}
+          aria-label={resumable ? "恢复" : "暂停"}
+          title={resumable ? "恢复" : "暂停"}
+          onClick={() => h.action(id, resumable ? "resume" : "pause")}
+        >
+          <Icon name={resumable ? "play" : "pause"} size={13} />
+        </button>
+        <button
+          className="dl-btn dl-btn--ghost dl-act-btn dl-act-del"
+          disabled={busy}
+          aria-label="删除"
+          title="删除（需确认）"
+          onClick={() => h.action(id, "remove")}
+        >
+          <Icon name="trash" size={13} />
+        </button>
+      </td>
+    </tr>
+  );
+});
 
 /// 排序值提取（与表头 SORTABLE 对应）。
 export function taskSortValue(t: TaskListItem, snap: TaskSnapshot | undefined, rate: TaskRate | undefined, key: SortKey): number | string {
