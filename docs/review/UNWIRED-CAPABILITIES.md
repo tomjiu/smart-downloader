@@ -356,6 +356,13 @@ NormalizedSource::XunleiShare(u) => {
 
 ## 5. 🟡 `web_seeds` —— 解析完整，传空
 
+> **✅ 已修复（2026-10-20，PR #118）**：bt.rs add 路径按源提取（.torrent
+> url-list / magnet ws=）并注入三个内核入口。**作用面修正**：magnet ws= 与
+> 2.0.x 的 url-list 实际由 libtorrent 原生兜底（parse_magnet_uri 读 ws、
+> 全文件 ctor 读 url-list）；本修复的关键价值在 **2.1**——info-section ctor
+> 丢弃顶层 url-list，daemon 侧提取是唯一路径。e2e：零 tracker 零 peer、
+> HTTP 服务器唯一数据源，完成 + 请求计数 > 0 + 内容逐字节一致。
+
 ### 现状
 
 ```rust
