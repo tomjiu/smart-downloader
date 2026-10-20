@@ -8,11 +8,11 @@ mod common;
 #[path = "../../../tests/integration/seed/mod.rs"]
 mod seed;
 
+use smart_dl_btcore::dl_engine::BtEngine;
 use smart_dl_core::identity::{CanonicalId, CanonicalKind, ContentIdentity};
 use smart_dl_core::state_machine::{EvalPhase, TaskState};
 use smart_dl_core::task::{DownloadTask, ProgressAggregate, RetryState, TaskMetadata};
 use smart_dl_core::types::{DownloadEngine, DownloadSource};
-use smart_dl_daemon::bt::BtEngine;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 

@@ -29,7 +29,7 @@ async fn serve() -> (std::net::SocketAddr, Arc<DaemonState>) {
     let engine = HttpEngine::new(reqwest::Client::new());
     #[cfg(feature = "bt")]
     let state = {
-        let bt = smart_dl_daemon::bt::BtEngine::new(
+        let bt = smart_dl_btcore::dl_engine::BtEngine::new(
             std::env::temp_dir().as_path(),
             None,
             0,

@@ -8,6 +8,7 @@
 
 pub mod alerts;
 pub mod bare;
+pub mod dl_engine;
 pub mod engine;
 pub mod ffi;
 pub mod magnet;
@@ -21,6 +22,7 @@ pub mod xunlei_engine;
 
 pub use alerts::{Alert, AlertKind, StateSubKind};
 pub use bare::Bare;
+pub use dl_engine::BtEngine;
 pub use engine::{peer_flags, BtCore, PeerInfo, TorrentStatus};
 pub use ffi::{Error, Result};
 pub use magnet::{fetch_metadata, FetchError, FetchOpts, FetchedTorrent};

@@ -52,7 +52,7 @@ pub fn transition_for(now: &TaskState, a: &Alert) -> Option<(TaskState, TaskStat
 ///   save_fastresume 立即回到自 poll 模式（防「先 abort 后保存」的未来回归）。
 pub fn spawn_alert_loop(
     state: Arc<DaemonState>,
-    guard: Arc<crate::bt::BtEngine>,
+    guard: Arc<smart_dl_btcore::dl_engine::BtEngine>,
     interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     // batch3-P1 + P0-3：置位常驻消费者旗标 → save_fastresume 纯等分发不自行 pop
@@ -60,7 +60,7 @@ pub fn spawn_alert_loop(
     tokio::spawn(async move {
         // P0-3：RAII 复位——future 被 abort（serve.rs 退出序列）或正常结束时，
         // 旗标自动清零，后续 save_fastresume 不再空等已死分发者（每任务 3s）。
-        struct ResetOnDrop(Arc<crate::bt::BtEngine>);
+        struct ResetOnDrop(Arc<smart_dl_btcore::dl_engine::BtEngine>);
         impl Drop for ResetOnDrop {
             fn drop(&mut self) {
                 self.0.clear_alert_loop_active();

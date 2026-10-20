@@ -14,11 +14,11 @@
 mod common;
 
 use common::lt_gate::LT_SESSION_GATE;
+use smart_dl_btcore::dl_engine::BtEngine;
 use smart_dl_core::identity::{CanonicalId, CanonicalKind, ContentIdentity};
 use smart_dl_core::state_machine::{EvalPhase, TaskState};
 use smart_dl_core::task::{DownloadTask, ProgressAggregate, RetryState, TaskMetadata};
 use smart_dl_core::types::{DownloadEngine, DownloadSource, EngineState};
-use smart_dl_daemon::bt::BtEngine;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;

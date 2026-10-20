@@ -283,7 +283,7 @@ mod bt_enabled {
         // V15：save_to 校验需要 canonicalize 根目录 → 目录须在测试进程存活期内
         // 有效；forget 交给测试进程生命周期（进程退出随 tmp 清理）。
         std::mem::forget(dir);
-        let bt = smart_dl_daemon::bt::BtEngine::new(
+        let bt = smart_dl_btcore::dl_engine::BtEngine::new(
             &dest_root,
             None,
             0,

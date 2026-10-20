@@ -25,7 +25,7 @@ async fn serve() -> (std::net::SocketAddr, Arc<DaemonState>) {
         // dest（/tmp/m6-test-*）依赖 temp_dir 白名单根，default 不能改——故把 BT 引擎
         // save_path 对齐 temp_dir()。测试 magnet 均为假 btih（无 metadata），remove 时
         // save_fastresume 走未就绪分支不落盘，save_path 零残留。
-        let bt = smart_dl_daemon::bt::BtEngine::new(
+        let bt = smart_dl_btcore::dl_engine::BtEngine::new(
             std::env::temp_dir().as_path(),
             None,
             0,

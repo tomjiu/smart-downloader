@@ -328,18 +328,10 @@ pub(crate) fn btih_of(magnet: &str) -> Option<String> {
 /// 不做完整解析——足以支撑 canonical 查重。
 #[cfg(feature = "bt")]
 pub fn torrent_infohash(b: &[u8]) -> Option<String> {
-    use sha1::Digest;
-    let (info, end) = smart_dl_core::bencode::locate_dict_value(b, b"info")?;
-    if b.get(info) != Some(&b'd') {
-        return None; // info 必须是 dict
-    }
-    let digest = sha1::Sha1::digest(&b[info..=end]);
-    Some(
-        digest
-            .iter()
-            .map(|x| format!("{x:02x}"))
-            .collect::<String>(),
-    )
+    // TD-4 建议 8 随迁：实现归位 core::torrent_meta::infohash_v1（btcore
+    // 引擎适配器与 daemon 快照面共用同一权威实现）；本导出保留 daemon
+    // 调用面（ops.rs / 测试）。
+    smart_dl_core::torrent_meta::infohash_v1(b)
 }
 
 /// 单文件 .torrent 总大小（info dict 内 `length` 字段）；多文件（`files`）→ None。
