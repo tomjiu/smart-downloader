@@ -1,0 +1,18 @@
+[package]
+name = "smart-dl-rss"
+version.workspace = true
+edition = "2021"
+authors = ["smart-downloader"]
+description = "RSS feed parsing + keyword rule matching (pure logic, extracted from daemon per TD-4)"
+license = "MIT OR Apache-2.0"
+publish.workspace = true
+
+[lib]
+name = "smart_dl_rss"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+quick-xml = { workspace = true }
+tracing = { workspace = true }
+regex = "1" # RSS 规则 use_regex + 剧集 S01E01 过滤器

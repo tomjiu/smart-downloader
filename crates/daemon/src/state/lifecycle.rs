@@ -52,7 +52,7 @@ impl DaemonState {
             queue_cfg: Mutex::new(crate::config::QueueCfg::default()),
             config_path: Mutex::new(None),
             live_config: Mutex::new(None),
-            rss: Mutex::new(crate::rss::RssState::default()),
+            rss: Mutex::new(smart_dl_rss::RssState::default()),
             rss_persist_path: None,
             bt_bans: Mutex::new(Vec::new()),
             bans_persist_path: None,
@@ -375,7 +375,7 @@ impl DaemonState {
     pub fn with_storage(mut self, path: PathBuf) -> Self {
         let rss_path = path.parent().map(|d| d.join("rss.json"));
         if let Some(rp) = &rss_path {
-            if let Some(st) = crate::rss::RssState::load(rp) {
+            if let Some(st) = smart_dl_rss::RssState::load(rp) {
                 tracing::info!(
                     "RSS 状态回读: {} feeds / {} rules",
                     st.feeds.len(),

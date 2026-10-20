@@ -673,7 +673,7 @@ pub struct DaemonState {
     /// RSS 订阅自动下载（qbit RSS 对标）：订阅/条目/规则；`/rss/*` 端点与
     /// refresh ticker 共用。逻辑与解析在 [`crate::rss`]（pub(crate)：rss 模块
     /// 非 state 子模块，字段跨模块访问）。
-    pub(crate) rss: Mutex<crate::rss::RssState>,
+    pub(crate) rss: Mutex<smart_dl_rss::RssState>,
     /// rss.json 路径（with_storage 派生：tasks.json 同目录；None = 不落盘）。
     pub(crate) rss_persist_path: Option<PathBuf>,
     /// BT 显式 IP 封禁列表（Task 46，qbit「永久封禁」对标）：有序去重；

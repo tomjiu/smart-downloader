@@ -8,6 +8,7 @@ members = [
     "crates/daemon",
     "crates/xunlei-ffi",
     "crates/xunlei-convert",
+    "crates/rss",
 ]
 # spike/cxx 是临时对比 spike,独立构建,排除出主 workspace
 exclude = ["spike/cxx"]

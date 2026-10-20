@@ -2774,6 +2774,7 @@ dependencies = [
  "smart-dl-core",
  "smart-dl-httpdl",
  "smart-dl-provider",
+ "smart-dl-rss",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2839,6 +2840,17 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "smart-dl-rss"
+version = "0.2.3"
+dependencies = [
+ "quick-xml",
+ "regex",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
