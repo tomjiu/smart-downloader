@@ -1174,6 +1174,12 @@ html,
 .dl-table tbody tr:hover {
   background: var(--hover);
 }
+/* P2 虚拟滚动：上下占位行——纯高度撑位，无内容无边框 */
+.dl-table tbody tr.dl-vpad td {
+  padding: 0;
+  border: none;
+  height: auto;
+}
 /* 选中态：左侧 3px accent 条（规范 §1.5.2） */
 .dl-table tbody tr.is-selected {
   background: var(--sel);
