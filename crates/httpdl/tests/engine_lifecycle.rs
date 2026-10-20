@@ -1,5 +1,5 @@
 //! M4a: HttpEngine 生命周期（impl DownloadEngine）：add 探测+规划、status/pause/resume/remove、
-//! peers 空、read_piece Unsupported。
+//! peers Unsupported（TD-2 修复后契约：不再撒谎返回空表）、read_piece Unsupported。
 
 mod common;
 mod integration;
@@ -86,14 +86,19 @@ async fn read_piece_is_unsupported() {
 }
 
 #[tokio::test]
-async fn peers_are_empty_for_http() {
+async fn peers_unsupported_for_http() {
+    // TD-2（审查建议 5）修复回归：HttpEngine::peers 原返回 Ok(vec![])
+    // （撒谎而非报错）——peer 是 BT 概念，HTTP 引擎必须显式 Unsupported。
     let srv = integration::http_server::HttpTestServer::start(Default::default()).await;
     let engine = HttpEngine::new(client());
     let tid = engine
         .add(&make_http_task("h5", &srv.url("/file")))
         .await
         .unwrap();
-    assert!(engine.peers(&tid).await.unwrap().is_empty());
+    assert!(matches!(
+        engine.peers(&tid).await,
+        Err(EngineError::Unsupported)
+    ));
 }
 
 #[tokio::test]
