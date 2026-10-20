@@ -69,7 +69,11 @@ impl Alert {
             StateSubKind::Finished
         } else if self.msg.contains("torrent paused") {
             StateSubKind::Paused
-        } else if self.msg.contains("error") {
+        } else if self.msg.contains("torrent error") {
+            // P2-25 修复（审查第三轮）：匹配 FFI 规范化前缀（lt_kernel.cpp
+            // 把 torrent_error_alert 统一改写为 "torrent error: <原始>"），
+            // 而非裸 "error"——种子名含 "error"（如 "error.mkv state changed
+            // to: downloading"）不再被误判 Error → 任务错标 Failed。
             StateSubKind::Error
         } else {
             StateSubKind::Other

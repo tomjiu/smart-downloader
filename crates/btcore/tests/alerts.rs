@@ -91,6 +91,24 @@ fn kind_mapping_covers_all_buckets() {
         resume_ready: false,
     };
     assert_eq!(paused.state_subkind(), StateSubKind::Paused);
+    // P2-25 回归：种子名含 "error" 的普通 state 消息不得误判 Error
+    let named_error = smart_dl_btcore::Alert {
+        kind: AlertKind::State,
+        ih: String::new(),
+        msg: "error.mkv state changed to: downloading".into(),
+        at: 0,
+        resume_ready: false,
+    };
+    assert_eq!(named_error.state_subkind(), StateSubKind::Other);
+    // FFI 规范化前缀（torrent_error_alert → "torrent error: <原始>"）命中
+    let real_error = smart_dl_btcore::Alert {
+        kind: AlertKind::State,
+        ih: String::new(),
+        msg: "torrent error: storage full".into(),
+        at: 0,
+        resume_ready: false,
+    };
+    assert_eq!(real_error.state_subkind(), StateSubKind::Error);
     assert!(!paused.is_resume_ready());
     let resume_ready = smart_dl_btcore::Alert {
         kind: AlertKind::Resume,
