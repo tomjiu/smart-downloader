@@ -42,12 +42,17 @@ async fn scheduled_task_waits_then_activates_and_completes() {
     let base = format!("http://{addr}");
     let client = reqwest::Client::new();
 
-    // 未来 1 秒启动（unix 秒粒度；调度循环 100ms 周期下 1-2s 内应完成激活+下载）
+    // 未来 2 秒启动：unix 秒粒度截断使 `+1` 的实际余量在 0.001-1s 间浮动——
+    // 测试恰在秒末尾启动时（余量 <100ms），100ms 周期的调度循环可在首次
+    // 快照查询前完成「激活 + 16KB 下载」，断言「到点前停留 Queued」随即
+    // 失败（实测 ~4% 复现率，Windows CI run #334 即此）。`+2` 保证余量
+    // 恒 ≥1s（最坏 1.001s），首查窗口（~20ms）绝无竞态；末段等待循环
+    // 10s 宽限对 2s 激活依然充裕。
     let start_at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs()
-        + 1;
+        + 2;
     let dest = std::env::temp_dir().join(format!("e23-sched-{}", std::process::id()));
     let resp = client
         .post(format!("{base}/tasks"))
