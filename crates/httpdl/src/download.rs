@@ -53,6 +53,103 @@ pub enum DynamicOutcome {
     Paused,
 }
 
+/// 段数据落盘策略（fsync 性能开关，PR #114 审查 §3.3 跟进项）。
+///
+/// - `per_segment = true`（默认）：每段 fsync 后才记账——P0-4 WAL 语义的
+///   最严粒度。SSD 推荐（~13ms fsync 摊在 16MB 段上占比可忽略）。
+/// - `per_segment = false`（批量模式）：累计 `batch_segments` 段或距上次
+///   落盘超过 `batch_interval`（先到者）才做一次「数据 fsync + 账本落盘」。
+///   机械盘场景的吞吐救星：段级 fsync 把机械盘吞吐支配到个位数 MB/s
+///   （PR #114 审查实测 2022 MB/s → 6.4 MB/s），批量化把 fsync 成本
+///   摊销到 N 段一次。
+///
+/// 两模式共享同一 WAL 不变量：**段数据 fsync 先于含该段的账本落盘**。
+/// 批量模式只是把不变量粒度从「段」放宽到「批」——崩溃时账本至多落后
+/// 于数据（重启重下少量段，代价可接受），绝不超前（不产生 P0-4 修复的
+/// 「账本已记、数据未落盘」→ 空洞文件问题）。批量模式下 `min_split`
+/// 调小（1-4MB）时 fsync 频率自然上升 4-16 倍的注意事项同样成立，
+/// 批量阈值是唯一对冲手段（审查 §3.3 建议 3）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SegmentSyncPolicy {
+    /// true = 每段 fsync（默认）；false = 批量模式。
+    pub per_segment: bool,
+    /// 批量模式触发阈值一：自上次落盘累计完成段数（默认 8）。
+    pub batch_segments: u32,
+    /// 批量模式触发阈值二：距上次落盘的时长（默认 2s）。任一先到即触发。
+    pub batch_interval: std::time::Duration,
+}
+
+impl Default for SegmentSyncPolicy {
+    fn default() -> Self {
+        Self {
+            per_segment: true,
+            batch_segments: 8,
+            batch_interval: std::time::Duration::from_secs(2),
+        }
+    }
+}
+
+impl SegmentSyncPolicy {
+    /// 批量触发判定（纯函数，可单测）：`pending` = 自上次落盘累计完成段数，
+    /// `since_last` = 距上次落盘（或批量计时起点）的时长。任一阈值先到
+    /// 即 true。`pending = 0` 恒 false（无脏数据不空转 fsync）。
+    pub fn should_flush(&self, pending: u32, since_last: std::time::Duration) -> bool {
+        pending > 0 && (pending >= self.batch_segments || since_last >= self.batch_interval)
+    }
+}
+
+/// 批量模式落盘状态（worker 间共享；只在 manager 锁内访问，
+/// 锁序恒为 manager → batch，无反向路径）。
+#[derive(Debug)]
+struct BatchSyncState {
+    /// 自上次落盘累计完成段数。
+    pending: u32,
+    /// 有未落盘的完成段（final flush 判据）。
+    dirty: bool,
+    /// 上次落盘时刻（初始 = 批量计时起点）。
+    last_flush: std::time::Instant,
+}
+
+/// 批量模式冲刷：数据 fsync 先行 → 账本快照落盘（WAL 顺序保持，
+/// 粒度从「段」放宽到「批」）。调用方必须已持有 manager 锁与 batch 锁
+/// （快照与计数在同一临界区内，账本视图与内存一致——与既有每段
+/// `ledger::save` 锁内口径相同）。fsync 失败按段级 fsync 同口径上抛；
+/// `ledger::save` 失败内部仅告警（既有语义：进度丢失 = 下次重下）。
+fn flush_batch(
+    batch: &mut BatchSyncState,
+    part: &Path,
+    manager: &SegmentManager,
+    ledger_handle: &Option<DynamicLedger>,
+    total: u64,
+) -> Result<(), String> {
+    // 数据先行：任一 handle fsync 均冲刷 inode 脏页（段写入各自的
+    // 短命 handle 已关闭，此处新开一次即可覆盖全部待落盘段）。
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(part)
+        .map_err(|e| format!("batch flush open: {e}"))?;
+    f.sync_data()
+        .map_err(|e| format!("batch flush fsync: {e}"))?;
+    drop(f);
+    // 账本随后：快照含全部已完成段（含触发本批的段——complete 已先于
+    // flush 调用在 manager 内执行）。
+    if let Some(l) = ledger_handle {
+        let snapshot = Ledger {
+            version: ledger::LEDGER_VERSION,
+            total,
+            min_split: l.min_split,
+            etag: l.etag.clone(),
+            last_modified: l.last_modified.clone(),
+            done: manager.done_ranges().to_vec(),
+        };
+        ledger::save(&l.path, &snapshot);
+    }
+    batch.pending = 0;
+    batch.dirty = false;
+    batch.last_flush = std::time::Instant::now();
+    Ok(())
+}
+
 /// worker 退出原因。
 enum WorkerExit {
     /// 队列领空（正常收工）。
@@ -85,7 +182,7 @@ fn rotate_mirrors(mirrors: &[String], worker_no: usize) -> Vec<String> {
 /// `headers` = 任务级自定义头（H-8 修复）：随每个段请求下发（与探测一致语义），
 /// 否则鉴权型源（Cookie/Token）段请求 403 不可用。任务头中的 `range`（大小写
 /// 不敏感）跳过——段区间由段参数生成，任务头不得劫持/制造重复 Range。
-/// 参数均为同层语义字段，聚合结构体反而增加调用方样板 → 允许 12 参。
+/// 参数均为同层语义字段，聚合结构体反而增加调用方样板 → 允许 13 参。
 #[allow(clippy::too_many_arguments)]
 pub async fn download_dynamic(
     client: &reqwest::Client,
@@ -100,6 +197,7 @@ pub async fn download_dynamic(
     ledger_handle: Option<DynamicLedger>,
     pause: Option<Arc<AtomicBool>>,
     progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+    sync: SegmentSyncPolicy,
 ) -> Result<DynamicOutcome, String> {
     // 预分配 .part（续传场景：旧 .part 保留，只写缺失段；不截断）
     let f = std::fs::OpenOptions::new()
@@ -130,6 +228,13 @@ pub async fn download_dynamic(
         None
     };
     let n_workers = segment_count(total);
+    // 批量落盘状态（fsync 性能开关）：仅在 !sync.per_segment 时使用；
+    // 锁序恒为 manager → batch（只在 manager 锁内的完成块/收尾冲刷中访问）。
+    let batch_state = Arc::new(Mutex::new(BatchSyncState {
+        pending: 0,
+        dirty: false,
+        last_flush: std::time::Instant::now(),
+    }));
     let mut workers = tokio::task::JoinSet::new();
     for worker_no in 0..n_workers {
         let client = client.clone();
@@ -148,6 +253,8 @@ pub async fn download_dynamic(
         let ledger_handle = ledger_handle.clone();
         let pause = pause.clone();
         let progress = progress.clone();
+        let batch_state = batch_state.clone();
+        // sync 为 Copy：worker 闭包按迭代自动拷贝（段写入跳过/保留 fsync 的依据）
         workers.spawn(async move {
             loop {
                 // 真暂停：段边界检查——置位后不再领取新段（在飞段收尾即退出）
@@ -174,8 +281,10 @@ pub async fn download_dynamic(
                 };
                 let mut ok = false;
                 for url in &mirrors {
-                    match download_segment_with_retry(&client, url, &part, seg, &headers, &limiter)
-                        .await
+                    match download_segment_with_retry(
+                        &client, url, &part, seg, &headers, &limiter, sync,
+                    )
+                    .await
                     {
                         Ok(()) => {
                             if let Some(sc) = &scores {
@@ -199,20 +308,32 @@ pub async fn download_dynamic(
                     ));
                 }
                 // 段完成：记账 + 账本原子落盘 + 进度回报（锁内一并完成，
-                // 保证账本视图与计数一致）
+                // 保证账本视图与计数一致）。落盘节奏由 SegmentSyncPolicy 决定：
+                // 每段（P0-4 默认）或批量（fsync 性能开关，WAL 顺序不变）。
                 {
                     let mut m = manager.lock();
                     m.complete(seg);
-                    if let Some(l) = &ledger_handle {
-                        let snapshot = Ledger {
-                            version: ledger::LEDGER_VERSION,
-                            total,
-                            min_split: l.min_split,
-                            etag: l.etag.clone(),
-                            last_modified: l.last_modified.clone(),
-                            done: m.done_ranges().to_vec(),
-                        };
-                        ledger::save(&l.path, &snapshot);
+                    if sync.per_segment {
+                        if let Some(l) = &ledger_handle {
+                            let snapshot = Ledger {
+                                version: ledger::LEDGER_VERSION,
+                                total,
+                                min_split: l.min_split,
+                                etag: l.etag.clone(),
+                                last_modified: l.last_modified.clone(),
+                                done: m.done_ranges().to_vec(),
+                            };
+                            ledger::save(&l.path, &snapshot);
+                        }
+                    } else {
+                        // 批量模式：记账在内存，fsync+账本落盘推迟到批边界
+                        //（锁序 manager → batch，与收尾冲刷同序）。
+                        let mut b = batch_state.lock();
+                        b.pending += 1;
+                        b.dirty = true;
+                        if sync.should_flush(b.pending, b.last_flush.elapsed()) {
+                            flush_batch(&mut b, &part, &m, &ledger_handle, total)?;
+                        }
                     }
                     if let Some(p) = &progress {
                         p(m.done_bytes());
@@ -222,7 +343,21 @@ pub async fn download_dynamic(
             }
         });
     }
-    // 任一 worker 失败 → 整体失败，取消其余；暂停退出优先于正常收工判定
+    // 任一 worker 失败 → 整体失败，取消其余；暂停退出优先于正常收工判定。
+    // 批量模式收尾冲刷（fsync 性能开关）：三出口统一先冲脏批——
+    // Completed/Paused 需完整 resume 凭据；Err 出口 best-effort（冲刷
+    // 失败不覆盖原错误，仅告警）。锁序与完成块一致（manager → batch）。
+    let flush_final = |policy: SegmentSyncPolicy| -> Result<(), String> {
+        if policy.per_segment {
+            return Ok(());
+        }
+        let m = manager.lock();
+        let mut b = batch_state.lock();
+        if !b.dirty {
+            return Ok(());
+        }
+        flush_batch(&mut b, part, &m, &ledger_handle, total)
+    };
     let mut paused = false;
     while let Some(res) = workers.join_next().await {
         match res {
@@ -230,14 +365,25 @@ pub async fn download_dynamic(
             Ok(Ok(WorkerExit::Paused)) => paused = true,
             Ok(Err(e)) => {
                 workers.abort_all();
+                // best-effort 冲刷：已写数据尽量入账（失败仅告警，
+                // 不覆盖原错误——账本落后数据是安全方向）
+                if let Err(fe) = flush_final(sync) {
+                    tracing::warn!("批量收尾冲刷失败（忽略，原错误优先）: {fe}");
+                }
                 return Err(e);
             }
             Err(e) => {
                 workers.abort_all();
+                if let Err(fe) = flush_final(sync) {
+                    tracing::warn!("批量收尾冲刷失败（忽略，原错误优先）: {fe}");
+                }
                 return Err(format!("worker panicked: {e}"));
             }
         }
     }
+    // 正常收工（Completed/Paused）：冲刷失败按错误传播（与段级 fsync
+    // 失败同口径——磁盘故障应被看见，而非静默交出一个未落盘的完成态）
+    flush_final(sync)?;
     if paused {
         return Ok(DynamicOutcome::Paused);
     }
@@ -271,6 +417,7 @@ async fn download_segment_with_retry(
     seg: crate::segment_manager::Segment,
     headers: &[(String, String)],
     limiter: &RateLimiter,
+    sync: SegmentSyncPolicy,
 ) -> Result<(), String> {
     let backoff = crate::retry::Backoff::default();
     let mut stack: Vec<(crate::segment_manager::Segment, bool)> = vec![(seg, true)];
@@ -279,7 +426,7 @@ async fn download_segment_with_retry(
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
-            match download_segment_streaming(client, url, part, cur, headers, limiter).await {
+            match download_segment_streaming(client, url, part, cur, headers, limiter, sync).await {
                 Ok(()) => break,
                 Err(e) if attempt < max_attempts && e.is_retryable(attempt) => {
                     let delay = e
@@ -418,6 +565,7 @@ async fn download_segment_streaming(
     seg: crate::segment_manager::Segment,
     headers: &[(String, String)],
     limiter: &RateLimiter,
+    sync: SegmentSyncPolicy,
 ) -> Result<(), SegmentError> {
     let mut req = client.get(url);
     for (k, v) in headers {
@@ -517,8 +665,15 @@ async fn download_segment_streaming(
     // 交付长度正确但内容全零的文件且状态 Completed。WAL 语义要求
     // 数据先于账本落盘。sync_data（不含 metadata：段内 seek+write
     // 不改文件大小，set_len 已在循环外完成）。
-    f.sync_data()
-        .map_err(|e| SegmentError::Transport(format!("segment fsync: {e}")))?;
+    //
+    // fsync 性能开关（PR #114 审查 §3.3）：批量模式（per_segment=false）
+    // 下本处跳过——数据 fsync 与记账一起推迟到批边界（flush_batch），
+    // WAL 顺序不变（数据 fsync 先于账本落盘），仅粒度从段放宽到批。
+    // 机械盘上每段 ~13ms 的 fsync 支配吞吐，批量化将其摊销到 N 段一次。
+    if sync.per_segment {
+        f.sync_data()
+            .map_err(|e| SegmentError::Transport(format!("segment fsync: {e}")))?;
+    }
     Ok(())
 }
 
@@ -533,6 +688,66 @@ pub(crate) fn parse_content_range_start(v: &str) -> Option<u64> {
     let unit = rest.split('/').next()?.trim();
     let start = unit.split('-').next()?.trim();
     start.parse().ok()
+}
+
+#[cfg(test)]
+mod sync_policy_tests {
+    use super::*;
+
+    #[test]
+    fn default_is_per_segment_wal_strict() {
+        // 默认必须保持 P0-4 语义（每段 fsync）：机械盘用户显式改配置才降级
+        let p = SegmentSyncPolicy::default();
+        assert!(p.per_segment);
+        assert_eq!(p.batch_segments, 8);
+        assert_eq!(p.batch_interval, std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn should_flush_segment_threshold() {
+        let p = SegmentSyncPolicy {
+            per_segment: false,
+            batch_segments: 3,
+            batch_interval: std::time::Duration::from_secs(3600),
+        };
+        // 计时远未到：纯段数驱动
+        let t0 = std::time::Duration::from_millis(1);
+        assert!(!p.should_flush(1, t0));
+        assert!(!p.should_flush(2, t0));
+        assert!(p.should_flush(3, t0), "达到段阈值必须触发");
+        assert!(p.should_flush(7, t0), "超过阈值恒触发");
+    }
+
+    #[test]
+    fn should_flush_interval_threshold() {
+        let p = SegmentSyncPolicy {
+            per_segment: false,
+            batch_segments: 1000,
+            batch_interval: std::time::Duration::from_millis(500),
+        };
+        let t_short = std::time::Duration::from_millis(100);
+        let t_over = std::time::Duration::from_millis(600);
+        assert!(!p.should_flush(1, t_short));
+        assert!(
+            p.should_flush(1, t_over),
+            "间隔超时即使只有 1 段也必须触发（防脏数据无限滞留页缓存）"
+        );
+    }
+
+    #[test]
+    fn should_flush_never_fires_on_clean_state() {
+        let p = SegmentSyncPolicy::default();
+        // pending=0（无脏段）恒不触发：不空转 fsync
+        assert!(!p.should_flush(0, std::time::Duration::from_secs(999)));
+    }
+
+    #[test]
+    fn per_segment_mode_should_flush_is_unused_but_consistent() {
+        // per_segment 模式不走 should_flush 路径；语义一致性锚：
+        // 批量阈值定义独立于模式位，纯函数口径不随模式漂移
+        let p = SegmentSyncPolicy::default();
+        assert!(p.should_flush(p.batch_segments, std::time::Duration::ZERO));
+    }
 }
 
 #[cfg(test)]

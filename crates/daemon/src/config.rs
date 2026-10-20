@@ -87,6 +87,24 @@ pub struct DownloadCfg {
     /// 现有行为）。合法域 1..=100（越界钳到边界）；仅启动时生效（烘入 client）。
     #[serde(default = "default_max_redirects")]
     pub max_redirects: u32,
+    /// 段数据落盘策略主开关（fsync 性能开关，PR #114 审查 §3.3 跟进项）：
+    /// true（默认）= 每段 fsync 后才记账（P0-4 WAL 最严粒度，SSD 推荐）；
+    /// false = 批量模式——累计 `fsync_batch_segments` 段或
+    /// `fsync_batch_interval_ms` 毫秒（先到者）才做一次「数据 fsync +
+    /// 账本落盘」。机械盘推荐 false：段级 fsync 把吞吐支配到个位数 MB/s
+    /// （审查实测 2022 MB/s → 6.4 MB/s），批量化摊销到 N 段一次。
+    /// 两模式均保持 WAL 不变量（数据 fsync 先于账本，仅粒度变粗）。
+    /// 仅启动时生效（烘入 HTTP 引擎）。
+    #[serde(default = "default_true")]
+    pub fsync_per_segment: bool,
+    /// 批量模式阈值一：自上次落盘累计完成段数。默认 8（审查建议 N=8：
+    /// 13ms fsync 摊到 8×16MB=128MB）。合法域 1..=1024（越界钳到边界）。
+    #[serde(default = "default_fsync_batch_segments")]
+    pub fsync_batch_segments: u32,
+    /// 批量模式阈值二：距上次落盘时长（毫秒），任一阈值先到即触发。
+    /// 默认 2000。合法域 100..=600000（越界钳到边界）。
+    #[serde(default = "default_fsync_batch_interval_ms")]
+    pub fsync_batch_interval_ms: u64,
 }
 
 /// 安全修复（P1-b）：与 Config::default() 单源——修复前 derive Default 令
@@ -99,12 +117,41 @@ impl Default for DownloadCfg {
             max_download_kb_s: 0,
             disk_precheck_strict: false,
             max_redirects: default_max_redirects(),
+            fsync_per_segment: default_true(),
+            fsync_batch_segments: default_fsync_batch_segments(),
+            fsync_batch_interval_ms: default_fsync_batch_interval_ms(),
         }
     }
 }
 
 fn default_max_redirects() -> u32 {
     10
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_fsync_batch_segments() -> u32 {
+    8
+}
+
+fn default_fsync_batch_interval_ms() -> u64 {
+    2000
+}
+
+impl DownloadCfg {
+    /// `[download]` 配置段 → httpdl 段落盘策略（含越界钳制，口径对齐
+    /// max_redirects 的使用点钳边界模式）。daemon 启动时烘入 HTTP 引擎。
+    pub fn segment_sync_policy(&self) -> smart_dl_httpdl::download::SegmentSyncPolicy {
+        smart_dl_httpdl::download::SegmentSyncPolicy {
+            per_segment: self.fsync_per_segment,
+            batch_segments: self.fsync_batch_segments.clamp(1, 1024),
+            batch_interval: std::time::Duration::from_millis(
+                self.fsync_batch_interval_ms.clamp(100, 600_000),
+            ),
+        }
+    }
 }
 
 /// BT 引擎配置。`encrypt` 缺省值是 `allow`（内核默认行为）而非空串，
@@ -561,6 +608,9 @@ impl Config {
             "max_download_kb_s": self.download.max_download_kb_s,
             "disk_precheck_strict": self.download.disk_precheck_strict,
             "max_redirects": self.download.max_redirects,
+            "fsync_per_segment": self.download.fsync_per_segment,
+            "fsync_batch_segments": self.download.fsync_batch_segments,
+            "fsync_batch_interval_ms": self.download.fsync_batch_interval_ms,
             "bt_storage_allocate": self.bt.storage_allocate,
             "max_upload_kb_s": self.bt.max_upload_kb_s,
             "proxy_enabled": !self.download.proxy.is_empty(),
@@ -605,6 +655,75 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fsync_defaults_are_per_segment_wal_strict() {
+        // 默认必须保持 P0-4 语义：机械盘用户显式 opt-in 才进批量模式
+        let c = Config::default();
+        assert!(c.download.fsync_per_segment);
+        assert_eq!(c.download.fsync_batch_segments, 8);
+        assert_eq!(c.download.fsync_batch_interval_ms, 2000);
+        let p = c.download.segment_sync_policy();
+        assert!(p.per_segment);
+        assert_eq!(p.batch_segments, 8);
+        assert_eq!(p.batch_interval, std::time::Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn fsync_batch_config_parses_and_clamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("fsync.toml");
+        // 越界值：segments=0（非法）/ interval=10ms（低于下限）
+        std::fs::write(
+            &p,
+            "[download]\nfsync_per_segment = false\nfsync_batch_segments = 0\nfsync_batch_interval_ms = 10\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert!(!c.download.fsync_per_segment, "批量模式 opt-in 生效");
+        let pol = c.download.segment_sync_policy();
+        assert!(!pol.per_segment);
+        assert_eq!(pol.batch_segments, 1, "segments=0 必须钳到下界 1");
+        assert_eq!(
+            pol.batch_interval,
+            std::time::Duration::from_millis(100),
+            "interval=10ms 必须钳到下界 100ms"
+        );
+        // 上界钳制
+        let c2 = Config {
+            download: DownloadCfg {
+                fsync_per_segment: false,
+                fsync_batch_segments: 999_999,
+                fsync_batch_interval_ms: 999_999_999,
+                ..DownloadCfg::default()
+            },
+            ..Config::default()
+        };
+        let pol2 = c2.download.segment_sync_policy();
+        assert_eq!(pol2.batch_segments, 1024, "segments 越界必须钳到上界 1024");
+        assert_eq!(
+            pol2.batch_interval,
+            std::time::Duration::from_millis(600_000),
+            "interval 越界必须钳到上界 600s"
+        );
+    }
+
+    #[test]
+    fn fsync_fields_in_snapshot() {
+        // 设置面可见口径：三个旋钮进 /config 快照（非敏感项）
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("snap.toml");
+        std::fs::write(
+            &p,
+            "[download]\nfsync_per_segment = false\nfsync_batch_segments = 16\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap["fsync_per_segment"], false);
+        assert_eq!(snap["fsync_batch_segments"], 16);
+        assert_eq!(snap["fsync_batch_interval_ms"], 2000);
+    }
 
     #[test]
     fn http_token_not_in_snapshot() {

@@ -95,7 +95,10 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     let http_engine: Arc<dyn smart_dl_core::types::DownloadEngine> = Arc::new(
         // B1：clone 一份给 DaemonState（metalink 引导 XML 拉取同源口径），
         // 原件移交 HTTP 引擎（探测/段下载）。
-        smart_dl_httpdl::HttpEngine::new_limited(client.clone(), cfg.download.max_download_kb_s),
+        // fsync 性能开关（PR #114 审查 §3.3）：[download] 配置段烘入引擎
+        // （每段 fsync 默认；机械盘用户可配批量模式换吞吐，WAL 语义不变）。
+        smart_dl_httpdl::HttpEngine::new_limited(client.clone(), cfg.download.max_download_kb_s)
+            .with_sync_policy(cfg.download.segment_sync_policy()),
     );
     // 3b. 云兜底 provider 列表装配（UNWIRED #3 重构：抽出可单测的
     // assemble_providers——mock / xunlei / quark 三源汇入）
