@@ -9,14 +9,12 @@ pub mod ownership;
 pub mod registry;
 pub mod router;
 pub mod session;
-pub mod sniffer;
 pub mod source_parse;
 pub mod state_machine;
 pub mod strategy;
 pub mod task;
 pub mod torrent_meta;
 pub mod types;
-pub mod xltd;
 
 pub use dedup::{DedupIndex, DedupOutcome};
 pub use heat::{heat_level, heat_score, HeatEvaluator, HeatLevel};
