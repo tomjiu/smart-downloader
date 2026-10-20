@@ -21,6 +21,7 @@ pub struct Config {
     pub xunlei: XunleiCfg,
     pub provider: ProviderCfg,
     pub provider_xunlei: ProviderXunleiCfg,
+    pub provider_quark: ProviderQuarkCfg,
     pub webhook: WebhookCfg,
     pub cleanup: CleanupCfg,
     pub post_download: PostDownloadCfg,
@@ -261,6 +262,18 @@ pub struct ProviderXunleiCfg {
     pub tier: Option<String>,
 }
 
+/// 夸克网盘 Provider（QuarkProvider）装配配置（UNWIRED #3 接线）。
+/// 默认关：需显式 `enabled=true` 才把 QuarkProvider 注入 provider 列表。
+/// Cookie 登录态：JSON 文件（provider 侧 load/save_auth，0600 原子写）；
+/// daemon 只读加载，登录写入由示例/CLI 侧完成（无 HTTP 登录端点）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ProviderQuarkCfg {
+    pub enabled: bool,
+    /// Cookie 登录态 JSON 路径；缺省时 daemon 用 `quark_auth.json`。
+    pub cookie_path: Option<PathBuf>,
+}
+
 /// 任务完成 Webhook 配置（E17）：任务到达完成态时 daemon 向 `url` POST 一条
 /// JSON 通知（fire-and-forget，单次尝试 5s 超时，失败仅记日志）。
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -369,6 +382,7 @@ impl Default for Config {
                 mock: false,
             },
             provider_xunlei: ProviderXunleiCfg::default(),
+            provider_quark: ProviderQuarkCfg::default(),
             webhook: WebhookCfg::default(),
             cleanup: CleanupCfg::default(),
             post_download: PostDownloadCfg::default(),
@@ -541,6 +555,7 @@ impl Config {
             "proxy_enabled": !self.download.proxy.is_empty(),
             "provider_enabled": self.provider.enabled,
             "provider_xunlei_enabled": self.provider_xunlei.enabled,
+            "provider_quark_enabled": self.provider_quark.enabled,
             // 身份档位名（非敏感；无 token 布尔那样有路径泄露风险）。
             "provider_xunlei_tier": self.resolve_xunlei_tier_name(),
             "webhook_url": self.webhook.url,
@@ -563,6 +578,12 @@ impl Config {
             "provider_xunlei_token_exists": self
                 .provider_xunlei
                 .token_path
+                .as_ref()
+                .map(|p| p.exists())
+                .unwrap_or(false),
+            "provider_quark_cookie_exists": self
+                .provider_quark
+                .cookie_path
                 .as_ref()
                 .map(|p| p.exists())
                 .unwrap_or(false),
@@ -849,6 +870,66 @@ path = "/tmp/sd.lock"
         let snap2 = c2.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
         assert_eq!(snap2["provider_xunlei_enabled"], true);
         assert_eq!(snap2["provider_xunlei_token_exists"], false);
+    }
+
+    #[test]
+    fn provider_quark_default_off() {
+        // UNWIRED #3：默认关闭、无 cookie_path；快照仅布尔，不泄露路径。
+        let c = Config::default();
+        assert!(!c.provider_quark.enabled);
+        assert!(c.provider_quark.cookie_path.is_none());
+        let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap["provider_quark_enabled"], false);
+        assert_eq!(snap["provider_quark_cookie_exists"], false);
+        assert!(
+            !snap
+                .as_object()
+                .unwrap()
+                .contains_key("provider_quark_cookie_path"),
+            "快照不得含 cookie 路径"
+        );
+    }
+
+    #[test]
+    fn provider_quark_enabled_with_cookie_path() {
+        // enabled=true + 真实 cookie 文件 → 快照反映存在性；缺失文件 → false。
+        let dir = tempfile::tempdir().unwrap();
+        let cookie = dir.path().join("quark_auth.json");
+        std::fs::write(
+            &cookie,
+            r#"{"cookie":"__pus=demo; __puus=demo","user_id":"42"}"#,
+        )
+        .unwrap();
+        let missing = dir.path().join("no_such.json");
+        let p = dir.path().join("config.toml");
+        std::fs::write(
+            &p,
+            format!(
+                "[provider_quark]\nenabled = true\ncookie_path = \"{}\"\n",
+                cookie.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert!(c.provider_quark.enabled);
+        assert_eq!(c.provider_quark.cookie_path, Some(cookie.clone()));
+        let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap["provider_quark_enabled"], true);
+        assert_eq!(snap["provider_quark_cookie_exists"], true);
+
+        let p2 = dir.path().join("config2.toml");
+        std::fs::write(
+            &p2,
+            format!(
+                "[provider_quark]\nenabled = true\ncookie_path = \"{}\"\n",
+                missing.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        let c2 = Config::load(Some(&p2)).unwrap();
+        assert!(c2.provider_quark.enabled);
+        let snap2 = c2.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+        assert_eq!(snap2["provider_quark_cookie_exists"], false);
     }
 
     #[test]

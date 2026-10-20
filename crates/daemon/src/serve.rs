@@ -97,47 +97,9 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
         // 原件移交 HTTP 引擎（探测/段下载）。
         smart_dl_httpdl::HttpEngine::new_limited(client.clone(), cfg.download.max_download_kb_s),
     );
-    // 3b. 云兜底 provider 列表（`[provider]` 配置；仅 MockProvider 现成实现——
-    // 开发/演示占位，真实 provider（迅雷云盘等）落地后按类型构造）
-    let mut providers: Vec<Arc<dyn smart_dl_provider::RemoteProvider>> = Vec::new();
-    if cfg.provider.enabled && cfg.provider.mock {
-        providers.push(Arc::new(smart_dl_provider::MockProvider::new("mock")));
-        tracing::info!("云兜底已启用（provider=mock，开发占位）");
-    }
-    // 3b+. 迅雷云盘 Provider 装配（XunleiProvider）。
-    // 决策说明：不引入新 feature 门，仅按 `cfg.provider_xunlei.enabled` 注入——
-    // smart-dl-provider 本就是 daemon 的常驻（非 optional）依赖，且现有 MockProvider
-    // 也仅由配置开关控制、无 feature 门；故复用同一最少惊讶原则，避免 xunlei-import
-    // （语义为「BT 任务导入 xlbt.cfg→fastresume」，且会联动拉起 bt + xunlei-convert）
-    // 作为无关门控而误导。
-    if cfg.provider_xunlei.enabled {
-        let tp = cfg
-            .provider_xunlei
-            .token_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("xunlei_auth.json"));
-        // 身份档位（P1-1）：env SMART_DL_XUNLEI_TIER > [provider_xunlei] tier > web。
-        // 未知档拒绝启动（防错档静默运行——错档 = 服务端可见的异常指纹）。
-        let tier_name = cfg.resolve_xunlei_tier_name();
-        let tier = smart_dl_provider::xunlei::tier::Tier::by_name(&tier_name).ok_or_else(|| {
-            ServeError::Engine(format!(
-                "未知迅雷身份档位 '{tier_name}'（可用: web/nas；env SMART_DL_XUNLEI_TIER 或 [provider_xunlei] tier）"
-            ))
-        })?;
-        let xp = smart_dl_provider::xunlei::provider::XunleiProvider::with_tier(
-            "xunlei",
-            tp.clone(),
-            tier,
-        );
-        let authenticated = xp.runtime().authenticated;
-        providers.push(Arc::new(xp));
-        tracing::info!(
-            "迅雷云盘 Provider 已装配: tier={}, token_path={:?}, authenticated={}",
-            tier.name,
-            tp,
-            authenticated
-        );
-    }
+    // 3b. 云兜底 provider 列表装配（UNWIRED #3 重构：抽出可单测的
+    // assemble_providers——mock / xunlei / quark 三源汇入）
+    let providers = assemble_providers(&cfg)?;
     #[cfg(feature = "bt")]
     let mut state = DaemonState::new(http_engine, providers)
         .with_dest_root(cfg.download.dest_root.clone())
@@ -579,6 +541,71 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     Ok(())
 }
 
+/// 云兜底 provider 列表装配（UNWIRED #3 重构：自 serve() 内联块抽出，可单测）。
+/// 三源汇入：`[provider] mock`（开发占位）/ `[provider_xunlei]` / `[provider_quark]`。
+///
+/// 装配原则（与 MockProvider/XunleiProvider 一致的最少惊讶）：无 feature 门，
+/// 仅按配置开关注入——smart-dl-provider 本就是 daemon 常驻（非 optional）依赖。
+fn assemble_providers(
+    cfg: &Config,
+) -> Result<Vec<Arc<dyn smart_dl_provider::RemoteProvider>>, ServeError> {
+    let mut providers: Vec<Arc<dyn smart_dl_provider::RemoteProvider>> = Vec::new();
+    if cfg.provider.enabled && cfg.provider.mock {
+        providers.push(Arc::new(smart_dl_provider::MockProvider::new("mock")));
+        tracing::info!("云兜底已启用（provider=mock，开发占位）");
+    }
+    // 迅雷云盘（XunleiProvider）。
+    if cfg.provider_xunlei.enabled {
+        let tp = cfg
+            .provider_xunlei
+            .token_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("xunlei_auth.json"));
+        // 身份档位（P1-1）：env SMART_DL_XUNLEI_TIER > [provider_xunlei] tier > web。
+        // 未知档拒绝启动（防错档静默运行——错档 = 服务端可见的异常指纹）。
+        let tier_name = cfg.resolve_xunlei_tier_name();
+        let tier = smart_dl_provider::xunlei::tier::Tier::by_name(&tier_name).ok_or_else(|| {
+            ServeError::Engine(format!(
+                "未知迅雷身份档位 '{tier_name}'（可用: web/nas；env SMART_DL_XUNLEI_TIER 或 [provider_xunlei] tier）"
+            ))
+        })?;
+        let xp = smart_dl_provider::xunlei::provider::XunleiProvider::with_tier(
+            "xunlei",
+            tp.clone(),
+            tier,
+        );
+        let authenticated = xp.runtime().authenticated;
+        providers.push(Arc::new(xp));
+        tracing::info!(
+            "迅雷云盘 Provider 已装配: tier={}, token_path={:?}, authenticated={}",
+            tier.name,
+            tp,
+            authenticated
+        );
+    }
+    // 夸克网盘（QuarkProvider，UNWIRED #3 接线）：实现已完整存在
+    //（provider/src/quark/share.rs 215+ 行，含 submit/resolve/refresh_links）
+    // 但从未装配——`GET /providers` 永远不含 quark。Cookie 登录态：
+    // JSON 文件（provider 侧 load/save_auth，0600 原子写，P1-6 已硬化）；
+    // daemon 只读加载，登录写入由示例/CLI 侧完成。
+    if cfg.provider_quark.enabled {
+        let cp = cfg
+            .provider_quark
+            .cookie_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("quark_auth.json"));
+        let qp = smart_dl_provider::quark::QuarkProvider::new("quark", cp.clone());
+        let authenticated = qp.runtime().authenticated;
+        providers.push(Arc::new(qp));
+        tracing::info!(
+            "夸克网盘 Provider 已装配: cookie_path={:?}, authenticated={}",
+            cp,
+            authenticated
+        );
+    }
+    Ok(providers)
+}
+
 /// 解析生效 HTTP token（第六轮 9.3.5）：env `SMART_DL_HTTP_TOKEN`（空串视为未设）
 /// > config `[server] http_token`；值为 `auto` → 生成强随机临时 token
 /// > （uuid v4，122 位随机，getrandom 支撑），`generated=true` 由调用方负责打印。
@@ -733,5 +760,85 @@ mod tests {
     fn parse_missing_value_errors() {
         assert!(parse_args(&["--config".into()]).is_err());
         assert!(parse_args(&["--addr".into()]).is_err());
+    }
+    #[test]
+    fn assemble_providers_quark_wiring() {
+        // UNWIRED #3：QuarkProvider 装配——enabled=true 注入 + 名字 "quark"
+        // + authenticated 随 cookie 文件存在性。默认关 → 不注入。
+        let dir = tempfile::tempdir().unwrap();
+        let cookie = dir.path().join("quark_auth.json");
+        std::fs::write(
+            &cookie,
+            r#"{"cookie":"__pus=demo; __puus=demo","user_id":"42"}"#,
+        )
+        .unwrap();
+
+        // 默认关：quark 不在列表
+        let cfg_off = Config::default();
+        let ps = assemble_providers(&cfg_off).unwrap();
+        assert!(
+            ps.iter().all(|p| p.name() != "quark"),
+            "默认关闭时 quark 不得装配"
+        );
+
+        // 开 + 有效 cookie：装配 + authenticated
+        let p = dir.path().join("config.toml");
+        std::fs::write(
+            &p,
+            format!(
+                "[provider_quark]\nenabled = true\ncookie_path = \"{}\"\n",
+                cookie.display().to_string().replace('\\', "\\\\")
+            ),
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&p)).unwrap();
+        let ps = assemble_providers(&cfg).unwrap();
+        let quark = ps
+            .iter()
+            .find(|p| p.name() == "quark")
+            .expect("enabled=true 时 quark 必须装配");
+        assert!(
+            quark.runtime().authenticated,
+            "有效 cookie 文件 → authenticated=true"
+        );
+
+        // 开 + 缺失 cookie：仍装配（登录态由服务端裁决），authenticated=false
+        let p2 = dir.path().join("config2.toml");
+        std::fs::write(
+            &p2,
+            "[provider_quark]\nenabled = true\ncookie_path = \"no_such.json\"\n",
+        )
+        .unwrap();
+        let cfg2 = Config::load(Some(&p2)).unwrap();
+        let ps2 = assemble_providers(&cfg2).unwrap();
+        let quark2 = ps2
+            .iter()
+            .find(|p| p.name() == "quark")
+            .expect("cookie 缺失不阻断装配");
+        assert!(
+            !quark2.runtime().authenticated,
+            "缺失 cookie → authenticated=false（登录态占位）"
+        );
+    }
+
+    #[test]
+    fn assemble_providers_mock_and_xunlei_unchanged() {
+        // 重构回归：抽出 assemble_providers 后 mock/xunlei 行为不变。
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(
+            &p,
+            "[provider]\nenabled = true\nmock = true\n[provider_xunlei]\nenabled = true\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&p)).unwrap();
+        let ps = assemble_providers(&cfg).unwrap();
+        assert!(ps.iter().any(|p| p.name() == "mock"), "mock 开关不变");
+        assert!(
+            ps.iter().any(|p| p.name() == "xunlei"),
+            "xunlei 开关不变（无 token → authenticated=false 但仍装配）"
+        );
+        let xunlei = ps.iter().find(|p| p.name() == "xunlei").unwrap();
+        assert!(!xunlei.runtime().authenticated);
     }
 }
