@@ -2728,6 +2728,7 @@ dependencies = [
  "smart-dl-core",
  "thiserror 1.0.69",
  "tokio",
+ "tracing",
  "xunlei-ffi",
 ]
 
