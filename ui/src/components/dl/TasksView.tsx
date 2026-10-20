@@ -6,6 +6,26 @@ import type { TaskListItem, TaskRate } from "@/lib/daemon/types";
 import { client } from "@/lib/daemon/store";
 import { EmptyState, SpeedPill, StateBadge } from "./Common";
 
+/// P0-2（Issue #115/#121）：后端 `TaskRecord.name` 为 `Option<String>` 且
+/// `skip_serializing_if` 缺省——`name` 可为 null/undefined。
+/// 展示与搜索都必须走兜底，否则 `t.name.toLowerCase()` 在 TypeScript 编译期
+/// 即报错（主 UI 构建因此失败），运行期任务名为空时搜索框一输入就白屏。
+function displayName(t: TaskListItem): string {
+  const n = t.name?.trim();
+  if (n) return n;
+  const s = (t.source ?? "").trim();
+  if (s) {
+    // 取 URL 路径末段作为展示兜底（仅展示；真实名字由引擎 CD 后回填）
+    try {
+      const seg = s.split("?")[0].split("#")[0].split("/").filter(Boolean).pop();
+      if (seg) return seg;
+    } catch {
+      /* 非法 URL 走 id 兜底 */
+    }
+  }
+  return t.task_id ?? "";
+}
+
 const FILTERS = [
   { key: "all", label: "全部", icon: "list-unordered" },
   { key: "active", label: "进行中", icon: "play" },
@@ -57,7 +77,7 @@ export default function TasksView({
   const shown = useMemo(
     () =>
       tasks.filter(
-        (t) => matchFilter(t, filter) && (!q || t.name.toLowerCase().includes(q.toLowerCase())),
+        (t) => matchFilter(t, filter) && (!q || displayName(t).toLowerCase().includes(q.toLowerCase())),
       ),
     [tasks, filter, q],
   );
@@ -164,7 +184,7 @@ export default function TasksView({
                 <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                   <StateBadge state={t.state} />
                   <div style={{ fontWeight: 600, flex: 1, minWidth: 160, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {t.name}
+                    {displayName(t)}
                   </div>
                   <span className="qoder-badge qoder-badge--default">{t.engine ?? "—"}</span>
                 </div>
