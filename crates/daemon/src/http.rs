@@ -1493,7 +1493,16 @@ async fn remove_task(
 ) -> impl IntoResponse {
     match state.remove_with(&id, q.delete_data).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
+        // Issue #120：错误分类映射（旧实现恒 404——引擎停止失败也报
+        // 「不存在」，误导排障）。NotFound → 404；引擎不可用/停止失败 →
+        // 500（服务端无法完成删除，任务记录仍在，可重试）。
+        Err(e) => {
+            let status = match &e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, e.to_string()).into_response()
+        }
     }
 }
 

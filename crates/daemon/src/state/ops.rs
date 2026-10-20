@@ -3662,20 +3662,64 @@ impl DaemonState {
         self.remove_with(id, false).await
     }
 
-    /// 删除任务 + 数据处置开关（E7）：`delete_data = true` 时引擎侧同步删除
-    /// 已下载数据（BT 删种子数据 / HTTP 删落盘文件）。引擎删除失败不阻塞
-    /// 记录移除（引擎 remove 本就是尽力而为——任务可能已不在引擎侧）。
+    /// 删除任务（Issue #120 P0 修复：先停引擎、后删记录，错误传播）。
+    ///
+    /// 旧实现三连静默：①先删记录（UI 立即消失，此后失败无迹可寻）→
+    /// ②`engine_for` Err 静默跳过（引擎未装配时引擎侧任务继续跑）→
+    /// ③`engine.remove` Err 静默吞掉（无日志无事件）→ 恒返回 `Ok`。
+    /// 用户侧表现即「删了还在下」：`.part` 持续增长、磁盘不释放、重启后
+    /// 记录已删无法恢复但文件残留。
+    ///
+    /// 新顺序（记录保留到引擎确认停止之后，失败可重试）：
+    /// 1. 锁内取记录快照（不删）——失败时任务仍在列表；
+    /// 2. `engine_for` 失败 → Err（引擎不可用 ≠ 放弃停止责任）；
+    /// 3. `engine.remove` 失败 → Err 传播；**NotFound 例外**：引擎侧已无
+    ///    此任务（会话重启/已退役）= 停止目标已达成，放行记录清理。
+    ///    HTTP 引擎的 remove 内部先置 pause 旗标（在飞段尽快收尾退出），
+    ///    无需额外 pause 调用；
+    /// 4. 引擎确认停止后才删记录 + autosave。
+    ///
+    /// 并发幂等：锁外 await 期间同 id 的并发 remove_with 各自走引擎
+    /// remove（引擎侧幂等/NotFound），末尾记录删除无条件执行（二次删
+    /// no-op）——与自动清扫（Err 分支跳过）与批量删除（逐项 Err 收集）
+    /// 两个既有 `Result` 消费方契约一致。
     pub async fn remove_with(&self, id: &str, delete_data: bool) -> Result<(), DaemonError> {
-        let rec = self
-            .tasks
-            .lock()
-            .remove(id)
-            .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
-        if let Some(tid) = rec.engine_tid {
-            if let Ok(engine) = self.engine_for(rec.engine_kind) {
-                let _ = engine.remove(&tid, delete_data).await;
+        enum StopPlan {
+            /// 无引擎句柄（provider 兜底完成 / 恢复失败记录）——直接清记录。
+            NoEngine,
+            /// 停引擎（engine 句柄 + 引擎侧任务 id）。
+            Stop {
+                engine: std::sync::Arc<dyn DownloadEngine>,
+                tid: crate::state::EngineTaskId,
+            },
+        }
+        let plan = {
+            let tasks = self.tasks.lock();
+            let Some(rec) = tasks.get(id) else {
+                return Err(DaemonError::NotFound(id.to_string()));
+            };
+            match rec.engine_tid.clone() {
+                Some(tid) => {
+                    let engine = self.engine_for(rec.engine_kind).map_err(|e| {
+                        DaemonError::Engine(format!("引擎不可用，无法停止任务 {id}: {e}"))
+                    })?;
+                    StopPlan::Stop { engine, tid }
+                }
+                None => StopPlan::NoEngine,
+            }
+        }; // ← tasks 锁在此释放（引擎 await 不跨锁）
+        if let StopPlan::Stop { engine, tid } = plan {
+            match engine.remove(&tid, delete_data).await {
+                Ok(()) => {}
+                Err(smart_dl_core::types::EngineError::NotFound) => {
+                    tracing::warn!("任务 {id} 引擎侧已不存在（NotFound），继续清理记录");
+                }
+                Err(e) => {
+                    return Err(DaemonError::Engine(format!("停止引擎任务失败 {id}: {e}")));
+                }
             }
         }
+        self.tasks.lock().remove(id);
         self.autosave();
         Ok(())
     }
