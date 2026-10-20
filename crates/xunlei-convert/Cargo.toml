@@ -1,6 +1,6 @@
 [package]
 name = "xunlei-convert"
-version = "0.2.1"
+version.workspace = true
 edition = "2021"
 authors = ["smart-downloader"]
 description = "Thunder BT task migration tools (xlbt.cfg + xltd -> libtorrent fastresume) - UNVERIFIED"
@@ -11,7 +11,9 @@ publish.workspace = true
 name = "xunlei_convert"
 
 [dependencies]
-xunlei-ffi = { path = "../xunlei-ffi" }
+# 审计修复（batch10-G，幽灵依赖消除）：删除 xunlei-ffi 依赖——全仓 0 处
+# xunlei_ffi 引用（架构审查问题 2①：幽灵依赖）；convert 的解析/转换
+# 纯 Rust 实现，不碰 FFI。若未来需要真机验证可重新引入。
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha1 = { workspace = true }

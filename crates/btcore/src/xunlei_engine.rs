@@ -143,8 +143,11 @@ impl XunleiBtEngine {
             XlTaskState::Downloading => EngineState::Downloading,
             XlTaskState::Paused => EngineState::Paused,
             XlTaskState::Completed => EngineState::Seeding,
-            // 其他状态（未真机确认）保守归为 Downloading
-            XlTaskState::Unknown => EngineState::Downloading,
+            // P1-19 修复：Unknown 不再伪装 Downloading——原实现把真实失败态
+            //（SDK 返回无法识别的状态码）映射为"下载中"，daemon 永不判
+            // 失败/重试，任务无限挂着。Error 态允许 daemon 侧失败拦截/
+            // 手动重试链路接管（比无限伪装诚实）。
+            XlTaskState::Unknown => EngineState::Error,
         }
     }
 }
@@ -211,13 +214,20 @@ impl DownloadEngine for XunleiBtEngine {
         };
 
         let engine_id = Self::engine_task_id(xl_id.0);
-        self.insert_task(engine_id.clone(), xl_id).await;
+        self.insert_task(engine_id.clone(), xl_id.clone()).await;
 
         // 启动任务
-        self.handle
-            .start_task(&xl_id)
-            .await
-            .map_err(|e| EngineError::Other(format!("xunlei start failed: {e}")))?;
+        // P0-13 修复：启动失败回滚引擎侧登记——原实现 `?` 直接返回，daemon
+        // 侧 rollback_slot_reservation 只清 daemon 记录，引擎 tasks 表残留
+        // xunlei-<n> 孤儿（engine_id 随 Err 被丢弃，无人再持有句柄）：
+        // SDK 侧任务持续跑（占带宽/磁盘），pause/remove/status 永不可达，
+        // 重启也不清理。start 失败 → 摘除登记 + best-effort delete_task。
+        if let Err(e) = self.handle.start_task(&xl_id).await {
+            self.remove_task(&engine_id).await;
+            // best-effort：SDK 侧可能已建任务（保留数据，用户可回收）
+            let _ = self.handle.delete_task(&xl_id, false).await;
+            return Err(EngineError::Other(format!("xunlei start failed: {e}")));
+        }
 
         // 启用 FreeDCDN 加速（免登录可用）
         let _ = self.handle.enable_free_dcdn(&xl_id).await;

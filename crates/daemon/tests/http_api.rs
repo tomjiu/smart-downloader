@@ -1324,8 +1324,10 @@ async fn add_task_with_sha256_e2e() {
     assert_eq!(snap["state"], "Completed", "正确 sha256 必须完成: {snap}");
     assert!(snap["error"].is_null(), "正确 sha256 不得告警: {snap}");
 
-    // 错误 sha256 → 降级接受（Completed）+ 告警含 sha256
-    // （第二个服务实例：同 URL 二次添加会被 canonical 查重 409）
+    // 错误 sha256 → 校验不符 → Error 终态 + 错误信息含 sha256
+    //（P2-19：原降级接受 Completed 会误导用户以为文件完好；文件已落位
+    // 保留供人工核验）
+    //（第二个服务实例：同 URL 二次添加会被 canonical 查重 409）
     let srv2 = TestServer::start(patterned(64 * 1024)).await;
     let resp = client
         .post(format!("{base}/tasks"))
@@ -1344,8 +1346,8 @@ async fn add_task_with_sha256_e2e() {
         .to_string();
     let snap = poll_terminal(&client, &base, &tid).await;
     assert_eq!(
-        snap["state"], "Completed",
-        "降级接受语义（Q-B5）经 API 保持: {snap}"
+        snap["state"], "Failed",
+        "校验不符不得标 Completed（P2-19）: {snap}"
     );
     let err = snap["error"].as_str().unwrap_or_default();
     assert!(err.contains("sha256"), "告警应定性 sha256: {err}");
@@ -2653,7 +2655,7 @@ async fn add_task_with_md5_sha1_e2e() {
         .to_string();
     assert!(msg.contains("互斥"), "错误应定性互斥: {msg}");
 
-    // 错误 sha1 → 降级接受（Completed）+ 告警点名 sha1
+    // 错误 sha1 → 校验不符 → Error 终态 + 错误信息点名 sha1（P2-19）
     let srv2 = TestServer::start(patterned(64 * 1024)).await;
     let resp = client
         .post(format!("{base}/tasks"))
@@ -2672,9 +2674,9 @@ async fn add_task_with_md5_sha1_e2e() {
         .to_string();
     let snap = poll_terminal(&client, &base, &tid).await;
     assert_eq!(
-        snap["state"], "Completed",
-        "降级接受语义（Q-B5）经 API 保持: {snap}"
+        snap["state"], "Failed",
+        "校验不符不得标 Completed（P2-19）: {snap}"
     );
     let err = snap["error"].as_str().unwrap_or_default();
-    assert!(err.contains("sha1"), "告警应定性 sha1: {err}");
+    assert!(err.contains("sha1"), "错误应定性 sha1: {err}");
 }

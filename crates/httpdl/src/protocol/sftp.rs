@@ -167,12 +167,17 @@ fn parse_sftp_url(url: &str) -> Option<(String, u16, String, String, String)> {
 }
 
 /// 终态错误判定：NoSuchFile/PermissionDenied 为协议级永久失败（重试无意义，
-/// 不参与二分拆分栈）；其余（IO/超时/连接断开）可重试。错误串匹配：
-/// russh-sftp Status 展示为 "{status_code}: {error_message}"，状态码枚举
-/// Display 固定为 "No such file"/"Permission denied"（SFTP v3 RFC 口径）。
+/// 不参与二分拆分栈）；其余（IO/超时/连接断开）可重试。
+/// 审计修复（P1-6，降低文案脆性）：russh-sftp 两代 Display 形态都覆盖——
+/// 状态码枚举名（"NoSuchFile" / "PermissionDenied"，Debug/枚举形态）与
+/// 标准文案（"no such file" / "permission denied"，SFTP v3 RFC 口径）。
+/// 原实现仅匹配英文文案，库版本变更 Display 后静默退化为长退避空耗。
 fn is_terminal(e: &str) -> bool {
     let l = e.to_ascii_lowercase();
-    l.contains("no such file") || l.contains("permission denied")
+    l.contains("no such file")
+        || l.contains("nosuchfile")
+        || l.contains("permission denied")
+        || l.contains("permissiondenied")
 }
 
 struct SftpTask {

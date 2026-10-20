@@ -4,6 +4,97 @@
 格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)；
 版本号语义：`0.x` 阶段以能力批次为单位推进，不承诺字段级兼容。
 
+## [0.2.3] - 2026-10-18
+
+第十轮修复批次（batch10）：基于 2026-10-16 三轮后端审查 + 架构评审
+（[docs/review/](docs/review/)，覆盖约 52,700 行）修复全部 14 个 P0、
+30+ 个 P1 与架构/文档问题，每批修复均以真实测试验证
+（复现工程 [repro/p0repro/](repro/p0repro/) 3 个缺陷实证全部转绿）。
+
+### 崩溃与安全（P0）
+- **多文件 .torrent 导入除零 panic**（P0-1，已实证复现）：bencode 字典序
+  下 `files` 先于 `piece length` 出现，真实种子（mktorrent/libtorrent/
+  Transmission 生成）全部命中——扫描时 piece_length 仍为 0 即计算偏移。
+  修复：两阶段解析（偏移计算延后到校验后）+ piece_length 16MiB 上限；
+  测试 fixture 修正为真实字典序键序
+- **total_size 求和溢出绕过磁盘预检**（P0-11，已实证）：`[u64::MAX, 1]`
+  回绕为 0 → 预检放行 → 写爆磁盘。修复：checked_add + TotalSizeOverflow
+- **loopback 前缀绕过**（P1-a，已实证 4 项）：删除 `starts_with("127.")`
+  兜底——`127.evil.com` 经 DNS 解析公网可骗过 fail-closed 闸门未鉴权绑公网
+- **登录页 DNS rebinding 防护**（P0-7）：本地登录页（接收明文密码）原零
+  HTTP 头校验，全路由套 Host 白名单 + Origin 同源守卫中间件
+- **serde 部分表默认值错位**（P1-b，已实证）：子表手写 Default 与
+  Config 单源——只写 `[server] http_token` 令 addr 变空串（daemon 起不来）、
+  只写 `[bt]` 任一键令 BT 静默关闭
+- **sanitize_rel 裸 CurDir**（P1-1）：`"."`/`"./"` 拒绝（dest 指向
+  dest_root 自身的静默失败链）+ Windows 保留名尾空格等价形态
+- **slot 预留超卖竞态**（flaky 实证 5 次 2 败）：gate_or_enqueue 检查+
+  插入+登记原子化
+
+### 数据完整性（P0）
+- **空洞文件双层防线**（P0-4）：段数据 fsync 后才记账（WAL 顺序，崩溃后
+  resume 不再交付长度正确的全零文件）+ 无摘要任务的完全稀疏检测
+- **无 ETag 跨源混拼**（P0-5）：换源作废判定与段账本同口径（total 不一致/
+  指纹消失/指纹不等均作废）——原实现主流无 ETag CDN 上恒放行，旧源账本
+  续传新源即静默数据损坏
+- **限速器三连**（P1-1/2/3）：持锁 sleep 串行化（并发段速率低于设定值）/
+  短窗口丢字节（速率系统性低估）/ 热调不清旧速率债务
+- **降级接受语义**（P2-19）：哈希不符不再标 Completed（文件落位保留 +
+  Error 明示损坏，7+2 个测试断言同步）
+- gen≥4 换源残留 .part 永久泄漏（枚举 0..=255）；finalize_part 预删
+  dest 数据丢失窗口（直接 rename 原子覆盖，Bug C/P2-17 双语义收敛）
+
+### Provider 与引擎
+- **匿名设备号配对**（P0-6）：单一 did32 缓存——原三调用点各自重新生成，
+  captcha_token 与 x-device-id 不匹配致匿名分享解析 100% 失败
+- **夸克/迅雷任务 ID 碰撞**（P0-8/9）：原子序号——同分享并发任务不再
+  互相覆盖句柄（文件内容错配根除）
+- **provider 并发闸门生效**（P1-17）：coordinator 层 RAII 占位——原
+  `busy < limit` 恒真（全仓无递增点），100 兜底任务可同时打进同一 provider
+- **refresh_auth 持锁跨 await**：三段式（快照→锁外网络刷新→CAS 回写）
+- **迅雷引擎孤儿任务**（P0-13）：start 失败回滚登记 + best-effort 删除
+- **cid_store 二次方爆炸**（P0-14，已实证 384KB 输入 6s + 95 万候选）：
+  二分查找 + 候选上限 + BTreeMap 区间（O(n²)→O(n log n)）
+- **bdecode 截断输入**（P1-23）：unterminated dict/list 报错——被截断的
+  fastresume 原「校验通过」
+- **XLTaskFlow ABI 漂移**（P1-24）：补 packed（实际 size 32 与声明 0x18
+  漂 8 字节）+ 断言补入回归
+- **xunlei Unknown 状态伪装**（P1-19）：映射 Error 不再伪装下载中
+- **xudt frame 32 位回绕**（P1-22）：checked_add
+
+### daemon 与运维
+- **设置即执行**（P0-10）：`PUT /settings` 配置 completion_action 不再
+  立即关机/退出（动作只由任务完成事件触发）
+- **RSS 持锁落盘**（P1-9，6 处）：锁内快照锁外写盘；**未处理条目上限**
+  （P1-10，5000/feed 防内存爆）
+- **热重载校验同口径**：负 share_ratio 等启动被拒的值不再热重载静默生效
+- **持久化 fsync**（tasks.json/bans.json/quark cookie/NAS token）：0600
+  先建后写 + sync_all（掉电丢全部任务/凭据可读窗口根除）
+- **lockfile unlink 竞态**：Drop 只 unlock 不删文件（防双实例）
+- **FTP PASV 值域校验**（P1-4）/ is_terminal 死代码（P1-5）/ SFTP 终态
+  判定文案脆性（P1-6）
+- **长驻循环启动盲区**（P2-8）：三处循环先工作后 sleep
+- **`DELETE /security/bans` 带 body**（P2-1）：新增 POST unban 端点；
+  **tokenless Host 缺失**（P2-3）改 fail-closed
+
+### 架构与文档
+- 幽灵依赖消除（xunlei-convert → xunlei-ffi 删除）；daemon nas feature
+  真正转发 btcore 校准版
+- 版本号全线统一 0.2.3（workspace/desktop/tauri.conf）；LICENSE-MIT +
+  LICENSE-APACHE 补齐（deny.toml 门禁合规硬缺口）
+- LOCK_MODEL.md 勘误：autosave 例外边如实登记 + 审计方法盲区章节
+  （`_` 前缀命名漏报机制）；BACKLOG 登记 A0 技术债（bencode 统一/
+  trait 拆分等 4 项架构演进）；D28 同号两义改名 DX-P2P-EXCL
+- README 文档地图 5→12 条；xunlei-import feature 编译修复（ContentIdentity
+  新字段未跟上，上游预存）
+
+### 验证
+- workspace（排除 btcore）997 passed / 0 failed（基线 983 + 14 新回归）
+- daemon `--features bt,ftp,sftp,xunlei-import` 433 passed 全绿；
+  btcore 42 passed；provider 164 passed；xunlei-convert 22 + ffi 8 passed
+- repro/p0repro 23 passed（3 个缺陷实证全部转绿为回归守护）
+- cargo clippy 0 error 0 warning（新引入代码）
+
 ## [0.2.2] - 2026-09-08
 
 第七轮收尾批次（batch7）：batch6 遗留 5 项暂缓缺陷全部落地 + 回归测试；
