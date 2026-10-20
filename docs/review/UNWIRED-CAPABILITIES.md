@@ -175,6 +175,11 @@ async fn http_429_is_retried_and_succeeds() {
 
 ## 2. 🔴 `SchedulerEvent::Progress` / `Speed` —— 生产代码零发布
 
+> **✅ 已修复（2026-10-20，PR #117）**：`poll_engine_states` 活跃轮次现在发布
+> Speed/Progress（HTTP 族 Downloading 双发；BT 下载双发、做种仅 Speed；终态
+> 轮次不发）+ 回归测试 ×5。Step 1 落地。Step 2（BT alert 流 500ms 侧补发）
+> 与 Step 3（轮询间隔 2s→500ms）为后续优化，未含在该 PR。
+
 ### 现状
 
 我写脚本严格排除 `#[cfg(test)]` 后验证：

@@ -700,14 +700,20 @@ async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Back
     };
     let inner2 = inner.clone();
     let tid2 = tid.clone();
-    // 任务级限速优先，未登记回退全局（与 FTP/HTTP 同口径）；登记条目
-    // 已在 set_limits 时串联全局上游（E16），此处直接取用即可。
-    let limiter = inner
-        .limiters
-        .lock()
-        .get(&tid)
-        .cloned()
-        .unwrap_or_else(|| inner.limiter.clone());
+    // 任务级限速「登记式取用」（与 FTP/HTTP 同口径；修复：运行中首次
+    // 设限不热调）：未登记任务以「不限速(0) + 串联全局上游」条目占位——
+    // 本循环持有的 Arc 与 set_limits 热调分支（Some → set_rate_kb_s）操作
+    // 同一实例。旧实现未登记时回退捕获全局 Arc，首次 set_limits 的 insert
+    // 产物无人消费（要等下一次 spawn 才生效——恢复重放 add→set_limits
+    // 立即下发即中招）。E16 串联语义不变：占位条目 rate=0 仅受全局上游
+    // 约束，与直接持全局 Arc 行为一致。
+    let limiter = {
+        let mut limiters = inner.limiters.lock();
+        limiters
+            .entry(tid.clone())
+            .or_insert_with(|| Arc::new(RateLimiter::new_chained(0, &inner.limiter)))
+            .clone()
+    };
     let sequential = {
         let tasks = inner.tasks.lock();
         tasks.get(&tid).map(|t| t.sequential).unwrap_or(false)

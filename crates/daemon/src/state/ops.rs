@@ -3899,6 +3899,22 @@ impl DaemonState {
                 // metadata.name 空缺 → 幂等回填 + 事件（E9 同语义：一次成功
                 // 后 name 非 None 自然停）。快照缓存照旧整体入缓存。
                 let seeding_since = self.cache_bt_poll(&id, &st);
+                // D36 补线（BT）：速率/进度事件——alert 流只管状态迁移，
+                // 速率快照此前仅存缓存不出事件。做种只发 Speed（up_rate 对
+                // UI/统计有意义；进度恒满无信息量）。置于执法前：达标暂停
+                // 轮次不追发（Paused 后的 Speed 是噪声）。
+                self.hub.publish(SchedulerEvent::Speed {
+                    task_id: id.clone(),
+                    down_rate: st.down_rate,
+                    up_rate: st.up_rate,
+                });
+                if st.state != EngineState::Seeding {
+                    self.hub.publish(SchedulerEvent::Progress {
+                        task_id: id.clone(),
+                        done: st.total_done,
+                        total: st.total,
+                    });
+                }
                 // F3/Task 39 执法：share_ratio（E33 all-time 口径，与快照字段
                 // 同源）+ 做种时长（seeding_since 起算）。仅 Seeding 态触发；
                 // 达阈值 → 完整 pause 语义（记录同步 Paused + autosave + 广播，
@@ -3959,6 +3975,23 @@ impl DaemonState {
             }
             if advanced.is_some() {
                 self.autosave(); // 锁外落盘：终态/推进落盘（修复 Bug B 重入自死锁）
+            }
+            // D36 补线：Speed/Progress 事件生产者（原为全仓库零生产者的设计缺口
+            // ——Throttler 1s 合并、UI SSE 路由、快照跳号补拉均已就位，唯独
+            // 没人发事件；UI 速率列只能依赖 2s 快照轮询）。引擎报 Downloading
+            // 的活跃轮次发双事件（终态/失败轮次不发：避免 Completed 之后
+            // 还追发 Speed{0}）。锁外发布：hub 自带锁，不与 tasks 锁嵌套。
+            if st.state == EngineState::Downloading {
+                self.hub.publish(SchedulerEvent::Speed {
+                    task_id: id.clone(),
+                    down_rate: st.down_rate,
+                    up_rate: st.up_rate,
+                });
+                self.hub.publish(SchedulerEvent::Progress {
+                    task_id: id.clone(),
+                    done: st.total_done,
+                    total: st.total,
+                });
             }
             // 仅真迁移产生 effect（to==from 的纯回填轮次不广播）；
             // E30：to 取拦截后的实际目标（重试安排 = Queued，非引擎报的 Failed）
