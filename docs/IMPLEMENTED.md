@@ -517,7 +517,7 @@ httpdl(ftp) 179 / lib 单元 134 全绿。每项独立 PR + CI 三 job 全绿后
   btcore 是 feature 门控依赖，config 层本地同步）；`BtEngine::new` 扩参 10 参
   （`#[allow(clippy::too_many_arguments)]`）；`/config` 快照新增
   `bt_enable_pex` / `bt_enable_utp` / `bt_encrypt` 三键。
-- `config.toml.example` [bt] 段同步三键注释。
+- `crates/daemon/config.toml.example` [bt] 段同步三键注释。
 
 **验证**：btcore 37/0（基线 35 + `apply_transport_smoke_roundtrip`（uTP 两态 ×
 加密三态全组合）+ `parse_encrypt_policy_variants`）；daemon default 266/0、

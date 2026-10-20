@@ -170,6 +170,40 @@ fn looks_like_hash(s: &str) -> bool {
     (s.len() == 32 || s.len() == 40 || s.len() == 64) && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
+/// 路径近邻查找（P0-14 二分化，PR #114 催修校准）：
+/// paths 需按 off 升序。两函数与 main 原线性实现【逐点等价】
+///（等价性回归测试见 tests::neighbor_lookup_matches_linear_reference）：
+/// - `find_after` ≡ `find(|&(off,_)| off > i && off <= i + 64 + hlen)`
+/// - `find_before` ≡ `rev().find(|&(off,_)| off < i && i <= off + 64)`
+///
+/// 等价性依据（单调性）：
+/// - after：`off <= i + 64 + hlen` 随 off 单调递减 → 首个 `off > i` 的条目
+///   不满足窗口时，其后条目同样不满足；
+/// - before：`i <= off + 64`（即 `off >= i - 64`）随 off 单调递增 → 最后一个
+///   `off < i` 的条目不满足窗口时，更早的条目同样不满足。
+///
+/// 催修复现的缺陷（已修）：before 若复用 `partition_point(off <= i)` 的前驱，
+/// 在存在 `off == i` 条目时会把【窗口自身】当相邻路径（hash↔path 配对错乱）。
+/// 必须用独立的 `partition_point(off < i)`。
+fn find_after(paths: &[(usize, String)], i: usize, hlen: usize) -> Option<(usize, &str)> {
+    let gt_i = paths.partition_point(|&(off, _)| off <= i);
+    paths
+        .get(gt_i)
+        .filter(|&&(off, _)| off <= i + 64 + hlen)
+        .map(|&(off, ref s)| (off, s.as_str()))
+}
+
+fn find_before(paths: &[(usize, String)], i: usize) -> Option<(usize, &str)> {
+    let lt_i = paths.partition_point(|&(off, _)| off < i);
+    if lt_i > 0 {
+        Some(&paths[lt_i - 1])
+            .filter(|&&(off, _)| i <= off + 64)
+            .map(|&(off, ref s)| (off, s.as_str()))
+    } else {
+        None
+    }
+}
+
 /// 二进制形态（TLV 或裸启发式）：hash 块 × 相邻路径串 配对。
 ///
 /// `tlv_mode=true`（XDLCTX 同族）时要求 hash 块前有可读 tag 字节；
@@ -197,6 +231,16 @@ fn extract_binary_entries(
     let hash_lens = [16usize, 20, 32];
     // 候选收集：hash 窗口（不可打印+随机）× 最近路径，按 gap（路径起点到窗口终点的距离）升序贪心接受，
     // 已接受窗口重叠的候选跳过 —— 避免把 tag 字节并入 hash（对齐歧义）。
+    //
+    // P0-14 修复（二次方爆炸，已实证 384KB 输入 6 秒 + 95 万候选）：
+    // ① 路径查找改二分（paths 已按 offset 排序，partition_point）——
+    //    原实现每个候选 O(#paths) 线性扫 ×2（after/before），输入每翻倍
+    //    时间×3-4（真实 cid_store.dat 是 hash+路径交错形态，用户导入即命中）；
+    // ② 候选总量上限 CAP（10_000）——原实现无上限 push，384KB 产生 95 万
+    //    候选每个带 path.clone()，内存放大数百倍；
+    // ③ 重叠判定改 BTreeMap 区间查询——原 taken_windows 线性扫每候选
+    //    O(#taken)。
+    const MAX_CANDS: usize = 10_000;
     #[derive(Clone)]
     struct Cand {
         off: usize,
@@ -210,17 +254,15 @@ fn extract_binary_entries(
         while i + hlen <= bytes.len() {
             let win = &bytes[i..i + hlen];
             if !is_printable(win) && looks_random(win) {
-                let after = paths
-                    .iter()
-                    .find(|&&(off, _)| off > i && off <= i + 64 + hlen);
-                let before = paths
-                    .iter()
-                    .rev()
-                    .find(|&&(off, _)| off < i && i <= off + 64);
+                // ① 二分：首个 off > i 的路径（paths 已按 off 升序）
+                let after = find_after(&paths, i, hlen);
+                // ① 二分：最后一个严格 off < i 的路径（独立 partition_point，
+                //    见 find_before 文档注释——催修复现的 off == i 自匹配缺陷）
+                let before = find_before(&paths, i);
                 let pick = after
-                    .map(|&(po, ref s)| (po, s, (po as i64 - (i + hlen) as i64).abs()))
+                    .map(|(po, s)| (po, s, (po as i64 - (i + hlen) as i64).abs()))
                     .or_else(|| {
-                        before.map(|&(po, ref s)| (po, s, (i as i64 - (po + s.len()) as i64).abs()))
+                        before.map(|(po, s)| (po, s, (i as i64 - (po + s.len()) as i64).abs()))
                     });
                 if let Some((_po, s, gap)) = pick {
                     let tag_ok = !tlv_mode
@@ -229,23 +271,42 @@ fn extract_binary_entries(
                         cands.push(Cand {
                             off: i,
                             hlen,
-                            path: s.clone(),
+                            path: s.to_string(),
                             gap,
                         });
+                        // ② 候选上限：防极端输入（随机块+路径交替的海量窗口）
+                        //    撑爆内存——截断后仅损失 best-effort 精度
+                        if cands.len() >= MAX_CANDS {
+                            break;
+                        }
                     }
                 }
             }
             i += 1;
         }
+        if cands.len() >= MAX_CANDS {
+            break;
+        }
     }
     cands.sort_by_key(|c| (c.gap, c.off));
-    let mut taken_windows: Vec<(usize, usize)> = Vec::new();
+    // ③ 重叠判定：BTreeMap 区间（start → end），每候选 O(log n)
+    let mut taken_windows: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
     for c in cands {
-        let win = (c.off, c.off + c.hlen);
-        if taken_windows.iter().any(|&(s, e)| c.off < e && win.1 > s) {
+        let (s, e) = (c.off, c.off + c.hlen);
+        // 前驱区间 end > s 或后继区间 start < e → 重叠
+        let overlapped = taken_windows
+            .range(..=s)
+            .next_back()
+            .is_some_and(|(_, &pe)| pe > s)
+            || taken_windows
+                .range(s..)
+                .next()
+                .is_some_and(|(&ns, _)| ns < e);
+        if overlapped {
             continue; // 与已接受窗口重叠 → 跳过（保最小 gap 的对齐候选）
         }
-        taken_windows.push(win);
+        taken_windows.insert(s, e);
         out.push(CidStoreEntry {
             hash_hex: hex::encode(&bytes[c.off..c.off + c.hlen]),
             hash_len: c.hlen,
@@ -395,5 +456,142 @@ mod tests {
     fn tiny_file_no_panic() {
         assert_eq!(analyze_cid_store(&[1, 2, 3]).1.len(), 0);
         assert_eq!(analyze_cid_store(&[]).0.file_size, 0);
+    }
+
+    /// P0-14 回归（整合批）：真实 cid_store.dat 形态（随机 hash 块 + 路径串
+    /// 交替）必须线性时间完成——原实现三处线性扫描叠加呈二次方爆炸，
+    /// 384KB 输入实测 6s（repro/p0repro round5 实证：输入每翻倍耗时 ×3-4）。
+    /// 512KB 输入修复后应为亚秒级；2s 上限给 debug 构建留 20 倍余量。
+    #[test]
+    fn hash_path_alternating_linear_time() {
+        let mut buf: Vec<u8> = Vec::with_capacity(512 * 1024);
+        let mut rng: u64 = 0x1234_5678_9abc_def0;
+        let mut next = || -> u64 {
+            // xorshift64（测试确定性，无需密码学质量）
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        while buf.len() < 512 * 1024 {
+            // 32 字节随机块（hash 形态：不可打印 + 高熵）
+            let h = next().to_le_bytes();
+            let h2 = next().to_le_bytes();
+            buf.extend_from_slice(&h);
+            buf.extend_from_slice(&h2);
+            buf.extend_from_slice(&h);
+            buf.extend_from_slice(&h2);
+            // 路径串（可打印 + 路径特征字符）
+            buf.extend_from_slice(
+                format!("/home/user/dl/file_{}.rar\n", next() % 99999).as_bytes(),
+            );
+        }
+        let t0 = std::time::Instant::now();
+        let (_report, entries) = analyze_cid_store(&buf);
+        let el = t0.elapsed();
+        assert!(
+            el < std::time::Duration::from_secs(2),
+            "512KB hash+路径交替输入必须在 2s 内完成（P0-14 二次方回归），实际 {el:?}"
+        );
+        assert!(!entries.is_empty(), "hash+路径交替形态应产出候选条目");
+    }
+
+    /// P0-14 回归（整合批）：纯可打印大输入（无随机块）快速完成——对照组，
+    /// 锁定「复杂度由随机块×路径邻近配对驱动，而非输入大小本身」。
+    #[test]
+    fn printable_only_large_input_fast() {
+        let mut buf: Vec<u8> = Vec::with_capacity(512 * 1024);
+        let mut i = 0u64;
+        while buf.len() < 512 * 1024 {
+            buf.extend_from_slice(format!("path segment {} /dir/file.txt ", i).as_bytes());
+            i += 1;
+        }
+        let t0 = std::time::Instant::now();
+        let (_r, entries) = analyze_cid_store(&buf);
+        let el = t0.elapsed();
+        assert!(
+            el < std::time::Duration::from_secs(2),
+            "纯可打印输入应快速: {el:?}"
+        );
+        assert_eq!(entries.len(), 0, "无随机块 → 无候选");
+    }
+
+    /// PR #114 催修 P0-1 回归：单条路径 off == 窗口起点 i 时，
+    /// before 必须是 None——不能把【窗口自身】当前驱。
+    /// 原缺陷写法（复用 partition_point(off <= i) 的前驱）会返回 Some((51, "p0"))。
+    #[test]
+    fn before_neighbor_requires_strictly_less_offset() {
+        let paths = vec![(51usize, "p0".to_string())];
+        // off == i：不是严格小于 → None
+        assert_eq!(find_before(&paths, 51), None);
+        // i 在窗口内前方（i <= off + 64 且 i > off）→ 命中
+        assert_eq!(find_before(&paths, 52), Some((51, "p0")));
+        assert_eq!(find_before(&paths, 115), Some((51, "p0")));
+        // i 超出窗口（i > off + 64）→ None
+        assert_eq!(find_before(&paths, 116), None);
+        // i 在 off 之前 → after 侧负责，before 为 None
+        assert_eq!(find_before(&paths, 50), None);
+    }
+
+    /// PR #114 催修 P0-1 回归：二分近邻查找与 main 原线性实现【逐点等价】
+    /// （随机属性测试——审查者 repro round10.rs 同口径：多 seed × 多密度，
+    /// 覆盖 off == i / off 重叠窗口 / 窗口边界 i-64 / i+64+hlen 等分支）。
+    /// 原缺陷写法在 off == i 存在时把窗口自身当前驱（实测 243/8889 不一致）。
+    #[test]
+    fn neighbor_lookup_matches_linear_reference() {
+        // main 原线性实现（等价性基准，逐字复刻）
+        let lin_after = |paths: &[(usize, String)], i: usize, hlen: usize| {
+            paths
+                .iter()
+                .find(|&&(off, _)| off > i && off <= i + 64 + hlen)
+                .map(|&(off, ref s)| (off, s.clone()))
+        };
+        let lin_before = |paths: &[(usize, String)], i: usize| {
+            paths
+                .iter()
+                .rev()
+                .find(|&&(off, _)| off < i && i <= off + 64)
+                .map(|&(off, ref s)| (off, s.clone()))
+        };
+        let bin_after =
+            |paths: &[(usize, String)], i: usize, hlen: usize| -> Option<(usize, String)> {
+                find_after(paths, i, hlen).map(|(off, s)| (off, s.to_string()))
+            };
+        let bin_before = |paths: &[(usize, String)], i: usize| -> Option<(usize, String)> {
+            find_before(paths, i).map(|(off, s)| (off, s.to_string()))
+        };
+
+        for seed in [0xdead_beefu64, 0x1234_5678u64, 0xcafe_babeu64, 42, 1] {
+            let mut rng = seed;
+            let mut next = || -> u64 {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            for _case in 0..40 {
+                // 路径集：off 落在窄域（高密度触发 off == i 与重叠窗口）
+                let n = 1 + (next() % 24) as usize;
+                let mut paths: Vec<(usize, String)> = (0..n)
+                    .map(|k| ((next() % 200) as usize, format!("p{k}_{}", next() % 1000)))
+                    .collect();
+                paths.sort_by_key(|&(off, _)| off);
+                // 检查点：密集扫 [0, 300) 全量 + hash 三种长度
+                for i in 0..300usize {
+                    for &hlen in &[16usize, 20, 32] {
+                        assert_eq!(
+                            bin_after(&paths, i, hlen),
+                            lin_after(&paths, i, hlen),
+                            "after 不等价: seed={seed:#x} i={i} hlen={hlen} paths={paths:?}"
+                        );
+                        assert_eq!(
+                            bin_before(&paths, i),
+                            lin_before(&paths, i),
+                            "before 不等价: seed={seed:#x} i={i} paths={paths:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

@@ -42,6 +42,32 @@ pub fn verify_file(path: &Path, expected_hex: &str) -> io::Result<bool> {
     Ok(sha256_file(path)? == expected_hex)
 }
 
+/// P0-4（防御纵深层）：无摘要任务的空洞文件兜底校验——完全稀疏
+/// （`blocks == 0` 且 `size > 0`）= `set_len` 预分配后从未写入任何字节。
+/// 写入操作总是分配块（即使写全零内容），故 blocks == 0 是「零写入」的
+/// 铁证，不会误伤合法全零内容文件；长度检查因预分配天然相等而失效的
+/// 场景（磁盘满时 set_len 稀疏成功 + 崩溃后账本续传跳过）由此捕获。
+/// 空文件（size == 0）合法放行；块信息不可得的平台（非 Unix）保守放行
+/// （无证据不定罪，段级 fsync 顺序保证仍是主防线）。
+pub fn verify_nonempty_blocks(path: &Path) -> io::Result<bool> {
+    let md = std::fs::metadata(path)?;
+    if md.len() == 0 {
+        return Ok(true); // 空文件：下载空内容合法
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if md.blocks() == 0 {
+            tracing::warn!(
+                "verify: {path:?} 完全稀疏（{} 字节零块分配）——疑似预分配空洞文件",
+                md.len()
+            );
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// 计算文件 SHA1（hex，E25 主源校验算法之一）。
 pub fn sha1_file(path: &Path) -> io::Result<String> {
     let mut h = Sha1::new();

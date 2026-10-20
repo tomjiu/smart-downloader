@@ -101,6 +101,10 @@ pub struct QuarkProvider {
     tasks: Arc<AsyncMutex<HashMap<ProviderTaskId, QuarkTaskHandle>>>,
     /// 自动冷却：失败后该时刻前不参与 fallback 选择（对齐 xunlei）。
     backoff_until: Arc<Mutex<Option<std::time::Instant>>>,
+    /// 任务句柄序号（P0-8 修复）：pwd_id 对同一分享是常量，同分享并发/
+    /// resubmit 会互相覆盖句柄 → resolve 拿到别人的 fids 直链（文件内容
+    /// 错配写入磁盘）。对齐 MockProvider::next_id 原子自增模式。
+    next_seq: std::sync::atomic::AtomicU64,
 }
 
 /// 直链保守有效期（秒）：夸克直链实测分钟级失效，
@@ -117,6 +121,7 @@ impl QuarkProvider {
             cookie_path,
             tasks: Arc::new(AsyncMutex::new(HashMap::new())),
             backoff_until: Arc::new(Mutex::new(None)),
+            next_seq: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -212,7 +217,13 @@ impl QuarkProvider {
             .share_save(&auth, &link.pwd_id, &stoken, "0", &fids)
             .await
             .map_err(ProviderError::from)?;
-        let pid = format!("{}-{}", self.name, link.pwd_id);
+        // P0-8 修复：pwd_id + 原子序号——同分享并发任务不再互相覆盖句柄
+        //（原实现 pwd_id 常量作 key，后写覆盖前者 → resolve 拿到别人的
+        // fids 直链 → 文件内容错配写入磁盘）。
+        let seq = self
+            .next_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = format!("{}-{}-{}", self.name, link.pwd_id, seq);
         self.tasks
             .lock()
             .await

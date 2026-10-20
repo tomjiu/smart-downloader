@@ -129,8 +129,14 @@ TOML 配置（默认 `./config.toml`，任务状态 `./tasks.json`）：`[downlo
 | [`docs/IMPLEMENTED.md`](docs/IMPLEMENTED.md) | 已实现档案（行为契约 / API / 验证证据） |
 | [`docs/PROJECT_STATUS.md`](docs/PROJECT_STATUS.md) | 四条主线现状交接报告 |
 | [`docs/CAPABILITY_MAP.md`](docs/CAPABILITY_MAP.md) | 远期能力地图（BiglyBT/aria2/eMule 对标） |
+| [`docs/LOCK_MODEL.md`](docs/LOCK_MODEL.md) | 并发锁模型（不变量 / 审计方法 / 加锁规约） |
+| [`docs/SECURITY_AUDIT.md`](docs/SECURITY_AUDIT.md) | 安全审计记录 |
+| [`docs/review/`](docs/review/) | 2026-10-16 三轮后端审查 + 架构评审（缺陷清单与修复依据） |
+| [`repro/p0repro/`](repro/p0repro/) | P0 缺陷复现工程（独立 crate，含修复后回归守护） |
 | [`docs/nas/`](docs/nas/) | NAS 场景校准结论（A2–A6） |
 | [`docs/ANDROID_TERMUX_DEPLOY.md`](docs/ANDROID_TERMUX_DEPLOY.md) | Android/Termux 部署 |
+| [`docs/BT_LOCAL_BUILD.md`](docs/BT_LOCAL_BUILD.md) | BT 本地构建指南 |
+| [`docs/FOUR_PLATFORM_ACCEPTANCE_PLAYBOOK.md`](docs/FOUR_PLATFORM_ACCEPTANCE_PLAYBOOK.md) | 四平台验收手册 |
 
 ## 仓库说明
 
