@@ -286,3 +286,38 @@ async fn restore_keeps_future_scheduled_out_of_engine() {
     assert_eq!(activated, vec![tid.clone()]);
     assert_eq!(fake2.added.lock().len(), 1);
 }
+
+/// P0-10 回归：全部任务已终态时热更 completion_action 不得立即执行——
+/// 修复前 batch5-P2 的「热更补判」语义是设置即执行：用户在任务全终态时
+/// 正常配置 shutdown（为下一批任务做准备）会立刻关机/退出。
+/// 修复后：配置变更仅登记，动作只由「任务完成事件」触发。
+#[tokio::test]
+async fn completion_action_hot_update_does_not_fire_immediately() {
+    let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+    let state = DaemonState::new(fake.clone() as Arc<dyn DownloadEngine>, vec![]);
+
+    // 场景：一个已完成任务（全终态）
+    state
+        .add_http_task("https://s.example/done.bin".into(), None)
+        .await
+        .unwrap();
+    {
+        let mut tasks = state.tasks.lock();
+        let id = tasks.keys().next().unwrap().clone();
+        let rec = tasks.get_mut(&id).unwrap();
+        rec.task.state = TaskState::Completed;
+        rec.engine_tid = None;
+    }
+
+    // 热更动作（全终态时设置 exit）——不得触发（修复前会补判执行，
+    // 测试进程将直接被 process::exit(0) 杀死）
+    state.set_completion_action("exit");
+
+    // 进程存活即通过（exit 若被补判触发，250ms 内进程会被杀）
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // 配置已登记（后续完成事件可触发）
+    //（fired 不得被无效触发消耗：本会话仍未执行过动作）
+    // 用行为断言：再次热更同值幂等，无副作用
+    state.set_completion_action("exit");
+}

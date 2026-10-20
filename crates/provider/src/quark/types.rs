@@ -58,12 +58,23 @@ pub fn save_auth(path: &std::path::Path, auth: &QuarkAuth) -> std::io::Result<()
         }
     }
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &serialized)?;
+    // 审计修复（batch10-F）：OpenOptions.mode(0o600) 先建后写——原实现
+    // fs::write 先以 0644 创建再 chmod，存在凭据可读窗口（注释自认
+    // "此前漏同步"却只改了注释未改实现语义）。对齐 xunlei/auth.rs 配方。
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
-    }
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?
+    };
+    #[cfg(not(unix))]
+    let mut f = std::fs::File::create(&tmp)?;
+    std::io::Write::write_all(&mut f, serialized.as_bytes())?;
+    drop(f);
     std::fs::rename(&tmp, path)?;
     #[cfg(unix)]
     {

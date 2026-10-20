@@ -11,6 +11,15 @@
 > **已完成事项的集中档案见 [`IMPLEMENTED.md`](IMPLEMENTED.md)**（行为契约/配置/API/验证证据）。
 > 本文档 = 一切**未实现**事项的总清单。排序：迅雷云盘线（当前主线）→ 研究尾巴 → 通用缺口 → 明确排除 → 未来愿景。
 
+## A0. 技术债（架构审查 2026-10-16 登记项）
+
+| # | 项 | 状态 | 说明 |
+|---|---|---|---|
+| TD-1 | **bencode 统一到 `core::bencode`** | 待做（中成本重构） | 全仓 5 文件 17 个 bencode 相关函数（core::bencode 唯一具备 MAX_DEPTH/checked 防护；bt_alerts.rs 扫描器与 infohash 原始 span 定位耦合；xunlei-convert/fastresume.rs 自带编码器配套 bdecode——batch10 已修其截断缺陷）。P0 级除零缺陷（bt_alerts）已于 batch10-a 修复消除直接风险；统一属架构收敛演进项，涉及 3 crate 接口变更 + 全量测试回归，建议独立 PR 实施。 |
+| TD-2 | **拆分 `DownloadEngine` trait**（40 方法 → 最小契约 + BtExt/HttpExt 扩展） | 待做（中成本重构） | 生产代码 33 处运行时 EngineKind 判断（ops.rs 14 处）；`HttpEngine::peers()` 返回空 Vec 撒谎而非报错。架构审查 §6 建议 5。 |
+| TD-3 | `core` 的 I/O 下沉（session/{output,manager,single_instance} 独立 storage crate） | 待做 | core 自述"纯逻辑"但含 ~590 行 fs I/O。架构审查 §6 建议 6。 |
+| TD-4 | `daemon/bt.rs` 移入 btcore；rss.rs 独立 crate；ops.rs 按域拆分 | 待做 | 架构审查 §6 建议 8/9/10（纯移动）。 |
+
 ## A. 迅雷云盘线（当前主线，按依赖排序）
 
 > 2026-08-25 大修：F2/F2.1 的「私有流格式」前提被推翻——铁证见 [`NOTES_F3_DIRECT_DOWNLOAD_POC.md`](../scripts/research/cloud_delivery/NOTES_F3_DIRECT_DOWNLOAD_POC.md) §2（26MB 全量 MD5 与云端逐字节一致 = 原始文件，「任何加密/转封装/私有容器假设被彻底排除」），[`RECON_PRIVATE_FORMAT.md`](../scripts/research/cloud_delivery/RECON_PRIVATE_FORMAT.md) 交叉印证（前置侦察）。旧 NOTES_STREAM_FORMAT 的「私有容器实锤」判定作废，样本随档移入 `_ARCHIVE/obsolete_docs/`。
@@ -67,7 +76,7 @@
 
 ## D. 明确排除（决策，不开发）
 
-- 迅雷私有 P2P 加速引擎（D28：纯 libtorrent；且 PHub 离线不可实现、DCDN 接入协议未公开）
+- 迅雷私有 P2P 加速引擎（DX-P2P-EXCL：纯 libtorrent；且 PHub 离线不可实现、DCDN 接入协议未公开。原名 "D28" 与 design 文档的 D28（FFI 绑定工具）同号冲突，batch10 改名 DX-P2P-EXCL 消歧）
 
 ## E. 未来愿景（仅记录，不讨论设计）
 

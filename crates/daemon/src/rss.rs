@@ -626,6 +626,14 @@ impl DaemonState {
         }
     }
 
+    /// P1-9 修复：锁外落盘辅助——克隆快照后释放调用方 guard 再序列化写盘。
+    /// 原实现全部调用点持 rss_state 锁调 rss_save（整表 JSON 序列化 +
+    /// 磁盘写毫秒级），并发 add/update/refresh/规则匹配全部串行排队。
+    /// 调用方在临界区内收集变更后，用本方法在锁外落盘。
+    fn rss_save_snapshot(&self, snapshot: &RssState) {
+        self.rss_save(snapshot);
+    }
+
     /// 添加订阅（立即拉取一次，失败即 Err——坏 URL 不应静默入列）。
     pub async fn rss_add_feed(&self, url: String) -> Result<(u64, String, usize), DaemonError> {
         let client = self.rss_client();
@@ -661,54 +669,65 @@ impl DaemonState {
         let xml = String::from_utf8_lossy(&xml_buf).into_owned();
         let parsed = parse_feed(&xml).map_err(DaemonError::InvalidSource)?;
 
-        let mut st = self.rss_state().lock();
-        // 同 URL 订阅去重（409 语义由 handler 转）
-        if st.feeds.iter().any(|f| f.url == url) {
-            return Err(DaemonError::Duplicate(url));
-        }
-        st.next_feed_id += 1;
-        let id = st.next_feed_id;
-        let title = if parsed.title.is_empty() {
-            url.clone()
-        } else {
-            parsed.title
+        let (id, title_out, count, snapshot) = {
+            let mut st = self.rss_state().lock();
+            // 同 URL 订阅去重（409 语义由 handler 转）
+            if st.feeds.iter().any(|f| f.url == url) {
+                return Err(DaemonError::Duplicate(url));
+            }
+            st.next_feed_id += 1;
+            let id = st.next_feed_id;
+            let title = if parsed.title.is_empty() {
+                url.clone()
+            } else {
+                parsed.title
+            };
+            let count = parsed.items.len();
+            st.feeds.push(RssFeed {
+                id,
+                url,
+                title,
+                added_at_unix: now_unix(),
+                last_refresh_unix: Some(now_unix()),
+                interval_override_secs: 0,
+                items: parsed.items,
+            });
+            let title_out = st.feeds.last().unwrap().title.clone();
+            (id, title_out, count, st.clone())
         };
-        let count = parsed.items.len();
-        st.feeds.push(RssFeed {
-            id,
-            url,
-            title,
-            added_at_unix: now_unix(),
-            last_refresh_unix: Some(now_unix()),
-            interval_override_secs: 0,
-            items: parsed.items,
-        });
-        self.rss_save(&st);
-        Ok((id, st.feeds.last().unwrap().title.clone(), count))
+        // P1-9：锁外落盘（原锁内整表 JSON 写盘阻塞并发操作）
+        self.rss_save_snapshot(&snapshot);
+        Ok((id, title_out, count))
     }
 
     /// 更新订阅设置（batch5.1）：interval_override_secs（0 = 跟随全局）。
     /// 未知 id → Err NotFound。
     pub fn rss_update_feed(&self, id: u64, interval_override_secs: u64) -> Result<(), DaemonError> {
-        let mut st = self.rss_state().lock();
-        let feed = st
-            .feeds
-            .iter_mut()
-            .find(|f| f.id == id)
-            .ok_or_else(|| DaemonError::NotFound(format!("feed {id} 不存在")))?;
-        feed.interval_override_secs = interval_override_secs;
-        self.rss_save(&st);
+        let snapshot = {
+            let mut st = self.rss_state().lock();
+            let feed = st
+                .feeds
+                .iter_mut()
+                .find(|f| f.id == id)
+                .ok_or_else(|| DaemonError::NotFound(format!("feed {id} 不存在")))?;
+            feed.interval_override_secs = interval_override_secs;
+            st.clone()
+        };
+        self.rss_save_snapshot(&snapshot); // P1-9：锁外落盘
         Ok(())
     }
 
     /// 移除订阅（未知 id → false）。
     pub fn rss_remove_feed(&self, id: u64) -> bool {
-        let mut st = self.rss_state().lock();
-        let before = st.feeds.len();
-        st.feeds.retain(|f| f.id != id);
-        let removed = st.feeds.len() != before;
+        let (removed, snapshot) = {
+            let mut st = self.rss_state().lock();
+            let before = st.feeds.len();
+            st.feeds.retain(|f| f.id != id);
+            let removed = st.feeds.len() != before;
+            (removed, st.clone())
+        };
         if removed {
-            self.rss_save(&st);
+            self.rss_save_snapshot(&snapshot); // P1-9：锁外落盘
         }
         removed
     }
@@ -761,38 +780,44 @@ impl DaemonState {
                 ));
             }
         }
-        let mut st = self.rss_state().lock();
-        if let Some(fid) = feed_id {
-            if !st.feeds.iter().any(|f| f.id == fid) {
-                return Err(DaemonError::InvalidSource(format!("feed_id {fid} 不存在")));
+        let (id, snapshot) = {
+            let mut st = self.rss_state().lock();
+            if let Some(fid) = feed_id {
+                if !st.feeds.iter().any(|f| f.id == fid) {
+                    return Err(DaemonError::InvalidSource(format!("feed_id {fid} 不存在")));
+                }
             }
-        }
-        st.next_rule_id += 1;
-        let id = st.next_rule_id;
-        st.rules.push(RssRule {
-            id,
-            name: name.trim().to_string(),
-            enabled,
-            must_contain,
-            must_not_contain,
-            feed_id,
-            tags,
-            dest,
-            use_regex,
-            episode_filter,
-        });
-        self.rss_save(&st);
+            st.next_rule_id += 1;
+            let id = st.next_rule_id;
+            st.rules.push(RssRule {
+                id,
+                name: name.trim().to_string(),
+                enabled,
+                must_contain,
+                must_not_contain,
+                feed_id,
+                tags,
+                dest,
+                use_regex,
+                episode_filter,
+            });
+            (id, st.clone())
+        };
+        self.rss_save_snapshot(&snapshot); // P1-9：锁外落盘
         Ok(id)
     }
 
     /// 移除规则（未知 id → false）。
     pub fn rss_remove_rule(&self, id: u64) -> bool {
-        let mut st = self.rss_state().lock();
-        let before = st.rules.len();
-        st.rules.retain(|r| r.id != id);
-        let removed = st.rules.len() != before;
+        let (removed, snapshot) = {
+            let mut st = self.rss_state().lock();
+            let before = st.rules.len();
+            st.rules.retain(|r| r.id != id);
+            let removed = st.rules.len() != before;
+            (removed, st.clone())
+        };
         if removed {
-            self.rss_save(&st);
+            self.rss_save_snapshot(&snapshot); // P1-9：锁外落盘
         }
         removed
     }
@@ -893,8 +918,13 @@ impl DaemonState {
                     feed.title = parsed.title;
                 }
                 // 防膨胀：已处理条目保留最近 N 条（N=[rss]
-                // max_processed_items_per_feed）；未处理条目全保留——截掉会丢
-                // 去重标记，源刷新时重复建任务。
+                // max_processed_items_per_feed）。
+                // P1-10 修复：未处理条目同样设上限（5000/feed）——原实现
+                // 「未处理全保留」在无规则命中/规则停用的 feed 上单调增长
+                // 撑爆内存（恶意/异常源可无限推条目）。超限丢弃最旧未处理
+                // 条目：被丢弃的旧条目若再次出现于源会重复建任务，但 5000
+                // 条未处理的积压本身已是异常态，内存防护优先。
+                const MAX_UNPROCESSED_PER_FEED: usize = 5000;
                 let cap = self.rss_max_processed_items();
                 let mut processed: Vec<RssItem> = feed
                     .items
@@ -902,11 +932,22 @@ impl DaemonState {
                     .filter(|i| i.task_id.is_some())
                     .cloned()
                     .collect();
+                let mut unprocessed: Vec<RssItem> = feed
+                    .items
+                    .iter()
+                    .filter(|i| i.task_id.is_none())
+                    .cloned()
+                    .collect();
                 if processed.len() > cap {
                     let keep = processed.split_off(processed.len() - cap);
-                    feed.items.retain(|i| i.task_id.is_none());
-                    feed.items.extend(keep);
+                    processed = keep;
                 }
+                if unprocessed.len() > MAX_UNPROCESSED_PER_FEED {
+                    let keep = unprocessed.split_off(unprocessed.len() - MAX_UNPROCESSED_PER_FEED);
+                    unprocessed = keep;
+                }
+                feed.items = processed;
+                feed.items.extend(unprocessed);
                 feed.items.clone()
             };
 
@@ -941,14 +982,19 @@ impl DaemonState {
                             if !rule.tags.is_empty() {
                                 let _ = self.set_task_tags(&task_id, Some(rule.tags.clone()));
                             }
-                            let mut st = self.rss_state().lock();
-                            if let Some(f) = st.feeds.iter_mut().find(|f| f.id == feed_id) {
-                                if let Some(it) = f.items.iter_mut().find(|i| i.guid == item.guid) {
-                                    it.task_id = Some(task_id.clone());
+                            // P1-9：锁内只改状态 + 克隆快照，锁外落盘
+                            let snapshot = {
+                                let mut st = self.rss_state().lock();
+                                if let Some(f) = st.feeds.iter_mut().find(|f| f.id == feed_id) {
+                                    if let Some(it) =
+                                        f.items.iter_mut().find(|i| i.guid == item.guid)
+                                    {
+                                        it.task_id = Some(task_id.clone());
+                                    }
                                 }
-                            }
-                            self.rss_save(&st);
-                            drop(st);
+                                st.clone()
+                            };
+                            self.rss_save_snapshot(&snapshot);
                             // 本地快照同步标记：后续规则跳过该条目
                             item.task_id = Some(task_id.clone());
                             matched += 1;

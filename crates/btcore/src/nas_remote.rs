@@ -438,28 +438,18 @@ impl DownloadEngine for NasRemoteEngine {
         Err(classify_error(st, &body))
     }
 
-    /// 超速申请（A4：仅 RUNNING 任务生效；body 空对象即可，配额 usage 独立）。
+    /// P1-16 修复：不再伪装实现 update_sources——原实现把「设备级超速申请」
+    /// （/device/v1/try_speed/apply，与任务无关的端点）塞进 update_sources
+    /// 的壳里：查了任务 id 却丢弃（_xlid），「形式满足契约、实质不相关」。
+    /// trait 契约语义是"该任务的源列表变更"，NAS 引擎不支持 → 明确
+    /// Unsupported（与同文件 add_url_seed 口径一致）。超速申请待提为
+    /// 独立接口（A4 校准资产保留在 docs/nas/A4_CALIBRATION_FINDINGS.md）。
     async fn update_sources(
         &self,
-        id: &EngineTaskId,
+        _id: &EngineTaskId,
         _urls: Vec<String>,
     ) -> Result<(), EngineError> {
-        let _xlid = self
-            .tasks
-            .lock()
-            .await
-            .get(id)
-            .cloned()
-            .ok_or(EngineError::NotFound)?;
-        let url = format!("{}/device/v1/try_speed/apply", self.cfg.base_url);
-        let payload = serde_json::json!({});
-        let (st, body) = self
-            .send_retry(reqwest::Method::POST, &url, Some(&payload), 10)
-            .await?;
-        if st == 200 {
-            return Ok(());
-        }
-        Err(classify_error(st, &body))
+        Err(EngineError::Unsupported)
     }
 
     async fn add_url_seed(&self, _id: &EngineTaskId, _url: &str) -> Result<(), EngineError> {

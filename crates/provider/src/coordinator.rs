@@ -9,7 +9,7 @@ use crate::types::{link_expired, now_unix, ProviderError, ProviderTaskId, Resolv
 use crate::RemoteProvider;
 use smart_dl_core::ownership::{decide_auto_fallback, FallbackDecision, FallbackPolicy};
 use smart_dl_core::task::DownloadTask;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -45,15 +45,55 @@ pub struct FallbackOutcome {
     pub transferred: Vec<String>,
 }
 
+/// P1-17 修复：per-provider 在途兜底 RAII 占位——原实现的并发闸门
+/// `rt.busy < rt.concurrency_limit` 恒真（全仓无 busy 递增点，三个构造点
+/// 全硬编码 0，仅 mock set_busy 供测试），「每 provider 并发上限 2」从未
+/// 生效 → 100 个兜底任务可同时打进同一 provider。coordinator 层计数：
+/// 进入 try_provider_fallback 前占位（超限换下一个），退出（成功/失败/
+/// panic 经 Drop）释放。
+struct BusyGuard {
+    busy: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
+    name: String,
+}
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        if let Some(c) = self.busy.lock().get_mut(&self.name) {
+            *c = c.saturating_sub(1);
+        }
+    }
+}
+
 /// 兜底协调器：Provider 列表 + FallbackPolicy。
 pub struct FallbackCoordinator {
     providers: Vec<Arc<dyn RemoteProvider>>,
     policy: FallbackPolicy,
+    /// P1-17：per-provider 在途兜底计数（名字 → 当前占用）。
+    busy: Arc<parking_lot::Mutex<HashMap<String, u32>>>,
 }
 
 impl FallbackCoordinator {
     pub fn new(providers: Vec<Arc<dyn RemoteProvider>>, policy: FallbackPolicy) -> Self {
-        FallbackCoordinator { providers, policy }
+        FallbackCoordinator {
+            providers,
+            policy,
+            busy: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// P1-17：尝试占用 provider 一个并发槽（超限 None；成功返回 RAII guard）。
+    fn try_acquire_busy(&self, name: &str, limit: u32) -> Option<BusyGuard> {
+        let mut m = self.busy.lock();
+        let cur = m.get(name).copied().unwrap_or(0);
+        let limit = limit.max(1); // 0 语义修正为至少 1（兜底本身即一个在途单位）
+        if cur >= limit {
+            return None;
+        }
+        m.insert(name.to_string(), cur + 1);
+        Some(BusyGuard {
+            busy: self.busy.clone(),
+            name: name.to_string(),
+        })
     }
 
     /// 选择 provider：enabled ∧ authenticated ∧ quota>0 ∧ !backoff ∧ 并发<limit。
@@ -116,6 +156,13 @@ impl FallbackCoordinator {
                 .iter()
                 .find(|p| p.name() == name)
                 .expect("select_provider 返回的 name 必须在列表中");
+            // P1-17：并发占位——超限（在途兜底 ≥ concurrency_limit）本轮
+            // 跳过该 provider 试下一个；成功则 RAII guard 保障任意退出路径释放。
+            let limit = provider.runtime().concurrency_limit;
+            let Some(_busy_guard) = self.try_acquire_busy(&name, limit) else {
+                tried.insert(name);
+                continue;
+            };
             match self
                 .try_provider_fallback(task, bt_paused, sink, provider)
                 .await

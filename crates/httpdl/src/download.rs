@@ -381,6 +381,13 @@ async fn download_segment_streaming(
             seg.len()
         ));
     }
+    // P0-4 修复（崩溃一致性层）：段数据 fsync 后才允许调用方记账——
+    // 原顺序「write_all（页缓存）→ 账本 save」在进程崩溃时产生空洞：
+    // 账本已记段完成但页缓存数据未落盘 → 重启 resume 跳过该段 →
+    // 交付长度正确但内容全零的文件且状态 Completed。WAL 语义要求
+    // 数据先于账本落盘。sync_data（不含 metadata：段内 seek+write
+    // 不改文件大小，set_len 已在循环外完成）。
+    f.sync_data().map_err(|e| format!("segment fsync: {e}"))?;
     Ok(())
 }
 
