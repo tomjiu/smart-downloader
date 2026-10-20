@@ -1637,7 +1637,10 @@ impl DownloadEngine for HttpEngine {
     }
 
     async fn peers(&self, _id: &EngineTaskId) -> Result<Vec<PeerInfo>, EngineError> {
-        Ok(vec![])
+        // TD-2（审查建议 5 最小修复）：不再「撒谎」返回空表——HTTP 引擎无
+        // peer 概念，返回 Unsupported 才是 trait 契约语义（daemon 层已在
+        // ops.rs 按 EngineKind 守卫，本修复不影响现有调用方）。
+        Err(EngineError::Unsupported)
     }
 
     async fn update_sources(
@@ -1764,11 +1767,13 @@ impl DownloadEngine for HttpEngine {
     }
 
     async fn add_url_seed(&self, _id: &EngineTaskId, _url: &str) -> Result<(), EngineError> {
-        Ok(())
+        // 同 peers：web seed 注入是 BT 语义，HTTP 静默 Ok 属契约违规。
+        Err(EngineError::Unsupported)
     }
 
     async fn ban_peer(&self, _id: &EngineTaskId, _peer: SocketAddr) -> Result<(), EngineError> {
-        Ok(())
+        // 同 peers：封禁 peer 是 BT 语义。
+        Err(EngineError::Unsupported)
     }
 
     async fn read_piece(&self, _id: &EngineTaskId, _idx: u32) -> Result<Vec<u8>, EngineError> {

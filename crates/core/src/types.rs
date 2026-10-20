@@ -319,7 +319,10 @@ pub trait DownloadEngine: Send + Sync {
         _id: &EngineTaskId,
         _peer: std::net::SocketAddr,
     ) -> Result<(), EngineError> {
-        Ok(()) // 默认：不支持直连 peer 注入
+        // TD-2（审查建议 5）：默认不再「撒谎」返回 Ok——peer 直连注入是
+        // BT 语义，未实现的引擎应显式报 Unsupported（BtEngine 覆写提供
+        // 真实实现；调用方 daemon 均按 EngineKind 守卫或 best-effort 忽略）。
+        Err(EngineError::Unsupported)
     }
     async fn ban_peer(&self, id: &EngineTaskId, peer: SocketAddr) -> Result<(), EngineError>;
     async fn read_piece(&self, id: &EngineTaskId, idx: u32) -> Result<Vec<u8>, EngineError>;
