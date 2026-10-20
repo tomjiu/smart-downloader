@@ -690,6 +690,15 @@ pub struct DaemonState {
     /// 两侧基于同一份未处理快照各自建任务 → 同一条目重复下载（先建任务成孤儿）。
     /// tokio Mutex（guard Send 可跨 await）持有整轮 refresh，后到者排队串行。
     pub(crate) rss_refresh_gate: tokio::sync::Mutex<()>,
+    /// rss.json 落盘串行化锁（Issue #121 B-5 修复）：P1-9 把落盘移到
+    /// rss_state 锁外后，各调用点手里的**旧快照**并发落盘会重排覆盖
+    /// （T1{A} 后写覆盖 T2{A,B} → B 丢失更新——tasks.json 的 P1-1 同款
+    /// 缺陷在 RSS 侧的翻版）。所有 rss.json 写入经 rss_save_snapshot
+    /// 在此锁内**重新快照**后落盘：写入序 = 拿锁序，每次写 = 拿锁时刻
+    /// 最新状态 → 最终文件必含全部已确认变更。锁序（叶子）：
+    /// rss_persist_lock → rss_state，无反向嵌套（全部调用点已在
+    /// rss_state 锁外）。
+    pub(crate) rss_persist_lock: std::sync::Mutex<()>,
     /// 会话累计流量（batch5 对标 qB 会话统计）：(down, up) 字节；由状态
     /// 轮询循环按引擎缓存速率 × 轮询间隔累加（估算口径，见
     /// accumulate_session_traffic）。Mutex 持锁极短（求和 + 加法）。

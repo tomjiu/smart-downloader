@@ -67,3 +67,7 @@ base64 = "0.22"
 sha1 = { workspace = true }
 sha2 = "0.10"
 md-5 = "0.10"
+
+# 进程生命周期实机测试（lifecycle_process.rs，unix-only：SIGTERM）
+[target.'cfg(unix)'.dev-dependencies]
+nix = { version = "0.29", features = ["signal"] }

@@ -54,6 +54,7 @@ impl DaemonState {
             live_config: Mutex::new(None),
             rss: Mutex::new(crate::rss::RssState::default()),
             rss_persist_path: None,
+            rss_persist_lock: std::sync::Mutex::new(()),
             bt_bans: Mutex::new(Vec::new()),
             bans_persist_path: None,
         }
