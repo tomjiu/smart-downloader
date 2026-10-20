@@ -252,9 +252,18 @@ pub(crate) fn update_score(scores: &Mutex<HashMap<String, i64>>, url: &str, delt
     *s = (*s + delta).clamp(SCORE_MIN, SCORE_MAX);
 }
 
-/// 段下载 + 失败缩小粒度重试（P1）：整段全 mirror 失败时，若可拆（len/2 >= MIN_RETRY_GRANULARITY）
-/// 则拆半重试；左右子段都成功才视为成功。子段写入各自区间（与整段写入等价）；
-/// 已成功子段的字节不回收（后续重试覆盖写，语义无害）。迭代式拆分栈（避免 async 递归装箱）。
+/// 段下载 + 失败退避重试（UNWIRED #1 接线，P1 粒度缩小的前置换 D25 退避）：
+/// 可重试错误（408/429/5xx/传输/截断）先指数退避重试同段（Retry-After
+/// 优先，1/2/4s ×4 次，jitter 防惊群）；耗尽或不可重试且可拆
+///（len/2 >= MIN_RETRY_GRANULARITY）→ 拆半重试（对 5xx/传输仍有用）；
+/// 429 永不拆分（旧实现 429 → 拆半 → 2× 请求 → 再 429 → 再拆半，
+/// 正反馈放大请求量——UNWIRED #1 的核心病灶）。
+///
+/// 总时延有界设计（task_proxy e2e 暴露的放大缺陷）：退避阶梯只在「根段」
+/// 生效；拆半子段单发不退避（= 旧口径）。若子段也带满额阶梯，等待时间
+/// 随拆分深度 2^n 放大（4 次 × 7s × 2^depth）；根段 4 次退避 + 子段树
+/// 零等待快速失败，总时延上界 ≈ 单段阶梯 7s + 请求开销。
+/// 迭代式拆分栈（避免 async 递归装箱）；栈元素 = (段, 是否根段)。
 async fn download_segment_with_retry(
     client: &reqwest::Client,
     url: &str,
@@ -263,26 +272,139 @@ async fn download_segment_with_retry(
     headers: &[(String, String)],
     limiter: &RateLimiter,
 ) -> Result<(), String> {
-    let mut stack: Vec<crate::segment_manager::Segment> = vec![seg];
-    while let Some(cur) = stack.pop() {
-        match download_segment_streaming(client, url, part, cur, headers, limiter).await {
-            Ok(()) => {}
-            Err(_) if cur.len() / 2 >= MIN_RETRY_GRANULARITY => {
-                let mid = cur.start + cur.len() / 2;
-                // 先压 right 再压 left → 先处理 left，与递归顺序一致
-                stack.push(crate::segment_manager::Segment {
-                    start: mid,
-                    end: cur.end,
-                });
-                stack.push(crate::segment_manager::Segment {
-                    start: cur.start,
-                    end: mid - 1,
-                });
+    let backoff = crate::retry::Backoff::default();
+    let mut stack: Vec<(crate::segment_manager::Segment, bool)> = vec![(seg, true)];
+    while let Some((cur, is_root)) = stack.pop() {
+        let max_attempts = if is_root { SEGMENT_MAX_ATTEMPTS } else { 1 };
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            match download_segment_streaming(client, url, part, cur, headers, limiter).await {
+                Ok(()) => break,
+                Err(e) if attempt < max_attempts && e.is_retryable(attempt) => {
+                    let delay = e
+                        .retry_after_hint()
+                        .unwrap_or_else(|| backoff.next_delay(attempt));
+                    let wait = delay + backoff_jitter();
+                    tracing::warn!(
+                        "段 [{},{}] 第 {attempt} 次失败（{e}），{:?} 后重试",
+                        cur.start,
+                        cur.end,
+                        wait
+                    );
+                    tokio::time::sleep(wait).await;
+                }
+                Err(e) if e.may_split() && cur.len() / 2 >= MIN_RETRY_GRANULARITY => {
+                    let mid = cur.start + cur.len() / 2;
+                    // 先压 right 再压 left → 先处理 left，与递归顺序一致；
+                    // 子段 is_root=false：单发不退避（总时延有界设计）
+                    stack.push((
+                        crate::segment_manager::Segment {
+                            start: mid,
+                            end: cur.end,
+                        },
+                        false,
+                    ));
+                    stack.push((
+                        crate::segment_manager::Segment {
+                            start: cur.start,
+                            end: mid - 1,
+                        },
+                        false,
+                    ));
+                    break;
+                }
+                Err(e) => return Err(format!("segment [{}, {}]: {e}", cur.start, cur.end)),
             }
-            Err(e) => return Err(format!("segment [{}, {}]: {e}", cur.start, cur.end)),
         }
     }
     Ok(())
+}
+
+/// 段级错误分类（UNWIRED #1）：状态码/Retry-After 在段边界不再被 String
+/// 抹平——旧实现 `Err(String)` 丢弃状态码后，429 与 5xx/传输错误同走
+/// 拆半路径，重试退避（retry.rs，已实现但零调用）无从接入。
+#[derive(Debug, Clone)]
+enum SegmentError {
+    /// HTTP 状态码（非 206/200）+ Retry-After 秒数（若服务器提供且可解析）。
+    Status(u16, Option<u64>),
+    /// 网络/IO/长度截断（可重试可拆分：连接中断重连、磁盘瞬态、体截断）。
+    Transport(String),
+    /// 206 Content-Range 与请求区间错位（不可重试；拆半保留旧口径）。
+    RangeMismatch(String),
+}
+
+/// 同段重试上限（D25 ×4：4 次尝试，间以 1/2/4s 退避）。
+const SEGMENT_MAX_ATTEMPTS: u32 = 4;
+
+/// Retry-After 钉制上限：恶意/异常大值（如 86400）会把任务睡眠挂死，
+/// 超过郎按缺省退避处理。
+const RETRY_AFTER_CAP_SECS: u64 = 60;
+
+impl SegmentError {
+    /// 是否值得同段重试（D25：408/429/5xx；403/404 终态）。
+    fn is_retryable(&self, attempt: u32) -> bool {
+        match self {
+            SegmentError::Status(code, _) => {
+                crate::retry::should_retry(*code, attempt, SEGMENT_MAX_ATTEMPTS)
+            }
+            SegmentError::Transport(_) => attempt < SEGMENT_MAX_ATTEMPTS,
+            SegmentError::RangeMismatch(_) => false,
+        }
+    }
+
+    /// 服务器指定等待（Retry-After，已钳制）；无则 None → 调用方用指数退避。
+    fn retry_after_hint(&self) -> Option<std::time::Duration> {
+        match self {
+            SegmentError::Status(_, Some(secs)) => Some(std::time::Duration::from_secs(
+                (*secs).min(RETRY_AFTER_CAP_SECS),
+            )),
+            _ => None,
+        }
+    }
+
+    /// 耗尽重试后是否允许拆半：429 拆半 = 请求量正反馈放大（核心病灶），
+    /// 永不拆；其余错误保留旧拆半口径（5xx/传输对更小区间仍可能成功）。
+    fn may_split(&self) -> bool {
+        !matches!(self, SegmentError::Status(429, _))
+    }
+
+    fn transport(e: impl std::fmt::Display) -> Self {
+        SegmentError::Transport(e.to_string())
+    }
+}
+
+impl std::fmt::Display for SegmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SegmentError::Status(code, Some(ra)) => {
+                write!(f, "status {code} (Retry-After: {ra}s)")
+            }
+            SegmentError::Status(code, None) => write!(f, "status {code}"),
+            SegmentError::Transport(e) => write!(f, "transport: {e}"),
+            SegmentError::RangeMismatch(e) => write!(f, "range mismatch: {e}"),
+        }
+    }
+}
+
+/// 退避抖动（0-500ms）：SystemTime 亚秒纳秒取模——httpdl 生产依赖零新增
+///（dev 侧的 rand 仅供测试）。防并发 worker 同步重试惊群。
+fn backoff_jitter() -> std::time::Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    std::time::Duration::from_nanos((nanos % 500_000_000) as u64)
+}
+
+/// 解析 `Retry-After` 响应头（仅数字秒形式；HTTP-date 形式解析失败 → None
+/// → 调用方回落指数退避）。钳制见 RETRY_AFTER_CAP_SECS。
+fn retry_after_secs(resp: &reqwest::Response) -> Option<u64> {
+    resp.headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .map(|s| s.min(RETRY_AFTER_CAP_SECS))
 }
 
 /// 单段流式下载：Range: bytes=start-end，chunk 边收边写 .part
@@ -296,7 +418,7 @@ async fn download_segment_streaming(
     seg: crate::segment_manager::Segment,
     headers: &[(String, String)],
     limiter: &RateLimiter,
-) -> Result<(), String> {
+) -> Result<(), SegmentError> {
     let mut req = client.get(url);
     for (k, v) in headers {
         if k.eq_ignore_ascii_case("range") {
@@ -311,7 +433,7 @@ async fn download_segment_streaming(
         )
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(SegmentError::transport)?;
     // RFC 7233 §2.1：服务器可忽略 Range 返回 200 全量体。容错路径：
     // 200 → 丢弃前 seg.start 字节后顺序写 seg.len 字节（正确但浪费带宽，
     // 仅非 206 服务器触发的兜底路径；206 主路径零浪费）。写满即弃流
@@ -333,26 +455,33 @@ async fn download_segment_streaming(
                 // 服务器省略；只拒绝「有头但与请求区间不符」的明确错位）。
                 None => 0u64,
                 other => {
-                    return Err(format!(
-                        "segment Content-Range mismatch (request start {}, got {other:?})",
+                    return Err(SegmentError::RangeMismatch(format!(
+                        "request start {}, got {other:?}",
                         seg.start
-                    ))
+                    )))
                 }
             }
         }
         reqwest::StatusCode::OK => seg.start,
-        other => return Err(format!("segment status {}", other)),
+        // UNWIRED #1：状态码 + Retry-After 在段边界保留（旧实现抹平成
+        // String，重试决策无从区分 429/5xx/终态）。
+        other => {
+            return Err(SegmentError::Status(
+                other.as_u16(),
+                retry_after_secs(&resp),
+            ))
+        }
     };
     let mut f = std::fs::OpenOptions::new()
         .write(true)
         .open(part)
-        .map_err(|e| format!("part open: {e}"))?;
+        .map_err(|e| SegmentError::Transport(format!("part open: {e}")))?;
     f.seek(SeekFrom::Start(seg.start))
-        .map_err(|e| e.to_string())?;
+        .map_err(SegmentError::transport)?;
     let mut written: u64 = 0;
     let mut skipped: u64 = 0;
     loop {
-        let chunk = resp.chunk().await.map_err(|e| e.to_string())?;
+        let chunk = resp.chunk().await.map_err(SegmentError::transport)?;
         let Some(chunk) = chunk else { break };
         if skipped < skip_start {
             let take = ((skip_start - skipped) as usize).min(chunk.len());
@@ -361,13 +490,13 @@ async fn download_segment_streaming(
                 let rest = &chunk[take..];
                 let n = rest.len().min((seg.len() - written) as usize);
                 limiter.wait(n as u64).await;
-                f.write_all(&rest[..n]).map_err(|e| e.to_string())?;
+                f.write_all(&rest[..n]).map_err(SegmentError::transport)?;
                 written += n as u64;
             }
         } else {
             let n = chunk.len().min((seg.len() - written) as usize);
             limiter.wait(n as u64).await;
-            f.write_all(&chunk[..n]).map_err(|e| e.to_string())?;
+            f.write_all(&chunk[..n]).map_err(SegmentError::transport)?;
             written += n as u64;
         }
         if written >= seg.len() {
@@ -375,11 +504,12 @@ async fn download_segment_streaming(
         }
     }
     if written != seg.len() {
-        return Err(format!(
+        // 传输截断：可重试（连接中断重连后同段重下）
+        return Err(SegmentError::Transport(format!(
             "segment length {} != expected {}",
             written,
             seg.len()
-        ));
+        )));
     }
     // P0-4 修复（崩溃一致性层）：段数据 fsync 后才允许调用方记账——
     // 原顺序「write_all（页缓存）→ 账本 save」在进程崩溃时产生空洞：
@@ -387,7 +517,8 @@ async fn download_segment_streaming(
     // 交付长度正确但内容全零的文件且状态 Completed。WAL 语义要求
     // 数据先于账本落盘。sync_data（不含 metadata：段内 seek+write
     // 不改文件大小，set_len 已在循环外完成）。
-    f.sync_data().map_err(|e| format!("segment fsync: {e}"))?;
+    f.sync_data()
+        .map_err(|e| SegmentError::Transport(format!("segment fsync: {e}")))?;
     Ok(())
 }
 
@@ -439,5 +570,85 @@ mod rotation_tests {
             r.sort();
             assert_eq!(r, m3);
         }
+    }
+}
+
+#[cfg(test)]
+mod segment_error_tests {
+    use super::*;
+
+    #[test]
+    fn status_429_retryable_then_never_splits() {
+        // UNWIRED #1 核心：429 可重试（退避）但永不拆半
+        let e = SegmentError::Status(429, None);
+        assert!(e.is_retryable(1));
+        assert!(e.is_retryable(3), "第 3 次失败仍可重试（共 4 次）");
+        assert!(!e.is_retryable(4), "第 4 次用尽 → 不再重试");
+        assert!(!e.may_split(), "429 永不拆半（正反馈放大病灶）");
+    }
+
+    #[test]
+    fn status_5xx_retryable_and_splittable_after_exhaustion() {
+        let e = SegmentError::Status(503, None);
+        assert!(e.is_retryable(1));
+        assert!(!e.is_retryable(4));
+        assert!(e.may_split(), "5xx 耗尽后拆半仍有效（旧口径保留）");
+    }
+
+    #[test]
+    fn terminal_statuses_fail_fast() {
+        // 403/404：终态——不重试（mirror 轮换/任务失败由上层处理）
+        for code in [400u16, 401, 403, 404, 416] {
+            let e = SegmentError::Status(code, None);
+            assert!(!e.is_retryable(1), "{code} 不应重试");
+        }
+    }
+
+    #[test]
+    fn transport_retryable_and_splittable() {
+        let e = SegmentError::Transport("connection reset".into());
+        assert!(e.is_retryable(1));
+        assert!(!e.is_retryable(4));
+        assert!(e.may_split());
+    }
+
+    #[test]
+    fn range_mismatch_is_never_retried() {
+        let e = SegmentError::RangeMismatch("offset drifted".into());
+        assert!(!e.is_retryable(1), "错位重试同请求无意义");
+        assert!(e.may_split(), "拆半口径保留（batch3-P1 设计）");
+    }
+
+    #[test]
+    fn retry_after_hint_capped_at_60s() {
+        // 恶意/异常大 Retry-After 钳制：86400 → 60s（不挂死任务）
+        let e = SegmentError::Status(429, Some(86400));
+        assert_eq!(
+            e.retry_after_hint(),
+            Some(std::time::Duration::from_secs(60))
+        );
+        let e2 = SegmentError::Status(429, Some(2));
+        assert_eq!(
+            e2.retry_after_hint(),
+            Some(std::time::Duration::from_secs(2))
+        );
+        // 无 Retry-After → None（调用方走指数退避）
+        assert_eq!(SegmentError::Status(429, None).retry_after_hint(), None);
+        assert_eq!(SegmentError::Transport("x".into()).retry_after_hint(), None);
+    }
+
+    #[test]
+    fn jitter_stays_within_500ms() {
+        for _ in 0..200 {
+            let j = backoff_jitter();
+            assert!(j <= std::time::Duration::from_millis(500));
+        }
+    }
+
+    #[test]
+    fn display_carries_status_and_retry_after() {
+        let e = SegmentError::Status(429, Some(3));
+        let s = format!("{e}");
+        assert!(s.contains("429") && s.contains("3"), "Display: {s}");
     }
 }
