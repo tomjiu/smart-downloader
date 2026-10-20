@@ -1,5 +1,7 @@
 "use client";
 /// 日志视图：事件流渲染（类型徽章 + 摘要）。
+/// 交互打磨批：类型 tab 补 aria-pressed；头部计数（总数/过滤后）；
+/// 过滤无匹配时给出明确空态文案。
 
 import { useMemo, useState } from "react";
 import type { SchedulerEventEnvelope } from "@/lib/daemon/types";
@@ -42,28 +44,37 @@ export default function LogsView({ events }: { events: SchedulerEventEnvelope[] 
   const types = useMemo(() => Array.from(new Set(events.map((e) => e.event.type))), [events]);
 
   return (
-    <div className="dl-enter">
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12 }}>
+    <div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12, alignItems: "center" }}>
         <button
-          className={`qoder-btn qoder-btn--ghost ${!type ? "dl-nav-item--active" : ""}`}
-          style={{ borderRadius: 99, padding: "4px 12px" }}
+          className={`dl-tab ${!type ? "dl-tab--active" : ""}`}
+          aria-pressed={!type}
           onClick={() => setType("")}
         >
           全部
+          <span className="dl-tab-count">{events.length}</span>
         </button>
         {types.map((t) => (
           <button
             key={t}
-            className={`qoder-btn qoder-btn--ghost ${type === t ? "dl-nav-item--active" : ""}`}
-            style={{ borderRadius: 99, padding: "4px 12px" }}
+            className={`dl-tab ${type === t ? "dl-tab--active" : ""}`}
+            aria-pressed={type === t}
             onClick={() => setType(t)}
           >
             {t}
           </button>
         ))}
+        <div style={{ flex: 1 }} />
+        <span style={{ fontSize: 11, color: "var(--fg-3)", whiteSpace: "nowrap" }}>
+          显示 {shown.length} / {events.length} 条（保留最近 500 条）
+        </span>
       </div>
       {shown.length === 0 ? (
-        <EmptyState icon="output" title="暂无事件" hint="事件流经 SSE 实时推送" />
+        <EmptyState
+          icon="output"
+          title={type ? "该类型暂无事件" : "暂无事件"}
+          hint={type ? "切换到其他类型试试" : "事件流经 SSE 实时推送"}
+        />
       ) : (
         <div className="dl-card" style={{ padding: 0, overflow: "hidden" }}>
           {shown.map((env, i) => (
@@ -74,18 +85,18 @@ export default function LogsView({ events }: { events: SchedulerEventEnvelope[] 
                 gap: 10,
                 alignItems: "baseline",
                 padding: "8px 14px",
-                borderBottom: "1px solid var(--border-subtle)",
+                borderBottom: "1px solid var(--line-2)",
                 fontSize: 13,
-                background: i % 2 ? "var(--bg-surface)" : "transparent",
+                background: i % 2 ? "var(--bg-3)" : "transparent",
               }}
             >
-              <span style={{ color: "var(--text-tertiary)", fontVariantNumeric: "tabular-nums", flex: "none" }}>
+              <span style={{ color: "var(--fg-3)", fontVariantNumeric: "tabular-nums", flex: "none" }}>
                 #{env.seq}
               </span>
-              <span className="qoder-badge qoder-badge--default" style={{ flex: "none" }}>
+              <span className="dl-badge" style={{ flex: "none" }}>
                 {String(env.event.type)}
               </span>
-              <span style={{ color: "var(--text-secondary)", overflow: "hidden", textOverflow: "ellipsis" }}>
+              <span style={{ color: "var(--fg-2)", overflow: "hidden", textOverflow: "ellipsis" }}>
                 {summarize(env)}
               </span>
             </div>

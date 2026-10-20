@@ -92,10 +92,10 @@ export default function SpeedChart({
             x2={W - pad.r}
             y1={t.y}
             y2={t.y}
-            stroke="var(--border-subtle)"
+            stroke="var(--line)"
             strokeDasharray="3 5"
           />
-          <text x={pad.l - 6} y={t.y + 3.5} textAnchor="end" fontSize="10" fill="var(--text-tertiary)">
+          <text x={pad.l - 6} y={t.y + 3.5} textAnchor="end" fontSize="10" fill="var(--fg-3)">
             {t.label}
           </text>
         </g>
@@ -115,7 +115,7 @@ export default function SpeedChart({
         <path
           d={upPath}
           fill="none"
-          stroke="var(--info)"
+          stroke="var(--ok)"
           strokeWidth="1.6"
           strokeDasharray="5 4"
           strokeLinecap="round"
