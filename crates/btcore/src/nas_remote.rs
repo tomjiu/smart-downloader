@@ -135,7 +135,14 @@ pub fn parse_speed_bps(raw: &str) -> u64 {
     } else {
         1
     };
-    (v * mult as f64) as u64
+    // P2-21 修复（审查第三轮）：负值/NaN/Inf 拒收；乘积饱和在
+    // 100 GiB/s（远超任何真实链路速率）——"9999999999GB/s" 不再以
+    // ~1e19 B/s 的荒谬值进入速率面（UI/限速器下游）。
+    if !v.is_finite() || v < 0.0 {
+        return 0;
+    }
+    const RATE_SANITY_CAP: f64 = (100u64 << 30) as f64; // 100 GiB/s
+    (v * mult as f64).min(RATE_SANITY_CAP) as u64
 }
 
 /// 远程引擎配置。
@@ -608,6 +615,20 @@ function uiauth(value){ return "eyJhbGciOiJIUzI1NiJ9.eyJrZXkiOiJVSUF1dGgifQ.sig"
     }
 
     // ── P1-21：403 重试闸 ──
+
+    // ── P2-21：速率解析饱和 ──
+
+    #[test]
+    fn parse_speed_absurd_values_capped() {
+        // 9999999999GB/s ≈ 1.07e19 → 钳制在 100 GiB/s 而非荒谬巨值
+        let capped = parse_speed_bps("9999999999GB/s");
+        assert_eq!(capped, 100u64 << 30, "got {capped}");
+        // 负值 / NaN → 0（拒收）
+        assert_eq!(parse_speed_bps("-5MB/s"), 0);
+        assert_eq!(parse_speed_bps("n/a"), 0);
+        // 正常值不受影响
+        assert_eq!(parse_speed_bps("1.5MB/s"), (1.5 * (1 << 20) as f64) as u64);
+    }
 
     #[test]
     fn retry_gate_idempotent_methods_always_retry() {
