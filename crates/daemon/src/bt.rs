@@ -529,7 +529,22 @@ impl DownloadEngine for BtEngine {
         // （恢复 piece 位图 + metadata，免全盘 checking / 免重新抓取）。
         let ih_hint = btih_hint(task);
         let fastresume = ih_hint.as_deref().and_then(|ih| self.load_fastresume(ih));
-        let web_seeds: Vec<String> = vec![];
+        // UNWIRED #5 接线：web seeds 解析层早已实现——.torrent 的 url-list
+        //（torrent_meta::collect_web_seeds）与 magnet 的 ws=（source_parse::
+        // magnet），旧实现恒传空 vec![]，两条解析链从未进内核。best-effort：
+        // 解析失败不阻断 add（add_magnet/add_torrent_file 自身会对坏源
+        // 报错；此处的 web_seeds 仅是增强载荷，不是准入条件）。fastresume
+        // 分支同样注入：回灌恢复的是 piece 位图，源里的 web seeds 仍需
+        // 显式传入内核（resume data 不含 ws 集合的语义保证）。
+        let web_seeds: Vec<String> = match &task.source {
+            DownloadSource::Magnet(m) => smart_dl_core::parse_magnet(m)
+                .map(|p| p.web_seeds)
+                .unwrap_or_default(),
+            DownloadSource::TorrentFile(bytes) => smart_dl_core::torrent_meta::parse_torrent(bytes)
+                .map(|s| s.web_seeds)
+                .unwrap_or_default(),
+            _ => vec![],
+        };
         let ih = match &task.source {
             DownloadSource::Magnet(m) => match &fastresume {
                 Some(data) => self.core.add_torrent_resume(data, &web_seeds),
