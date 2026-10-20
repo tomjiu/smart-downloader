@@ -25,6 +25,10 @@ pub struct XunleiProvider {
     tasks: Arc<AsyncMutex<HashMap<ProviderTaskId, CloudTaskHandle>>>,
     /// 自动冷却：失败后该时刻前不参与 fallback 选择。
     backoff_until: Arc<Mutex<Option<std::time::Instant>>>,
+    /// 任务句柄序号（P0-9 修复）：磁力提交响应 task_id 为空时原用秒级
+    //时间戳作 pid——同秒双提交互相顶掉（L298 注释自认 file=null、
+    // file_id 为空 → 恒走此分支）。原子序号消除碰撞。
+    next_seq: std::sync::atomic::AtomicU64,
 }
 
 /// 云端任务句柄。
@@ -52,6 +56,7 @@ impl XunleiProvider {
             tier,
             tasks: Arc::new(AsyncMutex::new(HashMap::new())),
             backoff_until: Arc::new(Mutex::new(None)),
+            next_seq: std::sync::atomic::AtomicU64::new(1),
         }
     }
 
@@ -201,21 +206,46 @@ impl crate::RemoteProvider for XunleiProvider {
         }
     }
     async fn refresh_auth(&self) -> Result<(), ProviderError> {
-        let mut guard = self.auth.lock().await;
-        if let Some(state) = guard.as_mut() {
-            if state.access_token_expiring(now_unix()) {
-                self.client
-                    .refresh(state)
-                    .await
-                    .map_err(|e| ProviderError::Other(e.to_string()))?;
+        // P1 修复（第二轮审查 §2.6）：网络刷新移出锁——原实现持 auth 锁跨
+        // refresh/refresh_captcha await（client 超时最长 30s），所有并发
+        // submit/resolve/status 在锁上排队，单个超时即 30s 级全停顿。
+        // 改三段式：锁内快照判定 → 锁外刷新（克隆 state）→ 锁内 CAS 回写
+        //（并发刷新竞争时以快照 token 比对避免回退覆盖）。
+        let snapshot = self.auth.lock().await.clone();
+        let Some(mut candidate) = snapshot else {
+            return Err(ProviderError::Auth);
+        };
+        let old_access = candidate.access_token.clone();
+        let old_captcha = candidate.captcha_token.clone();
+        let mut changed = false;
+        if candidate.access_token_expiring(now_unix()) {
+            self.client
+                .refresh(&mut candidate)
+                .await
+                .map_err(|e| ProviderError::Other(e.to_string()))?;
+            changed = true;
+        }
+        if candidate.captcha_token_expiring(now_unix()) {
+            self.client
+                .refresh_captcha(&mut candidate)
+                .await
+                .map_err(|e| ProviderError::Other(e.to_string()))?;
+            changed = true;
+        }
+        if !changed {
+            return Ok(());
+        }
+        let _ = save_auth(&self.token_path, &candidate);
+        {
+            let mut guard = self.auth.lock().await;
+            // CAS：并发刷新已推进过锁内 state（token 与快照不同）→ 不回写
+            //（避免旧快照覆盖更新的 token；本方刷新结果随落盘文件保留）。
+            let already_advanced = guard
+                .as_ref()
+                .is_some_and(|g| g.access_token != old_access || g.captcha_token != old_captcha);
+            if !already_advanced {
+                *guard = Some(candidate);
             }
-            if state.captcha_token_expiring(now_unix()) {
-                self.client
-                    .refresh_captcha(state)
-                    .await
-                    .map_err(|e| ProviderError::Other(e.to_string()))?;
-            }
-            let _ = save_auth(&self.token_path, state);
         }
         Ok(())
     }
@@ -246,8 +276,13 @@ impl crate::RemoteProvider for XunleiProvider {
                 .await
                 .map_err(|e| ProviderError::Other(e.to_string()))?;
 
+            // P0-9 修复：响应 task_id 为空（磁力提交恒如此）时，秒级时间戳
+            // + 原子序号双保险——原纯秒级戳在同秒双提交时互相顶掉。
             let pid = if resp.task_id.is_empty() {
-                format!("{}-{}", self.name, now_unix())
+                let seq = self
+                    .next_seq
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                format!("{}-{}-{}", self.name, now_unix(), seq)
             } else {
                 format!("{}-{}", self.name, resp.task_id)
             };

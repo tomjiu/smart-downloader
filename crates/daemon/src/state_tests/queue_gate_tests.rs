@@ -317,3 +317,101 @@ async fn resume_during_reservation_is_idempotent() {
     // 断言核心 = 有句柄且无重复引擎任务
     assert_eq!(rec.task.state, TaskState::Queued);
 }
+
+// ==================== PR #114 催修 P0-2：锁序统一（tasks → slot_reservations） ====================
+
+/// 并发 gate / attach / rollback / 计数混跑不得死锁（锁序回归锚定）。
+///
+/// parking_lot::Mutex 不可重入、无超时——锁序反转死锁即永久挂死。
+/// 修复前 attach_reserved_handle / rollback_slot_reservation 语义上为
+/// 反向锁序（slot_res → tasks），与 gate_or_enqueue / 递补筛选 /
+/// active_slot_counts（tasks → slot_res）方向相反；修复后统一为
+/// tasks → slot_reservations（摘除与落位/回滚并入同一 tasks 临界区）。
+///
+/// 本测试用 timeout 兜底：死锁时以超时失败暴露（而非挂死 CI），正常时
+/// 秒级完成。四类路径混跑最大化两把锁的交叉获取窗口：
+/// - 正常 add（gate → engine.add(5ms 延迟) → attach_reserved_handle）
+/// - 失败 add（gate → engine.add 失败 → rollback_slot_reservation）
+/// - active_slot_counts（快照读，tasks → slot_res 同向）
+/// - 在途 resume（另一 tasks 临界区 + 预留集 contains 检查）
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_gate_attach_rollback_no_deadlock() {
+    let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+    // 5ms 延迟扩大 gate（计数+登记）与 attach（摘除+落位）的重叠窗口
+    fake.set_add_delay_ms(5);
+    let state = Arc::new(DaemonState::new(fake.clone(), vec![]).with_queue_cfg(queue_cfg(0, 4, 0)));
+    for i in 0..12 {
+        fake.fail_url(&format!("https://srv/bad{i}.bin"));
+    }
+
+    let done = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        // ① 正常 add ×24（配额 4：gate 计数与 attach/落队高频交叉）
+        let mut add_futs = Vec::new();
+        for i in 0..24 {
+            let st = state.clone();
+            add_futs.push(tokio::spawn(async move {
+                st.add_http_task(format!("https://srv/ok{i}.bin"), None)
+                    .await
+                    .unwrap()
+            }));
+        }
+        // ② 失败 add ×12（rollback 路径）
+        let mut bad_futs = Vec::new();
+        for i in 0..12 {
+            let st = state.clone();
+            bad_futs.push(tokio::spawn(async move {
+                let _ = st
+                    .add_http_task(format!("https://srv/bad{i}.bin"), None)
+                    .await;
+            }));
+        }
+        // ③ 快照计数 ×12（同向锁序的读路径，参与竞争）
+        let mut cnt_futs = Vec::new();
+        for _ in 0..12 {
+            let st = state.clone();
+            cnt_futs.push(tokio::spawn(async move {
+                let _ = st.active_slot_counts();
+            }));
+        }
+        let mut ids = Vec::new();
+        for f in add_futs {
+            ids.push(f.await.unwrap());
+        }
+        for f in bad_futs {
+            f.await.unwrap();
+        }
+        for f in cnt_futs {
+            f.await.unwrap();
+        }
+        // ④ 收尾后在途窗口外的 resume（activate_one → tasks 临界区）
+        for id in ids.iter().take(4) {
+            let _ = state.resume(id).await;
+        }
+        ids
+    })
+    .await;
+
+    let ids = done.expect(
+        "60s 内未完成：gate/attach/rollback 并发死锁（锁序 tasks → slot_reservations 回归）",
+    );
+    // 收尾一致性：预留集必须清空（attach/rollback 全部走完）
+    assert!(
+        state.slot_reservations.lock().is_empty(),
+        "并发收尾后预留集必须清空"
+    );
+    // 24 个正常 add 全部返回（入引擎或落队，皆有记录）
+    assert_eq!(ids.len(), 24);
+    // 引擎侧绝无 bad URL（fail_url 任务永不入引擎，无论过闸失败还是落队）
+    let added = fake.added();
+    assert!(
+        added.iter().all(|u| u.starts_with("https://srv/ok")),
+        "失败 URL 不得进入引擎: {added:?}"
+    );
+    // 任务记录数：正常 24 全保留 + bad 过闸失败即删（0 条）/ 落队即保留
+    //（≤12 条，配额时序决定）→ 确定性区间 [24, 36]
+    let len = state.tasks.lock().len();
+    assert!(
+        (24..=36).contains(&len),
+        "任务记录数异常（应为 24 正常 + 落队 bad）: {len}"
+    );
+}

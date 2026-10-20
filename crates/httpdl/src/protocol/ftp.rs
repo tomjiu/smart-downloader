@@ -698,9 +698,20 @@ fn parse_pasv(resp: &str) -> Result<SocketAddr, String> {
     if nums.len() != 6 {
         return Err(format!("bad PASV tuple: {resp}"));
     }
+    // 审计修复（P1-4）：分量值域校验——原实现 `as u8` 静默截断 >255 的
+    // 分量、`nums[4]*256+nums[5]` 无回绕检查，畸形 PASV 应答（恶意/损坏
+    // 服务器）构造出声明之外的地址，后续 SSRF 校验面对的是“截断后”的
+    // 值，语义与实际不可对账。超出值域直接拒绝。
+    if nums.iter().any(|&n| n > 255) {
+        return Err(format!("bad PASV tuple (octet > 255): {resp}"));
+    }
+    let port = nums[4] * 256 + nums[5];
+    if port > 65535 {
+        return Err(format!("bad PASV tuple (port overflow): {resp}"));
+    }
     Ok(SocketAddr::from((
         [nums[0] as u8, nums[1] as u8, nums[2] as u8, nums[3] as u8],
-        (nums[4] * 256 + nums[5]) as u16,
+        port as u16,
     )))
 }
 
@@ -1330,9 +1341,13 @@ fn set_file_state(inner: &Arc<EngineInner>, tid: &str, name: &str, state: Engine
     }
 }
 
-/// 421/连接类错误可重试；550/协议终态不重试。
+/// 421/连接类错误可重试；5xx 协议终态不重试。
+/// 审计修复（P1-5，化简恒死代码）：原实现 `starts_with("550") ||
+/// starts_with("5")` 前者被后者完全包含（死代码）。5xx 是 RFC 959
+/// Permanent Negative Completion（永久否定完成）——重试与二分降粒
+/// 均无意义（服务器语义拒绝，非传输类错误）；4xx 临时否定参与重试。
 fn is_terminal(e: &str) -> bool {
-    e.starts_with("550") || e.starts_with("5")
+    e.starts_with('5')
 }
 
 fn part_path_of(dest: &Path) -> PathBuf {

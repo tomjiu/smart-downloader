@@ -24,8 +24,9 @@
 use crate::xunlei::auth::AuthState;
 use crate::xunlei::client::{Client, ClientError};
 use crate::xunlei::login_flow::{self, poll_device_session, start_device_session, DeviceSession};
-use axum::extract::State;
-use axum::http::{header, StatusCode};
+use axum::extract::{Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -75,6 +76,11 @@ impl LoginSession {
 }
 
 /// 构建登录页路由（测试与 CLI 共用）。
+/// P0-7 修复：全路由套 Host/Origin 同源守卫——登录页接收明文密码
+///（POST /api/login/pwd），原实现 299 行生产代码零 HTTP 头访问能力
+///（from_fn/middleware/layer/Origin/HOST 全 0 命中）→ DNS rebinding
+///（攻击者域名解析到 127.0.0.1）可跨源打登录接口（浏览器同源策略只
+/// 限制读响应，不限制发送简单 POST）。对齐 daemon http.rs auth_mw 语义。
 pub fn login_router(session: Arc<LoginSession>) -> Router {
     Router::new()
         .route("/", get(index))
@@ -84,7 +90,57 @@ pub fn login_router(session: Arc<LoginSession>) -> Router {
         .route("/api/login/pwd", post(pwd_login))
         .route("/api/login/sms/send", post(sms_send))
         .route("/api/login/sms/verify", post(sms_verify))
+        .layer(middleware::from_fn(local_origin_guard))
         .with_state(session)
+}
+
+/// Host 白名单判定（P0-7）：仅回环字面量（127.0.0.1 / localhost / [::1]），
+/// 允许任意端口——端口默认随机（--port 0）本身是一层缓解，精确端口匹配
+/// 需要把 bind 后的 addr 回注路由（收益边际，暂不做）。
+/// 非 IP 主机名一律拒绝：`127.evil.com` 等 DNS 可解析到公网/本机的
+/// 伪装形态不可信（同 daemon config.rs is_loopback_addr P1-a 口径）。
+fn guard_host_ok(host: &str) -> bool {
+    let h = host.rsplit_once(':').map(|(x, _)| x).unwrap_or(host);
+    let h = h.trim_start_matches('[').trim_end_matches(']');
+    h == "127.0.0.1" || h.eq_ignore_ascii_case("localhost") || h == "::1"
+}
+
+/// Origin 同源判定：仅接受 http(s)://<回环字面量>[:port] 形态。
+fn guard_origin_ok(origin: &str) -> bool {
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .unwrap_or(origin);
+    guard_host_ok(rest)
+}
+
+/// Host/Origin 同源守卫中间件（P0-7）：
+/// - Host 必须是回环字面量（rebinding 域名在此拦下）；
+/// - Origin 存在时必须同源（跨源 fetch 在此拦下）；缺失放行
+///   （直接打开 http://127.0.0.1:port/ 的导航请求无 Origin）。
+async fn local_origin_guard(req: Request, next: Next) -> axum::response::Response {
+    let headers: &HeaderMap = req.headers();
+    match headers.get(header::HOST).and_then(|v| v.to_str().ok()) {
+        Some(h) if guard_host_ok(h) => {}
+        // Host 缺失（HTTP/1.0 怪客户端）：登录页是浏览器场景，fail-closed
+        _ => {
+            return (
+                StatusCode::FORBIDDEN,
+                "host not allowed (local-only login page)",
+            )
+                .into_response()
+        }
+    }
+    if let Some(o) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+        if !guard_origin_ok(o) {
+            return (
+                StatusCode::FORBIDDEN,
+                "origin not allowed (local-only login page)",
+            )
+                .into_response();
+        }
+    }
+    next.run(req).await
 }
 
 /// 启动本地登录页服务：绑定 `127.0.0.1:<port>`（0 = 随机）。
@@ -506,5 +562,106 @@ mod tests {
             crate::xunlei::auth::load(&token_path).is_some(),
             "短信登录态未落盘"
         );
+    }
+
+    /// P0-7 回归：DNS rebinding 攻击防护——攻击者域名（解析到 127.0.0.1）
+    /// 的 Host/Origin 必须被 403 拦截；正常回环访问不受影响。
+    /// 修复前：登录页零中间件零头校验，`POST /api/login/pwd`（明文密码端点）
+    /// 可被任意 rebinding 域名跨源打击。
+    #[tokio::test]
+    async fn login_page_rebinding_attack_blocked() {
+        let upstream = spawn_mock_upstream().await;
+        let client = Client::with_bases(upstream.clone(), upstream.clone());
+        let dir = tempfile::tempdir().unwrap();
+        let sess = LoginSession::new(client, dir.path().join("auth.json"));
+        let app = login_router(sess);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let base = format!("http://{addr}");
+
+        let http = reqwest::Client::new();
+
+        // ① 正常回环访问：Host = 127.0.0.1:port → 放行
+        let r = http.get(format!("{base}/")).send().await.unwrap();
+        assert!(r.status().is_success(), "正常回环访问不得误伤");
+
+        // ② rebinding Host（evil 域名解析到 127.0.0.1）→ 403
+        let r = http
+            .get(format!("{base}/"))
+            .header("Host", "evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "rebinding Host 必须拦截");
+
+        // ③ 伪装回环前缀的主机名（127.evil.com）→ 403（同 P1-a 口径）
+        let r = http
+            .get(format!("{base}/"))
+            .header("Host", "127.evil.example")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN);
+
+        // ④ 跨源 Origin（正常 Host + evil Origin）→ 403
+        let r = http
+            .post(format!("{base}/api/login/pwd"))
+            .header("Origin", "http://evil.example")
+            .json(&json!({ "username": "x", "password": "y" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            StatusCode::FORBIDDEN,
+            "跨源 Origin 打密码端点必须拦截"
+        );
+
+        // ⑤ 同源 Origin（127.0.0.1）+ 密码端点 → 放行到业务层（400/200 均可，
+        // 关键是不被守卫 403）
+        let r = http
+            .post(format!("{base}/api/login/pwd"))
+            .header("Origin", &base)
+            .json(&json!({ "username": "x", "password": "y" }))
+            .send()
+            .await
+            .unwrap();
+        assert_ne!(
+            r.status(),
+            StatusCode::FORBIDDEN,
+            "同源 Origin 不得被守卫拦截"
+        );
+
+        // ⑥ localhost Host → 放行
+        let r = http
+            .get(format!("{base}/"))
+            .header("Host", format!("localhost:{}", addr.port()))
+            .send()
+            .await
+            .unwrap();
+        assert!(r.status().is_success(), "localhost 不得误伤");
+    }
+
+    /// P0-7 单元：Host/Origin 判定纯函数口径。
+    #[test]
+    fn guard_host_origin_predicates() {
+        assert!(guard_host_ok("127.0.0.1:8787"));
+        assert!(guard_host_ok("localhost:12345"));
+        assert!(guard_host_ok("LOCALHOST:1"));
+        assert!(guard_host_ok("[::1]:9999"));
+        assert!(guard_host_ok("127.0.0.1"));
+        assert!(!guard_host_ok("evil.example"));
+        assert!(!guard_host_ok("127.evil.example"));
+        assert!(!guard_host_ok("127.0.0.1.nip.io"));
+        assert!(!guard_host_ok("192.168.1.5:80"));
+        assert!(!guard_host_ok(""));
+        assert!(guard_origin_ok("http://127.0.0.1:9527"));
+        assert!(guard_origin_ok("http://localhost:9527"));
+        assert!(!guard_origin_ok("http://evil.example"));
+        assert!(!guard_origin_ok("https://127.0.0.1.nip.io"));
+        assert!(!guard_origin_ok("null"));
     }
 }

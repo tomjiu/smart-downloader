@@ -59,6 +59,15 @@ pub enum TorrentMetaError {
     BadType(&'static str),
     /// path 列表为空（多文件条目）。
     EmptyPath,
+    /// piece length 取值非法（≤ 0 或 > 16 MiB）。
+    /// P0-12 修复：原实现只校验类型不校验取值，0/-5 均被接受——
+    /// core 的 parse_torrent 是公开 API（任务预览/子文件选择门面），
+    /// 非法值会传染给下游除法/偏移计算。上限与 libtorrent 一致（1<<24）。
+    InvalidPieceLength(i64),
+    /// pieces 长度不是 20 的倍数（余数不得静默丢弃——与 daemon 侧口径统一）。
+    BadPiecesLen(usize),
+    /// 各文件 size 求和溢出 u64（P0-11：回绕后预检被绕过）。
+    TotalSizeOverflow,
 }
 
 impl fmt::Display for TorrentMetaError {
@@ -69,6 +78,15 @@ impl fmt::Display for TorrentMetaError {
             TorrentMetaError::MissingField(k) => write!(f, "info dict 缺字段 {k}"),
             TorrentMetaError::BadType(k) => write!(f, "字段 {k} 类型不符"),
             TorrentMetaError::EmptyPath => write!(f, "files 条目 path 列表为空"),
+            TorrentMetaError::InvalidPieceLength(v) => {
+                write!(f, "piece length 取值非法（须 1..={}，得到 {v}）", 1 << 24)
+            }
+            TorrentMetaError::BadPiecesLen(n) => {
+                write!(f, "pieces 长度 {n} 不是 20 的倍数")
+            }
+            TorrentMetaError::TotalSizeOverflow => {
+                write!(f, "各文件 size 求和溢出 u64")
+            }
         }
     }
 }
@@ -266,11 +284,21 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentSummary, TorrentMetaError> {
             .ok_or(TorrentMetaError::MissingField("piece length"))?,
     )
     .ok_or(TorrentMetaError::BadType("piece length"))?;
+    // P0-12 修复：取值校验（原实现仅校验类型，0/-5 被静默接受）。
+    // 上限 16 MiB 与 libtorrent 一致；越界值会在下游偏移计算中溢出回绕。
+    const MAX_PIECE_LEN: i64 = 1 << 24;
+    if !(1..=MAX_PIECE_LEN).contains(&piece_len) {
+        return Err(TorrentMetaError::InvalidPieceLength(piece_len));
+    }
     let pieces = as_bytes(
         info.dict_get(b"pieces")
             .ok_or(TorrentMetaError::MissingField("pieces"))?,
     )
     .ok_or(TorrentMetaError::BadType("pieces"))?;
+    // 与 daemon 侧（bt_alerts.rs）口径统一：余数不得静默丢弃。
+    if pieces.len() % 20 != 0 {
+        return Err(TorrentMetaError::BadPiecesLen(pieces.len()));
+    }
     let num_pieces = pieces.len() as i64 / 20;
 
     let mut files = Vec::new();
@@ -313,7 +341,12 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentSummary, TorrentMetaError> {
         return Err(TorrentMetaError::MissingField("length|files"));
     }
 
-    let total_size = files.iter().map(|f| f.size).sum();
+    // P0-11 修复：checked 求和——原 `sum()` 在 [u64::MAX, 1] 场景回绕为 0，
+    // 声称总大小 0 字节 → 磁盘预检必然放行 → 写爆磁盘（D36 整数层绕过）。
+    let total_size = files
+        .iter()
+        .try_fold(0u64, |acc, f| acc.checked_add(f.size))
+        .ok_or(TorrentMetaError::TotalSizeOverflow)?;
     Ok(TorrentSummary {
         infohash_v1,
         name,
@@ -560,5 +593,86 @@ mod tests {
         assert_eq!(bytes[e], b'e');
         let inner = crate::bencode::decode(&bytes[s..=e]).unwrap();
         assert!(inner.dict_get(b"name").is_some());
+    }
+
+    /// P0-12 回归：piece length = 0 / 负值 / 超 16MiB 必须被拒绝。
+    /// 修复前：只校验类型不校验取值，实测 0 与 -5 均被 ACCEPTED。
+    #[test]
+    fn invalid_piece_length_rejected() {
+        for bad in [0i64, -5, -1, (1 << 24) + 1, i64::MAX] {
+            let info = Value::Dict(vec![
+                (b"length".to_vec(), Value::Int(1)),
+                (b"name".to_vec(), Value::Bytes(b"x".to_vec())),
+                (b"piece length".to_vec(), Value::Int(bad)),
+                (b"pieces".to_vec(), Value::Bytes(vec![0u8; 20])),
+            ]);
+            let bytes = Value::Dict(vec![(b"info".to_vec(), info)]).into_bencode();
+            assert_eq!(
+                parse_torrent(&bytes).unwrap_err(),
+                TorrentMetaError::InvalidPieceLength(bad),
+                "piece length = {bad} 必须被拒绝"
+            );
+        }
+    }
+
+    /// P0-12 附带：pieces 长度非 20 倍数必须报错（原实现静默丢弃余数，
+    /// 21 字节 → num_pieces = 1，与 daemon 侧口径不一致）。
+    #[test]
+    fn pieces_len_not_multiple_of_20_rejected() {
+        let info = Value::Dict(vec![
+            (b"length".to_vec(), Value::Int(1)),
+            (b"name".to_vec(), Value::Bytes(b"x".to_vec())),
+            (b"piece length".to_vec(), Value::Int(16384)),
+            (b"pieces".to_vec(), Value::Bytes(vec![0u8; 21])),
+        ]);
+        let bytes = Value::Dict(vec![(b"info".to_vec(), info)]).into_bencode();
+        assert_eq!(
+            parse_torrent(&bytes).unwrap_err(),
+            TorrentMetaError::BadPiecesLen(21)
+        );
+    }
+
+    /// P0-11 回归：各文件 size 求和溢出 u64 必须报错。
+    /// 修复前：`sum()` 回绕——[u64::MAX, 1] 声称总大小 0 字节，
+    /// 磁盘预检必然放行 → 写爆磁盘（已实证：repro/p0repro round2）。
+    #[test]
+    fn total_size_overflow_rejected() {
+        let info = Value::Dict(vec![
+            (
+                b"files".to_vec(),
+                Value::List(vec![
+                    Value::Dict(vec![
+                        (b"length".to_vec(), Value::Int(i64::MAX)),
+                        (
+                            b"path".to_vec(),
+                            Value::List(vec![Value::Bytes(b"a".to_vec())]),
+                        ),
+                    ]),
+                    Value::Dict(vec![
+                        (b"length".to_vec(), Value::Int(i64::MAX)),
+                        (
+                            b"path".to_vec(),
+                            Value::List(vec![Value::Bytes(b"b".to_vec())]),
+                        ),
+                    ]),
+                    Value::Dict(vec![
+                        (b"length".to_vec(), Value::Int(i64::MAX)),
+                        (
+                            b"path".to_vec(),
+                            Value::List(vec![Value::Bytes(b"c".to_vec())]),
+                        ),
+                    ]),
+                ]),
+            ),
+            (b"name".to_vec(), Value::Bytes(b"pkg".to_vec())),
+            (b"piece length".to_vec(), Value::Int(16384)),
+            (b"pieces".to_vec(), Value::Bytes(vec![0u8; 20])),
+        ]);
+        let bytes = Value::Dict(vec![(b"info".to_vec(), info)]).into_bencode();
+        assert_eq!(
+            parse_torrent(&bytes).unwrap_err(),
+            TorrentMetaError::TotalSizeOverflow,
+            "3 × i64::MAX 的求和溢出必须报错而非回绕"
+        );
     }
 }

@@ -384,21 +384,31 @@ fn bdecode_at(
         b'd' => {
             let mut dict = Vec::new();
             let mut p = pos + 1;
+            // P1-23 修复：区分「遇到闭合 e」与「越界退出」——原实现两者
+            // 不可区分，截断输入（缺 'e'）返回 Ok（p+1 越界值），被截断
+            // 的 fastresume「校验通过」，校验器用途完全失效。
             while p < data.len() && data[p] != b'e' {
                 let (k, p1) = bdecode_bytes(data, p)?;
                 let (v, p2) = bdecode_at(data, p1, depth + 1)?;
                 dict.push((k, v));
                 p = p2;
             }
+            if p >= data.len() {
+                return Err(BencodeError::InvalidData("unterminated dict".into()));
+            }
             Ok((BencodeValue::Dict(dict), p + 1))
         }
         b'l' => {
             let mut list = Vec::new();
             let mut p = pos + 1;
+            // P1-23 修复：同上，unterminated list 必须报错
             while p < data.len() && data[p] != b'e' {
                 let (v, p1) = bdecode_at(data, p, depth + 1)?;
                 list.push(v);
                 p = p1;
+            }
+            if p >= data.len() {
+                return Err(BencodeError::InvalidData("unterminated list".into()));
             }
             Ok((BencodeValue::List(list), p + 1))
         }
