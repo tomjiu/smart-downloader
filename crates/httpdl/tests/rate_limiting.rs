@@ -173,3 +173,49 @@ async fn set_global_limits_rejects_up_direction() {
         .unwrap_err();
     assert!(matches!(err2, smart_dl_core::types::EngineError::Other(_)));
 }
+
+/// 修复回归（运行中首次设限热调）：spawn 改「登记式取用」limiter 后，
+/// add 返回即可 set_limits 热调——运行中循环立即按新速率节流。旧实现：
+/// 循环未登记时回退捕获全局 Arc（new_limited(0) = 不限），首次 set_limits
+/// 的 insert 产物无人消费 → 全速跑完（恢复重放 add→set_limits 即中招：
+/// 重启后限速任务实际不限速跑到底，须 pause→resume 再 spawn 才生效）。
+/// 确定性锚定：delay_ms=300 使首个响应体字节必晚于 set_limits 下发
+///（add→set_limits 时延 << 300ms）——无头部逃逸窗口，纯节流耗时可判。
+#[tokio::test]
+async fn first_set_limits_while_running_hot_applies() {
+    let srv = HttpTestServer::start(HttpServerConfig {
+        size: 4 * MB,
+        range: true,
+        patterned_content: true,
+        delay_ms: 300, // 头部消除器：任何响应体字节都晚于 set_limits
+        ..Default::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = HttpEngine::new_limited(reqwest::Client::new(), 0); // 全局不限
+    let task = make_http_task_to(
+        "fsl1",
+        &srv.url("/file"),
+        dir.path().to_path_buf(),
+        Some("out.bin"),
+    );
+    let tid = engine.add(&task).await.unwrap();
+    // 运行中「首次」设限 1MiB/s——修复后热调即时生效（无需 pause→resume）
+    engine.set_limits(&tid, Some(1024), None).await.unwrap();
+
+    let t0 = Instant::now();
+    let st = wait_terminal(&engine, &tid).await;
+    let el = t0.elapsed();
+    assert_eq!(st.state, EngineState::Completed, "error: {:?}", st.error);
+    assert!(
+        el >= Duration::from_millis(1200),
+        "首次设限未热调生效（4MiB @ 1MiB/s 应 ≈3.3s，实际 {el:?}）"
+    );
+    assert!(el < Duration::from_secs(15), "异常超长: {el:?}");
+    let got = std::fs::read(dir.path().join("out.bin")).unwrap();
+    assert_eq!(
+        sha256_of(&got),
+        sha256_of(&patterned(4 * MB)),
+        "热调限速不得破坏完整性"
+    );
+}
