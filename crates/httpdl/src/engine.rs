@@ -1079,21 +1079,41 @@ impl DownloadEngine for HttpEngine {
     }
 
     async fn add(&self, task: &DownloadTask) -> Result<EngineTaskId, EngineError> {
-        let (url, headers, backup_url, proxy) = match &task.source {
+        let (url, mut headers, backup_url, proxy, auth) = match &task.source {
             DownloadSource::Http {
                 url,
                 headers,
                 backup_url,
                 proxy,
+                auth,
                 ..
             } => (
                 url.clone(),
                 headers.clone(),
                 backup_url.clone(),
                 proxy.clone(),
+                auth.clone(),
             ),
             _ => return Err(EngineError::Other("source is not http".to_string())),
         };
+        // 契约修复（Issue #121 契约矩阵 #5 战果）：source.auth 此前在上方
+        // 解构的 `..` 中被丢弃——daemon 的 AddTaskReq.username/password →
+        // Auth::Basic 进 source 后全链零消费，探测/段下载不带 Authorization
+        // 头，Basic auth 下载端到端坏死（401 挑战服务器恒拒）。转成标准头
+        // 注入任务头集：probe 与段循环全链携带（H-8 同名 range 头跳过逻辑
+        // 不受影响——Authorization 不冲突；引擎侧 headers 为内存态，凭据
+        // 持久化仍走 source.auth 原字段，无新增落盘面）。
+        match &auth {
+            Some(smart_dl_core::types::Auth::Basic(u, p)) => {
+                use base64::Engine as _;
+                let cred = base64::engine::general_purpose::STANDARD.encode(format!("{u}:{p}"));
+                headers.push(("Authorization".to_string(), format!("Basic {cred}")));
+            }
+            Some(smart_dl_core::types::Auth::Bearer(t)) => {
+                headers.push(("Authorization".to_string(), format!("Bearer {t}")));
+            }
+            None => {}
+        }
         // E5 任务级代理：探测/下载全链均走任务专用 client（Some(proxy) 时）。
         // 任务级代理的意义正是「只有代理可达源」——探测若用共享 client 直连，
         // 代理专属源会在 add 时误判死亡。client 构建失败 → 任务拒绝（daemon
