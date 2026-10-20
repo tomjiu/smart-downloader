@@ -2,7 +2,7 @@
 //!
 //! 位置：crates/core/src/xltd.rs:151-152（同类代码见 bt_alerts.rs:215-216）
 //!
-//! ```rust
+//! ```text
 //! let piece_start = (idx as u64) * (piece_length as u64);
 //! let piece_end = piece_start + piece_length as u64;
 //! ```

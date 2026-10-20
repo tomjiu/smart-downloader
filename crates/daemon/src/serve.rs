@@ -183,7 +183,11 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     #[cfg(feature = "bt")]
     let mut bt_typed: Option<Arc<crate::bt::BtEngine>> = None;
     #[cfg(feature = "bt")]
-    let bt_core = {
+    // 注：块内副作用（apply_startup_conn / set_session_storage_allocate）
+    // 必须执行；返回的 core 句柄自 batch10-P0-3 起不再被 alert loop 消费
+    //（改用 bt_typed），下划线前缀仅消除未用告警。
+    #[allow(unused_variables)]
+    let bt_core: Option<Arc<smart_dl_btcore::BtCore>> = {
         if cfg.bt.enabled {
             let save = cfg.bt_save_path();
             std::fs::create_dir_all(&save)
@@ -373,13 +377,10 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     #[cfg(feature = "bt")]
     let (alert_handle, state_arc) = {
         let state_arc = Arc::new(state);
-        let handle = bt_core.map(|core| {
-            crate::bt_events::spawn_alert_loop(
-                state_arc.clone(),
-                core,
-                Duration::from_millis(500),
-                bt_typed.clone(),
-            )
+        // P0-3：spawn_alert_loop 收紧为必传 BtEngine（bt_core=Some ⟺
+        // bt_typed=Same 同块装配，unwrap 语义安全）
+        let handle = bt_typed.clone().map(|bt| {
+            crate::bt_events::spawn_alert_loop(state_arc.clone(), bt, Duration::from_millis(500))
         });
         (handle, state_arc)
     };
@@ -433,12 +434,14 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     // 4d--. 定时任务调度循环（E23）：1s 周期把到期任务接入引擎
     //（start_at 未来不入引擎，Queued 等待；jitter 错峰同样由本循环到点激活）。
     // 无定时任务时空转（filter 后空集，无引擎调用）。
+    // 审计修复（P2-8）：先工作后 sleep——原首睡 1s 令恢复的到期任务
+    // 首轮延迟激活（重启竞态：恢复完成到激活多等一拍）。
     {
         let st = state_arc.clone();
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(1)).await;
                 let _ = st.activate_due_tasks().await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
         });
     }
@@ -460,6 +463,14 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
                 }
                 match toml::from_str::<Config>(&text) {
                     Ok(new_cfg) => {
+                        // 审查修复（batch10-F）：热重载与启动同校验口径——
+                        // 原实现裸解析绕过全部语义校验（负 share_ratio 等
+                        // 启动被拒的值热重载静默生效）。
+                        if let Err(e) = new_cfg.validate() {
+                            tracing::warn!("配置热重载校验失败（保留旧配置）: {e}");
+                            last = Some(text);
+                            continue;
+                        }
                         st.refresh_config(&new_cfg, &tasks);
                         // E16：限速总阀门随热重载生效（文件为准——与 dest_root
                         // 同口径）；值无变化时 apply 内部 no-op，无事件噪声。

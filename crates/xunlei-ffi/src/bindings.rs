@@ -190,11 +190,15 @@ pub struct XLTaskInfo {
     pub _remaining: [u8; 924 - 0x38],
 }
 
-/// 任务流量信息（size 待定，暂按 0x18 = 24 设计）。
-#[repr(C)]
+/// 任务流量信息（size = 0x18 = 24）。
+/// P1-24 修复：补 packed——原 repr(C) 未 packed 实际 size = 32，与向
+/// SDK 声明的 size: 0x18 漂移 8 字节（其余 6 个 versioned struct 均因
+/// repr(C, packed) 与声明值一致，唯此结构漂移；abi_size_assert_aligned
+/// 恰好漏列它，漂移无回归保护）。packed 后 4+8+8+4 = 24 = 0x18 ✓。
+#[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
 pub struct XLTaskFlow {
-    pub size: c_uint, // = 0x18?
+    pub size: c_uint, // = 0x18
     pub download_bytes: c_ulonglong,
     pub upload_bytes: c_ulonglong,
     pub _pad: c_uint,
@@ -409,6 +413,12 @@ mod tests {
             size_of::<XLServerInfo>(),
             0x24,
             "XLServerInfo size 漂移即 ABI 回归"
+        );
+        // P1-24：XLTaskFlow 补入断言（原测试漏列，packed 前实为 32 漂移无报警）
+        assert_eq!(
+            size_of::<XLTaskFlow>(),
+            0x18,
+            "XLTaskFlow size 漂移即 ABI 回归（须 packed：4+8+8+4 = 24）"
         );
         assert_eq!(
             size_of::<XLTaskInfo>(),

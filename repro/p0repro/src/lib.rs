@@ -100,7 +100,8 @@ impl TorrentMeta {
         let mut name = String::new();
         let mut file_size = 0u64;
         let mut has_length = false;
-        let mut files = Vec::new();
+        // P0-1 修复（同步自主仓 bt_alerts.rs）：files 偏移计算延后到扫描结束
+        let mut files_raw: Vec<(String, u64)> = Vec::new();
         let mut has_files = false;
 
         let mut i = info_start + 1; // skip 'd'
@@ -164,7 +165,8 @@ impl TorrentMeta {
                     // files value 是 list（l...e）
                     let list_end = list_skip(b, i, 0)
                         .ok_or_else(|| Err2::InvalidSource("files 解析失败".into()))?;
-                    files = parse_file_list(&b[i + 1..list_end], piece_length)?;
+                    // 阶段一：仅收集 (path, length)
+                    files_raw = parse_file_list(&b[i + 1..list_end])?;
                     i = list_end + 1; // 跳过 list 的闭合 'e'
                 }
                 _ => {
@@ -180,8 +182,31 @@ impl TorrentMeta {
                 ".torrent 缺少必要字段 (piece length/pieces)".into(),
             ));
         }
+        const MAX_PIECE_LENGTH: u32 = 1 << 24;
+        if piece_length > MAX_PIECE_LENGTH {
+            return Err(Err2::InvalidSource(format!(
+                "piece length 超过上限 {MAX_PIECE_LENGTH}（得到 {piece_length}）"
+            )));
+        }
 
         if has_files {
+            // 阶段二：piece_length 已知且已校验，计算各文件 piece 偏移/数量
+            let plen = piece_length as u64;
+            let mut files = Vec::with_capacity(files_raw.len());
+            let mut total_size: u64 = 0;
+            for (path, length) in files_raw {
+                let piece_offset = (total_size / plen) as usize;
+                let piece_count = length.div_ceil(plen) as usize;
+                total_size = total_size.checked_add(length).ok_or_else(|| {
+                    Err2::InvalidSource("files 累计大小溢出 u64".into())
+                })?;
+                files.push(FileMeta {
+                    path,
+                    size: length,
+                    piece_offset,
+                    piece_count,
+                });
+            }
             // 多文件 torrent：files 数组已解析
             Ok(Self {
                 info_hash,
@@ -211,11 +236,10 @@ impl TorrentMeta {
 }
 
 /// 解析多文件 torrent 的 files 列表内容（bencode，`l`/`e` 已剥离）。
-
-fn parse_file_list(data: &[u8], piece_length: u32) -> Result<Vec<FileMeta>, Err2> {
+/// P0-1 修复：仅提取 (path, length)，偏移延后计算。
+fn parse_file_list(data: &[u8]) -> Result<Vec<(String, u64)>, Err2> {
     let mut files = Vec::new();
     let mut pos = 0usize;
-    let plen = piece_length as u64;
 
     while pos < data.len() {
         if data.get(pos) != Some(&b'd') {
@@ -260,16 +284,7 @@ fn parse_file_list(data: &[u8], piece_length: u32) -> Result<Vec<FileMeta>, Err2
         }
 
         if length > 0 && !path.is_empty() {
-            // 计算 piece 偏移和数量（按文件在 torrent 中的累计字节偏移）
-            let total_size: u64 = files.iter().map(|f: &FileMeta| f.size).sum();
-            let piece_offset = (total_size / plen) as usize;
-            let piece_count = length.div_ceil(plen) as usize;
-            files.push(FileMeta {
-                path,
-                size: length,
-                piece_offset,
-                piece_count,
-            });
+            files.push((path, length));
         }
 
         pos = dict_end + 1;

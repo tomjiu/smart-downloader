@@ -6,7 +6,11 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// 安全修复（P1-b）：子表手写 Default 与本处 derive Default 单源——
+/// 此前 Config::default() 与子表 derive Default 双源漂移，导致
+/// 「部分表 TOML」解析时其余字段退化为零值（addr=""/dest_root=""/
+/// bt.enabled=false 等）。子表 Default 修正后此处 derive 即复用子表实现。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
     pub server: ServerCfg,
@@ -29,7 +33,12 @@ pub struct Config {
     pub storage: StorageCfg,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// 安全修复（第三轮审查 P1-b）：子表手写 Default（与 Config::default() 单源）。
+/// 修复前：子表用 derive Default（addr = ""），而 Config::default() 手写
+/// "127.0.0.1:8787" —— 容器级 #[serde(default)] 下，用户只写同表任一键
+///（如 `[server] http_token = "x"`），其余字段退化为 derive 零值：
+/// addr 变空串 → bind("") 失败 → daemon 起不来。实测复现见 repro round3。
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct ServerCfg {
     /// HTTP/WS 监听地址，如 `127.0.0.1:8787`。
@@ -46,7 +55,17 @@ pub struct ServerCfg {
     pub extra_allowed_hosts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+impl Default for ServerCfg {
+    fn default() -> Self {
+        Self {
+            addr: "127.0.0.1:8787".into(),
+            http_token: None,
+            extra_allowed_hosts: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct DownloadCfg {
     /// 默认下载落盘根目录（三 add 入口的 dest 缺省值）。
@@ -67,6 +86,20 @@ pub struct DownloadCfg {
     /// 现有行为）。合法域 1..=100（越界钳到边界）；仅启动时生效（烘入 client）。
     #[serde(default = "default_max_redirects")]
     pub max_redirects: u32,
+}
+
+/// 安全修复（P1-b）：与 Config::default() 单源——修复前 derive Default 令
+/// dest_root = ""，只写 `[download] proxy = ...` 时落盘位置退化为相对 cwd。
+impl Default for DownloadCfg {
+    fn default() -> Self {
+        Self {
+            dest_root: PathBuf::from("./downloads"),
+            proxy: String::new(),
+            max_download_kb_s: 0,
+            disk_precheck_strict: false,
+            max_redirects: default_max_redirects(),
+        }
+    }
 }
 
 fn default_max_redirects() -> u32 {
@@ -205,7 +238,10 @@ impl Default for RssCfg {
 impl Default for BtCfg {
     fn default() -> Self {
         BtCfg {
-            enabled: false,
+            // 安全修复（P1-b）：与 Config::default() 单源——修复前此处 false，
+            // 只写 [bt] 任一其他键（如 max_upload_kb_s）时 enabled 退化为
+            // false → BT 静默关闭。
+            enabled: true,
             save_path: None,
             max_upload_kb_s: 0,
             enable_dht: false,
@@ -314,71 +350,34 @@ pub struct SchedulerCfg {
     pub completion_action: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct LockCfg {
     /// 单实例锁文件路径（重复启动 → 拒绝）。
     pub path: PathBuf,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+/// 安全修复（P1-b）：与 Config::default() 单源（path 非空串）。
+impl Default for LockCfg {
+    fn default() -> Self {
+        Self {
+            path: PathBuf::from("./daemon.lock"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct StorageCfg {
     /// 任务持久化文件（add/remove/状态变更自动落盘；启动时恢复）。
     pub tasks_path: PathBuf,
 }
 
-impl Default for Config {
+/// 安全修复（P1-b）：与 Config::default() 单源（tasks_path 非空串）。
+impl Default for StorageCfg {
     fn default() -> Self {
-        Config {
-            server: ServerCfg {
-                addr: "127.0.0.1:8787".into(),
-                http_token: None,
-                extra_allowed_hosts: Vec::new(),
-            },
-            download: DownloadCfg {
-                dest_root: PathBuf::from("./downloads"),
-                proxy: String::new(),
-                max_download_kb_s: 0,
-                disk_precheck_strict: false,
-                max_redirects: 10,
-            },
-            bt: BtCfg {
-                enabled: true,
-                save_path: None,
-                max_upload_kb_s: 0,
-                enable_dht: false,
-                enable_lsd: false,
-                enable_upnp: false,
-                enable_pex: false,
-                enable_utp: false,
-                encrypt: "allow".to_string(),
-                listen_port: 0,
-                max_connections: 0,
-                extra_trackers: Vec::new(),
-                max_share_ratio: default_bt_max_share_ratio(),
-                max_seeding_time_min: 0,
-                storage_allocate: false,
-            },
-            limits: LimitsCfg::default(),
-            queue: QueueCfg::default(),
-            rss: RssCfg::default(),
-            xunlei: XunleiCfg::default(),
-            provider: ProviderCfg {
-                enabled: false,
-                mock: false,
-            },
-            provider_xunlei: ProviderXunleiCfg::default(),
-            webhook: WebhookCfg::default(),
-            cleanup: CleanupCfg::default(),
-            post_download: PostDownloadCfg::default(),
-            scheduler: SchedulerCfg::default(),
-            lock: LockCfg {
-                path: PathBuf::from("./daemon.lock"),
-            },
-            storage: StorageCfg {
-                tasks_path: PathBuf::from("./tasks.json"),
-            },
+        Self {
+            tasks_path: PathBuf::from("./tasks.json"),
         }
     }
 }
@@ -391,36 +390,47 @@ impl Config {
         };
         let text = std::fs::read_to_string(p).map_err(|e| format!("读取配置 {p:?} 失败: {e}"))?;
         let cfg: Config = toml::from_str(&text).map_err(|e| format!("配置解析失败 {p:?}: {e}"))?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// 语义校验（启动与热重载同口径——审查修复：热重载原走裸 toml::from_str
+    /// 绕过全部校验，`bt.max_share_ratio = -1.0` 启动被拒却热重载接受，
+    /// 负阈值使分享率达标记恒真 → 任务一进 Seeding 立刻暂停）。
+    pub fn validate(&self) -> Result<(), String> {
         // bt.encrypt 三态校验（fail-fast：未知值启动即报错，不等到引擎装配）。
         // 合法值口径须与 btcore::engine::parse_encrypt_policy 一致（btcore 是
         // feature 门控依赖，config 不能引用其类型，此处本地同步白名单）。
-        if !matches!(cfg.bt.encrypt.trim(), "disable" | "allow" | "require") {
+        if !matches!(self.bt.encrypt.trim(), "disable" | "allow" | "require") {
             return Err(format!(
                 "配置 bt.encrypt = {:?} 无效：仅支持 disable / allow / require",
-                cfg.bt.encrypt
+                self.bt.encrypt
             ));
         }
         // 做种分享率上限（qbit Share Ratio Limit）：负数/NaN/超上限 → 拒绝启动
-        if !(0.0..=9999.0).contains(&cfg.bt.max_share_ratio) {
+        if !(0.0..=9999.0).contains(&self.bt.max_share_ratio) {
             return Err(format!(
                 "配置 bt.max_share_ratio = {} 无效：须在 0.0..=9999.0（0 = 不启用）",
-                cfg.bt.max_share_ratio
+                self.bt.max_share_ratio
             ));
         }
         // 做种时长上限（分钟）：超上限 → 拒绝启动
-        if cfg.bt.max_seeding_time_min > 999_999 {
+        if self.bt.max_seeding_time_min > 999_999 {
             return Err(format!(
                 "配置 bt.max_seeding_time_min = {} 无效：须在 0..=999999（0 = 不启用）",
-                cfg.bt.max_seeding_time_min
+                self.bt.max_seeding_time_min
             ));
         }
-        Ok(cfg)
+        Ok(())
     }
 
     /// 判定 addr 是否仅绑定回环地址（127.x/::1/localhost）。
     /// serve 启动检查用：非回环 + 无 http_token → 拒绝启动（V1 fail-closed）。
-    /// batch8：优先 SocketAddr/IpAddr 语义判定（含 v4-mapped 归一），字符串
-    /// 前缀判定保留为兜底——`[::ffff:127.0.0.1]` 等边缘写法不再漏判。
+    /// batch8：优先 SocketAddr/IpAddr 语义判定（含 v4-mapped 归一）。
+    /// 安全修复（第三轮审查 P1-a）：删除 `starts_with("127.")` 字符串前缀兜底——
+    /// `127.evil.com:8787` / `127.0.0.1.nip.io:8787` 等非 IP 主机名可借前缀
+    /// 通过判定，经 DNS 解析到公网 → 未鉴权绑公网（serve.rs fail-closed 闸门
+    /// 被绕过）。修复后：非 IP 主机名仅字面量 localhost 放行，其余 fail closed。
     pub fn is_loopback_addr(addr: &str) -> bool {
         fn ip_loopback(ip: std::net::IpAddr) -> bool {
             // v4-mapped IPv6（::ffff:a.b.c.d）按映射后的 v4 判定
@@ -440,7 +450,9 @@ impl Config {
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             return ip_loopback(ip);
         }
-        host.eq_ignore_ascii_case("localhost") || host.starts_with("127.") || host == "::1"
+        // 非 IP 主机名：仅字面量 localhost 放行。
+        // `127.` 前缀不再兜底——DNS 可将任意 `127.x.y.z` 形态主机名解析到公网。
+        host.eq_ignore_ascii_case("localhost")
     }
 
     /// 序列化为 TOML 文本（S1 设置面持久化）。无默认值裁剪——全量字段
@@ -600,6 +612,71 @@ mod tests {
         assert!(Config::is_loopback_addr("[::ffff:127.0.0.1]:8787"));
         assert!(Config::is_loopback_addr("[::1]:1"));
         assert!(!Config::is_loopback_addr("[::ffff:192.168.1.5]:8787"));
+    }
+
+    /// 安全回归（第三轮审查 P1-a）：`127.` 字符串前缀绕过必须堵死——
+    /// 非 IP 主机名（DNS 可解析到公网）不得通过回环判定。
+    /// 修复前实测 4 项绕过：`127.evil.com` / `127.0.0.1.attacker.example` /
+    /// `127.0.0.1.nip.io` / `127.0.0.1x`（repro/p0repro round3）。
+    #[test]
+    fn loopback_prefix_bypass_rejected() {
+        assert!(
+            !Config::is_loopback_addr("127.evil.com:8787"),
+            "127. 前缀非 IP 主机名必须 fail-closed"
+        );
+        assert!(!Config::is_loopback_addr("127.0.0.1.attacker.example:8787"));
+        assert!(!Config::is_loopback_addr("127.0.0.1.nip.io:8787"));
+        assert!(!Config::is_loopback_addr("127.0.0.1x:8787"));
+        // 真回环与字面量 localhost 仍放行
+        assert!(Config::is_loopback_addr("127.0.0.1:8787"));
+        assert!(Config::is_loopback_addr("LOCALHOST:8787"));
+        assert!(Config::is_loopback_addr("localhost"));
+        // 其他非回环主机名同样 fail-closed
+        assert!(!Config::is_loopback_addr("example.com:8787"));
+    }
+
+    /// 安全回归（第三轮审查 P1-b）：部分表 TOML 的其余字段不得退化为
+    /// derive 零值。修复前：`[download] proxy = ...` → dest_root 变 ""；
+    /// `[server] http_token = ...` → addr 变 ""（bind 失败）；
+    /// `[bt] max_upload_kb_s = ...` → enabled 变 false（BT 静默关闭）。
+    #[test]
+    fn partial_table_toml_keeps_sibling_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("partial.toml");
+
+        // 只写 [download] 的一个键 → dest_root 必须保持 ./downloads
+        std::fs::write(&p, "[download]\nproxy = \"socks5://127.0.0.1:1080\"\n").unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert_eq!(
+            c.download.dest_root,
+            PathBuf::from("./downloads"),
+            "部分表不得令 dest_root 退化为空串"
+        );
+        assert_eq!(c.download.proxy, "socks5://127.0.0.1:1080");
+        assert_eq!(c.download.max_redirects, 10);
+
+        // 只写 [server] 的一个键 → addr 必须保持 127.0.0.1:8787
+        std::fs::write(&p, "[server]\nhttp_token = \"x\"\n").unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert_eq!(
+            c.server.addr, "127.0.0.1:8787",
+            "部分表不得令 addr 退化为空串（bind 失败）"
+        );
+
+        // 只写 [bt] 的一个键 → enabled 必须保持 true
+        std::fs::write(&p, "[bt]\nmax_upload_kb_s = 100\n").unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert!(
+            c.bt.enabled,
+            "部分表不得令 bt.enabled 退化为 false（BT 静默关闭）"
+        );
+        assert_eq!(c.bt.max_upload_kb_s, 100);
+
+        // 只写 [storage] 的一个键 → lock.path 不受影响（不同表互不干扰）
+        std::fs::write(&p, "[storage]\ntasks_path = \"/data/t.json\"\n").unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert_eq!(c.storage.tasks_path, PathBuf::from("/data/t.json"));
+        assert_eq!(c.lock.path, PathBuf::from("./daemon.lock"));
     }
 
     #[test]

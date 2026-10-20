@@ -36,10 +36,14 @@ pub fn unwrap_frame(data: &[u8]) -> Option<Frame> {
     let fixed = u32::from_be_bytes(data[12..16].try_into().unwrap());
     let ctr = u32::from_be_bytes(data[16..20].try_into().unwrap());
     let plen = u32::from_be_bytes(data[20..24].try_into().unwrap()) as usize;
-    if data.len() < 24 + plen {
+    // P1-22 修复（handshake.rs:81 同型漏改）：24 + plen 用 checked_add——
+    // 32 位平台上 plen 接近 u32::MAX 时回绕，回绕后 < data.len() 通过
+    // 长度检查 → data[24..24+plen] 切片 panic。
+    let end = 24usize.checked_add(plen)?;
+    if data.len() < end {
         return None;
     }
-    let payload = data[24..24 + plen].to_vec();
+    let payload = data[24..end].to_vec();
     Some(Frame {
         ftype,
         seq,

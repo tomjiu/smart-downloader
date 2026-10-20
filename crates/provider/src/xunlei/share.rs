@@ -170,6 +170,12 @@ pub struct Sharer {
     http: reqwest::Client,
     /// 匿名 captcha_token（captcha/init 取得，300s 有效）。
     captcha: Mutex<Option<String>>,
+    /// 匿名设备号（did32）缓存——P0-6 修复：三个调用点
+    ///（ensure_captcha/list/resolve）原各自独立调 anonymous_device_id()
+    /// 每次生成新值，captcha_token 是用设备号 A 签的、x-device-id 却是
+    /// 设备号 B → token 与 device 不匹配 → 匿名分享解析 100% 失败。
+    /// 缓存后同一 Sharer 全链路用同一设备号（与 captcha/init 口径一致）。
+    device: Mutex<Option<String>>,
     /// 提取码校验得到的 pass_code_token（跨 list→resolve 复用）。
     pass_token: Mutex<Option<String>>,
 }
@@ -183,8 +189,22 @@ impl Sharer {
                 .build()
                 .unwrap_or_default(),
             captcha: Mutex::new(None),
+            device: Mutex::new(None),
             pass_token: Mutex::new(None),
         }
+    }
+
+    /// 取（或首次生成并缓存）本 Sharer 的匿名设备号 did32。
+    /// P0-6 修复：全链路单一设备号——captcha/init 签名、x-device-id 头、
+    /// 提码校验全部用同一值，消除「token 与 device 不匹配」。
+    fn anonymous_did32(&self) -> String {
+        if let Some(d) = self.device.lock().clone() {
+            return d;
+        }
+        let full = anonymous_device_id();
+        let did32 = device_id_32(&full).to_string();
+        *self.device.lock() = Some(did32.clone());
+        did32
     }
 
     /// 构造 share API 的三要素请求头（参考 client.rs::auth_headers，但 x-device-id 用 32 位匿名设备号）。
@@ -217,15 +237,14 @@ impl Sharer {
     /// 匿名（不带 captcha_sign）即可 200 返回 `{"captcha_token":"ck0....","expires_in":300}`。
     /// 该结论在 App 端 client_id 下验证；此处复用 Web 端 `CLIENT_ID` + Web 端 `captcha_sign`
     /// （与 client.rs::refresh_captcha 一致），并按需求用本地生成的匿名设备号。
-    async fn ensure_captcha(&self) -> Result<String, ShareError> {
-        // 已有则直接复用。
+    async fn ensure_captcha(&self) -> Result<(String, String), ShareError> {
+        // 已有则直接复用（P0-6：同时返回签发设备号，保证调用方同号）。
+        let did32 = self.anonymous_did32();
         if let Some(t) = self.captcha.lock().clone() {
-            return Ok(t);
+            return Ok((t, did32));
         }
-        let full_dev = anonymous_device_id();
-        let did32 = device_id_32(&full_dev); // 复用 sign::device_id_32
         let ts = now_millis().to_string();
-        let sign = captcha_sign(did32, &ts); // 复用 sign::captcha_sign（Web 端盐链）
+        let sign = captcha_sign(&did32, &ts); // 复用 sign::captcha_sign（Web 端盐链）
 
         #[derive(Deserialize)]
         struct CaptchaResp {
@@ -261,7 +280,7 @@ impl Sharer {
         let body: CaptchaResp = resp.json().await?;
         // 缓存（忽略 expires，下次 list/resolve 若失败可重试刷新）。
         *self.captcha.lock() = Some(body.captcha_token.clone());
-        Ok(body.captcha_token)
+        Ok((body.captcha_token, did32))
     }
 
     /// 提取码校验（登录态版）：pwd → pass_code_token。【B级待验】
@@ -433,15 +452,14 @@ impl Sharer {
 
     /// 全流程：匿名 captcha → 分享详情 →（需要时）提码校验 → 文件列表。
     pub async fn list(&self, link: &SharedLink) -> Result<Vec<SharedFile>, ShareError> {
-        let captcha_token = self.ensure_captcha().await?;
-        let full_dev = anonymous_device_id();
-        let did32 = device_id_32(&full_dev);
-        let device_id = did32; // 与 captcha/init 一致
+        // P0-6 修复：设备号与 captcha_token 同源配对（ensure_captcha 签发）——
+        // 原实现此处独立重新生成设备号，与签 token 的设备号不匹配。
+        let (captcha_token, device_id) = self.ensure_captcha().await?;
 
         // 若带提取码，先校验拿到 pass_code_token 并缓存。
         if let Some(_pwd) = &link.pass_code {
             let token = self
-                .verify_pass_code(link, device_id, &captcha_token)
+                .verify_pass_code(link, &device_id, &captcha_token)
                 .await?;
             *self.pass_token.lock() = Some(token);
         }
@@ -461,7 +479,7 @@ impl Sharer {
         let resp = self
             .http
             .get(&url)
-            .headers(self.share_headers(device_id, &captcha_token))
+            .headers(self.share_headers(&device_id, &captcha_token))
             .send()
             .await?;
         if !resp.status().is_success() {
@@ -497,9 +515,8 @@ impl Sharer {
         link: &SharedLink,
         file_id: &str,
     ) -> Result<ResolvedLink, ShareError> {
-        let captcha_token = self.ensure_captcha().await?;
-        let full_dev = anonymous_device_id();
-        let device_id = device_id_32(&full_dev);
+        // P0-6 修复：设备号与 captcha_token 同源配对
+        let (captcha_token, device_id) = self.ensure_captcha().await?;
         let pass_token = self.pass_token.lock().clone();
 
         let url = build_share_play_url(file_id, &link.share_id, pass_token.as_deref());
@@ -507,7 +524,7 @@ impl Sharer {
         let resp = self
             .http
             .get(&url)
-            .headers(self.share_headers(device_id, &captcha_token))
+            .headers(self.share_headers(&device_id, &captcha_token))
             .send()
             .await?;
         if !resp.status().is_success() {
