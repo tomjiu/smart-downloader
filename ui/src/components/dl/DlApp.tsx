@@ -237,8 +237,14 @@ export default function DlApp() {
       list.map(async (t) => {
         try {
           const fresh = await client.getTask(t.task_id);
-          // 引用稳定：表格消费的字段（done/total/state/error/name/limits/rates）
-          // 未变 → 沿用旧快照对象（行级 memo 浅比较生效）
+          // 引用稳定：表格消费的字段（done/total/state/error/name/limits/
+          // rates/累计统计）未变 → 沿用旧快照对象（行级 memo 浅比较生效）。
+          // 审计修复（2026-10-21）：旧比较漏 rates/limits/累计字段——做种任务
+          // done/total 恒定 → 快照冻结 → 上传速率列与 E33 累计统计永不更新
+          // （后端每 2s 提供新值被引用复用静默丢弃；注释声称包含但代码没有）。
+          const sameRates = (a?: { down_bytes_s: number; up_bytes_s: number } | null, b?: { down_bytes_s: number; up_bytes_s: number } | null) =>
+            (a?.down_bytes_s ?? 0) === (b?.down_bytes_s ?? 0) &&
+            (a?.up_bytes_s ?? 0) === (b?.up_bytes_s ?? 0);
           const p = prev[t.task_id];
           next[t.task_id] =
             p &&
@@ -246,7 +252,12 @@ export default function DlApp() {
             p.total === fresh.total &&
             p.state === fresh.state &&
             p.error === fresh.error &&
-            p.name === fresh.name
+            p.name === fresh.name &&
+            sameRates(p.rates, fresh.rates) &&
+            (p.limits?.down_kb_s ?? 0) === (fresh.limits?.down_kb_s ?? 0) &&
+            (p.limits?.up_kb_s ?? 0) === (fresh.limits?.up_kb_s ?? 0) &&
+            p.total_downloaded === fresh.total_downloaded &&
+            p.total_uploaded === fresh.total_uploaded
               ? p
               : fresh;
         } catch {
