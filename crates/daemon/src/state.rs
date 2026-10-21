@@ -576,8 +576,7 @@ impl AddHttpOpts {
         }
         if let Some(n) = &self.name {
             // V3 终审提前：引擎同函数拒，这里先拒避免错误信息隔着 Engine 包装
-            smart_dl_core::session::output::sanitize_rel(n)
-                .map_err(|e| format!("name 非法: {e}"))?;
+            smart_dl_storage::sanitize_rel(n).map_err(|e| format!("name 非法: {e}"))?;
         }
         Ok(())
     }

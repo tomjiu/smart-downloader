@@ -34,6 +34,7 @@ cbc = "0.1"
 # metalink 同款）
 quick-xml = { workspace = true }
 smart-dl-core = { path = "../core" }
+smart-dl-storage = { path = "../storage" }
 parking_lot = { workspace = true }
 tokio-rustls = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }

@@ -94,7 +94,7 @@ impl MetalinkFile {
                 self.name
             ));
         }
-        smart_dl_core::session::output::sanitize_rel(seg)
+        smart_dl_storage::sanitize_rel(seg)
             .map(|p| p.to_string_lossy().into_owned())
             .map_err(|e| format!("metalink <file> name 非法: {e}"))
     }

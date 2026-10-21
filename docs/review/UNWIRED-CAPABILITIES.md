@@ -324,6 +324,15 @@ if cfg.provider_quark.enabled {
 
 ## 4. 🟡 `core/sniffer.rs` —— 695 行，daemon 零调用
 
+> **✅ 已处置（2026-10-20，PR #134）**：死代码清理路线（非接线路线）。
+> 规则引擎方案已被 `source_parse` 活链取代——qqdl/fs2you/ed2k 均在链上，
+> sniffer 整体删除（735 行，git 历史可恢复）。**唯一独有能力 flashget://
+> 解码被抢救**进 `source_parse/flashget.rs` 并接入 `normalize_user_link`
+> 活链（base64 剥壳容错 + 大小写口径钉死），快车链族从此可下载。
+> 本节原「修法」（把 sniffer 接进 XunleiShare 分支）随模块删除作废——
+> 迅雷分享链接的导入仍走 `NormalizedSource::XunleiShare` 报错提示，
+> 真正接线需 provider 线（F3.1 后续）提供分享解析能力，与 sniffer 无关。
+
 ### 现状
 
 ```bash

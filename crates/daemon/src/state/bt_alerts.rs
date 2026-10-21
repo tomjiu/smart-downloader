@@ -101,7 +101,7 @@ impl TorrentMeta {
             .and_then(|v| v.as_bytes())
             .map(|raw| String::from_utf8_lossy(raw).into_owned())
             .ok_or_else(|| DaemonError::InvalidSource("name 解析失败".into()))?;
-        smart_dl_core::session::output::sanitize_rel(&name).map_err(|_| {
+        smart_dl_storage::sanitize_rel(&name).map_err(|_| {
             DaemonError::InvalidSource(format!(".torrent name 含非法路径分量已拒绝: {name}"))
         })?;
 

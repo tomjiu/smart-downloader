@@ -1,0 +1,13 @@
+[package]
+name = "smart-dl-storage"
+description = "落盘与输出层：路径净化（CWE-22/23）、.part 生命周期、跨卷 fallback、磁盘预检（D36）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -64,7 +64,7 @@ pub fn derive_mp4_name(url: &str) -> Option<String> {
     if stem.is_empty() {
         return None;
     }
-    smart_dl_core::session::output::sanitize_rel(&format!("{stem}.mp4"))
+    smart_dl_storage::sanitize_rel(&format!("{stem}.mp4"))
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
 }
