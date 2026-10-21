@@ -75,3 +75,4 @@ node_modules/
 desktop/src-tauri/native/
 .vcpkg-cache/
 libtorrent-rasterbar-dev_*.deb
+ui/package-lock.json

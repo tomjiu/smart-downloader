@@ -11,7 +11,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { TaskSnapshot } from "@/lib/daemon/types";
 import { client } from "@/lib/daemon/store";
-import { fmtBytes, fmtPct } from "@/lib/daemon/format";
+import { fmtBytes, fmtPct, fmtUnixShort } from "@/lib/daemon/format";
 import { StateBadge, TaskProgress } from "./Common";
 import { Icon } from "./Icon";
 import { displayName } from "./TasksTable";
@@ -115,6 +115,29 @@ export default function TaskDetail({
             <div className="dl-card" style={{ fontSize: 13 }}>
               <Row k="已传输" v={`${fmtBytes(task.done)} / ${fmtBytes(task.total)}`} />
               <Row k="任务 ID" v={task.task_id} />
+              {/* A3（契约审计 2026-10-21）：E33 做种统计透出——后端 TaskSnapshot
+                  的 total_downloaded/total_uploaded/share_ratio 仅 BT 任务携带
+                  （条件序列化），此前未建模 → 做种任务看不到分享率与累计流量。 */}
+              {(task.total_downloaded != null || task.total_uploaded != null) && (
+                <>
+                  <Row k="累计下载" v={fmtBytes(task.total_downloaded ?? 0)} />
+                  <Row k="累计上传" v={fmtBytes(task.total_uploaded ?? 0)} />
+                  {task.share_ratio != null && (
+                    <Row k="分享率" v={task.share_ratio.toFixed(2)} />
+                  )}
+                </>
+              )}
+              {/* A3：E30 重试预算透出——失败任务详情可见重试进度与下次到期。 */}
+              {task.max_retries != null && task.max_retries > 0 && (
+                <Row
+                  k="自动重试"
+                  v={
+                    task.next_retry_at_unix
+                      ? `${task.retries ?? 0}/${task.max_retries}（下次 ${fmtUnixShort(task.next_retry_at_unix)}）`
+                      : `${task.retries ?? 0}/${task.max_retries}`
+                  }
+                />
+              )}
               {task.error && <Row k="错误" v={task.error} danger />}
             </div>
 

@@ -48,3 +48,19 @@ export function fmtKb(kb: number | undefined | null): string {
   if (kb == null || !isFinite(kb)) return "—";
   return kb === 0 ? "不限" : `${kb} KiB/s`;
 }
+
+/// unix 秒 → 短时刻（A2：定时/重试徽章）。当年内省略年份；跨年含年份。
+export function fmtUnixShort(unix: number | undefined | null): string {
+  if (!unix || unix <= 0 || !isFinite(unix)) return "—";
+  const d = new Date(unix * 1000);
+  if (isNaN(d.getTime())) return "—";
+  const now = new Date();
+  const sameYear = d.getFullYear() === now.getFullYear();
+  return d.toLocaleString(undefined, {
+    ...(sameYear ? {} : { year: "numeric" }),
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
