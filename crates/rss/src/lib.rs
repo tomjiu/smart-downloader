@@ -29,6 +29,7 @@
 use quick_xml::events::Event;
 use quick_xml::Reader;
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// 订阅条目。
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -65,7 +66,8 @@ pub struct RssFeed {
 }
 
 /// 自动下载规则。
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct RssRule {
     pub id: u64,
     pub name: String,

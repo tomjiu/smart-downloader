@@ -3831,18 +3831,19 @@ impl DaemonState {
     }
 
     /// 任务操作日志（`GET /tasks/:id/logs`）：快照 + 事件序列。
-    pub fn task_logs(&self, id: &str) -> Result<serde_json::Value, DaemonError> {
+    pub fn task_logs(&self, id: &str) -> Result<crate::state::TaskLogs, DaemonError> {
         let tasks = self.tasks.lock();
         let rec = tasks
             .get(id)
             .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
-        Ok(serde_json::json!({
-            "task_id": rec.task.id,
-            "state": state_label(&rec.task.state),
-            "source": rec.task.source.redacted_debug(),
-            "error": rec.engine_status.as_ref().and_then(|s| s.error.clone()),
-            "events": rec.events,
-        }))
+        Ok(crate::state::TaskLogs {
+            task_id: rec.task.id.clone(),
+            state: state_label(&rec.task.state),
+            source: rec.task.source.redacted_debug(),
+            error: rec.engine_status.as_ref().and_then(|s| s.error.clone()),
+            // 记录级 events 克隆（响应即终值快照，无需持有锁的引用返回）。
+            events: rec.events.clone(),
+        })
     }
 
     /// 已完成任务自动清扫（E20）：扫描 Completed 且完成龄期 ≥

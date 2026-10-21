@@ -27,7 +27,7 @@ fn task_events_capped_at_500() {
         }
 
         let logs = state.task_logs(&tid).unwrap();
-        let events = logs["events"].as_array().unwrap();
+        let events = &logs.events;
         assert!(
             events.len() <= 500,
             "events 必须封顶 500，实际 {}",
@@ -35,9 +35,9 @@ fn task_events_capped_at_500() {
         );
         // 尾部保留最新：resume 必须是最后一条（第 600 轮的 resume）
         let last = events.last().unwrap();
-        assert_eq!(last["op"].as_str().unwrap(), "resume", "尾部应为最新事件");
+        assert_eq!(last.op.as_str(), "resume", "尾部应为最新事件");
         // 首条应是早期事件（add 已被挤出，存在中期 pause）
-        let first_op = events[0]["op"].as_str().unwrap();
+        let first_op = events[0].op.as_str();
         assert!(
             first_op == "pause" || first_op == "resume",
             "首条应为挤出边界后的操作事件，实际 {first_op}"
