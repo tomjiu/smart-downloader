@@ -73,6 +73,15 @@ jobs:
       - name: test daemon (sftp)
         run: cargo test -p smart-dl-daemon --features sftp
 
+      # ts-rs 生成类型漂移检查（PR #149/#150）：上方 cargo test 内嵌的
+      # export_bindings 测试会按 Rust 结构体重写 ui/src/lib/daemon/generated/。
+      # 提交内容与结构体不一致（改了 struct 忘记重新生成提交）→ 此处红，
+      # 防止生成物与契约漂移。仅 Linux：Windows checkout 的 autocrlf 行尾
+      # 转换会引入全文件假阳性。
+      - name: ts-rs generated types drift check
+        if: runner.os == 'Linux'
+        run: git diff --exit-code -- ui/src/lib/daemon/generated/
+
   bt-integration:
     # libtorrent native 集成测试（此前 if:false 占位，配方已脚本化并本地实测）：
     # scripts/ci/bt-linux-setup.sh [rootful] → 系统包 libtorrent 2.0.x + fakevcpkg 契约
