@@ -5,6 +5,7 @@
 //! - `qqdl://`  内容 = base64(真实URL)，无 AA/ZZ 壳
 
 use crate::source_parse::ed2k::parse_ed2k;
+use crate::source_parse::flashget::parse_flashget;
 use crate::source_parse::fs2you::parse_fs2you;
 use crate::source_parse::thunder::{decode_base64_lenient, decode_thunder};
 use crate::source_parse::xunlei_share::parse_xunlei_share;
@@ -71,6 +72,21 @@ pub fn normalize_user_link(link: &str) -> NormalizedSource {
                 }
             }
             Err(_) => NormalizedSource::Unsupported(format!("qqdl:// 解码失败: {rest}")),
+        };
+    }
+    if link
+        .get(..11)
+        .map(|p| p.eq_ignore_ascii_case("flashget://"))
+        .unwrap_or(false)
+    {
+        // flashget（快车链，chore/core-dead-code 批次从死代码 sniffer 抢救落位）：
+        // base64 内层 [FLASHGET]<url>[FLASHGET]，剥壳后须为 http(s) 直链。
+        return match parse_flashget(link) {
+            Ok(real) if is_http(&real) => NormalizedSource::Http(real),
+            Ok(other) => {
+                NormalizedSource::Unsupported(format!("flashget:// 解码为非 HTTP 协议: {other}"))
+            }
+            Err(_) => NormalizedSource::Unsupported(format!("flashget:// 解码失败: {link}")),
         };
     }
     if link.starts_with("magnet:") {
@@ -272,6 +288,62 @@ mod tests {
         match normalize_user_link("fs2you://!!!junk!!!") {
             NormalizedSource::Unsupported(msg) => {
                 assert!(msg.contains("fs2you 链接解析失败"), "msg={msg}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    // ── flashget（chore/core-dead-code 批次：从死代码 sniffer 抢救落位）──
+
+    #[test]
+    fn flashget_decodes_to_http() {
+        let inner = "[FLASHGET]http://example.com/files/a.bin[FLASHGET]";
+        let link = format!("flashget://{}", B64.encode(inner.as_bytes()));
+        assert_eq!(
+            normalize_user_link(&link),
+            NormalizedSource::Http("http://example.com/files/a.bin".into())
+        );
+    }
+
+    #[test]
+    fn flashget_bare_inner_decodes() {
+        // 包裹符被剥掉的形态
+        let link = format!("flashget://{}", B64.encode(b"http://example.com/b.bin"));
+        assert_eq!(
+            normalize_user_link(&link),
+            NormalizedSource::Http("http://example.com/b.bin".into())
+        );
+    }
+
+    #[test]
+    fn flashget_scheme_case_insensitive() {
+        // scheme 大小写混合：判定用 eq_ignore_ascii_case，载荷保留原大小写
+        // （base64 大小写敏感，全链 lowercase 会破坏载荷）
+        let inner = "[FLASHGET]http://example.com/c.bin[FLASHGET]";
+        let link = format!("FlashGet://{}", B64.encode(inner.as_bytes()));
+        assert_eq!(
+            normalize_user_link(&link),
+            NormalizedSource::Http("http://example.com/c.bin".into())
+        );
+    }
+
+    #[test]
+    fn flashget_bad_payload_is_unsupported() {
+        match normalize_user_link("flashget://!!!junk!!!") {
+            NormalizedSource::Unsupported(msg) => {
+                assert!(msg.contains("flashget:// 解码失败"), "msg={msg}");
+            }
+            other => panic!("expected Unsupported, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn flashget_non_http_inner_is_unsupported() {
+        let inner = "[FLASHGET]ftp://example.com/x[FLASHGET]";
+        let link = format!("flashget://{}", B64.encode(inner.as_bytes()));
+        match normalize_user_link(&link) {
+            NormalizedSource::Unsupported(msg) => {
+                assert!(msg.contains("非 HTTP"), "msg={msg}");
             }
             other => panic!("expected Unsupported, got {other:?}"),
         }
