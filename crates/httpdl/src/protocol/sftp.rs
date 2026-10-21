@@ -687,7 +687,12 @@ async fn download_file(
 async fn download_loop(inner: Arc<EngineInner>, tid: EngineTaskId, backoff: Backoff) {
     let (host, port, user, pass, path, dest, total) = {
         let tasks = inner.tasks.lock();
-        let t = tasks.get(&tid).unwrap();
+        // B2（2026-10-21）：spawn 到首次加锁之间存在移除窗口（daemon remove
+        // 可先行）——unwrap 会 panic 掉整个下载任务；对齐 engine.rs 的
+        // still_current 容错约定，任务已消失则静默退出。
+        let Some(t) = tasks.get(&tid) else {
+            return;
+        };
         (
             t.host.clone(),
             t.port,

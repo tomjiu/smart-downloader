@@ -62,6 +62,10 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// 任务操作日志上限（B1）：环形保留最近 N 条（内存 + `/tasks/:id/logs`
+/// 响应规模双重封顶）。UI 侧事件视图同量级截断（DlApp 500 条）。
+const TASK_EVENT_CAP: usize = 500;
+
 impl TaskRecord {
     fn push_event(&mut self, op: &str, detail: Option<String>) {
         self.events.push(TaskEvent {
@@ -69,6 +73,15 @@ impl TaskRecord {
             op: op.to_string(),
             detail,
         });
+        // 审计修复（B1，2026-10-21）：操作日志环形上限——add/pause/resume/remove/
+        // restored/auto_retry 均可入账，长寿命任务 + 高频操作（脚本化 pause/resume
+        // 循环、大重试预算）会使 Vec 无限增长，且 `GET /tasks/:id/logs` 全量
+        // 序列化响应同样无界。保留最近 TASK_EVENT_CAP 条（与 UI 侧 events
+        // 上限 500 同量级），超限从头丢弃（时间序保留尾部最新）。
+        let overflow = self.events.len().saturating_sub(TASK_EVENT_CAP);
+        if overflow > 0 {
+            self.events.drain(0..overflow);
+        }
     }
 
     /// 失败处置统一入口（E30）：重试预算未用尽 → 清引擎句柄、任务回 Queued、

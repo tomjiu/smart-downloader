@@ -770,7 +770,11 @@ async fn download_loop(
                     Ok(false) => {
                         let attempts = {
                             let mut tasks = inner.tasks.lock();
-                            let t = tasks.get_mut(&tid).unwrap();
+                            // B2（2026-10-21）：still_current 检查到本次加锁之间存在
+                            // 移除窗口——对齐 finish() 的容错约定（任务可能中途消失）
+                            let Some(t) = tasks.get_mut(&tid) else {
+                                return;
+                            };
                             t.verify_attempts += 1;
                             t.verify_attempts
                         };
@@ -782,12 +786,16 @@ async fn download_loop(
                         // 主源两次校验失败 → 切备用源（夸克 backup_url/backup_md5 机制）
                         let (backup_url, backup_md5, backup_used) = {
                             let tasks = inner.tasks.lock();
-                            let t = tasks.get(&tid).unwrap();
+                            let Some(t) = tasks.get(&tid) else {
+                                return;
+                            };
                             (t.backup_url.clone(), t.backup_md5.clone(), t.backup_used)
                         };
                         if let (Some(bu), false) = (&backup_url, backup_used) {
                             let mut tasks = inner.tasks.lock();
-                            let t = tasks.get_mut(&tid).unwrap();
+                            let Some(t) = tasks.get_mut(&tid) else {
+                                return;
+                            };
                             // 归因评分（E3）：唯一源两次校验失败 → 中毒直达下限（比段
                             // 传输失败更强的证据，跨任务避雷）；多候选集体失败无法
                             // 归因单一源（段可能混流）→ 不评分。
@@ -825,7 +833,9 @@ async fn download_loop(
                         // 归因评分同上：唯一源两次校验失败 → 中毒直达下限。
                         let rotated = {
                             let mut tasks = inner.tasks.lock();
-                            let t = tasks.get_mut(&tid).unwrap();
+                            let Some(t) = tasks.get_mut(&tid) else {
+                                return;
+                            };
                             if t.mirrors.len() == 1 {
                                 let bad = t.mirrors[0].clone();
                                 update_score(&inner.mirror_scores, &bad, SCORE_MIN);
@@ -846,7 +856,9 @@ async fn download_loop(
                         };
                         if let Some(cand) = rotated {
                             let mut tasks = inner.tasks.lock();
-                            let t = tasks.get_mut(&tid).unwrap();
+                            let Some(t) = tasks.get_mut(&tid) else {
+                                return;
+                            };
                             t.mirrors = vec![cand.clone()];
                             t.verify_attempts = 0;
                             t.error = None;

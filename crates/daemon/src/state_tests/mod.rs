@@ -502,6 +502,7 @@ mod cleanup_tests;
 mod conflict_tests;
 mod conn_limit_tests;
 mod ct_eq_tests;
+mod event_cap_tests;
 mod ftp_tests;
 mod global_limits_tests;
 mod list_batch_tests;
