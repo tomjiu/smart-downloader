@@ -51,7 +51,8 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
   const [confirmState, setConfirmState] = useState<{
     title: string;
     body: string;
-    run: () => Promise<void>;
+    /// run 现返回 Promise<boolean>（成功标志）——放宽为 unknown 兼容
+    run: () => Promise<unknown>;
   } | null>(null);
 
   const load = useCallback(async () => {
@@ -75,14 +76,19 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
     return () => clearInterval(iv);
   }, [load]);
 
-  const run = async (fn: () => Promise<unknown>, ok: string) => {
+  /// 审计修复（第四轮）：返回成功标志——调用侧的 .then(清空表单) 原来无
+  /// 条件执行，API 失败（400 校验/重名/网络错误）时用户输入的规则/订阅
+  /// URL 被 wiped，只能重新输入。失败保留输入，成功才清空。
+  const run = async (fn: () => Promise<unknown>, ok: string): Promise<boolean> => {
     setBusy(true);
     try {
       await fn();
       onToast({ kind: "success", text: ok });
       await load();
+      return true;
     } catch (e) {
       onToast({ kind: "error", text: String(e) });
+      return false;
     } finally {
       setBusy(false);
     }
@@ -109,7 +115,8 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
           episode_filter: rEpisode.trim() || null,
         }),
       "规则已创建",
-    ).then(() => {
+    ).then((created) => {
+      if (!created) return; // 失败保留表单（审计修复：旧实现无条件清空）
       setRName("");
       setRMust("");
       setRMustNot("");
@@ -121,7 +128,7 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
   };
 
   return (
-    <div className="" style={{ display: "grid", gap: 16, maxWidth: 860 }}>
+    <div style={{ display: "grid", gap: 16, maxWidth: 860 }}>
       {/* —— 订阅源 —— */}
       <Section title="订阅源" count={feeds.length}>
         <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
@@ -136,7 +143,9 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
             className="dl-btn dl-btn--primary"
             disabled={busy || !feedUrl.trim()}
             onClick={() =>
-              run(() => client.rssAddFeed(feedUrl.trim()), "订阅已添加").then(() => setFeedUrl(""))
+              run(() => client.rssAddFeed(feedUrl.trim()), "订阅已添加").then((created) => {
+                if (created) setFeedUrl(""); // 失败保留 URL（审计修复）
+              })
             }
           >
             添加订阅
