@@ -2592,7 +2592,7 @@ pub struct RssRulesList {
 
 async fn rss_rules_list(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let st = state.rss_state().lock();
-    let rules: Vec<smart_dl_rss::RssRule> = st.rules.iter().cloned().collect();
+    let rules: Vec<smart_dl_rss::RssRule> = st.rules.clone();
     Json(RssRulesList { rules }).into_response()
 }
 
