@@ -161,11 +161,14 @@ impl VipSpeedupClient {
         inner_base: impl Into<String>,
     ) -> Self {
         Self {
+            // P2-27 修复（审查第三轮）：原 .unwrap_or_default() 在构建失败时
+            // 退回**无超时**默认 client（fail-open）——静态配置实际不可失败，
+            // fail-loud 优于静默丢失全部超时语义。
             http: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
-                .unwrap_or_default(),
+                .expect("reqwest client build（静态超时配置，无失败路径）"),
             speedup_base: speedup_base.into().trim_end_matches('/').to_string(),
             cert_base: cert_base.into().trim_end_matches('/').to_string(),
             inner_base: inner_base.into().trim_end_matches('/').to_string(),
@@ -192,7 +195,7 @@ impl VipSpeedupClient {
             .send()
             .await?;
         let status = resp.status();
-        let body = resp.text().await.map_err(SpeedupError::Http)?;
+        let body = read_body_capped(resp).await?;
         if !status.is_success() {
             return Err(SpeedupError::Status(status.as_u16()));
         }
@@ -219,7 +222,7 @@ impl VipSpeedupClient {
             .send()
             .await?;
         let status = resp.status();
-        let body = resp.text().await.map_err(SpeedupError::Http)?;
+        let body = read_body_capped(resp).await?;
         if !status.is_success() {
             return Err(SpeedupError::Status(status.as_u16()));
         }
@@ -242,7 +245,7 @@ impl VipSpeedupClient {
             .send()
             .await?;
         let status = resp.status();
-        let body = resp.text().await.map_err(SpeedupError::Http)?;
+        let body = read_body_capped(resp).await?;
         if !status.is_success() {
             return Err(SpeedupError::Status(status.as_u16()));
         }
@@ -269,13 +272,34 @@ impl VipSpeedupClient {
             .send()
             .await?;
         let status = resp.status();
-        let body = resp.text().await.map_err(SpeedupError::Http)?;
+        let body = read_body_capped(resp).await?;
         if !status.is_success() {
             return Err(SpeedupError::Status(status.as_u16()));
         }
         serde_json::from_str(&body)
             .map_err(|e| SpeedupError::Json(format!("{e}; body head: {}", head(&body))))
     }
+}
+
+/// 响应体读取上限（P2-26）：状态/加速 API 均为小 JSON（<10 KiB 量级）；
+/// 1 MiB 已留两个数量级余量。恶意/异常服务器在 30s 超时内可推送数 GB——
+/// 必须有显式上限（审查第三轮 P2-26）。
+const BODY_CAP: usize = 1024 * 1024;
+
+/// 读响应体并施加 [`BODY_CAP`] 上限：超限即报错（非截断——半截 JSON
+/// 只会制造更隐蔽的解析错）。
+async fn read_body_capped(resp: reqwest::Response) -> Result<String, SpeedupError> {
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut resp = resp;
+    while let Some(chunk) = resp.chunk().await.map_err(SpeedupError::Http)? {
+        if buf.len() + chunk.len() > BODY_CAP {
+            return Err(SpeedupError::Json(format!(
+                "响应体超过 {BODY_CAP} 字节上限（异常/恶意服务器）"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    String::from_utf8(buf).map_err(|e| SpeedupError::Json(format!("响应体非 UTF-8: {e}")))
 }
 
 fn head(s: &str) -> String {

@@ -117,16 +117,26 @@ fn extract_json_entries(bytes: &[u8], report: &mut CidStoreReport) -> Vec<CidSto
         "cid", "gcid", "bcid", "hash", "md5", "sha1", "fileHash", "infohash",
     ];
     const PATH_KEYS: [&str; 6] = ["path", "filepath", "file_path", "name", "filename", "url"];
-    walk_json(&value, &mut out, &HASH_KEYS, &PATH_KEYS);
+    walk_json(&value, &mut out, &HASH_KEYS, &PATH_KEYS, 0);
     out
 }
+
+/// JSON 遍历深度上限（P2-30，审查第三轮）：显式防护——此前隐式依赖
+/// serde_json 解析器自身的 128 层上限；防御纵深：解析器上限变化时本层
+/// 不跟随回归（递归 walk 栈溢出不可 catch_unwind）。
+const JSON_WALK_MAX_DEPTH: usize = 64;
 
 fn walk_json(
     value: &serde_json::Value,
     out: &mut Vec<CidStoreEntry>,
     hash_keys: &[&str],
     path_keys: &[&str],
+    depth: usize,
 ) {
+    if depth > JSON_WALK_MAX_DEPTH {
+        return; // 超深子树静默剪枝（与解析器 128 层上限内的行为一致：
+                // 提取器对不可理解的结构本就跳过）
+    }
     match value {
         serde_json::Value::Object(map) => {
             let mut hash: Option<(String, usize)> = None;
@@ -153,12 +163,12 @@ fn walk_json(
                 }
             }
             for v in map.values() {
-                walk_json(v, out, hash_keys, path_keys);
+                walk_json(v, out, hash_keys, path_keys, depth + 1);
             }
         }
         serde_json::Value::Array(items) => {
             for v in items {
-                walk_json(v, out, hash_keys, path_keys);
+                walk_json(v, out, hash_keys, path_keys, depth + 1);
             }
         }
         _ => {}
@@ -411,6 +421,33 @@ fn push_path(raw: &[u8], off: usize, out: &mut Vec<(usize, String)>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// P2-30（审查第三轮）：超深 JSON 子树剪枝——嵌套 >64 层的 hash
+    /// 不再被提取（显式深度上限，不再隐式依赖 serde_json 解析器的
+    /// 128 层递归上限）。
+    #[test]
+    fn deep_json_subtree_pruned() {
+        // 构造 70 层嵌套，最深处放一个合法 hash
+        let mut body = String::from("{\"k\":");
+        for _ in 0..70 {
+            body.push_str("{\"deep\":");
+        }
+        body.push_str("{\"cid\":\"D41D8CD98F00B204E9800998ECF8427E\"}");
+        for _ in 0..70 {
+            body.push('}');
+        }
+        body.push('}');
+        let (_, entries) = analyze_cid_store(body.as_bytes());
+        assert!(
+            entries.is_empty(),
+            "超深子树应被剪枝，实际提取到 {} 条",
+            entries.len()
+        );
+        // 对照：同样的 hash 在浅层正常提取
+        let shallow = br#"{"cid":"D41D8CD98F00B204E9800998ECF8427E","path":"a.bin"}"#;
+        let (_, e2) = analyze_cid_store(shallow);
+        assert_eq!(e2.len(), 1);
+    }
 
     #[test]
     fn json_form_extracts_pairs() {

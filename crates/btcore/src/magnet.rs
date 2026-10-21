@@ -95,12 +95,25 @@ pub fn fetch_metadata(
     // 内核语义（Bug A 修复）：add 即 paused + 非 auto_managed → 必须 resume
     // 才会 announce / 连 peer 抓 metadata。
     core.resume(&ih)?;
+    // P2-24 修复（审查第三轮）：注入仍 best-effort（单个坏源不阻断整体
+    // 抓取），但失败计数进日志——原实现全 `let _ =` 吞错，全部注入失败
+    // 时唯一症状是 60s 后 Timeout，无法排障。
+    let mut inj_fail = 0usize;
+    let mut inj_total = 0usize;
     for tr in &opts.extra_trackers {
-        // best-effort：单个坏 tracker 不阻断整体抓取
-        let _ = core.add_tracker(&ih, tr);
+        inj_total += 1;
+        if core.add_tracker(&ih, tr).is_err() {
+            inj_fail += 1;
+        }
     }
     for p in &opts.bootstrap_peers {
-        let _ = core.add_peer(&ih, &p.ip().to_string(), p.port());
+        inj_total += 1;
+        if core.add_peer(&ih, &p.ip().to_string(), p.port()).is_err() {
+            inj_fail += 1;
+        }
+    }
+    if inj_fail > 0 {
+        tracing::warn!("magnet 元数据抓取的源注入部分失败：{inj_fail}/{inj_total}（不阻断抓取）");
     }
 
     let deadline = Instant::now() + opts.timeout;
@@ -120,7 +133,9 @@ pub fn fetch_metadata(
                 timeout: opts.timeout,
             });
         }
-        std::thread::sleep(opts.poll_interval);
+        // P2-23 修复（审查第三轮）：poll_interval=0 会变成无间隔忙等
+        // （单核打满）——钳制到 10ms 下限。
+        std::thread::sleep(opts.poll_interval.max(std::time::Duration::from_millis(10)));
     };
 
     // 元数据到手即清理任务与部分数据（临时 session 随后 Drop）
