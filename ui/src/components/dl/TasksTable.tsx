@@ -9,11 +9,13 @@
 /// 交互打磨批（本次加强）：
 /// - 表头排序：三态（默认 → 升 → 降 → 默认），aria-sort + 方向指示
 /// - 全选 checkbox indeterminate（部分选中显示横线态）
-/// - 行三段选择语义：单击=唯一选中 / Ctrl+单击=切换 / Shift+单击=范围加选
+/// - 行三段选择语义：单击=唯一选中 / Ctrl=单击=切换 / Shift+单击=范围加选
 /// - 键盘：↑/↓ 行间移动焦点；Enter 开详情；Space 选中
 /// - 速率过期衰减：SSE 断连后 5s 无新事件的速率显示 —（不再残留旧值）
+/// P2（Issue #115 实施计划 §8）：虚拟滚动——固定行高窗口化，零依赖。
+/// 1000+ 任务只渲染可视区 ± overscan（F4）；键盘导航跨窗口时先滚后聚焦。
 
-import { memo, useCallback, useMemo, useRef } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { TaskListItem, TaskRate, TaskSnapshot } from "@/lib/daemon/types";
 import { fmtBytes, fmtEta, fmtSpeed } from "@/lib/daemon/format";
 import { Icon } from "./Icon";
@@ -49,6 +51,12 @@ const RESUMABLE = ["Paused", "Queued", "Evaluating", "Failed", "Stopped"];
 
 /** 速率新鲜度窗口（ms）：超窗视为过期（SSE 断连残留清零）。 */
 const RATE_TTL_MS = 5000;
+
+/// P2 虚拟滚动常量：行高与 globals.css 的 --row-h: 32px 同步（固定行高
+/// 是窗口化数学的前提——行高变化时两处必须一起改）；OVERSCAN 平衡滚动
+/// 快速拖动时的白屏与渲染量。
+const ROW_H = 32;
+const OVERSCAN = 6;
 
 export type TaskAction = "pause" | "resume" | "remove";
 
@@ -130,6 +138,56 @@ export default function TasksTable({
   const indexOf = (id: string) => rows.findIndex((r) => r.t.task_id === id);
   void indexOf; // 保留给排序/调试用途（行点击已改用 idx 直传）
 
+  /// P2 虚拟滚动：可视窗口 [start, end)。滚动时 rAF 合并更新（高频
+  /// scroll 事件不直接 setState）；rows 数量变化时钳回有效区。
+  const wrapRef = useRef<HTMLDivElement>(null);
+  const [range, setRange] = useState({ start: 0, end: 40 });
+  const rafRef = useRef(0);
+  const measure = useCallback(() => {
+    const el = wrapRef.current;
+    if (!el) return;
+    const start = Math.max(0, Math.floor(el.scrollTop / ROW_H) - OVERSCAN);
+    const vis = Math.ceil(el.clientHeight / ROW_H);
+    const end = Math.min(rowsRef.current.length, start + vis + OVERSCAN * 2);
+    setRange((r) => (r.start === start && r.end === end ? r : { start, end }));
+  }, []);
+  const onScroll = useCallback(() => {
+    if (rafRef.current) return;
+    rafRef.current = requestAnimationFrame(() => {
+      rafRef.current = 0;
+      measure();
+    });
+  }, [measure]);
+  // 初始/尺寸变化/行数变化时重测（含列表缩短后 end 越界回收）
+  useEffect(() => {
+    measure();
+  }, [measure, rows.length]);
+  useEffect(() => {
+    const el = wrapRef.current;
+    if (!el || typeof ResizeObserver === "undefined") return;
+    const ro = new ResizeObserver(() => measure());
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [measure]);
+  const start = Math.min(range.start, Math.max(0, rows.length - 1));
+  const end = Math.min(range.end, rows.length);
+  const padTop = start * ROW_H;
+  const padBottom = Math.max(0, (rows.length - end) * ROW_H);
+
+  /// 键盘导航跨窗口：目标行未渲染时先滚动使其进入窗口，range 更新后
+  /// 由下方 effect 重试聚焦（React 渲染完成前 querySelector 拿不到行）。
+  const [focusIdx, setFocusIdx] = useState<number | null>(null);
+  useEffect(() => {
+    if (focusIdx == null) return;
+    const row = wrapRef.current?.querySelector<HTMLTableRowElement>(
+      `tr[data-idx="${focusIdx}"]`,
+    );
+    if (row) {
+      row.focus();
+      setFocusIdx(null);
+    }
+  }, [focusIdx, range]);
+
   /// P1-5-B（Issue #127）：行级交互 handlers 稳定化——经 ref 间接层读取
   /// 最新回调（DlApp 传入的内联箭头函数每秒变身份，直接透传会击穿行级
   /// memo）。包装后身份恒定，TaskRow 的浅比较只对数据 props 生效。
@@ -166,14 +224,29 @@ export default function TasksTable({
       },
       open: (id: string) => cbRef.current.open(id),
       action: (id: string, a: TaskAction) => cbRef.current.action(id, a),
-      /** 行键盘：↑/↓ 移焦点（tbody 子序 = 渲染序）；Enter 开详情；Space 选中 */
+      /** 行键盘：↑/↓ 移焦点（虚拟窗口下先滚后聚，见 focusIdx effect）；
+       * Enter 开详情；Space 选中 */
       key: (e: React.KeyboardEvent<HTMLTableRowElement>, idx: number, id: string) => {
         if (e.key === "ArrowDown" || e.key === "ArrowUp") {
           e.preventDefault();
-          const tbody = e.currentTarget.parentElement;
-          if (!tbody) return;
-          const next = tbody.children[idx + (e.key === "ArrowDown" ? 1 : -1)] as HTMLElement | undefined;
-          next?.focus();
+          const t = idx + (e.key === "ArrowDown" ? 1 : -1);
+          const total = rowsRef.current.length;
+          if (t < 0 || t >= total) return;
+          // 目标行不在当前窗口 → 先滚动使其渲染（滚动量对齐窗口中央）
+          const el = wrapRef.current;
+          if (el) {
+            const rowTop = t * ROW_H;
+            const rowBottom = rowTop + ROW_H;
+            if (rowTop < el.scrollTop) el.scrollTop = rowTop;
+            else if (rowBottom > el.scrollTop + el.clientHeight)
+              el.scrollTop = rowBottom - el.clientHeight;
+          }
+          // 窗口内直接聚焦；窗口刚扩展的下一帧由 effect 接力
+          const next = wrapRef.current?.querySelector<HTMLTableRowElement>(
+            `tr[data-idx="${t}"]`,
+          );
+          if (next) next.focus();
+          else setFocusIdx(t);
           return;
         }
         if (e.key === "Enter") {
@@ -207,8 +280,8 @@ export default function TasksTable({
   }
 
   return (
-    <div className="dl-table-wrap">
-      <table className="dl-table" aria-label="任务列表">
+    <div className="dl-table-wrap" ref={wrapRef} onScroll={onScroll}>
+      <table className="dl-table" aria-label="任务列表" aria-rowcount={rows.length}>
         <thead>
           <tr>
             <th className="dl-th-check">
@@ -257,18 +330,32 @@ export default function TasksTable({
           </tr>
         </thead>
         <tbody>
-          {rows.map(({ t, snap, sse }, i) => (
-            <TaskRow
-              key={t.task_id}
-              t={t}
-              snap={snap}
-              sse={sse}
-              isSel={selected.has(t.task_id)}
-              idx={i}
-              busy={busy}
-              h={rowHandlers}
-            />
-          ))}
+          {/* P2 虚拟滚动：上下占位行撑出完整滚动高度；窗口内行才渲染 */}
+          {padTop > 0 && (
+            <tr className="dl-vpad" style={{ height: padTop }} aria-hidden>
+              <td colSpan={8} />
+            </tr>
+          )}
+          {rows.slice(start, end).map(({ t, snap, sse }, vi) => {
+            const i = start + vi;
+            return (
+              <TaskRow
+                key={t.task_id}
+                t={t}
+                snap={snap}
+                sse={sse}
+                isSel={selected.has(t.task_id)}
+                idx={i}
+                busy={busy}
+                h={rowHandlers}
+              />
+            );
+          })}
+          {padBottom > 0 && (
+            <tr className="dl-vpad" style={{ height: padBottom }} aria-hidden>
+              <td colSpan={8} />
+            </tr>
+          )}
         </tbody>
       </table>
     </div>
@@ -310,6 +397,7 @@ const TaskRow = memo(function TaskRow({
   return (
     <tr
       className={isSel ? "is-selected" : ""}
+      data-idx={idx}
       onClick={(e) => h.click(e, idx, id)}
       onDoubleClick={() => h.open(id)}
       tabIndex={0}
