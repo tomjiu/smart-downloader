@@ -108,9 +108,17 @@ impl SegmentManager {
     }
 
     /// 段下载完成：累加字节数并记录区间（账本数据源）。
+    ///
+    /// 有序插入（按 start 升序）：多 worker 并发完成乱序是常态，而账本
+    /// 消费侧的 `Ledger::validate_segments`（engine load 过滤门）要求区间
+    /// **升序且不重叠**——旧实现按完成顺序 append，2+ worker 乱序完成时
+    /// 落盘账本被 validate 拒绝 → 暂停/崩溃后 resume 全量重下（内容仍
+    /// 正确、纯浪费带宽，故既有用例未拦截）。段互不相交（每段只领一次）
+    /// → 按 start 插入即维持全局有序，无重叠。
     pub fn complete(&mut self, seg: Segment) {
         self.done_bytes += seg.len();
-        self.done_ranges.push((seg.start, seg.end));
+        let pos = self.done_ranges.partition_point(|&(s, _)| s < seg.start);
+        self.done_ranges.insert(pos, (seg.start, seg.end));
     }
 
     /// 已下载字节数（含续传凭据折算）。
@@ -276,6 +284,39 @@ mod tests {
         m.complete(s2);
         assert_eq!(m.done_bytes(), 32 * MB);
         assert_eq!(m.pending_bytes(), 16 * MB);
+    }
+
+    #[test]
+    fn complete_out_of_order_keeps_ranges_sorted_and_ledger_valid() {
+        // 判别锚（乱序账本被 validate 拒绝的既有缺陷）：2 worker 乱序完成是
+        // 并发常态——worker1 先完成段1、worker0 后完成段0。旧实现按完成
+        // 顺序 append，落盘账本 done=[(1M,2M),(0,1M)] 被 validate_segments
+        // 拒绝（s=0 <= pe=2M）→ resume 全量重下。
+        let mut m = SegmentManager::new(8 * MB, 0, MB);
+        let segs: Vec<_> = std::iter::from_fn(|| m.take_segment()).collect();
+        assert_eq!(segs.len(), 8, "8MB/1MB = 8 段");
+        // 刻意乱序完成：1,3,0,2,5,7,4,6
+        for i in [1usize, 3, 0, 2, 5, 7, 4, 6] {
+            m.complete(segs[i]);
+        }
+        let ranges = m.done_ranges().to_vec();
+        let starts: Vec<u64> = ranges.iter().map(|r| r.0).collect();
+        let mut sorted = starts.clone();
+        sorted.sort();
+        assert_eq!(starts, sorted, "done_ranges 必须升序（validate 前置条件）");
+        // 落盘账本必须过 validate（engine load 过滤门口径）
+        let ledger = crate::ledger::Ledger {
+            version: crate::ledger::LEDGER_VERSION,
+            total: 8 * MB,
+            min_split: MB,
+            etag: None,
+            last_modified: None,
+            done: ranges,
+        };
+        assert!(
+            ledger.validate_segments(),
+            "乱序完成后的账本必须可被 resume 消费"
+        );
     }
 
     #[test]

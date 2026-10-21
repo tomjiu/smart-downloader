@@ -119,7 +119,7 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 
 ## 配置
 
-TOML 配置（默认 `./config.toml`，任务状态 `./tasks.json`）：`[download]`（dest_root/并发/限速/代理/disk_precheck_strict 磁盘预检严格模式）、`[bt]`（save_path/DHT/LSD/UPnP/做种）、`[provider]`（fallback 链）、`[server]`（bind/token）、`[webhook]`（任务完成通知 URL，POST JSON，fire-and-forget）、`[cleanup]`（auto_remove_completed_days 已完成任务 N 天后自动清扫，0 = 禁用；auto_remove_keep_data 默认保留文件）、`[post_download]`（完成后自动处理：move_to 移动到目标目录 + hook 外部程序，环境变量 SD_TASK_ID/SD_TASK_NAME/SD_FILE_PATH/SD_ENGINE 传任务上下文；空 = 禁用）、`[scheduler]`（start_jitter_seconds 错峰随机延迟上限，秒；0 = 关）。支持热重载。
+TOML 配置（默认 `./config.toml`，任务状态 `./tasks.json`）：`[download]`（dest_root/并发/限速/代理/disk_precheck_strict 磁盘预检严格模式/fsync_per_segment 段落盘策略——true 每段 fsync（默认，崩溃一致性最严）；false 批量模式，累计 fsync_batch_segments 段或 fsync_batch_interval_ms 毫秒先到者一次「数据 fsync+账本落盘」，机械盘吞吐推荐，WAL 语义不变；基准见 scripts/manual/fsync_bench.sh）、`[bt]`（save_path/DHT/LSD/UPnP/做种）、`[provider]`（fallback 链）、`[server]`（bind/token）、`[webhook]`（任务完成通知 URL，POST JSON，fire-and-forget）、`[cleanup]`（auto_remove_completed_days 已完成任务 N 天后自动清扫，0 = 禁用；auto_remove_keep_data 默认保留文件）、`[post_download]`（完成后自动处理：move_to 移动到目标目录 + hook 外部程序，环境变量 SD_TASK_ID/SD_TASK_NAME/SD_FILE_PATH/SD_ENGINE 传任务上下文；空 = 禁用）、`[scheduler]`（start_jitter_seconds 错峰随机延迟上限，秒；0 = 关）。支持热重载。
 
 ## 文档地图
 

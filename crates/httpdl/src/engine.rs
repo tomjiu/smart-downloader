@@ -5,7 +5,9 @@
 //! pause 真停（段边界退出）；epoch 单写者模型（resume 无条件新 epoch 循环，旧循环在检查点自杀且永不 finalize）。
 
 use crate::dash;
-use crate::download::{download_dynamic, update_score, DynamicLedger, DynamicOutcome, SCORE_MIN};
+use crate::download::{
+    download_dynamic, update_score, DynamicLedger, DynamicOutcome, SegmentSyncPolicy, SCORE_MIN,
+};
 use crate::hls;
 use crate::ledger;
 use crate::range::{multi_source_ok, probe_range, Probe};
@@ -124,6 +126,10 @@ pub struct HttpEngine {
     /// 构建时与任务级代理合并（任务级优先）。启动时全局代理已烘入共享
     /// client，本字段仅存运行中变更（None = 沿用启动口径，不重烘）。
     global_proxy: Arc<RwLock<Option<String>>>,
+    /// 段落盘策略（fsync 性能开关，PR #114 审查 §3.3）：每段（P0-4 默认）
+    /// 或批量（机械盘吞吐救星）。启动时烘入，不参与热重载（fsync 语义
+    /// 变更无运行中切换需求）。见 download::SegmentSyncPolicy。
+    sync_policy: SegmentSyncPolicy,
 }
 
 /// 从代理 URL 提取 `user:pass@`（E5：任务级代理 reqwest basic_auth 用；
@@ -182,7 +188,16 @@ impl HttpEngine {
                 limiters: Mutex::new(HashMap::new()),
             }),
             global_proxy: Arc::new(RwLock::new(None)),
+            sync_policy: SegmentSyncPolicy::default(),
         }
+    }
+
+    /// 段落盘策略注入（fsync 性能开关）：默认每段 fsync（P0-4 语义），
+    /// daemon 侧由 `[download]` 配置段构建（见 serve.rs）。builder 形式
+    /// 保持 new/new_limited 既有签名稳定（测试零改动）。
+    pub fn with_sync_policy(mut self, sync: SegmentSyncPolicy) -> Self {
+        self.sync_policy = sync;
+        self
     }
 
     /// 启动下载循环（代次 gen + 循环代次 epoch）。
@@ -240,6 +255,8 @@ impl HttpEngine {
         let inner = self.inner.clone();
         let inner_mon = self.inner.clone();
         let tid_mon = tid.clone();
+        // fsync 性能开关随任务循环带走（启动时烘入，不参与热重载）
+        let sync_policy = self.sync_policy;
         // batch3-P1：未知总长（chunked/动态生成，探测无 Content-Length）任务
         // 分流单连接流式循环——旧实现落入分段路径，SegmentManager::new(0,..)
         // 无段可领 → 立即 Drained → 0 字节文件被 finalize 成 dest 且任务
@@ -257,7 +274,7 @@ impl HttpEngine {
             })
         } else {
             tokio::spawn(async move {
-                download_loop(&client, limiter, inner, tid, gen, epoch).await;
+                download_loop(&client, limiter, inner, tid, gen, epoch, sync_policy).await;
             })
         };
         // 收尸监控：panic → 任务标 Error（V11 锁治理后 parking_lot 无中毒，
@@ -631,6 +648,7 @@ async fn download_loop(
     tid: EngineTaskId,
     gen: u64,
     epoch: u64,
+    sync_policy: SegmentSyncPolicy,
 ) {
     loop {
         // 快照任务参数（不跨 await 持锁）；gen/epoch 失配 → 本循环作废
@@ -719,6 +737,7 @@ async fn download_loop(
             Some(ledger_handle),
             Some(pause_flag),
             Some(progress),
+            sync_policy,
         )
         .await
         {

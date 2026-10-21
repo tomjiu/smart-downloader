@@ -183,6 +183,7 @@ async fn dynamic_segments_carry_custom_headers() {
         None,
         None,
         None,
+        smart_dl_httpdl::download::SegmentSyncPolicy::default(),
     )
     .await;
     assert!(r.is_ok(), "带头段下载应成功: {r:?}");
