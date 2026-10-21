@@ -223,12 +223,19 @@ export function ConfirmDialog({
           {body}
         </div>
         <div className="dl-confirm-actions">
-          <button ref={cancelRef} type="button" className="dl-btn" onClick={onCancel}>
+          <button
+            ref={cancelRef}
+            type="button"
+            className="dl-btn"
+            data-testid="confirm-cancel"
+            onClick={onCancel}
+          >
             取消
           </button>
           <button
             type="button"
             className={`dl-btn ${danger ? "dl-btn--danger-solid" : "dl-btn--primary"}`}
+            data-testid="confirm-ok"
             onClick={onConfirm}
           >
             {confirmText}

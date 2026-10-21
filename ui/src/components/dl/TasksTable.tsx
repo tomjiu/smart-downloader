@@ -397,7 +397,9 @@ const TaskRow = memo(function TaskRow({
   return (
     <tr
       className={isSel ? "is-selected" : ""}
+      data-testid="task-row"
       data-idx={idx}
+      data-task-state={t.state}
       onClick={(e) => h.click(e, idx, id)}
       onDoubleClick={() => h.open(id)}
       tabIndex={0}
@@ -417,6 +419,7 @@ const TaskRow = memo(function TaskRow({
       </td>
       <td
         className="dl-td-name"
+        data-testid="task-name"
         title={displayName(t)}
         onDoubleClick={(e) => {
           e.stopPropagation();
@@ -425,7 +428,7 @@ const TaskRow = memo(function TaskRow({
       >
         {displayName(t)}
       </td>
-      <td>
+      <td data-testid="task-state">
         <StateBadge state={t.state} />
         <QueuedNote t={t} />
       </td>
@@ -440,7 +443,7 @@ const TaskRow = memo(function TaskRow({
           </span>
         </div>
       </td>
-      <td className="dl-td-num">
+      <td className="dl-td-num" data-testid="task-speed">
         {down > 0 ? (
           <span className="dl-td-speed">
             <Icon name="arrow-down" size={11} /> {fmtSpeed(down)}
@@ -464,6 +467,7 @@ const TaskRow = memo(function TaskRow({
       <td className="dl-td-act" onClick={(e) => e.stopPropagation()}>
         <button
           className="dl-btn dl-btn--ghost dl-act-btn"
+          data-testid="pause-resume-btn"
           disabled={busy}
           aria-label={resumable ? "恢复" : "暂停"}
           title={resumable ? "恢复" : "暂停"}
@@ -473,6 +477,7 @@ const TaskRow = memo(function TaskRow({
         </button>
         <button
           className="dl-btn dl-btn--ghost dl-act-btn dl-act-del"
+          data-testid="delete-btn"
           disabled={busy}
           aria-label="删除"
           title="删除（需确认）"
