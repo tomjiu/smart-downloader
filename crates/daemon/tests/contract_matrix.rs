@@ -636,3 +636,464 @@ async fn contract_12_connections_on_http_task_is_409() {
         "HTTP 任务的 connections 必须 409（UI 可见的语义边界）"
     );
 }
+
+// ============ 补齐 8 条（#143 第一梯队；REALTEST-PLAN A-2 缺口
+// ============ #2/#3/#8/#11/#14/#15/#19/#20；2026-10-21） ============
+
+use base64::Engine as _;
+
+/// mini 正向代理（httpdl task_proxy.rs 同款策略）：任意方法/路径 → 按
+/// Range 回 206 切片或 200 全量，内容恒为 body；命中计数。返回（URL, hits）。
+async fn start_mini_proxy(body: Vec<u8>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_c = hits.clone();
+    let body = Arc::new(body);
+    let app =
+        axum::Router::new().fallback(axum::routing::any(move |req: axum::extract::Request| {
+            let hits = hits_c.clone();
+            let body = body.clone();
+            async move {
+                use axum::http::{header, StatusCode};
+                hits.fetch_add(1, Ordering::SeqCst);
+                let total = body.len() as u64;
+                let range = req
+                    .headers()
+                    .get(header::RANGE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                match range.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
+                    Some(spec) => {
+                        let mut parts = spec.split('-');
+                        let start: u64 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+                        let end: u64 = parts
+                            .next()
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(u64::MAX)
+                            .min(total - 1);
+                        let payload = body
+                            .get(start as usize..=(end as usize).min(total as usize - 1))
+                            .unwrap_or(&[])
+                            .to_vec();
+                        axum::response::Response::builder()
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header(
+                                header::CONTENT_RANGE,
+                                format!("bytes {start}-{end}/{total}"),
+                            )
+                            .body(axum::body::Body::from(payload))
+                            .unwrap()
+                            .into_response()
+                    }
+                    None => axum::response::Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_LENGTH, total.to_string())
+                        .body(axum::body::Body::from((*body).clone()))
+                        .unwrap()
+                        .into_response(),
+                }
+            }
+        }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    (format!("http://{addr}"), hits)
+}
+
+/// #2 `POST /tasks {torrent_b64}`：bt 构建真实加种（任务入列表）；
+/// 非 bt 构建清晰 400 点明「需 BT 引擎」——禁止静默空操作。
+/// 消费方：第二梯队「新建任务表单扩展」（当前 UI 未接线，形状按
+/// AddTaskReq.torrent_b64（http.rs:36-39）锚定）。
+#[tokio::test]
+async fn contract_02_torrent_b64_add() {
+    // 最小单文件 .torrent（bencode 手写，bt_api.rs minimal_torrent_b64 同款）
+    let mut t = b"d4:infod6:lengthi123e4:name4:test12:piece lengthi16384e6:pieces20:".to_vec();
+    t.extend_from_slice(&[0xAB; 20]);
+    t.extend_from_slice(b"ee");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&t);
+
+    #[cfg(feature = "bt")]
+    {
+        let _lt = common::lt_gate::LT_SESSION_GATE.lock().await;
+        let (addr, _state) = serve().await;
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+        // BT v1 引擎限制：任务 dest 必须等于全局落盘目录或走默认——
+        // 不传 dest（serve() 的全局根 = temp_dir），bt_api 同款惯例
+        let (status, val, id) =
+            add_task(&client, &base, serde_json::json!({ "torrent_b64": b64 })).await;
+        assert_eq!(status, reqwest::StatusCode::CREATED, "{val}");
+        assert!(!id.is_empty(), "task_id 必须返回: {val}");
+        let list: serde_json::Value = client
+            .get(format!("{base}/tasks"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(
+            list.as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t["task_id"].as_str() == Some(id.as_str())),
+            "用户可见效果：任务出现在列表"
+        );
+    }
+    #[cfg(not(feature = "bt"))]
+    {
+        let (addr, _state) = serve().await;
+        let base = format!("http://{addr}");
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("{base}/tasks"))
+            .json(&serde_json::json!({
+                "torrent_b64": b64,
+                "dest": std::env::temp_dir()
+                    .join(format!("contract-02-{}", std::process::id()))
+                    .display()
+                    .to_string()
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+        let v: serde_json::Value = resp.json().await.unwrap();
+        let err = v["error"].as_str().unwrap_or_default();
+        assert!(err.contains("BT 引擎"), "拒绝必须点明原因（非静默）: {err}");
+    }
+}
+
+/// #3 `POST /tasks {metalink_b64}`：两 `<file>` 逐条展开为 HTTP 任务集，
+/// 响应含 `task_ids`/`count`，全部 Completed + 落盘（用户可见效果）。
+#[tokio::test]
+async fn contract_03_metalink_b64_expands_and_completes() {
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let a = TestServer::start(patterned(64)).await;
+    let b = TestServer::start(patterned(128)).await;
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<metalink xmlns="urn:ietf:params:xml:ns:metalink">
+  <file name="alpha.bin"><url priority="1">{}</url></file>
+  <file name="beta.bin"><url priority="1">{}</url></file>
+</metalink>"#,
+        a.url(),
+        b.url()
+    );
+    let b64 = base64::engine::general_purpose::STANDARD.encode(xml.as_bytes());
+    let dest = tempfile::tempdir().unwrap();
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "metalink_b64": b64,
+            "dest": dest.path().display().to_string()
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = resp.status();
+    let v: serde_json::Value = resp.json().await.unwrap_or_default();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::CREATED,
+        "metalink 展开失败: {v}"
+    );
+    let ids = v["task_ids"].as_array().cloned().unwrap_or_default();
+    assert_eq!(ids.len(), 2, "两 <file> 必须展开两条任务: {v}");
+    assert_eq!(v["count"].as_u64(), Some(2), "count 与展开数一致: {v}");
+    for id in ids {
+        let id = id.as_str().unwrap().to_string();
+        let s = wait_terminal(&client, &base, &id, Duration::from_secs(15)).await;
+        assert_eq!(s["state"], "Completed", "{}", s);
+    }
+    assert!(dest.path().join("alpha.bin").exists(), "alpha.bin 必须落盘");
+    assert!(dest.path().join("beta.bin").exists(), "beta.bin 必须落盘");
+}
+
+/// #8 `POST /tasks {url, proxy}`（AddTaskReq.proxy）：真的走代理（服务器侧
+/// 断言）。目标 = RFC 2606 保留 `.invalid` 域（DNS 必失败）——内容只能经
+/// 代理获得，Completed 即证明探测+下载全链都过了代理。
+#[tokio::test]
+async fn contract_08_add_with_proxy_routes_through_proxy() {
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let body = patterned(256 * 1024);
+    let (proxy_url, hits) = start_mini_proxy(body).await;
+
+    let (status, v, id) = add_task(
+        &client,
+        &base,
+        serde_json::json!({
+            "url": "http://proxy-e2e.invalid/f.bin",
+            "proxy": proxy_url,
+        }),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{v}");
+    let s = wait_terminal(&client, &base, &id, Duration::from_secs(20)).await;
+    assert_eq!(s["state"], "Completed", "内容只能来自代理: {s}");
+    assert!(
+        hits.load(std::sync::atomic::Ordering::SeqCst) > 0,
+        "代理必须被真实触达（非仅探测）"
+    );
+}
+
+/// #11 `POST /tasks/:id/sequential {sequential}`（store.ts:138-140 UI 形状）：
+/// 快照回显（UI 唯一数据源），双向翻转（用户可见：开关可来回切）。
+#[tokio::test]
+async fn contract_11_sequential_ui_shape_roundtrip() {
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let srv = TestServer::start(patterned(64 * 1024)).await;
+    let (status, v, id) = add_task(&client, &base, serde_json::json!({ "url": srv.url() })).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{v}");
+
+    // UI 请求体形状：{"sequential": true}（store.ts:140）
+    let r: serde_json::Value = client
+        .post(format!("{base}/tasks/{id}/sequential"))
+        .json(&serde_json::json!({ "sequential": true }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        r["sequential"],
+        serde_json::json!(true),
+        "快照必须回显: {r}"
+    );
+
+    let r: serde_json::Value = client
+        .post(format!("{base}/tasks/{id}/sequential"))
+        .json(&serde_json::json!({ "sequential": false }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // false = 字段省略（skip_serializing_if 向后兼容契约）——缺失即 false
+    assert!(
+        r.get("sequential")
+            .map(|v| v == &serde_json::json!(false))
+            .unwrap_or(true),
+        "false 契约 = 省略或显式 false: {r}"
+    );
+}
+
+/// #14 `POST /tasks/:id/piece-priority {priority}`（store.ts:156-159 UI 形状，
+/// 0..=7）：HTTP 任务 → 409（BT-only 语义边界，UI 可见）；越界值 → 400。
+#[tokio::test]
+async fn contract_14_piece_priority_http_task_boundary() {
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let srv = TestServer::start(patterned(8 * 1024)).await;
+    let (status, v, id) = add_task(&client, &base, serde_json::json!({ "url": srv.url() })).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{v}");
+
+    // UI 请求体形状：{"priority": 7}（store.ts:158）
+    let resp = client
+        .post(format!("{base}/tasks/{id}/piece-priority"))
+        .json(&serde_json::json!({ "priority": 7 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "HTTP 任务的首尾块优先必须 409（BT-only 边界对 UI 可见）"
+    );
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        !v["error"].as_str().unwrap_or_default().is_empty(),
+        "错误信息必须可读: {v}"
+    );
+
+    // 越界（0..=7 之外）→ 400（契约：优先级取值域）
+    let resp = client
+        .post(format!("{base}/tasks/{id}/piece-priority"))
+        .json(&serde_json::json!({ "priority": 8 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST, "越界 400");
+}
+
+/// #14b（bt 构建）torrent 任务的真实生效面：`{"priority": 7}` → `{"ok": true}`。
+/// 此前 piece-first-last 零测试覆盖（bt_api 亦无），本条为首个回归锚。
+#[cfg(feature = "bt")]
+#[tokio::test]
+async fn contract_14b_piece_priority_on_torrent_task() {
+    let _lt = common::lt_gate::LT_SESSION_GATE.lock().await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let mut t = b"d4:infod6:lengthi123e4:name4:test12:piece lengthi16384e6:pieces20:".to_vec();
+    t.extend_from_slice(&[0xAB; 20]);
+    t.extend_from_slice(b"ee");
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&t);
+    // 同 contract_02：BT v1 dest 限制——不传走全局默认
+    let (status, val, id) =
+        add_task(&client, &base, serde_json::json!({ "torrent_b64": b64 })).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{val}");
+
+    let resp = client
+        .post(format!("{base}/tasks/{id}/piece-priority"))
+        .json(&serde_json::json!({ "priority": 7 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "torrent 任务应 200");
+    let v: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(v["ok"], serde_json::json!(true), "{v}");
+}
+
+/// #15 `POST /tasks/:id/super-seeding {enabled}`：HTTP 任务 → 409（BT-only
+/// 边界对 UI 可见）。torrent 任务的真实生效面已有
+/// bt_api.rs super_seeding_endpoint_roundtrip_on_torrent_task 覆盖。
+#[tokio::test]
+async fn contract_15_super_seeding_http_task_boundary() {
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let srv = TestServer::start(patterned(8 * 1024)).await;
+    let (status, v, id) = add_task(&client, &base, serde_json::json!({ "url": srv.url() })).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{v}");
+
+    let resp = client
+        .post(format!("{base}/tasks/{id}/super-seeding"))
+        .json(&serde_json::json!({ "enabled": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "HTTP 任务的超级种子必须 409（BT-only 边界对 UI 可见）"
+    );
+}
+
+/// #19 `POST /tasks/:id/priority`：相对移动 `{action:"top"}` 与绝对值
+/// `{priority:n}` 的回显契约（响应 `queue_priority`；top 必须真的到顶 =
+/// 小于其余排队任务的值）。三条排队任务（start_at 未来）建队列。
+#[tokio::test]
+async fn contract_19_priority_moves_and_echoes() {
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let srv = TestServer::start(patterned(8 * 1024)).await;
+    let future = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3600;
+
+    let mut ids = Vec::new();
+    for i in 0..3 {
+        // 源级去重：同 URL 二次添加 409 duplicate——排队队列用查询参区分源
+        let (status, v, id) = add_task(
+            &client,
+            &base,
+            serde_json::json!({ "url": format!("{}?q={i}", srv.url()), "start_at_unix": future }),
+        )
+        .await;
+        assert_eq!(status, reqwest::StatusCode::CREATED, "{v}");
+        ids.push(id);
+    }
+    let (a, b, _c) = (&ids[0], &ids[1], &ids[2]);
+
+    // 相对移动：中间任务置顶 → 返回值必须小于队列最小值（默认 0）→ 到顶
+    let v: serde_json::Value = client
+        .post(format!("{base}/tasks/{b}/priority"))
+        .json(&serde_json::json!({ "action": "top" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let top = v["queue_priority"].as_i64().unwrap_or(i64::MAX);
+    assert!(top < 0, "top 必须移到默认值 0 之上（更小）: {v}");
+
+    // 绝对值：同给 value 优先于 action（batch5-P2 语义）
+    let v: serde_json::Value = client
+        .post(format!("{base}/tasks/{a}/priority"))
+        .json(&serde_json::json!({ "priority": 5, "action": "top" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        v["queue_priority"].as_i64(),
+        Some(5),
+        "value 优先于 action: {v}"
+    );
+
+    // 相对移动：bottom → 大于当前最大（5）→ 到底
+    let v: serde_json::Value = client
+        .post(format!("{base}/tasks/{b}/priority"))
+        .json(&serde_json::json!({ "action": "bottom" }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let bottom = v["queue_priority"].as_i64().unwrap_or(i64::MIN);
+    assert!(bottom > 5, "bottom 必须移到最大值 5 之下（更大）: {v}");
+}
+
+/// #20 `GET/POST/DELETE /tasks/:id/trackers`：HTTP 任务全 409（BT-only
+/// 边界对 UI 可见；真实增删查已有 bt_api.rs trackers_add_list_remove_e2e）。
+#[tokio::test]
+async fn contract_20_trackers_http_task_boundary() {
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let srv = TestServer::start(patterned(8 * 1024)).await;
+    let (status, v, id) = add_task(&client, &base, serde_json::json!({ "url": srv.url() })).await;
+    assert_eq!(status, reqwest::StatusCode::CREATED, "{v}");
+
+    let resp = client
+        .post(format!("{base}/tasks/{id}/trackers"))
+        .json(&serde_json::json!({ "urls": ["http://t.example/announce"] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "POST 边界 409"
+    );
+
+    let resp = client
+        .get(format!("{base}/tasks/{id}/trackers"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT, "GET 边界 409");
+
+    let resp = client
+        .delete(format!(
+            "{base}/tasks/{id}/trackers?url=http://t.example/announce"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "DELETE 边界 409"
+    );
+}
