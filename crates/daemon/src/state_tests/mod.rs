@@ -491,6 +491,7 @@ impl DownloadEngine for FakeEngine {
     }
 }
 
+mod abba_lock_order_tests;
 mod add_opts_tests;
 mod auto_retry_tests;
 mod b10_tests;
@@ -513,6 +514,7 @@ mod post_download_tests;
 mod queue_gate_tests;
 mod rate_cache_tests;
 mod remove_hardening_tests;
+mod rss_persist_tests;
 mod scheduled_tests;
 mod seeding_limit_tests;
 mod sftp_tests;

@@ -630,8 +630,24 @@ impl DaemonState {
     /// 原实现全部调用点持 rss_state 锁调 rss_save（整表 JSON 序列化 +
     /// 磁盘写毫秒级），并发 add/update/refresh/规则匹配全部串行排队。
     /// 调用方在临界区内收集变更后，用本方法在锁外落盘。
-    fn rss_save_snapshot(&self, snapshot: &RssState) {
-        self.rss_save(snapshot);
+    ///
+    /// Issue #121 B-5 修复（并发丢失更新）：**忽略调用方传入的旧快照**，
+    /// 在 `rss_persist_lock` 临界区内重新取最新状态落盘。P1-9 只把落盘
+    /// 移出 rss_state 锁，但各调用点并发时手里的旧快照会重排覆盖
+    /// （T1{A} 后写覆盖 T2{A,B} → B 丢失——tasks.json 的 P1-1 同款
+    /// 缺陷翻版）。锁内重快照保证：写入序 = 拿锁序，且每次写的内容 =
+    /// 拿锁时刻最新状态 → 最终文件必含全部已确认变更。
+    /// 锁序（叶子）：rss_persist_lock → rss_state；全部调用点均在
+    /// rss_state 锁外（P1-9 成果），无反向嵌套。
+    /// pub(crate)：state_tests::rss_persist_tests 的确定性判别锚需要
+    /// 直接驱动最坏交错序列（旧快照后写覆盖）。
+    pub(crate) fn rss_save_snapshot(&self, _stale: &RssState) {
+        if self.rss_persist_path().is_none() {
+            return;
+        }
+        let _guard = self.rss_persist_lock.lock();
+        let latest = self.rss_state().lock().clone();
+        self.rss_save(&latest);
     }
 
     /// 添加订阅（立即拉取一次，失败即 Err——坏 URL 不应静默入列）。
