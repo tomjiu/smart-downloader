@@ -2421,6 +2421,11 @@ async fn rss_feeds_list(State(state): State<Arc<DaemonState>>) -> impl IntoRespo
                 "title": f.title,
                 "added_at_unix": f.added_at_unix,
                 "last_refresh_unix": f.last_refresh_unix,
+                // 契约修复（R11-1，2026-10-21）：PATCH /rss/feeds/:id 可设置
+                // interval_override_secs（batch5.1），但列表响应从未回读——
+                // UI 类型 RssFeed 有该字段且订阅卡片以其回显输入框，缺字段
+                // = 已设间隔的订阅刷新后显示回 0（写入后不可见的只写字段）。
+                "interval_override_secs": f.interval_override_secs,
                 "item_count": f.items.len(),
                 "pending_count": f.items.iter().filter(|i| i.task_id.is_none()).count(),
             })

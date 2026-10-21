@@ -318,3 +318,74 @@ fn sha256_hex(data: &[u8]) -> String {
     let out = h.finalize();
     out.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+/// R11-1 回归（契约审计 2026-10-21）：`GET /rss/feeds` 必须回读
+/// `interval_override_secs`——PATCH 可设置但列表从未透出（只写字段），
+/// UI 订阅卡片的间隔输入框刷新后显示回 0。
+#[tokio::test]
+async fn rss_feeds_list_echoes_interval_override() {
+    let tmp = tempfile::tempdir().unwrap();
+    let host = serve_feed_host().await;
+    let base = serve_daemon(tmp.path().to_path_buf()).await;
+    let client = reqwest::Client::new();
+
+    // 添加订阅
+    let resp = client
+        .post(format!("{base}/rss/feeds"))
+        .json(&serde_json::json!({ "url": format!("{host}/feed.xml") }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 201);
+    let feed = resp.json::<serde_json::Value>().await.unwrap();
+    let fid = feed["id"].as_u64().unwrap();
+
+    // 设置独立刷新间隔（batch5.1 PATCH）
+    let resp = client
+        .patch(format!("{base}/rss/feeds/{fid}"))
+        .json(&serde_json::json!({ "interval_override_secs": 1800 }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "PATCH 间隔应成功");
+
+    // 列表回读：字段必须存在且值正确（修复前缺失 → UI 显示回 0）
+    let resp = client
+        .get(format!("{base}/rss/feeds"))
+        .send()
+        .await
+        .unwrap();
+    let v = resp.json::<serde_json::Value>().await.unwrap();
+    let feeds = v["feeds"].as_array().unwrap();
+    let mine = feeds
+        .iter()
+        .find(|f| f["id"].as_u64() == Some(fid))
+        .unwrap();
+    assert_eq!(
+        mine["interval_override_secs"].as_u64(),
+        Some(1800),
+        "列表必须回读 interval_override_secs（只写字段缺陷）"
+    );
+
+    // 回改 0（跟随全局）也要正确回显
+    let resp = client
+        .patch(format!("{base}/rss/feeds/{fid}"))
+        .json(&serde_json::json!({ "interval_override_secs": 0 }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success());
+    let resp = client
+        .get(format!("{base}/rss/feeds"))
+        .send()
+        .await
+        .unwrap();
+    let v = resp.json::<serde_json::Value>().await.unwrap();
+    let mine = v["feeds"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["id"].as_u64() == Some(fid))
+        .unwrap();
+    assert_eq!(mine["interval_override_secs"].as_u64(), Some(0));
+}
