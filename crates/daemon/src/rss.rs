@@ -4,7 +4,14 @@
 //! 规则管理/周期刷新调度/命中自动建任务（复用 add_link_task_opts 全链）。
 //! 纯逻辑（解析/匹配/状态类型/持久化）在 `smart-dl-rss` crate。
 
-use smart_dl_rss::{item_matches, parse_feed, RssFeed, RssItem, RssRule, RssState};
+// TD-4 建议 9：#132 把纯逻辑抽到 `smart-dl-rss` 后，`RssFeed`/`RssState` 等
+// 类型从「daemon 内 pub」变为「外部 crate 私有 re-export」。
+// `state_tests::rss_persist_tests`（#125 引入的并发落盘判别锚）经
+// `crate::rss::RssFeed` 构造测试数据 —— 故此处 re-export 必须 pub(crate)，
+// 否则 lib test 编译失败（#125 与 #132 合并后的语义冲突，非任一 PR 自身缺陷）。
+pub(crate) use smart_dl_rss::{RssFeed, RssItem, RssRule, RssState};
+
+use smart_dl_rss::{item_matches, parse_feed};
 
 use crate::state::{DaemonError, DaemonState};
 
