@@ -3,7 +3,9 @@
 > **本文档是项目中「什么是真的」的唯一入口。**
 > 其他 `docs/review/*.md` 是历史审查记录，**会过期**；冲突时以本文档为准。
 >
-> 最后更新：2026-10-21 · main @ `5dfd654` · 版本 **0.2.3**
+> 最后更新：2026-10-21 · main @ `3653b96` · 版本 **0.2.3**
+>
+> 数据口径：行数 = `git ls-files` 过滤后 `wc -l`；测试 = `cargo test --workspace --exclude smart-dl-btcore`（Linux 本地实测）。
 
 ---
 
@@ -13,9 +15,9 @@
 |---|---|
 | 版本 | **0.2.3**（workspace + desktop + tauri.conf 三处一致） |
 | crates | 8 个：`core` `btcore` `httpdl` `provider` `daemon` `xunlei-ffi` `xunlei-convert` `rss` |
-| 源码 | `crates/` **77,904 行** Rust |
-| UI | `ui/src/` **20 文件 / 5,993 行** TS/TSX/CSS |
-| 测试 | **98 套件 / 1,086 通过 / 0 失败**（`cargo test --workspace --exclude smart-dl-btcore`） |
+| 源码 | `crates/` **83,604 行** Rust（含测试；src/ 为主 57,942 行） |
+| UI | `ui/src/` **20 文件 / 6,271 行** TS/TSX/CSS |
+| 测试 | **98 套件 / 1,092 通过 / 0 失败**（`cargo test --workspace --exclude smart-dl-btcore`，2026-10-21 实测） |
 | 集成测试文件 | daemon 33 个、httpdl 30 个 |
 | License | Apache-2.0 / MIT 双许可（#114 补） |
 
@@ -123,13 +125,13 @@ ftp://  ftps://  sftp://  http(s)://  metalink  .torrent
 
 ## 5. 待处理（open PR / issue）
 
-### PR 需 rebase（3）
+### PR 需 rebase（3）—— ✅ 已全部 rebase 完成（2026-10-21，响应 #143）
 
-| PR | 冲突原因 | 解法 |
+| PR | rebase 结果 | 本地验证 |
 |---|---|---|
-| **#138** TD-3 I/O 下沉（`session/output` → 独立 `storage` crate） | 与 #132（RSS 抽 crate）同改 daemon 存储层 | rebase 后 `session/rss` 相关已迁出 |
-| **#137** BtEngine 适配器 → btcore | 与 #134（死代码清理）同改 `core/src` | rebase 后注意 `sniffer`/`xltd` 已删 |
-| **#129** Playwright e2e | 与 #133（虚拟滚动）同改表格 DOM | **选择器需适配虚拟滚动**：不可见行不在 DOM，改 `scrollIntoView` 或断言可视窗口行数 |
+| **#138** TD-3 I/O 下沉（`session/output` → 独立 `storage` crate） | ✅ 冲突 3 处解毕（rss/storage 依赖并存；bt_alerts 取 #130 新解析 + storage 导入；lock 重生） | 1,081 通过 / fmt / clippy 零告警 |
+| **#137** BtEngine 适配器 → btcore | ✅ 仅 1 处冲突（parking_lot）；sniffer/xltd 零引用自动合并 | 1,092 通过 + `check --features bt` 过 |
+| **#129** Playwright e2e | ✅ TaskRow 补齐 6 个行级 testid + 虚拟滚动契约文档化 | **真实 daemon 实跑 5/5 全绿（46.9s）** |
 
 ### Issue 未关闭
 
