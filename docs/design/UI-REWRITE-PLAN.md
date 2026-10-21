@@ -12,7 +12,7 @@
 | 现状 | 需要 |
 |---|---|
 | 卡片列表（单屏 3-4 条） | 密集表格（单屏 15+ 条） |
-| 208px 常驻侧栏 | 顶部工具栏 + 状态栏 |
+| 208px 旧 IDE 式侧栏（qoder-ui） | 导航侧栏 + 视图工具栏（2026-10-19 重设计，对标 qBittorrent/Linear） |
 | 样式全在 qoder-ui（164 处引用） | 自有 12 主题 tokens |
 | 15/53 路由接入 | 分批补到 40+ |
 
@@ -46,7 +46,9 @@ ui/src/components/dl/TasksView.tsx ← 被 TasksTable 替代
 ### 必须修改的
 
 ```
-ui/src/components/dl/DlApp.tsx     ← 去掉侧栏，改工具栏 + 状态栏布局
+ui/src/components/dl/DlApp.tsx     ← 应用壳：侧栏 + 工具栏 + 状态栏
+ui/src/components/dl/Sidebar.tsx   ← 新增：导航侧栏（状态过滤/数据组/底部设置）
+ui/src/components/dl/Toolbar.tsx   ← 视图工具栏（纯上下文动作，不承担导航）
 ui/src/components/dl/SettingsView.tsx ← 主题卡改 2×6，默认 nord-dark
 ui/src/components/dl/TaskDetail.tsx   ← 修 name 渲染
 ```
@@ -370,7 +372,9 @@ cd ui && bun run build
 | 3 | 主题持久化 | 切换后刷新页面保持 |
 | 4 | 跟随系统 | 无 localStorage 时按 `prefers-color-scheme` |
 | 5 | 表格密度 | 1920×1080 单屏 ≥ 15 行 |
-| 6 | 无侧栏 | 导航在顶部工具栏 |
+| 6 | 导航侧栏 | 状态过滤/数据组/底部设置；可折叠 216px↔56px（2026-10-19 重设计） |
+| 6a | 字重扎实化 | Inter 内置字体 + 交互件 ≥600 + 内嵌高光线（2026-10-19 二轮） |
+| 6b | 主题卡预览 | 迷你窗口层级切片，12 主题深浅/色调可辨（2026-10-19 二轮） |
 | 7 | **限速真生效** | 设 100 KB/s → 实际速度 ≤ 100 KB/s |
 | 8 | **无任务名不崩** | 新建任务后立即搜索，不白屏 |
 | 9 | 行选中 | 点击行左侧出现 3px accent 竖条 |

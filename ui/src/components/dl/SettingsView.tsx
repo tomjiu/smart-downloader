@@ -44,11 +44,147 @@ function Switch({ on, onChange, label }: { on: boolean; onChange: (v: boolean) =
   );
 }
 
+/// P1-6（Issue #127）：预设方案——一键套用的配置组合（写入表单标记脏，
+/// 用户审阅后统一保存；不碰代理/目录等用户特定项）。域字段与
+/// Settings 接口对应；语义与 tomjiu 建议（PR116-UI-FEEDBACK §B）一致。
+const PRESETS: Array<{
+  key: string;
+  name: string;
+  desc: string;
+  icon: string;
+  entries: Array<[string, string, unknown]>;
+}> = [
+  {
+    key: "eco",
+    name: "省电 / 低负载",
+    desc: "并发 1、下载 1 MiB/s、上传 256 KiB/s、做种快速止盈",
+    icon: "battery",
+    entries: [
+      ["queue", "max_active_http", 1],
+      ["queue", "max_active_bt", 1],
+      ["queue", "max_active_ftp", 1],
+      ["bandwidth", "max_download_kb_s", 1024],
+      ["bandwidth", "max_upload_kb_s", 256],
+      ["bittorrent", "max_share_ratio", 0.5],
+      ["bittorrent", "max_seeding_time_min", 30],
+    ],
+  },
+  {
+    key: "turbo",
+    name: "极速下载",
+    desc: "不限速不限并发、启用全部 P2P 扩展（DHT/PEX/LSD/μTP）",
+    icon: "zap",
+    entries: [
+      ["bandwidth", "max_download_kb_s", 0],
+      ["bandwidth", "max_upload_kb_s", 0],
+      ["queue", "max_active_http", 0],
+      ["queue", "max_active_bt", 0],
+      ["queue", "max_active_ftp", 0],
+      ["bittorrent", "enable_dht", true],
+      ["bittorrent", "enable_lsd", true],
+      ["bittorrent", "enable_pex", true],
+      ["bittorrent", "enable_utp", true],
+      ["bittorrent", "encrypt", "allow"],
+    ],
+  },
+  {
+    key: "stealth",
+    name: "隐身 / 最安全",
+    desc: "强制加密、禁 DHT/PEX/LSD/μTP、小并发（代理需自配）",
+    icon: "shield",
+    entries: [
+      ["bittorrent", "encrypt", "require"],
+      ["bittorrent", "enable_dht", false],
+      ["bittorrent", "enable_lsd", false],
+      ["bittorrent", "enable_pex", false],
+      ["bittorrent", "enable_utp", false],
+      ["bittorrent", "enable_upnp", false],
+      ["queue", "max_active_http", 2],
+      ["queue", "max_active_bt", 1],
+    ],
+  },
+  {
+    key: "pt",
+    name: "PT 站",
+    desc: "强制加密、禁 DHT/PEX/LSD（私有 tracker 语义）、上传不限、比率 2.0",
+    icon: "radio-tower",
+    entries: [
+      ["bittorrent", "encrypt", "require"],
+      ["bittorrent", "enable_dht", false],
+      ["bittorrent", "enable_lsd", false],
+      ["bittorrent", "enable_pex", false],
+      ["bittorrent", "enable_utp", true],
+      ["bittorrent", "enable_upnp", true],
+      ["bandwidth", "max_upload_kb_s", 0],
+      ["bittorrent", "max_share_ratio", 2.0],
+      ["bittorrent", "max_seeding_time_min", 0],
+    ],
+  },
+];
+
+/// P1-6（Issue #127）：后端出厂默认（与 config.rs 各 Default impl 单源对齐——
+/// 后续后端加字段需同步此处）。恢复默认 = 写入表单标记脏（可审阅可放弃），
+/// 不直接落盘。
+const DEFAULTS: Record<string, Array<[string, string, unknown]>> = {
+  bandwidth: [
+    ["bandwidth", "max_download_kb_s", 0],
+    ["bandwidth", "max_upload_kb_s", 0],
+    ["bandwidth", "alt_enabled", false],
+    ["bandwidth", "alt_max_download_kb_s", 0],
+    ["bandwidth", "alt_max_upload_kb_s", 0],
+  ],
+  connection: [
+    ["connection", "proxy", ""],
+    ["connection", "bt_listen_port", 0],
+    ["connection", "bt_max_connections", 0],
+  ],
+  bittorrent: [
+    ["bittorrent", "enable_dht", false],
+    ["bittorrent", "enable_lsd", false],
+    ["bittorrent", "enable_upnp", false],
+    ["bittorrent", "enable_pex", false],
+    ["bittorrent", "enable_utp", false],
+    ["bittorrent", "encrypt", "allow"],
+    ["bittorrent", "max_share_ratio", 0],
+    ["bittorrent", "max_seeding_time_min", 0],
+    ["bittorrent", "storage_allocate", false],
+  ],
+  download: [
+    ["download", "disk_precheck_strict", false],
+    ["download", "max_redirects", 10],
+    ["scheduler", "start_jitter_seconds", 0],
+    ["scheduler", "completion_action", "none"],
+  ],
+  queue: [
+    ["queue", "max_active_bt", 0],
+    ["queue", "max_active_http", 0],
+    ["queue", "max_active_ftp", 0],
+  ],
+  cleanup: [
+    ["cleanup", "auto_remove_completed_days", 0],
+    ["cleanup", "auto_remove_keep_data", false],
+    ["post_download", "move_to", ""],
+    ["post_download", "hook", ""],
+    ["webhook", "url", ""],
+  ],
+};
+
 export default function SettingsView({ onToast }: { onToast: (t: { kind: string; text: string }) => void }) {
   const [s, setS] = useState<Settings | null>(null);
-  const [theme, setTheme] = useState<ThemeKey>(DEFAULT_THEME);
+  // P0-1 修复（Issue #127）：初始值读当前 DOM 实际 data-theme，而非硬编码
+  // DEFAULT_THEME——旧实现挂载即写回 nord-dark，系统浅色用户点开设置瞬间
+  // 变暗且 localStorage 被污染（layout 启动脚本的 prefers-color-scheme
+  // 判定被覆盖）。layout 启动脚本已保证 DOM 上是生效主题（savedTheme 或
+  // 系统偏好），此处以 DOM 为唯一真源；SSR 无 document 时退回默认值。
+  const [theme, setTheme] = useState<ThemeKey>(() => {
+    if (typeof document === "undefined") return DEFAULT_THEME;
+    const cur = document.documentElement.getAttribute("data-theme") as ThemeKey | null;
+    return cur && THEME_KEYS.includes(cur) ? cur : DEFAULT_THEME;
+  });
   const [dirty, setDirty] = useState<Record<string, unknown>>({});
   const [busy, setBusy] = useState(false);
+  // P1-6（Issue #127）：设置项搜索（分组/字段名关键词过滤）
+  const [search, setSearch] = useState("");
   // 后端连接（本地生效，不入 /settings）
   const [base, setBaseState] = useState("");
   const [token, setTokenState] = useState("");
@@ -64,8 +200,8 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
 
   useEffect(() => {
     load();
-    const savedTheme = (localStorage.getItem("dl.theme") as ThemeKey) || null;
-    if (savedTheme && THEME_KEYS.includes(savedTheme)) setTheme(savedTheme);
+    // 主题不再从 localStorage 二次读取（DOM 已是真源；双源会重现
+    // 「挂载写回旧值」的时序窗）。持久化键仅供 layout 启动脚本冷启动用。
     setBaseState(getBase());
     setTokenState(getToken());
   }, [load]);
@@ -115,6 +251,28 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
 
   const dirtyCount = useMemo(() => Object.keys(dirty).length, [dirty]);
 
+  /// 搜索命中判定（P1-6）：关键词对 section 标题/别名/字段名做包含匹配，
+  /// 空搜索恒命中。中文/英文别名都收录（如「限速 bandwidth speed」）。
+  const hit = (...keywords: string[]) =>
+    !search.trim() || keywords.some((k) => k.toLowerCase().includes(search.trim().toLowerCase()));
+
+  /// 一次 patch 多项（P1-6 preset / 恢复默认共用）：批量写入域字段并标记脏。
+  const patchMany = (entries: Array<[string, string, unknown]>) => {
+    setS((cur) => {
+      if (!cur) return cur;
+      const next: Record<string, unknown> = { ...(cur as unknown as Record<string, unknown>) };
+      for (const [d, k, v] of entries) {
+        next[d] = { ...(next[d] as object), [k]: v };
+      }
+      return next as unknown as Settings;
+    });
+    setDirty((cur) => {
+      const next = { ...cur };
+      for (const [d, k, v] of entries) next[`${d}.${k}`] = v;
+      return next;
+    });
+  };
+
   /// 未保存修改离开页面提醒（beforeunload 标准行为；切视图不阻断——
   /// dirty 状态在保存条上已可见）。
   useEffect(() => {
@@ -145,10 +303,73 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
         }
       }}
     >
-      {/* —— 带宽 —— */}
+      {/* —— 搜索 + 预设方案（P1-6，Issue #127） —— */}
+      <section className="dl-card">
+        <div className="dl-toolbar-search" style={{ maxWidth: 420 }}>
+          <Icon name="search" size={13} />
+          <input
+            className="dl-search-input"
+            placeholder="搜索设置项…（如：限速 / 加密 / 关机）"
+            aria-label="搜索设置项"
+            data-testid="settings-search"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && search) {
+                e.stopPropagation();
+                setSearch("");
+              }
+            }}
+          />
+          {search && (
+            <button type="button" className="dl-tool-btn" aria-label="清空搜索" title="清空搜索" onClick={() => setSearch("")}>
+              <Icon name="close" size={12} />
+            </button>
+          )}
+        </div>
+        <div style={{ margin: "12px 0 4px", display: "flex", alignItems: "center", gap: 8 }}>
+          <b>预设方案</b>
+          <span style={{ fontSize: 12, color: "var(--fg-3)" }}>一键套用配置组合（填入表单，审阅后统一保存）</span>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(210px, 1fr))", gap: 10 }}>
+          {PRESETS.map((p) => (
+            <button
+              key={p.key}
+              type="button"
+              className="dl-btn dl-btn--ghost"
+              style={{ flexDirection: "column", alignItems: "flex-start", gap: 4, padding: "10px 12px", textAlign: "left" }}
+              aria-label={`套用预设：${p.name}`}
+              disabled={busy}
+              onClick={() => {
+                patchMany(p.entries);
+                onToast({ kind: "success", text: `预设「${p.name}」已填入表单（${p.entries.length} 项，待保存）` });
+              }}
+            >
+              <span style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 600 }}>
+                <Icon name={p.icon as never} size={13} /> {p.name}
+              </span>
+              <span style={{ fontSize: 11.5, color: "var(--fg-3)", lineHeight: 1.4 }}>{p.desc}</span>
+            </button>
+          ))}
+        </div>
+      </section>
+
+      {search.trim() && (
+        <div className="dl-field-help" style={{ marginTop: -6 }}>
+          {`按「${search.trim()}」过滤——未命中的分组已隐藏`}
+        </div>
+      )}
+
+      {hit("带宽 bandwidth 限速 speed 备用 alt 上传 upload 调度") && (
       <section className="dl-card">
         <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
           <Icon name="speed" size={14} className="dl-sec-ico" /> 带宽
+          <span style={{ flex: 1 }} />
+          <button type="button" className="dl-btn dl-btn--ghost" style={{ fontSize: 11.5 }} disabled={busy}
+            aria-label="恢复带宽默认值" title="把本组字段填回出厂默认（待保存）"
+            onClick={() => patchMany(DEFAULTS.bandwidth)}>
+            恢复默认
+          </button>
         </h3>
         <div className="dl-form-grid">
           <label className="dl-field-label">
@@ -248,11 +469,18 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           </div>
         )}
       </section>
+      )}
 
-      {/* —— 连接 —— */}
+      {hit("连接 connection 代理 proxy 端口 port listen") && (
       <section className="dl-card">
         <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
           <Icon name="globe" size={14} className="dl-sec-ico" /> 连接与代理
+          <span style={{ flex: 1 }} />
+          <button type="button" className="dl-btn dl-btn--ghost" style={{ fontSize: 11.5 }} disabled={busy}
+            aria-label="恢复连接默认值" title="把本组字段填回出厂默认（待保存）"
+            onClick={() => patchMany(DEFAULTS.connection)}>
+            恢复默认
+          </button>
         </h3>
         <div className="dl-form-grid">
           <label className="dl-field-label">
@@ -293,14 +521,23 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           />
         </div>
       </section>
+      )}
 
       {/* —— BitTorrent —— */}
+      {hit("BitTorrent BT DHT PEX LSD uTP 加密 encrypt 做种 share ratio tracker upnp") && (
       <section className="dl-card">
         <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
           <Icon name="radio-tower" size={14} className="dl-sec-ico" /> BitTorrent
           {!s.bittorrent.bt_available && (
             <span className="dl-badge dl-badge--warning">当前构建未启用 BT</span>
           )}
+        
+        <span style={{ flex: 1 }} />
+        <button type="button" className="dl-btn dl-btn--ghost" style={{ fontSize: 11.5 }} disabled={busy}
+          aria-label="恢复BitTorrent默认值" title="把本组字段填回出厂默认（待保存）"
+          onClick={() => patchMany(DEFAULTS.bittorrent)}>
+          恢复默认
+        </button>
         </h3>
         <div className="dl-form-grid">
           <label className="dl-field-label">DHT（去中心化 peer 发现）<Effective kind="now" /></label>
@@ -368,11 +605,20 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           <div className="dl-field-help">每行一条；保存后仅对后续新建 BT 任务生效（存量任务在任务详情里管理 tracker）</div>
         </div>
       </section>
+      )}
 
       {/* —— 队列 —— */}
+      {hit("队列 queue 并发 active 并行") && (
       <section className="dl-card">
         <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
           <Icon name="layers" size={14} className="dl-sec-ico" /> 并发队列
+        
+        <span style={{ flex: 1 }} />
+        <button type="button" className="dl-btn dl-btn--ghost" style={{ fontSize: 11.5 }} disabled={busy}
+          aria-label="恢复队列默认值" title="把本组字段填回出厂默认（待保存）"
+          onClick={() => patchMany(DEFAULTS.queue)}>
+          恢复默认
+        </button>
         </h3>
         <div className="dl-form-grid">
           <label className="dl-field-label">BT 同时传输上限</label>
@@ -384,11 +630,20 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           <div className="dl-field-help">0 = 不限（禁用排队）；超配额自动排队，槽位空闲按提交顺序递补；手动恢复 = 强制开始</div>
         </div>
       </section>
+      )}
 
       {/* —— 下载与磁盘 —— */}
+      {hit("下载 download 磁盘 disk 目录 dest 预检 重定向 redirect 错峰 jitter 定时 关机 completion") && (
       <section className="dl-card">
         <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
           <Icon name="file-directory" size={14} className="dl-sec-ico" /> 下载
+        
+        <span style={{ flex: 1 }} />
+        <button type="button" className="dl-btn dl-btn--ghost" style={{ fontSize: 11.5 }} disabled={busy}
+          aria-label="恢复下载与磁盘默认值" title="把本组字段填回出厂默认（待保存）"
+          onClick={() => patchMany(DEFAULTS.download)}>
+          恢复默认
+        </button>
         </h3>
         <div className="dl-form-grid">
           <label className="dl-field-label">默认下载目录 <Effective kind="now" /></label>
@@ -410,13 +665,43 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           <label className="dl-field-label">错峰随机延迟（秒）<Effective kind="now" /></label>
           <input className="dl-input" type="number" min={0} value={s.scheduler.start_jitter_seconds} onChange={(e) => patch("scheduler", "start_jitter_seconds", num(e.target.value) ?? 0)} />
           <div className="dl-field-help">新任务在 0..=N 秒内随机延迟启动；0 = 关闭</div>
+
+          {/* P1-6（Issue #127）：完成后动作——后端 Task 46 已支持（PUT /settings
+              scheduler.completion_action，热更），UI 此前未暴露 = 「下载完成后
+              关机」无入口。 */}
+          <label className="dl-field-label">全部任务完成后 <Effective kind="now" /></label>
+          <select
+            className="dl-input"
+            aria-label="全部任务完成后动作"
+            data-testid="completion-action"
+            value={s.scheduler.completion_action || "none"}
+            onChange={(e) => patch("scheduler", "completion_action", e.target.value)}
+          >
+            <option value="none">不执行任何动作（默认）</option>
+            <option value="exit">退出 daemon 进程</option>
+            <option value="shutdown">关闭系统（关机）</option>
+            <option value="sleep">系统休眠</option>
+            <option value="hibernate">系统冬眠</option>
+          </select>
+          <div className="dl-field-help">
+            全部任务到达终态（含暂停/做种）后触发，每进程会话最多一次；空任务表不触发
+          </div>
         </div>
       </section>
+      )}
 
       {/* —— 完成后与清理 —— */}
+      {hit("完成后 清理 cleanup webhook hook 移动 move 自动") && (
       <section className="dl-card">
         <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
           <Icon name="check" size={14} className="dl-sec-ico" /> 完成后与清理
+        
+        <span style={{ flex: 1 }} />
+        <button type="button" className="dl-btn dl-btn--ghost" style={{ fontSize: 11.5 }} disabled={busy}
+          aria-label="恢复完成后与清理默认值" title="把本组字段填回出厂默认（待保存）"
+          onClick={() => patchMany(DEFAULTS.cleanup)}>
+          恢复默认
+        </button>
         </h3>
         <div className="dl-form-grid">
           <label className="dl-field-label">完成 Webhook <Effective kind="now" /></label>
@@ -432,11 +717,14 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           <Switch label="保留文件" on={s.cleanup.auto_remove_keep_data} onChange={(v) => patch("cleanup", "auto_remove_keep_data", v)} />
         </div>
       </section>
+      )}
 
       {/* —— 外观 —— */}
+      {hit("外观 主题 theme 色板") && (
       <section className="dl-card">
         <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
           <Icon name="paintcan" size={14} className="dl-sec-ico" /> 外观主题
+        
         </h3>
         <div className="dl-theme-grid">
           {THEME_KEYS.map((t) => (
@@ -447,11 +735,14 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           主题经 <code>data-theme</code> 属性切换，色板与设计规范 12 主题逐变量一致
         </div>
       </section>
+      )}
 
       {/* —— 后端连接 —— */}
+      {hit("后端 连接 server 地址 token base") && (
       <section className="dl-card">
         <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
           <Icon name="server" size={14} className="dl-sec-ico" /> 后端连接
+        
         </h3>
         <div className="dl-form-grid">
           <label className="dl-field-label">daemon 地址</label>
@@ -478,6 +769,7 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           <div className="dl-field-help">保存在本机浏览器存储；修改后自动生效（下次请求即走新地址）</div>
         </div>
       </section>
+      )}
 
       {/* —— 保存条（页尾 + sticky：长页滚动始终可达） —— */}
       <div className="dl-actions dl-actions--sticky">

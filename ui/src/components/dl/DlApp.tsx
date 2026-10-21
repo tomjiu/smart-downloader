@@ -60,6 +60,23 @@ function matchFilter(t: TaskListItem, f: TaskFilterKey): boolean {
   }
 }
 
+/// SSE 速率新鲜度 TTL（与 TasksTable.RATE_TTL_MS 同口径；DlApp 侧的
+/// 过期清理 interval 消费）。
+const RATE_TTL_MS = 5000;
+
+/// 活跃（非终态）任务状态集（P1-5-C：全终态时冻结快照轮询的判定口径；
+/// 与 Common.tsx StateBadge 的 live 集一致 + Queued/Evaluating/Paused
+/// ——Paused 仍是可恢复的进行中语义）。
+const ACTIVE_STATES = [
+  "Downloading",
+  "Seeding",
+  "Transferring",
+  "FallbackProvider",
+  "Evaluating",
+  "Queued",
+  "Paused",
+];
+
 export default function DlApp() {
   const [view, setView] = useState<ViewKey>("tasks");
   /// 侧栏折叠（2026-10-19：localStorage 持久化；未存过且窄屏 → 图标栏）。
@@ -67,6 +84,9 @@ export default function DlApp() {
   const searchInputRef = useRef<HTMLInputElement | null>(null);
   const [tasks, setTasks] = useState<TaskListItem[]>([]);
   const [snapshots, setSnapshots] = useState<Record<string, TaskSnapshot>>({});
+  /// 快照最新引用（refreshSnapshots 引用稳定化用；避免 state 依赖重建回调）
+  const snapshotsRef = useRef<Record<string, TaskSnapshot>>({});
+  snapshotsRef.current = snapshots;
   const [rates, setRates] = useState<Record<string, TaskRate>>({});
   const [stats, setStats] = useState<Stats | null>(null);
   const [events, setEvents] = useState<SchedulerEventEnvelope[]>([]);
@@ -144,8 +164,29 @@ export default function DlApp() {
       client.stats().catch(() => null),
     ]);
     if (t !== null) {
-      setTasks(t);
       setLoaded(true);
+      // P1-5-A 修复（Issue #127）：内容签名去重 + 项级引用稳定。
+      // 旧实现每秒无条件 setTasks(新数组)：1000+ 任务时整树每秒重渲染，
+      // onClick 被排队到下一空闲帧 → 点击滞后 100-300ms。签名覆盖
+      // TaskListItem 全部字段（id/state/source/engine/name），内容不变
+      // 则跳过 set；变更时内容未变的项沿用旧对象引用（行级 memo 生效）。
+      let sig = "";
+      const prev = new Map(tasksRef.current.map((x) => [x.task_id, x]));
+      const reused = t.map((x) => {
+        sig += `${x.task_id}\u0001${x.state}\u0001${x.source}\u0001${x.engine ?? ""}\u0001${x.name ?? ""}\u0002`;
+        const p = prev.get(x.task_id);
+        return p &&
+          p.state === x.state &&
+          p.name === x.name &&
+          p.source === x.source &&
+          p.engine === x.engine
+          ? p
+          : x;
+      });
+      if (sig !== taskSigRef.current) {
+        taskSigRef.current = sig;
+        setTasks(reused);
+      }
     }
     if (s) {
       setStats(s);
@@ -163,19 +204,45 @@ export default function DlApp() {
   /// 详情快照轮询：仅对当前列表中的任务并发拉取（表格进度/大小/ETA 数据源）。
   /// 节拍 2s 独立于列表轮询（1s）：任务量大时减半请求压力；tasks 最新引用
   /// 经 ref 传递（避免每秒新数组引用重置 interval 计时）。
+  /// P1-5-C 修复（Issue #127）：全终态冻结——无进行中任务且任务集合未变时
+  /// 停拉（终值的快照已入账，继续拉只产生每 2s 的解析+重渲染压力）；
+  /// 出现新任务/活跃任务即自动恢复。快照项引用稳定：内容未变沿用旧对象
+  /// （配合行级 memo，速率列不变时不重渲染行）。
   const tasksRef = useRef<TaskListItem[]>([]);
   tasksRef.current = tasks;
+  const taskSigRef = useRef<string>("");
+  const snapIdsRef = useRef<string>("");
   const refreshSnapshots = useCallback(async () => {
     const list = tasksRef.current;
     if (list.length === 0) {
       setSnapshots((cur) => (Object.keys(cur).length === 0 ? cur : {}));
+      snapIdsRef.current = "";
       return;
     }
+    const hasActive = list.some((t) => ACTIVE_STATES.includes(t.state));
+    const idsSig = list.map((x) => x.task_id).join(",");
+    if (!hasActive && idsSig === snapIdsRef.current) {
+      return; // 全终态 + 集合未变 → 冻结（终值已入账）
+    }
+    snapIdsRef.current = idsSig;
+    const prev = snapshotsRef.current;
     const next: Record<string, TaskSnapshot> = {};
     await Promise.all(
       list.map(async (t) => {
         try {
-          next[t.task_id] = await client.getTask(t.task_id);
+          const fresh = await client.getTask(t.task_id);
+          // 引用稳定：表格消费的字段（done/total/state/error/name/limits/rates）
+          // 未变 → 沿用旧快照对象（行级 memo 浅比较生效）
+          const p = prev[t.task_id];
+          next[t.task_id] =
+            p &&
+            p.done === fresh.done &&
+            p.total === fresh.total &&
+            p.state === fresh.state &&
+            p.error === fresh.error &&
+            p.name === fresh.name
+              ? p
+              : fresh;
         } catch {
           /* 任务可能已移除；保留缺失（表格显示 —） */
         }
@@ -238,6 +305,26 @@ export default function DlApp() {
     const iv = setInterval(refreshSnapshots, 2000);
     return () => clearInterval(iv);
   }, [refreshSnapshots]);
+
+  /// P1-5（Issue #127）速率 TTL 过期清理：旧实现靠每秒无条件 setTasks
+  /// 触发整树重算来「刷新」SSE 速率的新鲜度判定；签名去重后静默期无重渲染，
+  /// 过期清理必须自驱动（仅在实际有过期项时 setState——频率 ≤ 1 次/秒）。
+  useEffect(() => {
+    const iv = setInterval(() => {
+      setRates((cur) => {
+        const now = Date.now();
+        let changed = false;
+        const next: Record<string, TaskRate> = {};
+        for (const k of Object.keys(cur)) {
+          const v = cur[k];
+          if (now - v.ts < RATE_TTL_MS) next[k] = v;
+          else changed = true;
+        }
+        return changed ? next : cur;
+      });
+    }, 1000);
+    return () => clearInterval(iv);
+  }, []);
 
   /// 选集随任务列表收缩（已移除任务的选中项清除）。
   useEffect(() => {
