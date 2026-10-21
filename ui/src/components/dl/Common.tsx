@@ -5,7 +5,7 @@
 /// 初始焦点取消按钮）；TableSkeleton（E8：首帧数据未到时不再误报「暂无任务」）。
 
 import { useEffect, useRef } from "react";
-import { fmtBytes, fmtPct, fmtSpeed } from "@/lib/daemon/format";
+import { fmtBytes, fmtPct, fmtSpeed, fmtUnixShort } from "@/lib/daemon/format";
 import { Icon } from "./Icon";
 
 export const STATE_TONE: Record<string, { label: string; badge: string; bar: string }> = {
@@ -34,6 +34,45 @@ export function StateBadge({ state }: { state: string }) {
       {meta.label}
     </span>
   );
+}
+
+/// A2（契约审计 2026-10-21）：Queued 态限定徽章——后端 TaskSummary 透出
+/// start_at_unix（E23 定时）与 next_retry_at_unix（E30 重试）专供列表区分，
+/// 不建模则定时/重试等待与普通排队无法区分（用户看到「卡在排队」）。
+/// 渲染规则：Queued 态按字段追加「定时 hh:mm」/「重试 x/y」小徽章；
+/// 非 Queued 不渲染（字段语义即 Queued 附注）。定时优先于重试展示
+/// （同一任务两者并存理论上不存在：定时任务失败后 next_retry 才出现，
+/// 而 start_at 已消费清零——并存时以定时为准防误导）。
+export function QueuedNote({
+  t,
+}: {
+  t: {
+    state: string;
+    start_at_unix?: number;
+    retries?: number;
+    max_retries?: number;
+    next_retry_at_unix?: number;
+  };
+}) {
+  if (t.state !== "Queued") return null;
+  if (t.start_at_unix && t.start_at_unix > 0) {
+    return (
+      <span className="dl-badge dl-badge--info dl-queued-note" title={`定时启动：${fmtUnixShort(t.start_at_unix)}`}>
+        <Icon name="clock" size={11} /> 定时 {fmtUnixShort(t.start_at_unix)}
+      </span>
+    );
+  }
+  if (t.next_retry_at_unix && t.next_retry_at_unix > 0) {
+    const retries = t.retries ?? 0;
+    const max = t.max_retries;
+    const label = max ? `重试 ${retries}/${max}` : `重试 ${retries}`;
+    return (
+      <span className="dl-badge dl-badge--warning dl-queued-note" title={`下次重试：${fmtUnixShort(t.next_retry_at_unix)}`}>
+        <Icon name="sync" size={11} /> {label}
+      </span>
+    );
+  }
+  return null;
 }
 
 export function TaskProgress({

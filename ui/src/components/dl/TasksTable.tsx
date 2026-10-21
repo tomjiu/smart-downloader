@@ -17,7 +17,7 @@ import { memo, useCallback, useMemo, useRef } from "react";
 import type { TaskListItem, TaskRate, TaskSnapshot } from "@/lib/daemon/types";
 import { fmtBytes, fmtEta, fmtSpeed } from "@/lib/daemon/format";
 import { Icon } from "./Icon";
-import { StateBadge, stateLabel } from "./Common";
+import { StateBadge, stateLabel, QueuedNote } from "./Common";
 
 export function displayName(t: { name?: string | null; source?: string | null; task_id?: string }): string {
   return t.name?.trim() || deriveNameFromSource(t.source) || t.task_id || "";
@@ -339,6 +339,7 @@ const TaskRow = memo(function TaskRow({
       </td>
       <td>
         <StateBadge state={t.state} />
+        <QueuedNote t={t} />
       </td>
       <td>
         <div className="dl-td-progress">

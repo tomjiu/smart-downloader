@@ -8,16 +8,29 @@ export interface TaskFile {
   done: number;
 }
 
-/// GET /tasks 列表项（轻量形状，对齐 daemon list_tasks）。
+/// GET /tasks 列表项（轻量形状，对齐 daemon list_tasks 返回 TaskSummary）。
 /// P0-2 修复（Issue #115）：后端 TaskRecord.name 为 Option<String> +
 /// skip_serializing_if —— UI 侧必须可空，否则 null 时渲染 "null"、
 /// 搜索 .toLowerCase() 直接 TypeError 白屏。
+/// A2 补齐（契约审计 2026-10-21）：后端 TaskSummary 还透出 tags /
+/// start_at_unix / retries 系字段（均条件序列化，缺省 = 未设置）——
+/// 定时任务与重试等待都停留在 Queued 态，不建模则无法区分展示。
 export interface TaskListItem {
   task_id: string;
   state: string;
   source: string;
   engine?: string | null;
   name?: string | null;
+  /** 用户标签（E18；空 = 后端序列化省略） */
+  tags?: string[];
+  /** 定时启动时刻（E23，unix 秒；0/缺省 = 未调度）。非 0 且 Queued = 定时等待中 */
+  start_at_unix?: number;
+  /** 已执行自动重试次数（E30；0/缺省 = 无） */
+  retries?: number;
+  /** 自动重试次数上限（E30；0/缺省 = 不自动重试） */
+  max_retries?: number;
+  /** 重试到期时刻（E30，unix 秒；非 0 且 Queued = 重试等待中） */
+  next_retry_at_unix?: number;
 }
 
 /// GET /tasks/:id 详情快照（对齐 daemon task_snapshot）。
@@ -45,6 +58,21 @@ export interface TaskSnapshot {
    *  生产者（events.rs 枚举存在但 ops.rs 不发布），快照 rates 是唯一
    *  真实来源；SSE 若将来补齐则作为更新鲜的覆盖层） */
   rates?: { down_bytes_s: number; up_bytes_s: number };
+  /** 累计下行字节（E33，BT 透出；0/缺省 = 单向引擎或尚未产生） */
+  total_downloaded?: number;
+  /** 累计上行字节（E33，BT 透出；0/缺省 = 单向引擎或尚未产生） */
+  total_uploaded?: number;
+  /** 分享率（E33）：total_uploaded / total_downloaded；缺省 = 无下行
+   *  （比率无意义）或非 BT 引擎。任务详情做种统计区数据源。 */
+  share_ratio?: number;
+  /** 用户标签（E18；空 = 序列化省略） */
+  tags?: string[];
+  /** 已执行自动重试次数（E30；0/缺省 = 无） */
+  retries?: number;
+  /** 自动重试次数上限（E30；0/缺省 = 不自动重试） */
+  max_retries?: number;
+  /** 重试到期时刻（E30，unix 秒；非 0 且 Queued = 重试等待中） */
+  next_retry_at_unix?: number;
 }
 
 /// 事件流派生的任务级速率（Speed 事件）。

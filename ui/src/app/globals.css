@@ -204,6 +204,14 @@ body {
   background: var(--bg-3);
   color: var(--fg);
 }
+/* A2：Queued 态限定徽章（定时/重试）——与主状态徽章同行并排，
+   尺寸略缩（次要信息），间距 6px 防贴连。 */
+.dl-queued-note {
+  margin-left: 6px;
+  font-weight: 500;
+  font-size: 11px;
+  padding: 0 6px;
+}
 .dl-badge--primary { background: var(--accent-bg); color: var(--accent); }
 .dl-badge--info { background: var(--info-bg); color: var(--info); }
 .dl-badge--success { background: var(--ok-bg); color: var(--ok); }

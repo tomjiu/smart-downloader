@@ -10,6 +10,7 @@ import type {
   Settings,
   SettingsApplyReport,
   Stats,
+  TaskListItem,
   TaskSnapshot,
 } from "./types";
 
@@ -70,7 +71,11 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export class DaemonClient {
   // 任务（GET /tasks 返回裸数组）
-  listTasks(): Promise<TaskSnapshot[]> {
+  /// A1 修复（契约审计 2026-10-21）：返回类型改为 TaskListItem[]——后端
+  /// list_tasks 实际返回 TaskSummary 轻量形状（无 done/total/rates），
+  /// 旧声明 TaskSnapshot[] 是类型级谎言（结构性兼容侥幸过编译，
+  /// 但误导后续消费——若读 done/total 将拿到 undefined）。
+  listTasks(): Promise<TaskListItem[]> {
     return req("/tasks");
   }
   getTask(id: string): Promise<TaskSnapshot> {

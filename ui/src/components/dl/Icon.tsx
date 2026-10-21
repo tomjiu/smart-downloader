@@ -36,9 +36,16 @@ export type IconName =
   | "error"
   | "search"
   | "panel-left"
-  | "chevron-left";
+  | "chevron-left"
+  | "clock";
 
 const PATHS: Record<IconName, React.ReactNode> = {
+  clock: (
+    <>
+      <circle cx="12" cy="12" r="9" />
+      <path d="M12 7v5l3.5 2" />
+    </>
+  ),
   "arrow-down": <path d="M12 4v14m0 0l-5-5m5 5l5-5" />,
   "arrow-up": <path d="M12 20V6m0 0l-5 5m5-5l5 5" />,
   battery: (

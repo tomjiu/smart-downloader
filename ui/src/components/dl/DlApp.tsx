@@ -173,13 +173,19 @@ export default function DlApp() {
       let sig = "";
       const prev = new Map(tasksRef.current.map((x) => [x.task_id, x]));
       const reused = t.map((x) => {
-        sig += `${x.task_id}\u0001${x.state}\u0001${x.source}\u0001${x.engine ?? ""}\u0001${x.name ?? ""}\u0002`;
+        // A2：签名纳入限定字段（start_at/next_retry/retries）——定时到期激活、
+        // 重试计数变化都会驱动徽章刷新；tags 同步入签（列表尚未展示，防未来
+        // 遗漏）。内容不变则跳过 set；变更时内容未变的项沿用旧对象引用。
+        sig += `${x.task_id}\u0001${x.state}\u0001${x.source}\u0001${x.engine ?? ""}\u0001${x.name ?? ""}\u0001${x.start_at_unix ?? 0}\u0001${x.next_retry_at_unix ?? 0}\u0001${x.retries ?? 0}\u0001${(x.tags ?? []).join("\u0003")}\u0002`;
         const p = prev.get(x.task_id);
         return p &&
           p.state === x.state &&
           p.name === x.name &&
           p.source === x.source &&
-          p.engine === x.engine
+          p.engine === x.engine &&
+          p.start_at_unix === x.start_at_unix &&
+          p.next_retry_at_unix === x.next_retry_at_unix &&
+          p.retries === x.retries
           ? p
           : x;
       });
