@@ -22,8 +22,6 @@ pub mod metalink;
 /// NAS 版迅雷引擎托管（xllite/pan-cli，Linux-only）。附录 E-2026-08-30。
 #[cfg(feature = "nas")]
 pub mod nas;
-#[cfg(feature = "nas")]
-pub mod nas_remote;
 /// RSS 订阅自动下载（qbit RSS 对标）：feed 解析（RSS 2.0/Atom）+ 规则匹配
 /// 自动建任务 + `/rss/*` 端点 + refresh ticker。
 pub mod rss;

@@ -135,7 +135,14 @@ pub fn parse_speed_bps(raw: &str) -> u64 {
     } else {
         1
     };
-    (v * mult as f64) as u64
+    // P2-21 修复（审查第三轮）：负值/NaN/Inf 拒收；乘积饱和在
+    // 100 GiB/s（远超任何真实链路速率）——"9999999999GB/s" 不再以
+    // ~1e19 B/s 的荒谬值进入速率面（UI/限速器下游）。
+    if !v.is_finite() || v < 0.0 {
+        return 0;
+    }
+    const RATE_SANITY_CAP: f64 = (100u64 << 30) as f64; // 100 GiB/s
+    (v * mult as f64).min(RATE_SANITY_CAP) as u64
 }
 
 /// 远程引擎配置。
@@ -263,6 +270,8 @@ impl NasRemoteEngine {
     }
 
     /// 带一次重自举重试的请求。
+    ///
+    /// P1-20/P1-21 修复（审查第三轮）：见 [`should_retry_403`] 文档。
     async fn send_retry(
         &self,
         method: reqwest::Method,
@@ -275,11 +284,40 @@ impl NasRemoteEngine {
             .send(method.clone(), url, &jwt, json_body, timeout_s)
             .await?;
         if st == 403 {
-            let jwt2 = self.ensure_jwt(true).await?;
+            if !should_retry_403(&method, &body) {
+                return Ok((st, body));
+            }
+            let jwt2 = match self.ensure_jwt(true).await {
+                Ok(j) => j,
+                Err(e) => {
+                    // P1-20：保留原始 403 body（根因诊断载体——配额耗尽等
+                    // 场景的解释在首个响应里，重自举失败不应将其吞掉）
+                    return Err(EngineError::Other(format!(
+                        "403 后重自举失败: {e}；原始响应: {}",
+                        truncate(&body, 512)
+                    )));
+                }
+            };
             return self.send(method, url, &jwt2, json_body, timeout_s).await;
         }
         Ok((st, body))
     }
+}
+
+/// 403 重试闸（P1-21，审查第三轮）：
+/// - 幂等方法（GET/HEAD/DELETE）→ 恒可重试；
+/// - 非幂等方法（POST 创建任务等）→ 仅当 403 body 含 JWT 失效签名
+///   （`invalid number of segments` / `permission_deny`，与 `classify_error`
+///   同一判据）才重试——避免「响应被篡改为 403 → 重试再创建一个」的
+///   双建风险（每日创建配额 3 次，误重试一次即浪费一次配额）。
+fn should_retry_403(method: &reqwest::Method, body: &str) -> bool {
+    if matches!(
+        *method,
+        reqwest::Method::GET | reqwest::Method::HEAD | reqwest::Method::DELETE
+    ) {
+        return true;
+    }
+    body.contains("invalid number of segments") || body.contains("permission_deny")
 }
 
 fn urlencode(s: &str) -> String {
@@ -381,8 +419,15 @@ impl DownloadEngine for NasRemoteEngine {
             .map(parse_speed_bps)
             .unwrap_or(0);
         let progress = t.get("progress").and_then(|p| p.as_f64()).unwrap_or(0.0);
-        // progress 语义未定案（0-100 疑似百分比，A4 观测）：仅当落在 [0,100] 视为百分比
-        let (done, total) = if (0.0..=100.0).contains(&progress) {
+        // P2-22 修复（审查第三轮）：progress 语义未定案（0-100 百分比 /
+        // 0-1 比例两说，A4 观测）——归一化到百分比再映射 done/total =
+        // pct/100（进度显示正确）。已知残留：total=100 是**合成值**（该
+        // API 无字节数来源，UI 大小列显示 "100 B" 属已知妥协——复活路径
+        // 校准时若确认字段语义，应改为透传真实 size）。非法值（负/超界/
+        // NaN）→ (0, 0)。
+        let (done, total) = if (0.0..=1.0).contains(&progress) {
+            (progress * 100.0, 100.0)
+        } else if (0.0..=100.0).contains(&progress) {
             (progress, 100.0)
         } else {
             (0.0, 0.0)
@@ -574,6 +619,56 @@ function uiauth(value){ return "eyJhbGciOiJIUzI1NiJ9.eyJrZXkiOiJVSUF1dGgifQ.sig"
             urlencode("device_id#c7d089…"),
             "device_id%23c7d089%E2%80%A6"
         );
+    }
+
+    // ── P1-21：403 重试闸 ──
+
+    // ── P2-21：速率解析饱和 ──
+
+    #[test]
+    fn parse_speed_absurd_values_capped() {
+        // 9999999999GB/s ≈ 1.07e19 → 钳制在 100 GiB/s 而非荒谬巨值
+        let capped = parse_speed_bps("9999999999GB/s");
+        assert_eq!(capped, 100u64 << 30, "got {capped}");
+        // 负值 / NaN → 0（拒收）
+        assert_eq!(parse_speed_bps("-5MB/s"), 0);
+        assert_eq!(parse_speed_bps("n/a"), 0);
+        // 正常值不受影响
+        assert_eq!(parse_speed_bps("1.5MB/s"), (1.5 * (1 << 20) as f64) as u64);
+    }
+
+    #[test]
+    fn retry_gate_idempotent_methods_always_retry() {
+        assert!(should_retry_403(&reqwest::Method::GET, "anything"));
+        assert!(should_retry_403(&reqwest::Method::HEAD, ""));
+        assert!(should_retry_403(&reqwest::Method::DELETE, "quota whatever"));
+    }
+
+    #[test]
+    fn retry_gate_post_requires_jwt_signature() {
+        // JWT 失效签名 → 可重试（重自举后大概率成功）
+        assert!(should_retry_403(
+            &reqwest::Method::POST,
+            r#"{"error":"permission_deny"}"#
+        ));
+        assert!(should_retry_403(
+            &reqwest::Method::POST,
+            "invalid number of segments"
+        ));
+        // 其他 403（配额/风控）→ 不重试（防双建 + 防浪费每日 3 次配额）
+        assert!(!should_retry_403(
+            &reqwest::Method::POST,
+            r#"{"error":"task_create_count_limit"}"#
+        ));
+        assert!(!should_retry_403(&reqwest::Method::POST, "rate limited"));
+        assert!(!should_retry_403(&reqwest::Method::POST, ""));
+    }
+
+    #[test]
+    fn retry_gate_patch_like_post() {
+        // PATCH（v2 pause/resume 挂载点）同 POST 语义：需 JWT 签名
+        assert!(!should_retry_403(&reqwest::Method::PATCH, "mystery 403"));
+        assert!(should_retry_403(&reqwest::Method::PATCH, "permission_deny"));
     }
 
     #[test]
