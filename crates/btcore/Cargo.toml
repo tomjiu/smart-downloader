@@ -12,6 +12,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+parking_lot = { workspace = true }
 smart-dl-core = { path = "../core" }
 fs2 = { workspace = true }
 

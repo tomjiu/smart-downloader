@@ -146,7 +146,7 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
 
     // 4. BT 引擎（先取 core 句柄，供 alert 事件流）
     #[cfg(feature = "bt")]
-    let mut bt_typed: Option<Arc<crate::bt::BtEngine>> = None;
+    let mut bt_typed: Option<Arc<smart_dl_btcore::dl_engine::BtEngine>> = None;
     #[cfg(feature = "bt")]
     // 注：块内副作用（apply_startup_conn / set_session_storage_allocate）
     // 必须执行；返回的 core 句柄自 batch10-P0-3 起不再被 alert loop 消费
@@ -158,7 +158,7 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
             std::fs::create_dir_all(&save)
                 .map_err(|e| ServeError::Engine(format!("BT 落盘目录创建失败 {save:?}: {e}")))?;
             let bt = Arc::new(
-                crate::bt::BtEngine::new(
+                smart_dl_btcore::dl_engine::BtEngine::new(
                     &save,
                     Some(cfg.download.proxy.as_str()),
                     cfg.download.max_download_kb_s,

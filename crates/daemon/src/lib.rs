@@ -6,7 +6,6 @@
 
 pub mod baidu_resolve;
 #[cfg(feature = "bt")]
-pub mod bt;
 #[cfg(feature = "bt")]
 pub mod bt_events;
 pub mod cli;

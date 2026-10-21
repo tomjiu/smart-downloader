@@ -20,7 +20,7 @@ use base64::Engine as _;
 async fn serve_bt() -> (std::net::SocketAddr, Arc<DaemonState>, std::path::PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let save = dir.path().to_path_buf();
-    let bt = smart_dl_daemon::bt::BtEngine::new(
+    let bt = smart_dl_btcore::dl_engine::BtEngine::new(
         &save,
         None,
         0,
@@ -359,7 +359,7 @@ async fn readd_same_magnet_after_restart_ok() {
 
     // 第一次"运行"
     let r1 = {
-        let bt = smart_dl_daemon::bt::BtEngine::new(
+        let bt = smart_dl_btcore::dl_engine::BtEngine::new(
             dir.path(),
             None,
             0,
@@ -381,7 +381,7 @@ async fn readd_same_magnet_after_restart_ok() {
     assert!(r1.is_ok(), "首次 add 应成功: {:?}", r1.err());
 
     // "重启"：新 session（同 save_path）重新 add
-    let bt2 = smart_dl_daemon::bt::BtEngine::new(
+    let bt2 = smart_dl_btcore::dl_engine::BtEngine::new(
         dir.path(),
         None,
         0,
@@ -643,7 +643,7 @@ async fn serve_bt_in(
     store: Option<std::path::PathBuf>,
 ) -> (std::net::SocketAddr, Arc<DaemonState>, std::path::PathBuf) {
     let save = dir.to_path_buf();
-    let bt = smart_dl_daemon::bt::BtEngine::new(
+    let bt = smart_dl_btcore::dl_engine::BtEngine::new(
         &save,
         None,
         0,
@@ -758,7 +758,7 @@ async fn file_priority_persisted_and_replayed_after_restart() {
     }
 
     // —— "重启"：新 session（同 save 目录）+ restore_from → 立即重放
-    let bt2 = smart_dl_daemon::bt::BtEngine::new(
+    let bt2 = smart_dl_btcore::dl_engine::BtEngine::new(
         dir.path(),
         None,
         0,

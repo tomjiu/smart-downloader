@@ -2734,6 +2734,7 @@ dependencies = [
  "async-trait",
  "bindgen",
  "fs2",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",

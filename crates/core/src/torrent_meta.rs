@@ -147,6 +147,27 @@ fn collect_web_seeds(top: &Value) -> Vec<String> {
     out
 }
 
+/// .torrent 的 v1 infohash（40 hex 小写）= SHA1(info dict 原始字节)。
+///
+/// TD-4 建议 8 随迁：原 daemon `state::torrent_infohash` 的核心逻辑归位
+/// core（btcore 引擎适配器与 daemon 快照面共用同一实现）。
+/// 解析失败（无法定位 info / 畸形）→ `None`。
+pub fn infohash_v1(bytes: &[u8]) -> Option<String> {
+    let (s, e) = bencode::locate_dict_value(bytes, b"info")?;
+    if bytes.get(s) != Some(&b'd') {
+        return None; // info 必须是 dict
+    }
+    let mut hasher = Sha1::new();
+    hasher.update(&bytes[s..=e]);
+    Some(
+        hasher
+            .finalize()
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect(),
+    )
+}
+
 /// 解析 .torrent 字节 → 摘要。单文件（length）/多文件（files）双形态。
 pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentSummary, TorrentMetaError> {
     let top = bencode::decode(bytes).map_err(TorrentMetaError::Decode)?;
@@ -155,14 +176,7 @@ pub fn parse_torrent(bytes: &[u8]) -> Result<TorrentSummary, TorrentMetaError> {
     }
 
     // infohash = SHA1(info dict 原始字节)
-    let (s, e) = bencode::locate_dict_value(bytes, b"info").ok_or(TorrentMetaError::MissingInfo)?;
-    let mut hasher = Sha1::new();
-    hasher.update(&bytes[s..=e]);
-    let infohash_v1: String = hasher
-        .finalize()
-        .iter()
-        .map(|x| format!("{x:02x}"))
-        .collect();
+    let infohash_v1 = infohash_v1(bytes).ok_or(TorrentMetaError::MissingInfo)?;
 
     let info = top.dict_get(b"info").ok_or(TorrentMetaError::MissingInfo)?;
     let Value::Dict(_) = info else {

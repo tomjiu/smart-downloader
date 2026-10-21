@@ -1,4 +1,9 @@
-//! BtEngine（feature `bt`）：libtorrent 薄核（smart-dl-btcore）接入 DownloadEngine。
+//! BtEngine：libtorrent 薄核（smart-dl-btcore）接入 DownloadEngine。
+//!
+//! TD-4 建议 8（ARCHITECTURE-REVIEW §6 建议 8）：本文件自 daemon/src/bt.rs
+//! 移入 btcore（纯移动 + 两处纯函数改用 core 权威实现）——btcore 成为
+//! 自包含的「内核 + DownloadEngine 适配器」，CLI/桌面端可不依赖 daemon
+//! 直接复用。daemon 侧保留 bt_events（alert 消费）与 bt_alerts（快照解析）。
 //!
 //! 单个 BtCore session（save_path = 任务默认落盘目录）；engine_tid = libtorrent
 //! 返回的 infohash（40 hex）。magnet / .torrent 文件 → add_magnet / add_torrent_file。
@@ -10,7 +15,7 @@
 //! 重启后 add 同一 magnet/torrent 时按 infohash 查 `.fastresume` → `add_torrent_resume`
 //! 回灌 → libtorrent 恢复 piece 位图 + metadata，免全盘 checking / 免重新抓取 metadata。
 
-use smart_dl_btcore::{BtCore, TorrentStatus};
+use crate::{BtCore, TorrentStatus};
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
     BtSessionPatch, Capability, DownloadEngine, DownloadSource, EngineError, EngineKind,
@@ -91,7 +96,7 @@ pub struct BtEngine {
         parking_lot::Mutex<
             std::collections::HashMap<
                 String,
-                Vec<tokio::sync::mpsc::UnboundedSender<smart_dl_btcore::Alert>>,
+                Vec<tokio::sync::mpsc::UnboundedSender<crate::Alert>>,
             >,
         >,
     >,
@@ -162,7 +167,7 @@ impl BtEngine {
         let _ = core.set_alert_mask(0xFFFF);
         // 全局网络策略（代理 + 限速）：启动时一次 apply（代理/限速不参与热重载）
         let proxy_cfg = match proxy {
-            Some(u) if !u.is_empty() => match smart_dl_btcore::ffi::parse_proxy(u) {
+            Some(u) if !u.is_empty() => match crate::ffi::parse_proxy(u) {
                 Ok(c) => Some(c),
                 Err(e) => return Err(format!("bt proxy 解析失败 {u:?}: {e:?}")),
             },
@@ -174,10 +179,9 @@ impl BtEngine {
         core.apply_discovery(enable_dht, enable_lsd, enable_upnp, enable_pex)
             .map_err(|e| format!("bt apply_discovery: {e:?}"))?;
         // 传输层开关（uTP + MSE 加密）：启动时一次 apply，不参与热重载
-        let enc_policy =
-            smart_dl_btcore::engine::parse_encrypt_policy(encrypt).ok_or_else(|| {
-                format!("bt.encrypt 解析失败 {encrypt:?}: 仅支持 disable/allow/require")
-            })?;
+        let enc_policy = crate::engine::parse_encrypt_policy(encrypt).ok_or_else(|| {
+            format!("bt.encrypt 解析失败 {encrypt:?}: 仅支持 disable/allow/require")
+        })?;
         core.apply_transport(enable_utp, enc_policy)
             .map_err(|e| format!("bt apply_transport: {e:?}"))?;
         Ok(BtEngine {
@@ -282,7 +286,7 @@ impl BtEngine {
     }
 
     /// pop_alerts + 持续执法入口（alert 循环每轮调用）。
-    pub fn pop_alerts_enforcing_pause(&self, cap: usize) -> Vec<smart_dl_btcore::Alert> {
+    pub fn pop_alerts_enforcing_pause(&self, cap: usize) -> Vec<crate::Alert> {
         self.enforce_pauses();
         let alerts = self.core.pop_alerts(cap).unwrap_or_default();
         self.dispatch_resume_alerts(&alerts);
@@ -291,7 +295,7 @@ impl BtEngine {
 
     /// batch3-P1：把 RESUME alert 分发给注册的等待者（唯一消费者 pop 后回填）。
     /// 无等待者时丢弃（与旧行为一致）；等待者已离开（recv 端关闭）→ 清除。
-    fn dispatch_resume_alerts(&self, alerts: &[smart_dl_btcore::Alert]) {
+    fn dispatch_resume_alerts(&self, alerts: &[crate::Alert]) {
         dispatch_resume_alerts(&self.resume_waiters, alerts);
     }
 
@@ -353,16 +357,13 @@ impl BtEngine {
 
 type ResumeWaiters = Arc<
     parking_lot::Mutex<
-        std::collections::HashMap<
-            String,
-            Vec<tokio::sync::mpsc::UnboundedSender<smart_dl_btcore::Alert>>,
-        >,
+        std::collections::HashMap<String, Vec<tokio::sync::mpsc::UnboundedSender<crate::Alert>>>,
     >,
 >;
 
 /// batch3-P1：把 RESUME alert 分发给注册的等待者（唯一消费者 pop 后回填）。
 /// 无等待者时丢弃（与旧行为一致）；等待者已离开（recv 端关闭）→ 清除。
-fn dispatch_resume_alerts(waiters: &ResumeWaiters, alerts: &[smart_dl_btcore::Alert]) {
+fn dispatch_resume_alerts(waiters: &ResumeWaiters, alerts: &[crate::Alert]) {
     if alerts.is_empty() {
         return;
     }
@@ -371,7 +372,7 @@ fn dispatch_resume_alerts(waiters: &ResumeWaiters, alerts: &[smart_dl_btcore::Al
         return;
     }
     for a in alerts {
-        if a.kind != smart_dl_btcore::AlertKind::Resume || a.ih.is_empty() {
+        if a.kind != crate::AlertKind::Resume || a.ih.is_empty() {
             continue;
         }
         if let Some(list) = waiters.get_mut(&a.ih) {
@@ -411,7 +412,7 @@ fn save_fastresume_impl(
         EngineError::Other(core_err(&e))
     })?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    let mut saved: Option<smart_dl_btcore::ResumeBytes> = None;
+    let mut saved: Option<crate::ResumeBytes> = None;
     // batch3-P1：常驻 alert 消费者存在 → 纯等分发（不自行 pop，双消费者互吞
     // 是本批修的缺陷）；无消费者（单元测试直连 BtEngine）→ 自行 pop 兜底，
     // 与旧行为一致（此时 ring 无其他消费者，无互吞问题）。
@@ -428,7 +429,7 @@ fn save_fastresume_impl(
                 // 其他并发保存者的 Resume 等待者也能收到分发（消除互吞）
                 dispatch_resume_alerts(waiters, &alerts);
                 for a in alerts {
-                    if a.kind == smart_dl_btcore::AlertKind::Resume && a.is_resume_ready() {
+                    if a.kind == crate::AlertKind::Resume && a.is_resume_ready() {
                         if let Ok(r) = core.take_resume_data(ih) {
                             saved = Some(r);
                         } else {
@@ -490,7 +491,7 @@ fn save_fastresume_impl(
     Ok(Some(p))
 }
 
-fn core_err(e: &smart_dl_btcore::Error) -> String {
+fn core_err(e: &crate::Error) -> String {
     format!("{:?}", e)
 }
 
@@ -510,9 +511,9 @@ fn percent_encode(s: &str) -> String {
 
 /// ffi 错误分类：NotFound（torrent/metadata 缺失）→ EngineError::NotFound，
 /// 其余 → Other（供子文件优先级链路区分 404 与「metadata 未就绪」409）。
-fn bt_engine_err(e: smart_dl_btcore::Error) -> EngineError {
+fn bt_engine_err(e: crate::Error) -> EngineError {
     match e {
-        smart_dl_btcore::Error::NotFound(_) => EngineError::NotFound,
+        crate::Error::NotFound(_) => EngineError::NotFound,
         other => EngineError::Other(core_err(&other)),
     }
 }
@@ -520,8 +521,10 @@ fn bt_engine_err(e: smart_dl_btcore::Error) -> EngineError {
 /// 从任务 source 提取 infohash hint（fastresume 定位用）：magnet → btih；.torrent → SHA1(info)。
 fn btih_hint(task: &DownloadTask) -> Option<String> {
     match &task.source {
-        DownloadSource::Magnet(m) => crate::state::btih_of(m),
-        DownloadSource::TorrentFile(b) => crate::state::torrent_infohash(b),
+        DownloadSource::Magnet(m) => smart_dl_core::source_parse::magnet::parse_magnet(m)
+            .ok()
+            .map(|i| i.infohash),
+        DownloadSource::TorrentFile(b) => smart_dl_core::torrent_meta::infohash_v1(b),
         _ => None,
     }
 }
@@ -808,7 +811,7 @@ impl DownloadEngine for BtEngine {
         // 启动时代理原样重放（会话级边界不变，E8）；重新 parse 失败 → Other
         //（启动时已校验过，此处兜底）
         let proxy_cfg = match net.proxy_url.as_deref() {
-            Some(u) => match smart_dl_btcore::ffi::parse_proxy(u) {
+            Some(u) => match crate::ffi::parse_proxy(u) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     return Err(EngineError::Other(format!(
@@ -876,8 +879,8 @@ impl DownloadEngine for BtEngine {
         let transport_changed =
             merged.enable_utp != snap.enable_utp || merged.encrypt != snap.encrypt;
         if transport_changed {
-            let enc_policy = smart_dl_btcore::engine::parse_encrypt_policy(&merged.encrypt)
-                .ok_or_else(|| {
+            let enc_policy =
+                crate::engine::parse_encrypt_policy(&merged.encrypt).ok_or_else(|| {
                     EngineError::Other(format!(
                         "bt.encrypt 解析失败 {:?}: 仅支持 disable/allow/require",
                         merged.encrypt
@@ -911,7 +914,7 @@ impl DownloadEngine for BtEngine {
             n.clone()
         };
         let proxy_cfg = match net.proxy_url.as_deref() {
-            Some(u) => match smart_dl_btcore::ffi::parse_proxy(u) {
+            Some(u) => match crate::ffi::parse_proxy(u) {
                 Ok(c) => Some(c),
                 Err(e) => {
                     return Err(EngineError::Other(format!(
