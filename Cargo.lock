@@ -3845,6 +3845,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1 0.10.7",
+ "smart-dl-core",
  "tempfile",
  "thiserror 1.0.69",
 ]

@@ -31,11 +31,25 @@ pub struct FileMeta {
 #[cfg(feature = "bt")]
 impl TorrentMeta {
     /// 从 .torrent 字节解析元数据（单文件/多文件）。
+    ///
+    /// TD-1 统一：info dict 定位走 `core::bencode::locate_dict_value`（原始
+    /// span，SHA1 哈希语义），字段提取走 `core::bencode::decode` 物化树。
+    /// 物化模型下全字段先可见再计算偏移——旧 span 扫描器的 P0-1 时序风险
+    /// （字典序下 files 先于 piece length 出现，扫描到 files 时 plen=0）在
+    /// 结构上消除。安全校验全部保留：V3 路径净化 / P0-11 checked_add /
+    /// MAX_PIECE_LENGTH 上限 / pieces 对齐。
+    #[cfg(feature = "bt")]
     pub fn parse(b: &[u8]) -> Result<Self, DaemonError> {
         use sha1::Digest;
-        let (info_start, info_end) = locate_info(b).ok_or_else(|| {
-            DaemonError::InvalidSource(".torrent 解析失败：无法定位 info dict".into())
-        })?;
+        let (info_start, info_end) = smart_dl_core::bencode::locate_dict_value(b, b"info")
+            .ok_or_else(|| {
+                DaemonError::InvalidSource(".torrent 解析失败：无法定位 info dict".into())
+            })?;
+        if b.get(info_start) != Some(&b'd') {
+            return Err(DaemonError::InvalidSource(
+                ".torrent info 字段不是字典".into(),
+            ));
+        }
 
         let info_hash = {
             let digest = sha1::Sha1::digest(&b[info_start..=info_end]);
@@ -45,127 +59,107 @@ impl TorrentMeta {
                 .collect::<String>()
         };
 
-        let mut piece_length = 0u32;
-        let mut pieces_hash = Vec::new();
-        let mut name = String::new();
-        let mut file_size = 0u64;
-        let mut has_length = false;
-        // P0-1 修复：files 的 piece 偏移计算延后到扫描结束——bencode 规范要求
-        // info dict 键按字典序排列（files < name < piece length < pieces），
-        // 扫到 files 时 piece_length 必然仍为 0，旧实现在此计算偏移 = 除零 panic。
-        // 真实种子（mktorrent/libtorrent/Transmission 生成）全部遵守字典序，
-        // 仅旧测试 fixture 手工把 piece length 提前才碰巧不炸。
-        let mut files_raw: Vec<(String, u64)> = Vec::new();
-        let mut has_files = false;
+        let info: smart_dl_core::bencode::Value =
+            smart_dl_core::bencode::decode(&b[info_start..=info_end]).map_err(|e| {
+                DaemonError::InvalidSource(format!(".torrent info dict 解析失败: {e}"))
+            })?;
 
-        let mut i = info_start + 1; // skip 'd'
-        let end = info_end;
-        while i < end {
-            let (key, after_key) = be_str(b, i)
-                .ok_or_else(|| DaemonError::InvalidSource(".torrent info dict 解析失败".into()))?;
-            i = after_key;
-
-            match key {
-                b"piece length" => {
-                    piece_length = be_int(b, i)
-                        .ok_or_else(|| DaemonError::InvalidSource("piece length 解析失败".into()))?
-                        as u32;
-                    i = value_skip(b, i, 0).ok_or_else(|| {
-                        DaemonError::InvalidSource(".torrent info dict 解析失败".into())
-                    })?;
-                }
-                b"pieces" => {
-                    let pieces_data = be_str(b, i)
-                        .ok_or_else(|| DaemonError::InvalidSource("pieces 解析失败".into()))?;
-                    if pieces_data.0.len() % 20 != 0 {
-                        return Err(DaemonError::InvalidSource(
-                            "pieces 长度不是 20 的倍数".into(),
-                        ));
-                    }
-                    pieces_hash = pieces_data.0.as_chunks::<20>().0.to_vec();
-                    i = value_skip(b, i, 0).ok_or_else(|| {
-                        DaemonError::InvalidSource(".torrent info dict 解析失败".into())
-                    })?;
-                }
-                b"name" => {
-                    name = String::from_utf8_lossy(
-                        be_str(b, i)
-                            .ok_or_else(|| DaemonError::InvalidSource("name 解析失败".into()))?
-                            .0,
-                    )
-                    .into_owned();
-                    // 安全修复（V3）：torrent 根名直通 dest_root.join，恶意 name
-                    // （../、绝对路径）即任意文件写——parse 层即拒任务。
-                    smart_dl_core::session::output::sanitize_rel(&name).map_err(|_| {
-                        DaemonError::InvalidSource(format!(
-                            ".torrent name 含非法路径分量已拒绝: {name}"
-                        ))
-                    })?;
-                    i = value_skip(b, i, 0).ok_or_else(|| {
-                        DaemonError::InvalidSource(".torrent info dict 解析失败".into())
-                    })?;
-                }
-                b"length" => {
-                    file_size = be_int(b, i)
-                        .ok_or_else(|| DaemonError::InvalidSource("length 解析失败".into()))?
-                        as u64;
-                    has_length = true;
-                    i = value_skip(b, i, 0).ok_or_else(|| {
-                        DaemonError::InvalidSource(".torrent info dict 解析失败".into())
-                    })?;
-                }
-                b"files" => {
-                    has_files = true;
-                    // files value 是 list（l...e）
-                    let list_end = list_skip(b, i, 0)
-                        .ok_or_else(|| DaemonError::InvalidSource("files 解析失败".into()))?;
-                    // 阶段一：仅收集 (path, length)，不碰 piece_length
-                    files_raw = parse_file_list(&b[i + 1..list_end])?;
-                    i = list_end + 1; // 跳过 list 的闭合 'e'
-                }
-                _ => {
-                    i = value_skip(b, i, 0).ok_or_else(|| {
-                        DaemonError::InvalidSource(".torrent info dict 解析失败".into())
-                    })?;
-                }
-            }
-        }
-
-        if piece_length == 0 || pieces_hash.is_empty() {
-            return Err(DaemonError::InvalidSource(
-                ".torrent 缺少必要字段 (piece length/pieces)".into(),
-            ));
-        }
-        // piece_length 上限（与 libtorrent 一致：1 << 24 = 16 MiB）：
+        // piece length：非零 + 上限（与 libtorrent 一致：1 << 24 = 16 MiB）。
         // 恶意种子的超大 piece_length 会在下游偏移计算中溢出回绕
         // （xltd 块扫描、piece 偏移映射），release 下静默读错位置。
         const MAX_PIECE_LENGTH: u32 = 1 << 24;
-        if piece_length > MAX_PIECE_LENGTH {
+        let piece_length = info
+            .dict_get(b"piece length")
+            .and_then(|v| v.as_int())
+            .ok_or_else(|| {
+                DaemonError::InvalidSource(".torrent 缺少必要字段 (piece length/pieces)".into())
+            })? as u32;
+        if piece_length == 0 || piece_length > MAX_PIECE_LENGTH {
             return Err(DaemonError::InvalidSource(format!(
                 "piece length 超过上限 {MAX_PIECE_LENGTH}（得到 {piece_length}）"
             )));
         }
 
-        if has_files {
-            // 阶段二：piece_length 已知且已校验，计算各文件 piece 偏移/数量
+        // pieces：20 字节/条对齐，余数不得静默丢弃。
+        let pieces_data = info
+            .dict_get(b"pieces")
+            .and_then(|v| v.as_bytes())
+            .ok_or_else(|| {
+                DaemonError::InvalidSource(".torrent 缺少必要字段 (piece length/pieces)".into())
+            })?;
+        if pieces_data.is_empty() || pieces_data.len() % 20 != 0 {
+            return Err(DaemonError::InvalidSource(
+                "pieces 长度不是 20 的倍数".into(),
+            ));
+        }
+        let pieces_hash = pieces_data.as_chunks::<20>().0.to_vec();
+
+        // name：utf-8 lossy + V3 净化（torrent 根名直通 dest_root.join，
+        // 恶意 name（../、绝对路径）即任意文件写——parse 层即拒任务）。
+        let name = info
+            .dict_get(b"name")
+            .and_then(|v| v.as_bytes())
+            .map(|raw| String::from_utf8_lossy(raw).into_owned())
+            .ok_or_else(|| DaemonError::InvalidSource("name 解析失败".into()))?;
+        smart_dl_core::session::output::sanitize_rel(&name).map_err(|_| {
+            DaemonError::InvalidSource(format!(".torrent name 含非法路径分量已拒绝: {name}"))
+        })?;
+
+        if let Some(files_v) = info.dict_get(b"files") {
+            // 多文件 torrent：逐文件提取 (path, length)，V3 逐段净化 +
+            // P0-11 累计溢出拒绝 + piece 偏移计算（plen 已校验非零）。
+            let entries = files_v
+                .as_list()
+                .ok_or_else(|| DaemonError::InvalidSource("files 解析失败".into()))?;
             let plen = piece_length as u64;
-            let mut files = Vec::with_capacity(files_raw.len());
+            let mut files = Vec::with_capacity(entries.len());
             let mut total_size: u64 = 0;
-            for (path, length) in files_raw {
-                // P0-11 同源防护：累计偏移溢出即拒（防回绕后偏移错位）
-                let piece_offset = (total_size / plen) as usize;
-                let piece_count = length.div_ceil(plen) as usize;
-                total_size = total_size
-                    .checked_add(length)
-                    .ok_or_else(|| DaemonError::InvalidSource("files 累计大小溢出 u64".into()))?;
-                files.push(FileMeta {
-                    path,
-                    size: length,
-                    piece_offset,
-                    piece_count,
-                });
+            for entry in entries {
+                let length = entry
+                    .dict_get(b"length")
+                    .and_then(|v| v.as_int())
+                    .ok_or_else(|| DaemonError::InvalidSource("files length 解析失败".into()))?
+                    as u64;
+                let path_parts = entry
+                    .dict_get(b"path")
+                    .and_then(|v| v.as_list())
+                    .ok_or_else(|| DaemonError::InvalidSource("files path list 解析失败".into()))?;
+                let mut parts = Vec::with_capacity(path_parts.len());
+                for seg_v in path_parts {
+                    let seg = seg_v.as_bytes().ok_or_else(|| {
+                        DaemonError::InvalidSource("path segment 解析失败".into())
+                    })?;
+                    let seg_str = String::from_utf8_lossy(seg).into_owned();
+                    if seg_str == ".."
+                        || seg_str.contains('/')
+                        || seg_str.contains('\\')
+                        || seg_str.is_empty()
+                    {
+                        return Err(DaemonError::InvalidSource(format!(
+                            "files path 含非法段已拒绝: {seg_str}"
+                        )));
+                    }
+                    parts.push(seg_str);
+                }
+                if parts.is_empty() {
+                    return Err(DaemonError::InvalidSource("files path 为空".into()));
+                }
+                let path = parts.join(std::path::MAIN_SEPARATOR_STR);
+
+                if length > 0 && !path.is_empty() {
+                    let piece_offset = (total_size / plen) as usize;
+                    let piece_count = length.div_ceil(plen) as usize;
+                    total_size = total_size.checked_add(length).ok_or_else(|| {
+                        DaemonError::InvalidSource("files 累计大小溢出 u64".into())
+                    })?;
+                    files.push(FileMeta {
+                        path,
+                        size: length,
+                        piece_offset,
+                        piece_count,
+                    });
+                }
             }
-            // 多文件 torrent：files 数组已解析
             Ok(Self {
                 info_hash,
                 piece_length,
@@ -176,11 +170,11 @@ impl TorrentMeta {
             })
         } else {
             // 单文件 torrent
-            if !has_length {
-                return Err(DaemonError::InvalidSource(
-                    ".torrent 缺少 length 字段".into(),
-                ));
-            }
+            let file_size = info
+                .dict_get(b"length")
+                .and_then(|v| v.as_int())
+                .ok_or_else(|| DaemonError::InvalidSource(".torrent 缺少 length 字段".into()))?
+                as u64;
             Ok(Self {
                 info_hash,
                 piece_length,
@@ -191,91 +185,6 @@ impl TorrentMeta {
             })
         }
     }
-}
-
-/// 解析多文件 torrent 的 files 列表内容（bencode，`l`/`e` 已剥离）。
-/// P0-1 修复：仅提取 (path, length) 对——piece 偏移计算依赖 piece_length，
-/// 而 bencode 字典序保证 files 先于 piece length 出现，故偏移必须延后计算。
-#[cfg(feature = "bt")]
-fn parse_file_list(data: &[u8]) -> Result<Vec<(String, u64)>, DaemonError> {
-    let mut files = Vec::new();
-    let mut pos = 0usize;
-
-    while pos < data.len() {
-        if data.get(pos) != Some(&b'd') {
-            pos = value_skip(data, pos, 0)
-                .ok_or_else(|| DaemonError::InvalidSource("files 列表解析失败".into()))?;
-            continue;
-        }
-        let dict_end = dict_skip(data, pos, 0)
-            .ok_or_else(|| DaemonError::InvalidSource("files dict 解析失败".into()))?;
-        let file_dict = &data[pos..=dict_end];
-
-        let mut path = String::new();
-        let mut length = 0u64;
-        let mut j = 1;
-        while j < file_dict.len() - 1 {
-            let (key, after_key) = be_str(file_dict, j)
-                .ok_or_else(|| DaemonError::InvalidSource("files dict key 解析失败".into()))?;
-            j = after_key;
-            match key {
-                b"length" => {
-                    length = be_int(file_dict, j)
-                        .ok_or_else(|| DaemonError::InvalidSource("files length 解析失败".into()))?
-                        as u64;
-                    j = value_skip(file_dict, j, 0).ok_or_else(|| {
-                        DaemonError::InvalidSource("files dict value 解析失败".into())
-                    })?;
-                }
-                b"path" => {
-                    // path value 是 list（l...e）
-                    let path_list_end = list_skip(file_dict, j, 0).ok_or_else(|| {
-                        DaemonError::InvalidSource("files path list 解析失败".into())
-                    })?;
-                    path = parse_path_list(&file_dict[j + 1..path_list_end])?;
-                    j = path_list_end + 1;
-                }
-                _ => {
-                    j = value_skip(file_dict, j, 0).ok_or_else(|| {
-                        DaemonError::InvalidSource("files dict value 解析失败".into())
-                    })?;
-                }
-            }
-        }
-
-        if length > 0 && !path.is_empty() {
-            files.push((path, length));
-        }
-
-        pos = dict_end + 1;
-    }
-
-    Ok(files)
-}
-
-/// 解析 path list 内容（bencode，`l`/`e` 已剥离）为路径字符串。
-/// 安全修复（V3）：逐段净化——拒 `..` / 绝对路径段，恶意种子不得写出 dest_root。
-#[cfg(feature = "bt")]
-fn parse_path_list(data: &[u8]) -> Result<String, DaemonError> {
-    let mut parts = Vec::new();
-    let mut p = 0usize;
-    while p < data.len() {
-        let (seg, after) = be_str(data, p)
-            .ok_or_else(|| DaemonError::InvalidSource("path segment 解析失败".into()))?;
-        let seg_str = String::from_utf8_lossy(seg).into_owned();
-        if seg_str == ".." || seg_str.contains('/') || seg_str.contains('\\') || seg_str.is_empty()
-        {
-            return Err(DaemonError::InvalidSource(format!(
-                "files path 含非法段已拒绝: {seg_str}"
-            )));
-        }
-        parts.push(seg_str);
-        p = after;
-    }
-    if parts.is_empty() {
-        return Err(DaemonError::InvalidSource("files path 为空".into()));
-    }
-    Ok(parts.join(std::path::MAIN_SEPARATOR_STR))
 }
 
 impl DaemonState {
@@ -420,7 +329,10 @@ pub(crate) fn btih_of(magnet: &str) -> Option<String> {
 #[cfg(feature = "bt")]
 pub fn torrent_infohash(b: &[u8]) -> Option<String> {
     use sha1::Digest;
-    let (info, end) = locate_info(b)?;
+    let (info, end) = smart_dl_core::bencode::locate_dict_value(b, b"info")?;
+    if b.get(info) != Some(&b'd') {
+        return None; // info 必须是 dict
+    }
     let digest = sha1::Sha1::digest(&b[info..=end]);
     Some(
         digest
@@ -432,26 +344,20 @@ pub fn torrent_infohash(b: &[u8]) -> Option<String> {
 
 /// 单文件 .torrent 总大小（info dict 内 `length` 字段）；多文件（`files`）→ None。
 /// v1 仅覆盖单文件场景（B10 空间预检用）；多文件留后续。
+/// TD-1：locate + decode 组合（负数 length 语义与旧实现一致 → None）。
 #[cfg(feature = "bt")]
 pub fn torrent_total_size(b: &[u8]) -> Option<u64> {
-    let (info, end) = locate_info(b)?;
-    let mut i = info + 1;
-    while i < end {
-        let (key, ai) = be_str(b, i)?;
-        i = ai;
-        match key {
-            b"length" => {
-                if b.get(i) != Some(&b'i') {
-                    return None;
-                }
-                let e = b[i..].iter().position(|&c| c == b'e')? + i;
-                return std::str::from_utf8(&b[i + 1..e]).ok()?.parse().ok();
-            }
-            b"files" => return None, // 多文件：v1 不解析
-            _ => i = value_skip(b, i, 0)?,
-        }
+    let (info, end) = smart_dl_core::bencode::locate_dict_value(b, b"info")?;
+    if b.get(info) != Some(&b'd') {
+        return None;
     }
-    None
+    let v = smart_dl_core::bencode::decode(&b[info..=end]).ok()?;
+    if v.dict_get(b"files").is_some() {
+        return None; // 多文件：v1 不解析
+    }
+    v.dict_get(b"length")?
+        .as_int()
+        .and_then(|n| u64::try_from(n).ok())
 }
 
 /// .torrent 空间预检总大小（B10）：优先 TorrentMeta::parse——多文件取 files 各项
@@ -468,97 +374,6 @@ pub fn torrent_precheck_total(b: &[u8]) -> Option<u64> {
             }
         }
         Err(_) => torrent_total_size(b),
-    }
-}
-
-/// 定位 info dict：返回 (info 值起始 'd' 下标, info dict 闭合 'e' 下标)。
-#[cfg(feature = "bt")]
-fn locate_info(b: &[u8]) -> Option<(usize, usize)> {
-    if b.first() != Some(&b'd') {
-        return None;
-    }
-    let mut i = 1; // 顶层 dict 键值对扫描
-    while i < b.len() {
-        let (key, after_key) = be_str(b, i)?;
-        i = after_key;
-        if key == b"info" {
-            if b.get(i) != Some(&b'd') {
-                return None; // info 必须是 dict
-            }
-            let end = dict_skip(b, i, 0)?;
-            return Some((i, end));
-        }
-        // 跳过值（结构感知），继续找 `info`
-        i = value_skip(b, i, 0)?;
-    }
-    None
-}
-
-/// bencode 字符串 `len:data` → (data, 内容后下标)。
-#[cfg(feature = "bt")]
-fn be_str(b: &[u8], at: usize) -> Option<(&[u8], usize)> {
-    let colon = b[at..].iter().position(|&c| c == b':')? + at;
-    let len: usize = std::str::from_utf8(&b[at..colon]).ok()?.parse().ok()?;
-    let start = colon + 1;
-    // 安全修复（H-3 同型）：start+len 裸加法——恶意 fastresume/torrent 的超大
-    // 长度字段在 release 下回绕或直接越界 → 切片 panic。checked_add + 界检查。
-    let end = start.checked_add(len)?;
-    if end > b.len() {
-        return None;
-    }
-    Some((&b[start..end], end))
-}
-
-/// bencode 整数 `i<digits>e` → 值。
-#[cfg(feature = "bt")]
-fn be_int(b: &[u8], at: usize) -> Option<i64> {
-    if b.get(at) != Some(&b'i') {
-        return None;
-    }
-    let e = b[at..].iter().position(|&c| c == b'e')? + at;
-    let s = std::str::from_utf8(&b[at + 1..e]).ok()?;
-    s.parse().ok()
-}
-
-/// dict 结束下标：从 `start`（'d'）按 键(字符串)→值 结构推进到闭合 'e'。
-/// 键位置固定为字符串（len: 数字开头），值可为任意类型——值内的数据字节
-/// （如 pieces 的 20 字节）不会被误当 len: 解析。
-/// 安全修复（V4）：带深度参数，超限返回 None（恶意种子不再能栈溢出 abort）。
-#[cfg(feature = "bt")]
-fn dict_skip(b: &[u8], start: usize, depth: usize) -> Option<usize> {
-    const MAX_DEPTH: usize = 64;
-    if depth > MAX_DEPTH {
-        return None;
-    }
-    let mut i = start + 1;
-    while b.get(i) != Some(&b'e') {
-        let (_, after) = be_str(b, i)?; // 键：字符串
-        i = value_skip(b, after, depth + 1)?; // 值：任意类型
-    }
-    Some(i)
-}
-
-/// list 结束下标：从 `start`（'l'）按 值* 推进到闭合 'e'。
-#[cfg(feature = "bt")]
-fn list_skip(b: &[u8], start: usize, depth: usize) -> Option<usize> {
-    let mut i = start + 1;
-    while b.get(i) != Some(&b'e') {
-        i = value_skip(b, i, depth + 1)?;
-    }
-    Some(i)
-}
-
-/// 跳过任意 bencode 值（dict/list/int/str），返回其后的下标。
-#[cfg(feature = "bt")]
-fn value_skip(b: &[u8], i: usize, depth: usize) -> Option<usize> {
-    match b.get(i)? {
-        b'd' => dict_skip(b, i, depth).map(|e| e + 1),
-        b'l' => list_skip(b, i, depth).map(|e| e + 1),
-        b'i' => {
-            let e = b[i..].iter().position(|&c| c == b'e')? + i;
-            Some(e + 1)
-        }
-        _ => be_str(b, i).map(|(_, after)| after),
     }
 }
 

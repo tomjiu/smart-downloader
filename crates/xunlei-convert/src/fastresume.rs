@@ -21,6 +21,7 @@ use std::path::Path;
 
 use crate::xlbt_cfg::XlbtCfg;
 use crate::xltd::XltdAnalysis;
+use smart_dl_core::bencode::Value;
 
 /// fastresume 转换结果（JSON 报告 + bencode fastresume 生成）。
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -300,190 +301,47 @@ pub enum BencodeError {
 }
 
 /// 将 fastresume 编码为 bencode 字节流（libtorrent v1 格式）。
+///
+/// TD-1 统一：编码走 `core::bencode::encode`（键按字典序输出——规范要求的
+/// bencode 键序；旧手写编码器把 `file sizes`（含空格 0x20）排在末尾，属
+/// 字典序违规但 libtorrent 解码器宽容故未暴露。统一后输出即规范序）。
 pub fn bencode_fastresume(fr: &Fastresume) -> Result<Vec<u8>, BencodeError> {
-    let mut out = Vec::new();
-    out.push(b'd');
-    encode_bytes(&mut out, b"file-format")?;
-    encode_bytes(&mut out, b"libtorrent resume file")?;
-    encode_bytes(&mut out, b"file-version")?;
-    out.extend_from_slice(&encode_int(1));
-    encode_bytes(&mut out, b"info-hash")?;
-    encode_bytes(&mut out, &fr.info_hash)?;
-    encode_bytes(&mut out, b"pieces")?;
-    encode_bytes(&mut out, &fr.pieces)?;
-    encode_bytes(&mut out, b"name")?;
-    encode_bytes(&mut out, fr.name.as_bytes())?;
-    encode_bytes(&mut out, b"save_path")?;
-    encode_bytes(&mut out, fr.save_path.as_bytes())?;
-    encode_bytes(&mut out, b"total-uploaded")?;
-    out.extend_from_slice(&encode_int(0));
-    encode_bytes(&mut out, b"upload-mode")?;
-    out.extend_from_slice(&encode_int(0));
-    encode_bytes(&mut out, b"file sizes")?;
-    out.extend_from_slice(&encode_file_sizes(&fr.file_sizes));
-    out.push(b'e');
-    Ok(out)
+    let file_sizes = Value::List(
+        fr.file_sizes
+            .iter()
+            .map(|&[size, pad]| Value::List(vec![Value::Int(size as i64), Value::Int(pad as i64)]))
+            .collect(),
+    );
+    let v = Value::Dict(vec![
+        (
+            b"file-format".to_vec(),
+            Value::Bytes(b"libtorrent resume file".to_vec()),
+        ),
+        (b"file-version".to_vec(), Value::Int(1)),
+        (b"info-hash".to_vec(), Value::Bytes(fr.info_hash.to_vec())),
+        (b"pieces".to_vec(), Value::Bytes(fr.pieces.clone())),
+        (b"name".to_vec(), Value::Bytes(fr.name.as_bytes().to_vec())),
+        (
+            b"save_path".to_vec(),
+            Value::Bytes(fr.save_path.as_bytes().to_vec()),
+        ),
+        (b"total-uploaded".to_vec(), Value::Int(0)),
+        (b"upload-mode".to_vec(), Value::Int(0)),
+        (b"file sizes".to_vec(), file_sizes),
+    ]);
+    Ok(smart_dl_core::bencode::encode(&v))
 }
 
-fn encode_bytes(out: &mut Vec<u8>, data: &[u8]) -> Result<(), BencodeError> {
-    out.extend_from_slice(format!("{}:", data.len()).as_bytes());
-    out.extend_from_slice(data);
-    Ok(())
-}
+// ============= bencode 解码（TD-1：core::bencode 委托） =============
 
-fn encode_int(n: i64) -> Vec<u8> {
-    format!("i{}e", n).into_bytes()
-}
+/// bencode 值（core 权威实现的别名——访问器 `dict_get`/`as_bytes`/`as_int`/
+/// `as_list` 由 core::bencode::Value 提供）。
+pub type BencodeValue = smart_dl_core::bencode::Value;
 
-fn encode_file_sizes(sizes: &[[u64; 2]]) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.push(b'l');
-    for &[size, pad] in sizes {
-        out.push(b'l');
-        out.extend_from_slice(&encode_int(size as i64));
-        out.extend_from_slice(&encode_int(pad as i64));
-        out.push(b'e');
-    }
-    out.push(b'e');
-    out
-}
-
-// ============= 最小 bencode 解码器（仅 fastresume v1 校验所需） =============
-
-/// 最小 bencode 值。
-#[derive(Debug, Clone, PartialEq)]
-pub enum BencodeValue {
-    Dict(Vec<(Vec<u8>, BencodeValue)>),
-    List(Vec<BencodeValue>),
-    Int(i64),
-    Bytes(Vec<u8>),
-}
-
-/// 最小 bencode 解码器。
-/// 安全修复（V4）：递归深度上限 64（恶意 fastresume 的超深嵌套会栈溢出 abort）。
+/// bencode 解码（委托 `core::bencode::decode`：MAX_DEPTH 递归上限 + 长度
+/// 字段 checked_add 防护 + 截断输入报错——P1-23 修复在 core 侧同款保有）。
 pub fn bdecode(data: &[u8]) -> Result<BencodeValue, BencodeError> {
-    let (val, _) = bdecode_at(data, 0, 0)?;
-    Ok(val)
-}
-
-fn bdecode_at(
-    data: &[u8],
-    pos: usize,
-    depth: usize,
-) -> Result<(BencodeValue, usize), BencodeError> {
-    const MAX_DEPTH: usize = 64;
-    if depth > MAX_DEPTH {
-        return Err(BencodeError::InvalidData(format!(
-            "nesting depth exceeds {MAX_DEPTH}"
-        )));
-    }
-    if pos >= data.len() {
-        return Err(BencodeError::InvalidData("unexpected eof".into()));
-    }
-    match data[pos] {
-        b'd' => {
-            let mut dict = Vec::new();
-            let mut p = pos + 1;
-            // P1-23 修复：区分「遇到闭合 e」与「越界退出」——原实现两者
-            // 不可区分，截断输入（缺 'e'）返回 Ok（p+1 越界值），被截断
-            // 的 fastresume「校验通过」，校验器用途完全失效。
-            while p < data.len() && data[p] != b'e' {
-                let (k, p1) = bdecode_bytes(data, p)?;
-                let (v, p2) = bdecode_at(data, p1, depth + 1)?;
-                dict.push((k, v));
-                p = p2;
-            }
-            if p >= data.len() {
-                return Err(BencodeError::InvalidData("unterminated dict".into()));
-            }
-            Ok((BencodeValue::Dict(dict), p + 1))
-        }
-        b'l' => {
-            let mut list = Vec::new();
-            let mut p = pos + 1;
-            // P1-23 修复：同上，unterminated list 必须报错
-            while p < data.len() && data[p] != b'e' {
-                let (v, p1) = bdecode_at(data, p, depth + 1)?;
-                list.push(v);
-                p = p1;
-            }
-            if p >= data.len() {
-                return Err(BencodeError::InvalidData("unterminated list".into()));
-            }
-            Ok((BencodeValue::List(list), p + 1))
-        }
-        b'i' => {
-            let start = pos + 1;
-            let end_rel = data[start..]
-                .iter()
-                .position(|&b| b == b'e')
-                .ok_or_else(|| BencodeError::InvalidData("unterminated int".into()))?;
-            let end = start + end_rel;
-            let s = std::str::from_utf8(&data[start..end])
-                .map_err(|e| BencodeError::InvalidData(format!("invalid int utf8: {}", e)))?;
-            let n: i64 = s
-                .parse()
-                .map_err(|e| BencodeError::InvalidData(format!("invalid int: {}", e)))?;
-            Ok((BencodeValue::Int(n), end + 1))
-        }
-        _ => {
-            let (bytes, p) = bdecode_bytes(data, pos)?;
-            Ok((BencodeValue::Bytes(bytes), p))
-        }
-    }
-}
-
-fn bdecode_bytes(data: &[u8], pos: usize) -> Result<(Vec<u8>, usize), BencodeError> {
-    let colon = data[pos..]
-        .iter()
-        .position(|&b| b == b':')
-        .ok_or_else(|| BencodeError::InvalidData("missing colon in bytes".into()))?
-        + pos;
-    let len_str = std::str::from_utf8(&data[pos..colon]).map_err(|e| {
-        BencodeError::InvalidData(format!("invalid len utf8 at pos {}: {}", pos, e))
-    })?;
-    let len: usize = len_str
-        .parse()
-        .map_err(|e| BencodeError::InvalidData(format!("invalid len at pos {}: {}", pos, e)))?;
-    // 安全修复（H-3 同型）：colon+1+len 裸加法回绕可绕过截断检查 → 切片 panic。
-    let end = colon
-        .checked_add(1)
-        .and_then(|s| s.checked_add(len))
-        .ok_or_else(|| BencodeError::InvalidData(format!("len overflow at pos {pos}")))?;
-    if end > data.len() {
-        return Err(BencodeError::InvalidData("bytes truncated".into()));
-    }
-    Ok((data[colon + 1..end].to_vec(), end))
-}
-
-impl BencodeValue {
-    pub fn dict_get(&self, key: &[u8]) -> Option<&BencodeValue> {
-        match self {
-            BencodeValue::Dict(dict) => dict.iter().find(|(k, _)| k == key).map(|(_, v)| v),
-            _ => None,
-        }
-    }
-
-    pub fn as_bytes(&self) -> Option<&[u8]> {
-        match self {
-            BencodeValue::Bytes(b) => Some(b),
-            _ => None,
-        }
-    }
-
-    pub fn as_int(&self) -> Option<i64> {
-        match self {
-            BencodeValue::Int(n) => Some(*n),
-            _ => None,
-        }
-    }
-
-    pub fn as_list(&self) -> Option<&[BencodeValue]> {
-        match self {
-            BencodeValue::List(l) => Some(l),
-            _ => None,
-        }
-    }
+    smart_dl_core::bencode::decode(data).map_err(|e| BencodeError::InvalidData(e.to_string()))
 }
 
 #[cfg(test)]
