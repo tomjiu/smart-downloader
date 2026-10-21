@@ -2789,6 +2789,7 @@ dependencies = [
  "smart-dl-httpdl",
  "smart-dl-provider",
  "smart-dl-rss",
+ "smart-dl-storage",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2826,6 +2827,7 @@ dependencies = [
  "sha1 0.10.7",
  "sha2 0.10.9",
  "smart-dl-core",
+ "smart-dl-storage",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -2865,6 +2867,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "smart-dl-storage"
+version = "0.2.3"
+dependencies = [
+ "tempfile",
+ "thiserror 1.0.69",
 ]
 
 [[package]]

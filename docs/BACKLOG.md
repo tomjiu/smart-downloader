@@ -15,10 +15,10 @@
 
 | # | 项 | 状态 | 说明 |
 |---|---|---|---|
-| TD-1 | **bencode 统一到 `core::bencode`** | 待做（中成本重构） | 全仓 5 文件 17 个 bencode 相关函数（core::bencode 唯一具备 MAX_DEPTH/checked 防护；bt_alerts.rs 扫描器与 infohash 原始 span 定位耦合；xunlei-convert/fastresume.rs 自带编码器配套 bdecode——batch10 已修其截断缺陷）。P0 级除零缺陷（bt_alerts）已于 batch10-a 修复消除直接风险；统一属架构收敛演进项，涉及 3 crate 接口变更 + 全量测试回归，建议独立 PR 实施。 |
+| TD-1 | **bencode 统一到 `core::bencode`** | ✅ 已完成（PR #130） | 全仓 bencode 入口统一为 core::bencode（MAX_DEPTH/checked 防护）；修 provider 朴素扫描缺陷，净 -244 行。 |
 | TD-2 | **拆分 `DownloadEngine` trait**（40 方法 → 最小契约 + BtExt/HttpExt 扩展） | 待做（中成本重构） | 生产代码 33 处运行时 EngineKind 判断（ops.rs 14 处）；`HttpEngine::peers()` 返回空 Vec 撒谎而非报错。架构审查 §6 建议 5。 |
-| TD-3 | `core` 的 I/O 下沉（session/{output,manager,single_instance} 独立 storage crate） | 待做 | core 自述"纯逻辑"但含 ~590 行 fs I/O。架构审查 §6 建议 6。 |
-| TD-4 | `daemon/bt.rs` 移入 btcore；rss.rs 独立 crate；ops.rs 按域拆分 | 待做 | 架构审查 §6 建议 8/9/10（纯移动）。 |
+| TD-3 | `core` 的 I/O 下沉（session/{output,manager,single_instance} 独立 storage crate） | ✅ 已完成（PR #138） | `session/output.rs`（306 行活代码，sanitize_rel/OutputManager/磁盘预检，httpdl×8 + daemon×6 消费）下沉为独立 `smart-dl-storage` crate；`session/manager.rs`（SessionManager，147 行）经核实为**生产死代码**（daemon 用自己的 state/persistence.rs，tasks.json 原子写 + autosave，两套平行实现从未接线）随迁删除；single_instance 已由 #134 先行删除。core 自此生产代码零 fs I/O。 |
+| TD-4 | `daemon/bt.rs` 移入 btcore；rss.rs 独立 crate；ops.rs 按域拆分 | 建议 8/9 ✅（PR #137/#132） | bt.rs→btcore/dl_engine.rs（git rename 识别）；rss.rs→独立 crate。建议 10（ops.rs 拆分）与 TD-2 Step3 同文件，待 TD-2 提案（ENGINE-TRAIT-SPLIT.md）拍板后一并动。 |
 
 ## A. 迅雷云盘线（当前主线，按依赖排序）
 

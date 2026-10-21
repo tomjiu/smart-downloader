@@ -3386,7 +3386,7 @@ impl DaemonState {
                 ));
             }
             // V3 终审同函数：与 add 入参同一裁决点（非法路径分量即拒）
-            smart_dl_core::session::output::sanitize_rel(n)
+            smart_dl_storage::sanitize_rel(n)
                 .map_err(|e| DaemonError::InvalidSource(format!("name 非法: {e}")))?;
         }
         {
@@ -4167,7 +4167,7 @@ impl HttpSink for FallbackSink {
         // join——绝对路径名此前可整体替换 base，在 dest_root 外任意建目录
         // （引擎落盘前的最后一道 mkdir 同源防线）。
         if let Some(rel) = &name {
-            match smart_dl_core::session::output::sanitize_rel(rel) {
+            match smart_dl_storage::sanitize_rel(rel) {
                 Ok(safe) => {
                     if let Some(parent) = dest_root.join(&safe).parent() {
                         let _ = std::fs::create_dir_all(parent);
@@ -4407,7 +4407,7 @@ pub fn precheck_space(p: &Path, total: u64, strict: bool) -> Result<(), DaemonEr
         );
         return Ok(());
     };
-    use smart_dl_core::session::output::{evaluate_disk, DiskCheck};
+    use smart_dl_storage::{evaluate_disk, DiskCheck};
     if let DiskCheck::Insufficient {
         required,
         available,

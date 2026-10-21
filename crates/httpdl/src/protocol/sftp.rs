@@ -806,7 +806,7 @@ fn finalize_part(part: &Path, dest: &Path, total: u64) -> Result<(), String> {
             tracing::warn!("finalize_part: 删除目标文件失败 {dest:?}: {e}");
         }
     }
-    let om = smart_dl_core::session::output::OutputManager::new(PathBuf::from("."));
+    let om = smart_dl_storage::OutputManager::new(PathBuf::from("."));
     om.finalize_to(part, dest, total).map_err(|e| e.to_string())
 }
 
@@ -954,8 +954,8 @@ impl DownloadEngine for SftpEngine {
             .clone()
             .unwrap_or_else(|| "download.bin".to_string());
         // 安全修复（V3 同款）：任务名净化后再 join（拒 .. / 绝对路径）。
-        let rel_pb = smart_dl_core::session::output::sanitize_rel(&rel)
-            .map_err(|e| EngineError::Other(e.to_string()))?;
+        let rel_pb =
+            smart_dl_storage::sanitize_rel(&rel).map_err(|e| EngineError::Other(e.to_string()))?;
         let dest = task.dest_root.join(&rel_pb);
         // .part 超长（源变小）→ 作废
         let part = part_path_of(&dest);

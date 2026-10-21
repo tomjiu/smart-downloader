@@ -1,7 +1,7 @@
 //! M3: .part 管理（§12 输出层）。
 //! 命名 / 长度校验 / 完成落位（rename，跨盘 copy fallback + 删源）。
 
-use smart_dl_core::session::output::{OutputError, OutputManager};
+use smart_dl_storage::{OutputError, OutputManager};
 use std::fs;
 use std::path::PathBuf;
 

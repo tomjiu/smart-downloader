@@ -1,7 +1,7 @@
 //! M3: 磁盘预检（§12 D36 分段公式）。
 //! required = max(total×1.1, total + min(500MB, total))；不足拒绝入队。
 
-use smart_dl_core::session::output::{evaluate_disk, required_disk, DiskCheck};
+use smart_dl_storage::{evaluate_disk, required_disk, DiskCheck};
 
 const MB: u64 = 1024 * 1024;
 const GB: u64 = 1024 * MB;

@@ -11,12 +11,12 @@ use crate::segment_manager::{
 };
 use crate::static_split::segment_count;
 use parking_lot::Mutex;
-use smart_dl_core::session::output::OutputManager;
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
     Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
     EngineTaskId, FileProgress, PeerInfo,
 };
+use smart_dl_storage::OutputManager;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -274,7 +274,7 @@ impl FtpEngine {
         // 落位目录：dest_root/<目录名>（URL 最后一段非空名称；根目录 → host）
         // 安全修复（V3）：目录名可能来自远端 LIST 响应，join 前净化。
         let dir_name = dir_name_of(&path, &host);
-        let dir_pb = smart_dl_core::session::output::sanitize_rel(&dir_name)
+        let dir_pb = smart_dl_storage::sanitize_rel(&dir_name)
             .map_err(|e| EngineError::Other(e.to_string()))?;
         let dest_dir = task.dest_root.join(&dir_pb);
         std::fs::create_dir_all(&dest_dir)
@@ -290,7 +290,7 @@ impl FtpEngine {
             // 四字符，恶意/被入侵服务器 LIST 输出形如 `C:evil.txt`（Windows
             // 带盘符前缀）经 Path::join 直接替换 base 逃出 dest_root；与
             // 单文件路径 sanitize_rel 口径对齐，非法条目跳过（拒杀整任务）。
-            let safe_name = match smart_dl_core::session::output::sanitize_rel(&e.name) {
+            let safe_name = match smart_dl_storage::sanitize_rel(&e.name) {
                 Ok(pb) => pb,
                 Err(_) => {
                     println!("ftp] 目录条目名非法，跳过: {:?}", e.name);
@@ -1523,7 +1523,7 @@ impl DownloadEngine for FtpEngine {
                     .clone()
                     .unwrap_or_else(|| "download.bin".to_string());
                 // 安全修复（V3）：任务名净化后再 join（拒 .. / 绝对路径）。
-                let rel_pb = smart_dl_core::session::output::sanitize_rel(&rel)
+                let rel_pb = smart_dl_storage::sanitize_rel(&rel)
                     .map_err(|e| EngineError::Other(e.to_string()))?;
                 let dest = task.dest_root.join(&rel_pb);
                 // .part 超长（源变小）→ 作废

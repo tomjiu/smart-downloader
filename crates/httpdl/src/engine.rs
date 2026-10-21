@@ -1160,7 +1160,7 @@ impl DownloadEngine for HttpEngine {
         // `<清单名>.ts`（sanitize_rel 终审）→ 兑底 download.ts。
         if hls::is_hls_url(&url) {
             let rel_pb: String = match &task.metadata.name {
-                Some(rel) => smart_dl_core::session::output::sanitize_rel(rel)
+                Some(rel) => smart_dl_storage::sanitize_rel(rel)
                     .map_err(|e| EngineError::Other(e.to_string()))?
                     .to_string_lossy()
                     .into_owned(),
@@ -1214,7 +1214,7 @@ impl DownloadEngine for HttpEngine {
         // download.mp4。
         if dash::is_dash_url(&url) {
             let rel_pb: String = match &task.metadata.name {
-                Some(rel) => smart_dl_core::session::output::sanitize_rel(rel)
+                Some(rel) => smart_dl_storage::sanitize_rel(rel)
                     .map_err(|e| EngineError::Other(e.to_string()))?
                     .to_string_lossy()
                     .into_owned(),
@@ -1324,14 +1324,14 @@ impl DownloadEngine for HttpEngine {
         //   与 FTP 引擎同语义）→ "download.bin" 兜底。派生候选经 sanitize_rel
         //   终审，失败则逐级跳过（远端可控字段不得拒杀任务/制造穿越）。
         let rel_pb = match &task.metadata.name {
-            Some(rel) => smart_dl_core::session::output::sanitize_rel(rel)
+            Some(rel) => smart_dl_storage::sanitize_rel(rel)
                 .map_err(|e| EngineError::Other(e.to_string()))?,
             None => {
                 let mut chosen = std::path::PathBuf::from("download.bin");
                 let url_cand = url_basename(&url);
                 let candidates = probe.filename.iter().chain(url_cand.iter());
                 for cand in candidates {
-                    if let Ok(pb) = smart_dl_core::session::output::sanitize_rel(cand) {
+                    if let Ok(pb) = smart_dl_storage::sanitize_rel(cand) {
                         chosen = pb;
                         break;
                     }

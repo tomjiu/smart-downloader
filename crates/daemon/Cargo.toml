@@ -46,6 +46,7 @@ reqwest = { workspace = true }
 quick-xml = { workspace = true }
 smart-dl-core = { path = "../core" }
 smart-dl-rss = { path = "../rss" }
+smart-dl-storage = { path = "../storage" }
 smart-dl-httpdl = { path = "../httpdl" }
 smart-dl-provider = { path = "../provider" }
 smart-dl-btcore = { path = "../btcore", optional = true }

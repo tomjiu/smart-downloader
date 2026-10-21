@@ -184,7 +184,7 @@ async fn probe_endpoint(
                 .filename
                 .iter()
                 .chain(smart_dl_httpdl::url_basename(url).iter())
-                .find_map(|c| smart_dl_core::session::output::sanitize_rel(c).ok())
+                .find_map(|c| smart_dl_storage::sanitize_rel(c).ok())
                 .unwrap_or_else(|| std::path::PathBuf::from("download.bin"));
             (
                 StatusCode::OK,

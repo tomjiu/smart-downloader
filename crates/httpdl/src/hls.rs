@@ -617,7 +617,7 @@ pub fn derive_ts_name(url: &str) -> Option<String> {
     if stem.is_empty() {
         return None;
     }
-    smart_dl_core::session::output::sanitize_rel(&format!("{stem}.ts"))
+    smart_dl_storage::sanitize_rel(&format!("{stem}.ts"))
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
 }
