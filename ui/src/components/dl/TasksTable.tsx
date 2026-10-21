@@ -444,12 +444,21 @@ const TaskRow = memo(function TaskRow({
         </div>
       </td>
       <td className="dl-td-num" data-testid="task-speed">
-        {down > 0 ? (
+        {/* #147 §一核查补修：旧门 down>0 会把「仅上传」的做种任务速率列
+            恒置为 ———数据双路（SSE 事件 + 快照回落）都健康时仍不可见，
+            #146 只修了数据侧（快照引用比较），渲染门是另一半根因。
+            现改为 down>0 || up>0：下载段仅 down>0 时渲染（保持原样），
+            做种任务只显 ↑ 上传速率。 */}
+        {down > 0 || up > 0 ? (
           <span className="dl-td-speed">
-            <Icon name="arrow-down" size={11} /> {fmtSpeed(down)}
+            {down > 0 && (
+              <>
+                <Icon name="arrow-down" size={11} /> {fmtSpeed(down)}
+                {up > 0 && " "}
+              </>
+            )}
             {up > 0 && (
               <>
-                {" "}
                 <Icon name="arrow-up" size={11} /> {fmtSpeed(up)}
               </>
             )}
