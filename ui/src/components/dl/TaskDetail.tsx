@@ -148,6 +148,7 @@ export default function TaskDetail({
                 <input
                   className="dl-input"
                   aria-label="任务下载限速"
+                  data-testid="limit-down"
                   placeholder={task.limits?.down_kb_s ? `当前 ${task.limits.down_kb_s}` : "0 = 不限"}
                   value={down}
                   onChange={(e) => setDown(e.target.value)}
@@ -163,6 +164,7 @@ export default function TaskDetail({
                 <div />
                 <button
                   className="dl-btn dl-btn--primary"
+                  data-testid="apply-limit"
                   onClick={() =>
                     run(
                       () => {

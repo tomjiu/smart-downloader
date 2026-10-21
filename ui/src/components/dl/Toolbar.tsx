@@ -64,6 +64,7 @@ export default function Toolbar({
             aria-expanded={adding}
             aria-controls="dl-add-bar"
             title={adding ? "收起新建任务栏（Esc）" : "展开新建任务栏"}
+            data-testid="new-task-btn"
             onClick={onNew}
           >
             <Icon name="plus" size={13} /> 新建任务
@@ -117,6 +118,7 @@ export default function Toolbar({
               className="dl-search-input"
               placeholder="搜索任务… （按 / 聚焦）"
               aria-label="搜索任务"
+              data-testid="search-input"
               value={query}
               onChange={(e) => onQuery(e.target.value)}
               onKeyDown={(e) => {

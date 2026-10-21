@@ -542,6 +542,7 @@ export default function DlApp() {
                     className="dl-input dl-add-input"
                     placeholder="http(s):// · ftp(s):// · sftp:// · magnet:?xt=… · .m3u8 · .meta4"
                     aria-label="下载链接"
+                    data-testid="add-url-input"
                     value={newUrl}
                     autoFocus
                     onChange={(e) => setNewUrl(e.target.value)}
@@ -553,7 +554,12 @@ export default function DlApp() {
                       }
                     }}
                   />
-                  <button className="dl-btn dl-btn--primary" disabled={busy || !newUrl.trim()} onClick={add}>
+                  <button
+                    className="dl-btn dl-btn--primary"
+                    disabled={busy || !newUrl.trim()}
+                    data-testid="add-submit"
+                    onClick={add}
+                  >
                     添加
                   </button>
                   {/* Batch A 槽位：torrent 文件 / metalink / headers / sha256
