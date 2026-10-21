@@ -614,13 +614,4 @@ if last_data_end < file_size {
 | `core/xltd.rs` 与 `xunlei-convert/xltd.rs` 是重复实现 | ❌ 算法不同（块扫描 vs SHA1 piece 校验） |
 | README 有断链 | ❌ 链接全部有效 |
 | `build_bitfield_from_indices` 越界 panic | ❌ 有 `if i < num_pieces` 检查 |
-| 依赖图基本健康 | ⚠️ 遗漏了幽灵依赖与「未接线模块」 |
-
-> **⚠️ 上表最后一行的措辞已修正（2026-10-21）**：原文写作「~1,800 行死代码」，
-> 这个数字**不准确且具误导性**。经 §6.5 逐项复核，其中只有 `core::xltd`(216)
-> 一项真正可删；`sniffer`/`single_instance`/`provider::hash` 均为**误判**，
-> `btcore::xudt` 是研究资产不应删。**任何以「死代码」为名的批量删除都必须先过 §6.5。**
->
-> 实际处置结果（PR #134）：删除 `sniffer`(735) + `xltd`(306) + `single_instance`(39)
-> = 1,080 行，且从 `sniffer` **抢救出 `flashget://` 解码能力**接入活链
-> （`source_parse/normalize.rs:79`）。详见 §6.5 与 PR #134。
+| 依赖图基本健康 | ⚠️ 遗漏了幽灵依赖与 ~1,800 行死代码 |
