@@ -1,12 +1,14 @@
 //! Provider 类型（§13）：运行态、任务状态、直链文件、错误。
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// Provider 侧任务句柄（v1 用字符串 id）。
 pub type ProviderTaskId = String;
 
 /// Provider 运行态（D5：Provider 含运行态，供路由选择）。
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct ProviderRuntime {
     pub enabled: bool,
     pub authenticated: bool,

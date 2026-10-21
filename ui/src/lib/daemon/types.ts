@@ -1,109 +1,53 @@
-/// daemon API 类型（对齐 crates/daemon/src/http.rs 线格式）。
+/// daemon API 类型（对齐 crates/daemon 线格式）。
+///
+/// 2026-10-21（#147 §六 / #143 第一梯队）：核心线格式类型改由 ts-rs 从
+/// Rust 结构体生成（`ui/src/lib/daemon/generated/`，`cargo test
+/// export_bindings` 导出，随仓库提交）——字段名漂移在编译期报错，不再
+/// 运行时静默失效。本文件是唯一门面：生成类型重导出 + 尚无 Rust 结构体
+/// 的响应（json! 宏构建）保留手写并标注 TODO。
+///
+/// 仍手写（后端为 serde_json::json! 动态构建，待 DTO 化后纳入生成）：
+/// - GET /settings 快照（state/settings.rs settings_snapshot）
+/// - GET /rss/feeds 与 /rss/items（http.rs json! 计数聚合）
+/// - GET /tasks/:id/logs（ops.rs task_logs）
 
-export type EngineKind = "Bt" | "Http" | "Ftp" | "Provider";
+// ---- ts-rs 生成类型（单一事实来源：Rust 结构体）----
 
-export interface TaskFile {
-  path: string;
-  size: number;
-  done: number;
-}
-
-/// GET /tasks 列表项（轻量形状，对齐 daemon list_tasks 返回 TaskSummary）。
-/// P0-2 修复（Issue #115）：后端 TaskRecord.name 为 Option<String> +
-/// skip_serializing_if —— UI 侧必须可空，否则 null 时渲染 "null"、
-/// 搜索 .toLowerCase() 直接 TypeError 白屏。
-/// A2 补齐（契约审计 2026-10-21）：后端 TaskSummary 还透出 tags /
-/// start_at_unix / retries 系字段（均条件序列化，缺省 = 未设置）——
-/// 定时任务与重试等待都停留在 Queued 态，不建模则无法区分展示。
-export interface TaskListItem {
-  task_id: string;
-  state: string;
-  source: string;
-  engine?: string | null;
-  name?: string | null;
-  /** 用户标签（E18；空 = 后端序列化省略） */
-  tags?: string[];
-  /** 定时启动时刻（E23，unix 秒；0/缺省 = 未调度）。非 0 且 Queued = 定时等待中 */
-  start_at_unix?: number;
-  /** 已执行自动重试次数（E30；0/缺省 = 无） */
-  retries?: number;
-  /** 自动重试次数上限（E30；0/缺省 = 不自动重试） */
-  max_retries?: number;
-  /** 重试到期时刻（E30，unix 秒；非 0 且 Queued = 重试等待中） */
-  next_retry_at_unix?: number;
-}
-
-/// GET /tasks/:id 详情快照（对齐 daemon task_snapshot）。
-export interface TaskSnapshot {
-  task_id: string;
-  state: string;
-  source: string;
-  dest_root?: string;
-  engine?: string | null;
-  done: number;
-  total: number;
-  error?: string | null;
-  files?: TaskFile[];
-  /// P0-2 修复（Issue #115）：name 可空（后端 Option + skip_serializing_if）。
-  name?: string | null;
-  /** 任务级连接数上限（S1-c，仅 BT；未设置 = undefined） */
-  max_connections?: number;
-  /** 顺序下载（BT/HTTP） */
-  sequential?: boolean;
-  /** 任务级限速 */
-  limits?: { down_kb_s?: number | null; up_kb_s?: number | null };
-  /** 定时启动（unix 秒；0 = 未调度） */
-  start_at_unix?: number;
-  /** 实时速率（快照时点；UI 速率列的主数据源——SSE speed 事件后端尚无
-   *  生产者（events.rs 枚举存在但 ops.rs 不发布），快照 rates 是唯一
-   *  真实来源；SSE 若将来补齐则作为更新鲜的覆盖层） */
-  rates?: { down_bytes_s: number; up_bytes_s: number };
-  /** 累计下行字节（E33，BT 透出；0/缺省 = 单向引擎或尚未产生） */
-  total_downloaded?: number;
-  /** 累计上行字节（E33，BT 透出；0/缺省 = 单向引擎或尚未产生） */
-  total_uploaded?: number;
-  /** 分享率（E33）：total_uploaded / total_downloaded；缺省 = 无下行
-   *  （比率无意义）或非 BT 引擎。任务详情做种统计区数据源。 */
-  share_ratio?: number;
-  /** 用户标签（E18；空 = 序列化省略） */
-  tags?: string[];
-  /** 已执行自动重试次数（E30；0/缺省 = 无） */
-  retries?: number;
-  /** 自动重试次数上限（E30；0/缺省 = 不自动重试） */
-  max_retries?: number;
-  /** 重试到期时刻（E30，unix 秒；非 0 且 Queued = 重试等待中） */
-  next_retry_at_unix?: number;
-}
+export type { TaskSummary as TaskListItem } from "./generated/TaskSummary";
+export type { TaskSnapshot } from "./generated/TaskSnapshot";
+export type { TaskRates } from "./generated/TaskRates";
+export type { FileProgress as TaskFile } from "./generated/FileProgress";
+export type { DaemonStats as Stats } from "./generated/DaemonStats";
+export type { GlobalLimits } from "./generated/GlobalLimits";
+export type { SchedulerEvent } from "./generated/SchedulerEvent";
+export type { Envelope as SchedulerEventEnvelope } from "./generated/Envelope";
+export type { SettingsApplyReport } from "./generated/SettingsApplyReport";
+export type { EngineKind } from "./generated/EngineKind";
+export type { TaskState } from "./generated/TaskState";
+export type { AddTaskReq } from "./generated/AddTaskReq";
+export type { LimitReq } from "./generated/LimitReq";
+export type { SequentialReq } from "./generated/SequentialReq";
+export type { ConnectionsReq } from "./generated/ConnectionsReq";
+export type { SetProxyReq } from "./generated/SetProxyReq";
+export type { RenameTaskReq } from "./generated/RenameTaskReq";
+export type { TagsReq } from "./generated/TagsReq";
+export type { PiecePriorityReq } from "./generated/PiecePriorityReq";
+export type { BatchTaskReq } from "./generated/BatchTaskReq";
+export type { BatchSelect } from "./generated/BatchSelect";
+export type { GlobalLimitReq } from "./generated/GlobalLimitReq";
+export type { RssFeedUpdateReq } from "./generated/RssFeedUpdateReq";
+export type { AddRssRuleReq } from "./generated/AddRssRuleReq";
 
 /// 事件流派生的任务级速率（Speed 事件）。
+/// 客户端本地形状：ts 时间戳为 UI 侧落地时刻（TTL 新鲜度判定用），
+/// 非后端字段——不入生成类型。
 export interface TaskRate {
   down: number;
   up: number;
   ts: number;
 }
 
-export interface Stats {
-  total: number;
-  by_state: Record<string, number>;
-  by_engine: Record<string, number>;
-  down_bytes_s: number;
-  up_bytes_s: number;
-  /** 会话累计流量（batch5；估算口径） */
-  session_down_bytes: number;
-  session_up_bytes: number;
-}
-
-export interface GlobalLimits {
-  max_download_kb_s: number;
-  max_upload_kb_s: number;
-}
-
-export interface SchedulerEventEnvelope {
-  seq: number;
-  event: { type: string; [k: string]: unknown };
-}
-
-// ---- S1 设置面 ----
+// ---- S1 设置面（GET /settings 为 json! 动态构建——待 DTO 化，见文件头）----
 
 export interface SettingsBandwidth {
   max_download_kb_s: number;
@@ -166,7 +110,7 @@ export interface Settings {
   meta: { persist_path: string | null };
 }
 
-// ---- RSS（qbit RSS Downloader 对标，batch5）----
+// ---- RSS（GET /rss/feeds 与 /rss/items 为 json! 动态构建——待 DTO 化）----
 
 export interface RssItem {
   feed_id: number;
@@ -203,13 +147,6 @@ export interface RssRule {
   use_regex?: boolean;
   /** 集数过滤，如 `1x02;1x04-1x06`（batch5） */
   episode_filter?: string | null;
-}
-
-export interface SettingsApplyReport {
-  applied: string[];
-  restart_required: string[];
-  persisted: boolean;
-  limits: GlobalLimits;
 }
 
 /// 12 主题（Issue #115 Phase 1：nord/carbon/gruvbox/catppuccin/solarized/mono

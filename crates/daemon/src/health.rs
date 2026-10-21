@@ -2,10 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 use smart_dl_core::types::PeerInfo;
+use ts_rs::TS;
 
 /// 健康事件类型。
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export)]
 pub enum HealthEventKind {
     /// 反吸血黑名单命中（peer_id 前缀 / client 标识），仅记录不 ban。
     LeechDetected,

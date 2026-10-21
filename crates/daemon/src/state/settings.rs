@@ -22,6 +22,7 @@
 
 use super::*;
 use smart_dl_core::types::BtSessionPatch;
+use ts_rs::TS;
 
 /// `PUT /settings` 请求体：各域可选，域内字段可选（None = 不调整）。
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -129,7 +130,8 @@ pub struct QueueReq {
 }
 
 /// `PUT /settings` 响应：应用结果分类 + 当前生效限速。
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
 pub struct SettingsApplyReport {
     /// 立即生效（或新任务生效）的设置键（点分路径）。
     pub applied: Vec<String>,
