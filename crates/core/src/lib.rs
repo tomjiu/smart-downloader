@@ -10,7 +10,6 @@ pub mod registry;
 pub mod router;
 pub mod source_parse;
 pub mod state_machine;
-pub mod strategy;
 pub mod task;
 pub mod torrent_meta;
 pub mod types;

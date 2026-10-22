@@ -244,11 +244,11 @@ enable_upnp = false
 
 **行为契约**：
 - 协议嗅探引擎 `core/src/sniffer.rs`（FileCentipede 4 层规则移植）：scheme 直判（thunder/qqdl/fs2you/magnet/ed2k/ftp/http）、文本正则提取多链接、协议推断（.torrent 后缀、pan.xunlei.com/s/、pan.quark.cn/s/ 分享识别）、规则表可配置。
-- BitComet 策略建议器 `core/src/strategy.rs` + `btcore::strategy` 门面：`DiskCacheAdvice`（自适应缓存+4 优先级桶，来源 r1 §4.3 + r2 disk_cache_priority）与 `AntiLeechAdvice`（分级反吸血→libtorrent settings_pack 建议值，来源 r1 §4.7）；纯函数，接入点注释标明。
+- BitComet 策略建议器 `btcore/src/strategy.rs`（原 `core/src/strategy.rs`，#143 第三梯队建议 7 迁回原位，门面已回收）：`DiskCacheAdvice`（自适应缓存+4 优先级桶，来源 r1 §4.3 + r2 disk_cache_priority）与 `AntiLeechAdvice`（分级反吸血→libtorrent settings_pack 建议值，来源 r1 §4.7）；纯函数，接入点注释标明。
 - 夸克网盘 Provider `provider/src/quark/`：QuarkClient（stoken→detail→save→task→download 全链）、QuarkProvider 实现 `RemoteProvider`、Cookie 登录态持久化、错误分类（NotLogin/ShareExpired/QuotaExhausted）+ 失败冷却（同 xunlei 模式）。端点形状待真机验证（注释标注）。
 - ed2k 链接解析 `core/src/source_parse/ed2k.rs`：解析 name/size/md4，路由层给出"已识别但暂不支持下载"的明确错误（完整引擎仍列远期）。
 
-**验证**：sniffer 13 测 + strategy 7 测 + quark 10 测（axum mock）全绿；`cargo test --workspace --exclude smart-dl-btcore` 全绿。
+**验证**：sniffer 13 测 + strategy 7 测 + quark 10 测（axum mock）全绿；`cargo test --workspace --exclude smart-dl-btcore` 全绿（strategy 7 测随迁由 bt-integration job 的 `cargo test -p smart-dl-btcore` 覆盖）。
 **文档**：`docs/CAPABILITY_ABSORBED.md`（吸收能力总清单：✅/🔶/📋/🚫 四档逐项标注 + 不吸收决策清单 + 接入路线图）。
 
 ### 16. 跨平台通解文档（用户需求 Q2）
