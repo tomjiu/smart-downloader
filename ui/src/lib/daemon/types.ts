@@ -64,6 +64,9 @@ export type { FilePriorityReq } from "./generated/FilePriorityReq";
 export type { FilePriorityEntry } from "./generated/FilePriorityEntry";
 export type { FilePrioritiesOut } from "./generated/FilePrioritiesOut";
 export type { BansReq } from "./generated/BansReq";
+// ---- 第二梯队 Wave B（新建任务全字段表单 + 探测预览）----
+export type { ProbeReq } from "./generated/ProbeReq";
+export type { ProbeOut } from "./generated/ProbeOut";
 
 /// 事件流派生的任务级速率（Speed 事件）。
 /// 客户端本地形状：ts 时间戳为 UI 侧落地时刻（TTL 新鲜度判定用），

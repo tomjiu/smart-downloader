@@ -114,7 +114,10 @@ pub struct AddTaskReq {
 }
 
 /// E31 探测预览请求：不建任务，仅探测 URL 元数据（add 前预览入口）。
-#[derive(Deserialize)]
+/// TS 导出（第二梯队新建表单）：字段与 add 同名同语义（headers/proxy/auth
+/// 原样随探测下发——预览即验证反防盗链配置是否有效）。
+#[derive(Deserialize, TS)]
+#[ts(export, optional_fields)]
 pub struct ProbeReq {
     /// http(s) 直链（v1 仅支持 HTTP 源预览；magnet/ed2k/ftp → 400）。
     pub url: String,
@@ -132,6 +135,23 @@ pub struct ProbeReq {
     /// HTTP Basic 认证密码（可空串）。
     #[serde(default)]
     pub password: Option<String>,
+}
+
+/// E31 探测预览响应（200 形状）：与引擎落盘名派生链同源的 suggest_name +
+/// 大小/Range/ETag/Last-Modified/Content-Type。Option 字段无 skip——
+/// None 序列化为 null（与旧 json! wire 一致）；url 不回显（凭据不二次暴露）。
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct ProbeOut {
+    pub state: String,
+    /// None = 服务端未回 Content-Length（大小未知，json! 时代为 null）。
+    pub total: Option<u64>,
+    pub range_supported: bool,
+    pub filename: Option<String>,
+    pub suggest_name: String,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+    pub content_type: Option<String>,
 }
 
 /// E31 探测预览：`POST /probe` —— 复用引擎同源探测（GET Range: bytes=0-0）
@@ -190,16 +210,16 @@ async fn probe_endpoint(
                 .unwrap_or_else(|| std::path::PathBuf::from("download.bin"));
             (
                 StatusCode::OK,
-                Json(serde_json::json!({
-                    "state": "ok",
-                    "total": p.total,
-                    "range_supported": p.range_supported,
-                    "filename": p.filename,
-                    "suggest_name": suggest.to_string_lossy(),
-                    "etag": p.etag,
-                    "last_modified": p.last_modified,
-                    "content_type": p.content_type,
-                })),
+                Json(ProbeOut {
+                    state: "ok".into(),
+                    total: p.total,
+                    range_supported: p.range_supported,
+                    filename: p.filename,
+                    suggest_name: suggest.to_string_lossy().into_owned(),
+                    etag: p.etag,
+                    last_modified: p.last_modified,
+                    content_type: p.content_type,
+                }),
             )
                 .into_response()
         }

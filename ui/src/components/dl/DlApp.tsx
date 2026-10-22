@@ -35,6 +35,7 @@ import LogsView from "./LogsView";
 import RssView from "./RssView";
 import SettingsView from "./SettingsView";
 import TaskDetail from "./TaskDetail";
+import NewTaskForm from "./NewTaskForm";
 import Toolbar, { TASK_FILTERS, type TaskFilterKey, type ViewKey } from "./Toolbar";
 import Sidebar from "./Sidebar";
 import StatusBar from "./StatusBar";
@@ -98,7 +99,6 @@ export default function DlApp() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState(false);
-  const [newUrl, setNewUrl] = useState("");
   /// E8：首帧数据是否已到（区分「加载中」骨架与「暂无任务」空态）。
   const [loaded, setLoaded] = useState(false);
   /// 表头排序（null = 后端默认序）。
@@ -457,20 +457,15 @@ export default function DlApp() {
     [act, selected],
   );
 
-  const add = async () => {
-    if (busy || !newUrl.trim()) return;
-    setBusy(true);
-    try {
-      await client.addTask({ url: newUrl.trim() });
-      setNewUrl("");
-      setAdding(false);
+  /// 新建任务成功回调（Wave B：表单组件自理提交/校验/错误取景，
+  /// 这里只负责收尾刷新与 toast——metalink 多任务展示 count）。
+  const onTaskAdded = useCallback(
+    async ({ count }: { count: number }) => {
+      toast({ kind: "success", text: count > 1 ? `已添加 ${count} 个任务（metalink 展开）` : "任务已添加" });
       await refresh();
-    } catch (e) {
-      toast({ kind: "error", text: `添加失败：${String(e)}` });
-    } finally {
-      setBusy(false);
-    }
-  };
+    },
+    [refresh, toast],
+  );
 
   const toggleSelect = useCallback((id: string) => {
     setSelected((cur) => {
@@ -544,36 +539,10 @@ export default function DlApp() {
           <main className="dl-main">
           {view === "tasks" && (
             <>
-              {adding && (
-                <div className="dl-card dl-add-bar" id="dl-add-bar">
-                  <input
-                    className="dl-input dl-add-input"
-                    placeholder="http(s):// · ftp(s):// · sftp:// · magnet:?xt=… · .m3u8 · .meta4"
-                    aria-label="下载链接"
-                    data-testid="add-url-input"
-                    value={newUrl}
-                    autoFocus
-                    onChange={(e) => setNewUrl(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") add();
-                      if (e.key === "Escape") {
-                        e.stopPropagation();
-                        setAdding(false);
-                      }
-                    }}
-                  />
-                  <button
-                    className="dl-btn dl-btn--primary"
-                    disabled={busy || !newUrl.trim()}
-                    data-testid="add-submit"
-                    onClick={add}
-                  >
-                    添加
-                  </button>
-                  {/* Batch A 槽位：torrent 文件 / metalink / headers / sha256
-                      （POST /tasks 全字段）—— 后续批次填 */}
-                </div>
-              )}
+              {/* Wave B（#143 第二梯队）：全字段新建表单（链接/.torrent/metalink
+                  + 探测预览 + 高级项）。常驻挂载 hidden 切换——收起不丢已填
+                  内容；Esc 不收表单（防误触丢稿），收起走「取消」/工具栏。 */}
+              <NewTaskForm open={adding} onOpen={setAdding} onAdded={onTaskAdded} />
               {!loaded ? (
                 <TableSkeleton />
               ) : (
