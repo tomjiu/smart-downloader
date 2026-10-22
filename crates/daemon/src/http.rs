@@ -19,7 +19,7 @@ use axum::{
     Json, Router,
 };
 use base64::Engine as _;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -226,21 +226,39 @@ pub struct AddXunleiImportReq {
 
 /// F5 P2SP：给 BT 任务注入云盘直链 web seed（`POST /tasks/:id/webseeds`）。
 /// URL 必须原样（带 `at=` 防篡改签名，禁改 query）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export)]
 pub struct WebseedReq {
     pub urls: Vec<String>,
 }
 
 /// E29 tracker 运行时管理：`POST /tasks/:id/trackers` 批量追加（仅 BT 任务）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export)]
 pub struct TrackersReq {
     pub urls: Vec<String>,
 }
 
 /// E29：`DELETE /tasks/:id/trackers?url=...`（URL 精确匹配，无匹配 404）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export)]
 pub struct RemoveTrackerQuery {
     pub url: String,
+}
+
+/// 追加计数响应（trackers / webseeds 批量追加共用：`{added: n}`）。
+/// TS 导出（第二梯队种源管理）：wire 由 json! 改结构体，UI 编译期锁定。
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct AddedCount {
+    pub added: usize,
+}
+
+/// tracker 精确删除响应：`{removed: url}`。
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct RemovedUrl {
+    pub removed: String,
 }
 
 /// 任务级限速（`POST /tasks/:id/limit`，P1 能力增强）。
@@ -303,9 +321,29 @@ pub struct ConnectionsReq {
 /// 手动添加 peer（`POST /tasks/:id/peers`，qbit「添加 peer」对标）：
 /// `addrs` 逐条注入（`ip:port`，支持 IPv6 `[::1]:6881`）；部分成功语义——
 /// 逐条回执 `[{addr, ok, error?}]`；任务非 BT → 全部回执 err（409）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export)]
 pub struct AddPeersReq {
     pub addrs: Vec<String>,
+}
+
+/// peer 注入逐条回执（部分成功语义：单项失败不短路）。
+#[derive(Serialize, TS)]
+#[ts(export, optional_fields)]
+pub struct PeerOutcome {
+    pub addr: String,
+    pub ok: bool,
+    /// 失败原因（ok=false 时存在；成功时省略——响应侧字段省略契约）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<String>,
+}
+
+/// peer 注入响应体：`{results: [...]}`。
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct PeerResults {
+    pub results: Vec<PeerOutcome>,
 }
 
 async fn task_add_peers(
@@ -343,36 +381,44 @@ async fn task_add_peers(
         )
             .into_response();
     }
-    let body: Vec<_> = results
-        .iter()
-        .map(|(addr, r)| match r {
-            Ok(()) => serde_json::json!({ "addr": addr, "ok": true }),
-            Err(e) => serde_json::json!({ "addr": addr, "ok": false, "error": e }),
-        })
-        .collect();
-    let any_ok = results.iter().any(|(_, r)| r.is_ok());
-    let any_unsupported = results.iter().any(|(_, r)| {
-        r.as_ref()
-            .is_err_and(|e| e.contains("仅 BT 任务支持添加 peer"))
+    // DTO 化（第二梯队）：逐条回执结构体化（旧 json! 逐字段手拼，字段名
+    // 漂移无编译期防护）。
+    let body = PeerResults {
+        results: results
+            .into_iter()
+            .map(|(addr, r)| PeerOutcome {
+                addr,
+                ok: r.is_ok(),
+                error: r.err(),
+            })
+            .collect(),
+    };
+    let any_ok = body.results.iter().any(|r| r.ok);
+    let any_unsupported = body.results.iter().any(|r| {
+        r.error
+            .as_deref()
+            .is_some_and(|e| e.contains("仅 BT 任务支持添加 peer"))
     });
     let status = if any_ok || !any_unsupported {
         StatusCode::OK
     } else {
         StatusCode::CONFLICT
     };
-    (status, Json(serde_json::json!({ "results": body }))).into_response()
+    (status, Json(body)).into_response()
 }
 
 /// 超级种子开关（`POST /tasks/:id/super-seeding`，BitComet 首创 / qbit 任务
 /// 右键同名能力）：`{enabled: bool}`。仅 BT 任务（其余 409）；做种态生效、
 /// 下载中设置无效果（libtorrent seed_mode flag 语义，与 qbit 一致）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export)]
 pub struct SuperSeedingReq {
     pub enabled: bool,
 }
 
 /// 强制宣告请求（Task 46）：tracker / dht 至少一项真（否则 400）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export)]
 pub struct AnnounceReq {
     /// 强制向全部 tracker 宣告（缺省 true）。
     #[serde(default = "default_true")]
@@ -420,19 +466,29 @@ async fn json_err_response(
 
 /// IP 封禁请求（Task 46）：`{"ips": ["1.2.3.4", ...]}`；非法 IP 逐条报错
 /// （部分成功语义，不整批拒绝）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export)]
 pub struct BansReq {
     pub ips: Vec<String>,
 }
 
 /// 队列优先级请求（Task 46）：绝对值 `{"priority": 3}` 或相对移动
 /// `{"action": "top"|"bottom"|"up"|"down"}`（二选一，同给以 value 优先）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export, optional_fields)]
 pub struct PriorityReq {
     #[serde(default)]
     pub priority: Option<i32>,
     #[serde(default)]
     pub action: Option<String>,
+}
+
+/// 队列优先级响应：`{queue_priority: v}`（设置后的新值）。
+/// TS 导出（第二梯队）：UI 队列优先级操作接线。
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct QueuePriorityOut {
+    pub queue_priority: i32,
 }
 
 /// 队列优先级设置（Task 46）：`POST /tasks/:id/priority`。
@@ -442,7 +498,7 @@ async fn task_priority(
     Json(req): Json<PriorityReq>,
 ) -> Response {
     match state.set_task_priority(&id, req.priority, req.action).await {
-        Ok(v) => Json(serde_json::json!({ "queue_priority": v })).into_response(),
+        Ok(v) => Json(QueuePriorityOut { queue_priority: v }).into_response(),
         Err(e) => daemon_error_response(e, &id),
     }
 }
@@ -791,15 +847,25 @@ async fn task_rename(
 
 /// 任务级子文件优先级（`POST /tasks/:id/files/priority`，P1 能力增强，仅 BT）。
 /// priority 语义同 libtorrent：0=不下载 / 1=低 / 4=默认 / 7=最高。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export)]
 pub struct FilePriorityReq {
     pub priorities: Vec<FilePriorityEntry>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export)]
 pub struct FilePriorityEntry {
     pub index: usize,
     pub priority: u32,
+}
+
+/// 子文件优先级响应：`{priorities: [...]}`（下标 = 文件序，与快照 files
+/// 对齐；null = 引擎未上报该文件）。TS 导出（第二梯队文件优先级选择器）。
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct FilePrioritiesOut {
+    pub priorities: Vec<Option<u32>>,
 }
 
 /// `POST /tasks/:id/files/priority`：批量设置子文件优先级，响应 = 当前各文件
@@ -815,16 +881,7 @@ async fn task_file_priority(
         .map(|e| (e.index, e.priority))
         .collect();
     match state.set_task_file_priorities(&id, &prio).await {
-        Ok(prios) => {
-            let list: Vec<serde_json::Value> = prios
-                .into_iter()
-                .map(|p| match p {
-                    Some(v) => serde_json::json!(v),
-                    None => serde_json::Value::Null,
-                })
-                .collect();
-            Json(serde_json::json!({ "priorities": list })).into_response()
-        }
+        Ok(prios) => Json(FilePrioritiesOut { priorities: prios }).into_response(),
         Err(e) => {
             let body = Json(serde_json::json!({ "error": e.to_string() }));
             let status = match e {
@@ -844,7 +901,7 @@ async fn task_webseeds(
     Json(req): Json<WebseedReq>,
 ) -> impl IntoResponse {
     match state.add_webseeds(&id, &req.urls).await {
-        Ok(n) => Json(serde_json::json!({ "added": n })).into_response(),
+        Ok(n) => Json(AddedCount { added: n }).into_response(),
         Err(e) => {
             let body = Json(serde_json::json!({ "error": e.to_string() }));
             let status = match e {
@@ -883,7 +940,7 @@ async fn task_trackers_add(
     Json(req): Json<TrackersReq>,
 ) -> impl IntoResponse {
     match state.add_trackers(&id, &req.urls).await {
-        Ok(n) => Json(serde_json::json!({ "added": n })).into_response(),
+        Ok(n) => Json(AddedCount { added: n }).into_response(),
         Err(e) => {
             let body = Json(serde_json::json!({ "error": e.to_string() }));
             let status = match e {
@@ -904,7 +961,7 @@ async fn task_trackers_remove(
     Query(q): Query<RemoveTrackerQuery>,
 ) -> impl IntoResponse {
     match state.remove_tracker(&id, &q.url).await {
-        Ok(()) => Json(serde_json::json!({ "removed": q.url })).into_response(),
+        Ok(()) => Json(RemovedUrl { removed: q.url }).into_response(),
         Err(e) => {
             let body = Json(serde_json::json!({ "error": e.to_string() }));
             let status = match e {
