@@ -1,0 +1,10 @@
+# ts-rs 生成配置（#147 §六 / #143 第一梯队；本文件先前遗漏提交——CI 漂移
+# 检查因此空转：无此配置时 export_bindings 导出到 <crate>/bindings/，
+# `git diff --exit-code -- ui/src/lib/daemon/generated/` 恒净，防漂移失效）。
+# - TS_RS_EXPORT_DIR：统一导出到 UI 生成目录（相对仓库根；cargo [env] 对
+#   测试二进制生效，本地与 CI 行为一致）。
+# - TS_RS_LARGE_INT=number：u64/i64 映射 number（unix 秒与计数语义足够；
+#   bigint 会迫使 UI 全链路 BigInt 运算）。
+[env]
+TS_RS_EXPORT_DIR = { value = "ui/src/lib/daemon/generated", relative = true }
+TS_RS_LARGE_INT = "number"

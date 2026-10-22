@@ -73,14 +73,23 @@ jobs:
       - name: test daemon (sftp)
         run: cargo test -p smart-dl-daemon --features sftp
 
-      # ts-rs 生成类型漂移检查（PR #149/#150）：上方 cargo test 内嵌的
-      # export_bindings 测试会按 Rust 结构体重写 ui/src/lib/daemon/generated/。
-      # 提交内容与结构体不一致（改了 struct 忘记重新生成提交）→ 此处红，
-      # 防止生成物与契约漂移。仅 Linux：Windows checkout 的 autocrlf 行尾
-      # 转换会引入全文件假阳性。
+      # ts-rs 生成类型漂移检查（PR #149/#150；本 PR 补强）：
+      # ① .cargo/config.toml 此前遗漏提交——export 导出到 <crate>/bindings/
+      #   默认目录，此处 diff 恒净（检查空转）。现配置 [env] 统一导出路径，
+      #   本地与 CI 行为一致，检查真实生效。
+      # ② git diff 只看已跟踪修改：新增结构体未重新生成提交 → 未跟踪新文件
+      #   漏检。补 ls-files --others 兜住「漏生成」方向。
+      # 仅 Linux：Windows checkout 的 autocrlf 行尾转换会引入全文件假阳性。
       - name: ts-rs generated types drift check
         if: runner.os == 'Linux'
-        run: git diff --exit-code -- ui/src/lib/daemon/generated/
+        run: |
+          git diff --exit-code -- ui/src/lib/daemon/generated/
+          UNTRACKED=$(git ls-files --others --exclude-standard ui/src/lib/daemon/generated/)
+          if [ -n "$UNTRACKED" ]; then
+            echo "::error::生成目录存在未提交的新类型（Rust 侧新增结构体后须 cargo test 重新生成并提交）"
+            echo "$UNTRACKED"
+            exit 1
+          fi
 
   bt-integration:
     # libtorrent native 集成测试（此前 if:false 占位，配方已脚本化并本地实测）：
