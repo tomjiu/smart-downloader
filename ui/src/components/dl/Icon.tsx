@@ -37,7 +37,16 @@ export type IconName =
   | "search"
   | "panel-left"
   | "chevron-left"
-  | "clock";
+  | "clock"
+  | "link"
+  | "copy"
+  | "chevron-up"
+  | "chevron-down"
+  | "chevrons-top"
+  | "chevrons-bottom"
+  | "pencil"
+  | "tag"
+  | "magnet"
 
 const PATHS: Record<IconName, React.ReactNode> = {
   clock: (
@@ -154,6 +163,50 @@ const PATHS: Record<IconName, React.ReactNode> = {
     </>
   ),
   "chevron-left": <path d="M14 6l-6 6 6 6" />,
+  /* 第二梯队（种源管理/队列优先级/重命名标签） */
+  link: (
+    <>
+      <path d="M10 14a5 5 0 007.07 0l3.18-3.18a5 5 0 00-7.07-7.07L11.5 5.4" />
+      <path d="M14 10a5 5 0 00-7.07 0L3.75 13.18a5 5 0 007.07 7.07L12.5 18.6" />
+    </>
+  ),
+  copy: (
+    <>
+      <rect x="9" y="9" width="11" height="11" rx="1" />
+      <path d="M5 15H4a1 1 0 01-1-1V4a1 1 0 011-1h10a1 1 0 011 1v1" />
+    </>
+  ),
+  "chevron-up": <path d="M6 14l6-6 6 6" />,
+  "chevron-down": <path d="M6 10l6 6 6-6" />,
+  "chevrons-top": (
+    <>
+      <path d="M6 11l6-6 6 6" />
+      <path d="M6 18l6-6 6 6" />
+    </>
+  ),
+  "chevrons-bottom": (
+    <>
+      <path d="M6 6l6 6 6-6" />
+      <path d="M6 13l6 6 6-6" />
+    </>
+  ),
+  pencil: (
+    <>
+      <path d="M17 3l4 4L8 20l-5 1 1-5L17 3z" />
+    </>
+  ),
+  tag: (
+    <>
+      <path d="M20 13l-7 7-9-9V3h8l8 8z" />
+      <circle cx="7.5" cy="7.5" r="1" />
+    </>
+  ),
+  magnet: (
+    <>
+      <path d="M6 3v8a6 6 0 0012 0V3" />
+      <path d="M6 3h4v6H6zM14 3h4v6h-4z" />
+    </>
+  ),
 };
 
 export function Icon({

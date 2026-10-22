@@ -7,6 +7,17 @@
 /// - 操作反馈分色：成功 info / 失败 err（旧实现同色误导）
 /// - 限速输入 placeholder 回显当前值（snapshot.limits；旧实现看不出已设限速）
 /// - 子文件 >30 截断时明示总数（不再静默截断）
+/// 第二梯队（#143 种源管理 / 队列优先级 / 文件优先级 / 重命名 / 标签）：
+/// - Esc 分层：焦点在输入件内 → 第一次 Esc 仅失焦（GitHub 惯例——多行
+///   textarea 里直接关抽屉会误伤输入）；失焦后再 Esc 才关抽屉
+/// - 重命名：行内编辑（Enter 保存 / Esc 取消 / 空值与未改名禁用提交）
+/// - 标签：逗号或空白分隔 → 数组（后端 E18 归一化）；清空 = null 语义
+/// - 队列优先级：置顶/上移/下移/置底（PriorityReq action 语义），
+///   操作后回显 queue_priority 数值
+/// - 子文件优先级选择器（BT）：0 不下载 / 1 低 / 4 正常 / 7 高，
+///   初值来自快照 file_priorities（下标与 files 对齐）
+/// - BT 任务追加 TaskBtPanel（tracker/peer/webseed/超级做种/宣告/recheck/
+///   magnet/导出）
 
 import { useEffect, useRef, useState } from "react";
 import type { TaskSnapshot } from "@/lib/daemon/types";
@@ -15,8 +26,30 @@ import { fmtBytes, fmtPct, fmtUnixShort } from "@/lib/daemon/format";
 import { StateBadge, TaskProgress } from "./Common";
 import { Icon } from "./Icon";
 import { displayName } from "./TasksTable";
+import TaskBtPanel from "./TaskBtPanel";
 
 const FILES_SHOWN = 30;
+
+/// libtorrent 子文件优先级档位（http.rs FilePriorityReq 注释口径）。
+const FILE_PRIORITIES = [
+  { value: 0, label: "不下载" },
+  { value: 1, label: "低" },
+  { value: 4, label: "正常" },
+  { value: 7, label: "高" },
+] as const;
+
+/// 标签输入 → 数组（逗号/空白分隔，trim + 去重去空）。
+function parseTags(text: string): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const raw of text.split(/[,，\s]+/)) {
+    const t = raw.trim();
+    if (!t || seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
 
 export default function TaskDetail({
   id,
@@ -36,6 +69,24 @@ export default function TaskDetail({
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
 
+  /// 重命名（行内编辑态）。
+  const [editingName, setEditingName] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+  const nameInputRef = useRef<HTMLInputElement>(null);
+
+  /// 标签编辑。
+  const [tagsDraft, setTagsDraft] = useState("");
+  const [editingTags, setEditingTags] = useState(false);
+  const tagsInputRef = useRef<HTMLInputElement>(null);
+
+  /// 队列优先级（操作后回显；快照无该字段——set-only 契约）。
+  const [queuePrio, setQueuePrio] = useState<number | null>(null);
+  const [prioBusy, setPrioBusy] = useState(false);
+
+  /// 文件优先级：本地乐观值（下标 → 档位；快照轮询 1.5s 会再对齐）。
+  const [filePrioOverride, setFilePrioOverride] = useState<Record<number, number>>({});
+  const [filePrioBusy, setFilePrioBusy] = useState<number | null>(null);
+
   useEffect(() => {
     let alive = true;
     const load = async () => {
@@ -46,6 +97,8 @@ export default function TaskDetail({
         // 审查修复（P2）：顺序下载开关回读快照字段——原实现恒初始化 false，
         // 已开启的任务显示"已关闭"且首点误发 true。
         setSeq(Boolean(t.sequential));
+        // 重置乐观覆盖（快照是权威值；任务切换时也须清）。
+        setFilePrioOverride({});
       } catch {
         /* 抽屉期间任务可能被移除 */
       }
@@ -59,13 +112,26 @@ export default function TaskDetail({
   }, [id]);
 
   /// Esc 关闭 + 初始聚焦（键盘可达性）。
+  /// Esc 分层（第二梯队）：焦点在输入件 → 第一次失焦，再 Esc 才关。
   useEffect(() => {
     closeRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") {
-        e.stopPropagation();
-        onClose();
+      if (e.key !== "Escape") return;
+      const t = e.target as HTMLElement | null;
+      if (
+        t instanceof HTMLElement &&
+        (t.tagName === "TEXTAREA" ||
+          t.tagName === "INPUT" ||
+          t.tagName === "SELECT" ||
+          t.isContentEditable)
+      ) {
+        // 不 stopPropagation——让输入件自身的 React onKeyDown（如重命名
+        // 取消编辑）继续收到该事件；此处只消费「关抽屉」语义。
+        t.blur();
+        return;
       }
+      e.stopPropagation();
+      onClose();
     };
     document.addEventListener("keydown", onKey, true);
     return () => document.removeEventListener("keydown", onKey, true);
@@ -79,6 +145,83 @@ export default function TaskDetail({
     } catch (e) {
       setMsg({ ok: false, text: String(e) });
     }
+  };
+
+  /// 队列优先级动作（top/up/down/bottom）。busy 独立禁用四钮。
+  const movePrio = (action: "top" | "up" | "down" | "bottom") => {
+    setPrioBusy(true);
+    client
+      .taskPriority(id, { action })
+      .then(({ queue_priority }) => {
+        setQueuePrio(queue_priority);
+        setMsg({ ok: true, text: `队列优先级已调整（当前 ${queue_priority}）` });
+        onChanged();
+      })
+      .catch((e) => setMsg({ ok: false, text: String(e) }))
+      .finally(() => setPrioBusy(false));
+  };
+
+  /// 保存重命名（空值/未修改禁用；失败回显错误）。
+  const saveName = () => {
+    if (!task) return;
+    const next = nameDraft.trim();
+    if (!next || next === (task.name ?? displayName(task))) {
+      setEditingName(false);
+      return;
+    }
+    client
+      .taskRename(id, next)
+      .then((snap) => {
+        setTask(snap);
+        setEditingName(false);
+        setMsg({ ok: true, text: "任务名已更新" });
+        onChanged();
+      })
+      .catch((e) => setMsg({ ok: false, text: `重命名失败：${String(e)}` }));
+  };
+
+  /// 保存标签（空 = 清空 null 语义；后端归一化后回显）。
+  const saveTags = () => {
+    const tags = parseTags(tagsDraft);
+    client
+      .taskTags(id, tags.length > 0 ? tags : null)
+      .then(({ tags: normalized }) => {
+        setTask((cur) => (cur ? { ...cur, tags: normalized } : cur));
+        setEditingTags(false);
+        setMsg({ ok: true, text: normalized.length > 0 ? "标签已保存" : "标签已清空" });
+        onChanged();
+      })
+      .catch((e) => setMsg({ ok: false, text: `保存标签失败：${String(e)}` }));
+  };
+
+  /// 子文件优先级变更：乐观更新 + 单文件级 busy。
+  const setFilePrio = (index: number, priority: number) => {
+    if (!task) return;
+    setFilePrioBusy(index);
+    setFilePrioOverride((cur) => ({ ...cur, [index]: priority }));
+    client
+      .taskFilePriority(id, [{ index, priority }])
+      .then(({ priorities }) => {
+        // 响应 = 全量优先级表（与 files 下标对齐）；null 项保留乐观值。
+        setFilePrioOverride((cur) => {
+          const next = { ...cur };
+          priorities.forEach((p, i) => {
+            if (p != null) next[i] = p;
+          });
+          return next;
+        });
+        onChanged();
+      })
+      .catch((e) => {
+        setMsg({ ok: false, text: `优先级设置失败：${String(e)}` });
+        // 失败回滚乐观值（下一轮快照轮询会覆盖，显式清理更即时）。
+        setFilePrioOverride((cur) => {
+          const next = { ...cur };
+          delete next[index];
+          return next;
+        });
+      })
+      .finally(() => setFilePrioBusy(null));
   };
 
   return (
@@ -99,14 +242,125 @@ export default function TaskDetail({
         ) : (
           <div style={{ display: "grid", gap: 14 }}>
             <div>
-              {/* P0-2 修复：name 可空兜底（绝不渲染 null） */}
-              <div style={{ fontWeight: 600, marginBottom: 6, wordBreak: "break-all" }}>
-                {displayName(task)}
-              </div>
-              <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {/* 重命名（第二梯队）：标题行内编辑——铅笔进入，Enter 保存，Esc 取消 */}
+              {editingName ? (
+                <div style={{ display: "flex", gap: 6, marginBottom: 6 }}>
+                  <input
+                    ref={nameInputRef}
+                    className="dl-input"
+                    aria-label="任务名"
+                    data-testid="rename-input"
+                    value={nameDraft}
+                    autoFocus
+                    onChange={(e) => setNameDraft(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        saveName();
+                      }
+                      if (e.key === "Escape") {
+                        e.stopPropagation();
+                        setEditingName(false);
+                      }
+                    }}
+                    onBlur={() => setEditingName(false)}
+                  />
+                  <button
+                    type="button"
+                    className="dl-btn dl-btn--primary"
+                    aria-label="保存任务名"
+                    data-testid="rename-save"
+                    disabled={!nameDraft.trim() || nameDraft.trim() === (task.name ?? displayName(task))}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={saveName}
+                  >
+                    <Icon name="check" size={13} />
+                  </button>
+                </div>
+              ) : (
+                <div
+                  style={{ fontWeight: 600, marginBottom: 6, wordBreak: "break-all", display: "flex", alignItems: "center", gap: 6 }}
+                >
+                  {/* P0-2 修复：name 可空兜底（绝不渲染 null） */}
+                  <span style={{ minWidth: 0, wordBreak: "break-all" }}>{displayName(task)}</span>
+                  <button
+                    type="button"
+                    className="dl-btn dl-btn--ghost dl-act-btn"
+                    aria-label="重命名"
+                    title="重命名"
+                    data-testid="rename-start"
+                    onClick={() => {
+                      setNameDraft(task.name ?? displayName(task));
+                      setEditingName(true);
+                      requestAnimationFrame(() => nameInputRef.current?.focus());
+                    }}
+                  >
+                    <Icon name="pencil" size={12} />
+                  </button>
+                </div>
+              )}
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
                 <StateBadge state={task.state} />
                 {task.engine && <span className="dl-badge">{task.engine}</span>}
                 <span className="dl-badge">{fmtPct(task.done, task.total)}</span>
+                {/* 标签（E18 透出）：展示 + 行内编辑 */}
+                {(task.tags ?? []).map((t) => (
+                  <span key={t} className="dl-badge dl-badge--info">
+                    <Icon name="tag" size={10} /> {t}
+                  </span>
+                ))}
+                {editingTags ? (
+                  <span style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
+                    <input
+                      ref={tagsInputRef}
+                      className="dl-input"
+                      style={{ minHeight: 24, width: 200 }}
+                      aria-label="标签（逗号分隔）"
+                      data-testid="tags-input"
+                      placeholder="逗号或空格分隔"
+                      value={tagsDraft}
+                      autoFocus
+                      onChange={(e) => setTagsDraft(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          saveTags();
+                        }
+                        if (e.key === "Escape") {
+                          e.stopPropagation();
+                          setEditingTags(false);
+                        }
+                      }}
+                      onBlur={() => setEditingTags(false)}
+                    />
+                    <button
+                      type="button"
+                      className="dl-btn dl-btn--primary"
+                      aria-label="保存标签"
+                      data-testid="tags-save"
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={saveTags}
+                    >
+                      <Icon name="check" size={12} />
+                    </button>
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    className="dl-btn dl-btn--ghost"
+                    style={{ minHeight: 22, padding: "1px 8px" }}
+                    aria-label={(task.tags ?? []).length > 0 ? "编辑标签" : "添加标签"}
+                    title={(task.tags ?? []).length > 0 ? "编辑标签" : "添加标签"}
+                    data-testid="tags-edit"
+                    onClick={() => {
+                      setTagsDraft((task.tags ?? []).join(", "));
+                      setEditingTags(true);
+                      requestAnimationFrame(() => tagsInputRef.current?.focus());
+                    }}
+                  >
+                    <Icon name="tag" size={11} /> {(task.tags ?? []).length > 0 ? "编辑标签" : "标签"}
+                  </button>
+                )}
               </div>
             </div>
 
@@ -133,12 +387,64 @@ export default function TaskDetail({
                   k="自动重试"
                   v={
                     task.next_retry_at_unix
-                      ? `${task.retries ?? 0}/${task.max_retries}（下次 ${fmtUnixShort(task.next_retry_at_unix)}）`
+                      ? `${task.retries ?? 0}/${task.max_retries}（下次 ${fmtUnixShort(Number(task.next_retry_at_unix))}）`
                       : `${task.retries ?? 0}/${task.max_retries}`
                   }
                 />
               )}
+              {queuePrio != null && <Row k="队列优先级" v={String(queuePrio)} />}
               {task.error && <Row k="错误" v={task.error} danger />}
+            </div>
+
+            {/* 队列优先级（第二梯队；全引擎可用——排队调度语义与引擎无关） */}
+            <div className="dl-card">
+              <b style={{ display: "block", marginBottom: 10 }}>队列优先级</b>
+              <div className="dl-prio-group" role="group" aria-label="队列优先级调整">
+                <button
+                  type="button"
+                  className="dl-btn dl-btn--ghost"
+                  disabled={prioBusy}
+                  title="移到队列最前（下一个开始）"
+                  data-testid="prio-top"
+                  onClick={() => movePrio("top")}
+                >
+                  <Icon name="chevrons-top" size={13} /> 置顶
+                </button>
+                <button
+                  type="button"
+                  className="dl-btn dl-btn--ghost"
+                  disabled={prioBusy}
+                  title="上移一位"
+                  data-testid="prio-up"
+                  onClick={() => movePrio("up")}
+                >
+                  <Icon name="chevron-up" size={13} /> 上移
+                </button>
+                <button
+                  type="button"
+                  className="dl-btn dl-btn--ghost"
+                  disabled={prioBusy}
+                  title="下移一位"
+                  data-testid="prio-down"
+                  onClick={() => movePrio("down")}
+                >
+                  <Icon name="chevron-down" size={13} /> 下移
+                </button>
+                <button
+                  type="button"
+                  className="dl-btn dl-btn--ghost"
+                  disabled={prioBusy}
+                  title="移到队列最后"
+                  data-testid="prio-bottom"
+                  onClick={() => movePrio("bottom")}
+                >
+                  <Icon name="chevrons-bottom" size={13} /> 置底
+                </button>
+              </div>
+              <div className="dl-field-help" style={{ marginTop: 8 }}>
+                排队任务的执行顺序；进行中任务不受影响。
+                {queuePrio != null ? ` 当前值 ${queuePrio}（数值大者优先）。` : ""}
+              </div>
             </div>
 
             <div className="dl-card">
@@ -266,34 +572,62 @@ export default function TaskDetail({
               </div>
             </div>
 
+            {/* BT 种源管理（第二梯队核心）——仅 BT 引擎渲染 */}
+            {task.engine === "bt" && <TaskBtPanel taskId={task.task_id} onChanged={onChanged} />}
+
             {task.files && task.files.length > 0 && (
               <div className="dl-card">
                 <b style={{ display: "block", marginBottom: 10 }}>
                   子文件 <span className="dl-badge">{task.files.length}</span>
+                  {task.engine === "bt" && (
+                    <span className="dl-field-help" style={{ display: "inline", marginLeft: 8 }}>
+                      优先级：不下载 / 低 / 正常 / 高
+                    </span>
+                  )}
                 </b>
                 <div style={{ display: "grid", gap: 8 }}>
-                  {task.files.slice(0, FILES_SHOWN).map((f) => (
-                    <div key={f.rel_path}>
-                      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, gap: 8 }}>
-                        <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          {f.rel_path}
-                        </span>
-                        <span style={{ flex: "none", fontVariantNumeric: "tabular-nums", color: "var(--fg-3)" }}>
-                          {fmtBytes(f.done)} / {fmtBytes(f.size)}
-                        </span>
+                  {task.files.slice(0, FILES_SHOWN).map((f, i) => {
+                    const prio =
+                      filePrioOverride[i] ?? task.file_priorities?.[i] ?? 4;
+                    return (
+                      <div key={f.rel_path}>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, gap: 8, alignItems: "center" }}>
+                          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={f.rel_path}>
+                            {f.rel_path}
+                          </span>
+                          <span style={{ flex: "none", display: "inline-flex", gap: 8, alignItems: "center", fontVariantNumeric: "tabular-nums", color: "var(--fg-3)" }}>
+                            {fmtBytes(f.done)} / {fmtBytes(f.size)}
+                            {task.engine === "bt" && (
+                              <select
+                                className="dl-prio-select"
+                                aria-label={`文件 ${f.rel_path} 优先级`}
+                                data-testid={`file-prio-${i}`}
+                                disabled={filePrioBusy === i}
+                                value={prio}
+                                onChange={(e) => setFilePrio(i, Number(e.target.value))}
+                              >
+                                {FILE_PRIORITIES.map((p) => (
+                                  <option key={p.value} value={p.value}>
+                                    {p.label}
+                                  </option>
+                                ))}
+                              </select>
+                            )}
+                          </span>
+                        </div>
+                        <div className="dl-progress dl-progress--thin" style={{ marginTop: 3 }}>
+                          <span
+                            className="dl-bar dl-bar--run"
+                            style={{ width: `${f.size ? (f.done / f.size) * 100 : 0}%` }}
+                          />
+                        </div>
                       </div>
-                      <div className="dl-progress dl-progress--thin" style={{ marginTop: 3 }}>
-                        <span
-                          className="dl-bar dl-bar--run"
-                          style={{ width: `${f.size ? (f.done / f.size) * 100 : 0}%` }}
-                        />
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
                 {task.files.length > FILES_SHOWN && (
                   <div className="dl-field-help" style={{ marginTop: 10 }}>
-                    共 {task.files.length} 个子文件，仅显示前 {FILES_SHOWN} 项
+                    共 {task.files.length} 个子文件，仅显示前 {FILES_SHOWN} 项（优先级设置同理仅前 {FILES_SHOWN} 项）
                   </div>
                 )}
               </div>

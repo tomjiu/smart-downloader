@@ -191,6 +191,114 @@ body {
   cursor: not-allowed;
 }
 
+/* ── 第二梯队（种源管理等）：多行输入与列表件 ── */
+.dl-textarea {
+  background: var(--bg);
+  border: 1px solid var(--line-3);
+  border-radius: var(--radius);
+  padding: 6px 8px;
+  font: inherit;
+  font-size: var(--fs-sm);
+  color: var(--fg);
+  min-width: 0;
+  width: 100%;
+  resize: vertical;
+  min-height: 56px;
+  line-height: 1.5;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.dl-textarea::placeholder {
+  color: var(--fg-3);
+}
+.dl-textarea:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+.dl-textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+.dl-textarea:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* tracker 表：紧凑行（url 占满 + tier 徽章 + 删除钮） */
+.dl-track-list {
+  display: grid;
+  gap: 2px;
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--line-2);
+  border-radius: var(--radius);
+  padding: 4px;
+}
+.dl-track-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 6px;
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  min-width: 0;
+}
+.dl-track-row:hover {
+  background: var(--bg-hover, var(--bg));
+}
+.dl-track-url {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.dl-track-tier {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  font-size: var(--fs-sm);
+  color: var(--fg-3);
+}
+
+/* 优先级按钮组（置顶/上移/下移/置底）：等宽连排 */
+.dl-prio-group {
+  display: inline-flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+/* peer/webseed 逐条回执列表（部分成功语义） */
+.dl-peer-results {
+  display: grid;
+  gap: 2px;
+  font-size: var(--fs-sm);
+  font-family: var(--font-mono, ui-monospace, monospace);
+}
+.dl-peer-results .ok {
+  color: var(--ok);
+}
+.dl-peer-results .err {
+  color: var(--err);
+}
+
+/* 子文件优先级下拉（行内小件） */
+.dl-prio-select {
+  background: var(--bg);
+  border: 1px solid var(--line-3);
+  border-radius: var(--radius-sm);
+  font: inherit;
+  font-size: var(--fs-sm);
+  color: var(--fg);
+  padding: 1px 4px;
+  min-width: 64px;
+}
+.dl-prio-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
 /* ── 徽章（状态色底 + 同色文字，色盲友好靠文字冗余）── */
 .dl-badge {
   display: inline-flex;

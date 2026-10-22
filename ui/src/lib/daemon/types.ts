@@ -46,6 +46,24 @@ export type { RssRule } from "./generated/RssRule";
 export type { RssFeedsList } from "./generated/RssFeedsList";
 export type { RssItemsList } from "./generated/RssItemsList";
 export type { RssRulesList } from "./generated/RssRulesList";
+// ---- 第二梯队（种源管理 / 队列优先级 / 文件优先级）----
+export type { TrackerEntry } from "./generated/TrackerEntry";
+export type { TrackersReq } from "./generated/TrackersReq";
+export type { RemoveTrackerQuery } from "./generated/RemoveTrackerQuery";
+export type { AddedCount } from "./generated/AddedCount";
+export type { RemovedUrl } from "./generated/RemovedUrl";
+export type { AddPeersReq } from "./generated/AddPeersReq";
+export type { PeerOutcome } from "./generated/PeerOutcome";
+export type { PeerResults } from "./generated/PeerResults";
+export type { WebseedReq } from "./generated/WebseedReq";
+export type { SuperSeedingReq } from "./generated/SuperSeedingReq";
+export type { AnnounceReq } from "./generated/AnnounceReq";
+export type { PriorityReq } from "./generated/PriorityReq";
+export type { QueuePriorityOut } from "./generated/QueuePriorityOut";
+export type { FilePriorityReq } from "./generated/FilePriorityReq";
+export type { FilePriorityEntry } from "./generated/FilePriorityEntry";
+export type { FilePrioritiesOut } from "./generated/FilePrioritiesOut";
+export type { BansReq } from "./generated/BansReq";
 
 /// 事件流派生的任务级速率（Speed 事件）。
 /// 客户端本地形状：ts 时间戳为 UI 侧落地时刻（TTL 新鲜度判定用），
