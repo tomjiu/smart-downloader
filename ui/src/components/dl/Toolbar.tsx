@@ -11,7 +11,7 @@
 import type { RefObject } from "react";
 import { Icon } from "./Icon";
 
-export type ViewKey = "tasks" | "stats" | "rss" | "logs" | "settings";
+export type ViewKey = "tasks" | "stats" | "rss" | "logs" | "settings" | "security";
 
 export const TASK_FILTERS = [
   { key: "all", label: "全部" },
@@ -29,6 +29,7 @@ const VIEW_TITLES: Record<Exclude<ViewKey, "tasks">, { title: string; sub: strin
   rss: { title: "RSS", sub: "订阅源与自动抓取规则" },
   logs: { title: "日志", sub: "daemon 事件流（实时）" },
   settings: { title: "设置", sub: "主题、连接与引擎参数" },
+  security: { title: "安全", sub: "BT 对等连接 IP 封禁表（引擎级黑名单）" },
 };
 
 export default function Toolbar({

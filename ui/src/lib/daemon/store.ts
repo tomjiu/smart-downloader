@@ -8,6 +8,11 @@ import type {
   AddRssRuleReq,
   AddTaskReq,
   AnnounceReq,
+  BansImportOut,
+  BansImportReq,
+  BansListOut,
+  BansOut,
+  BansReq,
   BatchTaskReq,
   ConnectionsReq,
   FilePriorityEntry,
@@ -333,6 +338,32 @@ export class DaemonClient {
   /// 反防盗链配置是否有效）。非 2xx 抛错误（req 统一错误提取）。
   probe(body: Partial<ProbeReq>): Promise<ProbeOut> {
     return req("/probe", { method: "POST", body: JSON.stringify(body) });
+  }
+
+  // ---- IP 封禁（第二梯队 Wave C；BT 引擎级黑名单）----
+  /// 当前封禁表（规范化后的 IP / 区间字符串）。
+  listBans(): Promise<BansListOut> {
+    return req("/security/bans");
+  }
+  /// 批量封禁：逐条回执（非法 IP / 引擎不可用逐条报错，不整批拒绝）。
+  banIps(ips: string[]): Promise<BansOut> {
+    const body: BansReq = { ips };
+    return req("/security/bans", { method: "POST", body: JSON.stringify(body) });
+  }
+  /// 批量解禁（幂等）。
+  unbanIps(ips: string[]): Promise<BansOut> {
+    const body: BansReq = { ips };
+    return req("/security/bans", { method: "DELETE", body: JSON.stringify(body) });
+  }
+  /// IP 段批量导入（DAT PeerGuardian / P2P 格式文本；部分成功语义）。
+  /// 注意：全失败时 400（错误体含 imported/errors）——req 统一抛错，
+  /// 调用方如需部分结果须自行 fetch（UI 直接展示错误文案即可）。
+  importBans(text: string): Promise<BansImportOut> {
+    const body: BansImportReq = { text };
+    return req("/security/bans/import", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
   }
 
   // ---- RSS ----
