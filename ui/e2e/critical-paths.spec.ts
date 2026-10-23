@@ -304,4 +304,35 @@ test.describe.serial('关键路径 e2e（真实 daemon + 真实下载）', () =>
     // 草稿不提交——清场（afterEach 删任务）；这里只验证草稿留存
     expect(pageErrors, '页面不得有未捕获异常').toEqual([]);
   });
+
+  test('8. IP 封禁页：视图渲染 + 空态 + 逐条回执错误透出（Wave C）', async ({ page, request }) => {
+    const pageErrors: string[] = [];
+    page.on('pageerror', (e) => pageErrors.push(String(e)));
+    await page.goto('/');
+
+    // 8a. 侧栏切到安全视图（Ctrl+5 同效——快捷键序已扩到 6 视图）
+    await page.getByRole('button', { name: '安全', exact: true }).click();
+    await expect(page.getByText('IP 封禁表', { exact: true })).toBeVisible();
+    // 空表空态（daemon 干净启动，无历史封禁）
+    await expect(page.getByText('暂无封禁项')).toBeVisible({ timeout: 5_000 });
+
+    // 8b. API 直接验证列表端点（UI 空态的数据源）
+    const bans = (await request.get(`${BASE}/security/bans`).then((r) => r.json())) as {
+      banned: string[];
+    };
+    expect(bans.banned).toEqual([]);
+
+    // 8c. 封禁尝试（无 BT 引擎构建 → 逐条回执 ok:false + 原因，UI 原样透出
+    //     ——这是「不隐藏引擎边界」的契约面；真实封禁链路由 CI bt job 覆盖）
+    await page.getByTestId('bans-add-input').fill('1.2.3.4\nnot-an-ip');
+    await page.getByTestId('bans-add-submit').click();
+    const results = page.getByTestId('bans-results');
+    await expect(results).toBeVisible({ timeout: 5_000 });
+    await expect(results).toContainText('1.2.3.4');
+    await expect(results).toContainText('not-an-ip');
+    await expect(results).toContainText('✗');
+    // 回执后列表仍为空（全部失败不入表）
+    await expect(page.getByText('暂无封禁项')).toBeVisible();
+    expect(pageErrors, '页面不得有未捕获异常').toEqual([]);
+  });
 });

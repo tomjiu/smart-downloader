@@ -492,6 +492,52 @@ pub struct BansReq {
     pub ips: Vec<String>,
 }
 
+/// 封禁列表响应（GET /security/bans）：`{banned: [...]}`（规范化后的
+/// IP / 区间字符串，与落盘 bans.json 同源）。
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct BansListOut {
+    pub banned: Vec<String>,
+}
+
+/// 封禁/解禁逐条回执（部分成功语义）。
+#[derive(Serialize, TS)]
+#[ts(export, optional_fields)]
+pub struct BanOutcome {
+    pub ip: String,
+    pub ok: bool,
+    /// 失败原因（ok=false 时存在；成功时省略）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub error: Option<String>,
+}
+
+/// 封禁/解禁响应（POST / DELETE /security/bans）：回填最新列表 + 逐条回执。
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct BansOut {
+    pub banned: Vec<String>,
+    pub results: Vec<BanOutcome>,
+}
+
+/// IP 段批量导入请求（batch5）：`text` = DAT（PeerGuardian）或 P2P 格式
+/// 文本（逐行一个区间；`#` 注释与空行跳过）。
+#[derive(Deserialize, TS)]
+#[ts(export)]
+pub struct BansImportReq {
+    pub text: String,
+}
+
+/// IP 段导入响应（部分成功语义）：可解析行入引擎，失败行收集进 errors
+///（带行号前缀）。
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct BansImportOut {
+    pub imported: usize,
+    pub errors: Vec<String>,
+    pub banned: Vec<String>,
+}
+
 /// 队列优先级请求（Task 46）：绝对值 `{"priority": 3}` 或相对移动
 /// `{"action": "top"|"bottom"|"up"|"down"}`（二选一，同给以 value 优先）。
 #[derive(Deserialize, TS)]
@@ -587,16 +633,17 @@ async fn task_magnet(State(state): State<Arc<DaemonState>>, Path(id): Path<Strin
 /// 批量封禁（Task 46）：`POST /security/bans`。
 async fn security_ban(State(state): State<Arc<DaemonState>>, Json(req): Json<BansReq>) -> Response {
     let results = state.ban_ips(req.ips).await;
-    Json(serde_json::json!({
-        "banned": state.list_bans(),
-        "results": results
+    Json(BansOut {
+        banned: state.list_bans(),
+        results: results
             .into_iter()
-            .map(|(ip, r)| match r {
-                Ok(()) => serde_json::json!({ "ip": ip, "ok": true }),
-                Err(e) => serde_json::json!({ "ip": ip, "ok": false, "error": e }),
+            .map(|(ip, r)| BanOutcome {
+                ip,
+                ok: r.is_ok(),
+                error: r.err(),
             })
-            .collect::<Vec<_>>(),
-    }))
+            .collect(),
+    })
     .into_response()
 }
 
@@ -606,29 +653,26 @@ async fn security_unban(
     Json(req): Json<BansReq>,
 ) -> Response {
     let results = state.unban_ips(req.ips).await;
-    Json(serde_json::json!({
-        "banned": state.list_bans(),
-        "results": results
+    Json(BansOut {
+        banned: state.list_bans(),
+        results: results
             .into_iter()
-            .map(|(ip, r)| match r {
-                Ok(()) => serde_json::json!({ "ip": ip, "ok": true }),
-                Err(e) => serde_json::json!({ "ip": ip, "ok": false, "error": e }),
+            .map(|(ip, r)| BanOutcome {
+                ip,
+                ok: r.is_ok(),
+                error: r.err(),
             })
-            .collect::<Vec<_>>(),
-    }))
+            .collect(),
+    })
     .into_response()
 }
 
 /// 封禁列表（Task 46）：`GET /security/bans`。
 async fn security_list_bans(State(state): State<Arc<DaemonState>>) -> Response {
-    Json(serde_json::json!({ "banned": state.list_bans() })).into_response()
-}
-
-/// IP 段批量导入请求（batch5）：`text` = DAT（PeerGuardian）或 P2P 格式
-/// 文本（逐行一个区间；`#` 注释与空行跳过）。
-#[derive(Deserialize)]
-pub struct BansImportReq {
-    pub text: String,
+    Json(BansListOut {
+        banned: state.list_bans(),
+    })
+    .into_response()
 }
 
 /// IP 段批量导入（batch5 对标 qB/BitComet IP filter 文件）：`POST /security/bans/import`。
@@ -645,11 +689,11 @@ async fn security_ban_import(
     };
     (
         status,
-        Json(serde_json::json!({
-            "imported": imported,
-            "errors": errors,
-            "banned": state.list_bans(),
-        })),
+        Json(BansImportOut {
+            imported,
+            errors,
+            banned: state.list_bans(),
+        }),
     )
         .into_response()
 }

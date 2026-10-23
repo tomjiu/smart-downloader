@@ -34,6 +34,7 @@ import StatsView from "./StatsView";
 import LogsView from "./LogsView";
 import RssView from "./RssView";
 import SettingsView from "./SettingsView";
+import SecurityView from "./SecurityView";
 import TaskDetail from "./TaskDetail";
 import NewTaskForm from "./NewTaskForm";
 import Toolbar, { TASK_FILTERS, type TaskFilterKey, type ViewKey } from "./Toolbar";
@@ -135,15 +136,15 @@ export default function DlApp() {
     else if (window.innerWidth <= 900) setSideCollapsed(true);
   }, []);
 
-  /// 全局快捷键（Slack/GitHub 惯例）：Ctrl/Cmd+1..5 切视图、/ 聚焦搜索。
+  /// 全局快捷键（Slack/GitHub 惯例）：Ctrl/Cmd+1..6 切视图、/ 聚焦搜索。
   /// 输入控件内不拦截（除 Ctrl 组合——数字组合在输入框内无编辑语义冲突）。
   useEffect(() => {
-    const ORDER: ViewKey[] = ["tasks", "stats", "rss", "logs", "settings"];
+    const ORDER: ViewKey[] = ["tasks", "stats", "rss", "logs", "security", "settings"];
     const isTyping = (t: EventTarget | null) =>
       t instanceof HTMLElement &&
       (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
     const onKey = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key >= "1" && e.key <= "5") {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key >= "1" && e.key <= "6") {
         e.preventDefault();
         setView(ORDER[Number(e.key) - 1]);
         return;
@@ -571,6 +572,7 @@ export default function DlApp() {
           {view === "rss" && <RssView onToast={toast} />}
           {view === "logs" && <LogsView events={events} />}
           {view === "settings" && <SettingsView onToast={toast} />}
+          {view === "security" && <SecurityView onToast={toast} />}
           {/* historyTick 驱动曲线重绘 */}
           <span hidden>{historyTick}</span>
           </main>
