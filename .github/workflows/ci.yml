@@ -54,6 +54,11 @@ jobs:
       - name: test core
         run: cargo test -p smart-dl-core
 
+      # rss crate（TD-4 拆分时 CI 清单漏加——测试盲区是 #161 发现 tests/
+      # 为空的根因，2026-10-23 补）。
+      - name: test rss
+        run: cargo test -p smart-dl-rss
+
       - name: test httpdl (with ftp feature)
         run: cargo test -p smart-dl-httpdl --features ftp
 
