@@ -61,9 +61,7 @@ fn set_tags_normalizes_and_links_everywhere() {
         // 日志事件
         let logs = state.task_logs(&id0).unwrap();
         assert!(
-            serde_json::to_string(&logs["events"])
-                .unwrap()
-                .contains("tags_changed"),
+            logs.events.iter().any(|e| e.op.contains("tags_changed")),
             "应有 tags_changed 事件"
         );
     });

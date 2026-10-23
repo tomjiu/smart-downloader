@@ -83,10 +83,7 @@ async fn poll_caches_rates_into_stats_and_pause_zeroes() {
     let st = state.stats();
     assert_eq!(st.down_bytes_s, 0, "暂停后聚合下行速率必须清零");
     assert_eq!(st.up_bytes_s, 0, "暂停后聚合上行速率必须清零");
-    assert_eq!(
-        state.task_logs(&tid).unwrap()["state"],
-        serde_json::json!("Paused")
-    );
+    assert_eq!(state.task_logs(&tid).unwrap().state, "Paused");
 }
 
 #[tokio::test]

@@ -55,7 +55,9 @@ scripts/research/xunlei/extracted/
 
 # NAS 校准证据（含个人元数据，不入库；结论已写入 docs/nas/*.md）
 docs/nas/evidence/
-/.cargo/
+# 注：曾忽略整个 /.cargo/ 目录——ts-rs 导出配置（config.toml）因此被静默
+# 吞掉，CI 漂移检查空转（见 tier2 PR 说明）。config.toml 必须入库；
+# 本地个人覆盖请用 ~/.cargo/config.toml（CARGO_HOME 层级），勿改仓库内文件。
 
 # daemon 运行时状态（V9 类）：任务记录 daemon 启动会真实恢复（个人任务数据入库），
 # lock 为 PID 文件——均属本机运行状态，严禁入库

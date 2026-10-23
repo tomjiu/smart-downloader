@@ -2431,29 +2431,48 @@ async fn rss_feed_add(
     }
 }
 
+/// `GET /rss/feeds` 列表条目（原 json! 动态构建，DTO 化纳入 ts-rs 生成）。
+/// wire 逐键一致；`last_refresh_unix` 的 None 序列化为 null（非省略）——
+/// 从未刷新过的订阅为 null。
+#[derive(serde::Serialize, TS)]
+#[ts(export)]
+pub struct RssFeedDto {
+    pub id: u64,
+    pub url: String,
+    pub title: String,
+    pub added_at_unix: u64,
+    pub last_refresh_unix: Option<u64>,
+    // 契约修复（R11-1，2026-10-21）回读字段：PATCH /rss/feeds/:id 可设置
+    // interval_override_secs（batch5.1），订阅卡片以其回显输入框。
+    pub interval_override_secs: u64,
+    pub item_count: usize,
+    pub pending_count: usize,
+}
+
+/// `GET /rss/feeds` 响应包。
+#[derive(serde::Serialize, TS)]
+#[ts(export)]
+pub struct RssFeedsList {
+    pub feeds: Vec<RssFeedDto>,
+}
+
 async fn rss_feeds_list(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let st = state.rss_state().lock();
-    let feeds: Vec<serde_json::Value> = st
+    let feeds: Vec<RssFeedDto> = st
         .feeds
         .iter()
-        .map(|f| {
-            serde_json::json!({
-                "id": f.id,
-                "url": f.url,
-                "title": f.title,
-                "added_at_unix": f.added_at_unix,
-                "last_refresh_unix": f.last_refresh_unix,
-                // 契约修复（R11-1，2026-10-21）：PATCH /rss/feeds/:id 可设置
-                // interval_override_secs（batch5.1），但列表响应从未回读——
-                // UI 类型 RssFeed 有该字段且订阅卡片以其回显输入框，缺字段
-                // = 已设间隔的订阅刷新后显示回 0（写入后不可见的只写字段）。
-                "interval_override_secs": f.interval_override_secs,
-                "item_count": f.items.len(),
-                "pending_count": f.items.iter().filter(|i| i.task_id.is_none()).count(),
-            })
+        .map(|f| RssFeedDto {
+            id: f.id,
+            url: f.url.clone(),
+            title: f.title.clone(),
+            added_at_unix: f.added_at_unix,
+            last_refresh_unix: f.last_refresh_unix,
+            interval_override_secs: f.interval_override_secs,
+            item_count: f.items.len(),
+            pending_count: f.items.iter().filter(|i| i.task_id.is_none()).count(),
         })
         .collect();
-    Json(serde_json::json!({ "feeds": feeds })).into_response()
+    Json(RssFeedsList { feeds }).into_response()
 }
 
 /// 订阅设置更新请求（batch5.1）：interval_override_secs（0 = 跟随全局）。
@@ -2491,30 +2510,50 @@ async fn rss_feed_remove(
     }
 }
 
+/// `GET /rss/items` 列表条目（原 json! 动态构建）：feed 维度 join
+/// （feed_id/feed_title 来自所属订阅）。`pub_date`/`task_id` 的 None
+/// 序列化为 null（非省略）。
+#[derive(serde::Serialize, TS)]
+#[ts(export)]
+pub struct RssItemDto {
+    pub feed_id: u64,
+    pub feed_title: String,
+    pub guid: String,
+    pub title: String,
+    pub url: String,
+    pub pub_date: Option<String>,
+    pub task_id: Option<String>,
+}
+
+/// `GET /rss/items` 响应包。
+#[derive(serde::Serialize, TS)]
+#[ts(export)]
+pub struct RssItemsList {
+    pub items: Vec<RssItemDto>,
+}
+
 async fn rss_items_list(
     State(state): State<Arc<DaemonState>>,
     Query(q): Query<RssItemsQuery>,
 ) -> impl IntoResponse {
     let st = state.rss_state().lock();
-    let items: Vec<serde_json::Value> = st
+    let items: Vec<RssItemDto> = st
         .feeds
         .iter()
         .filter(|f| q.feed_id.map(|id| f.id == id).unwrap_or(true))
         .flat_map(|f| {
-            f.items.iter().map(move |i| {
-                serde_json::json!({
-                    "feed_id": f.id,
-                    "feed_title": f.title,
-                    "guid": i.guid,
-                    "title": i.title,
-                    "url": i.url,
-                    "pub_date": i.pub_date,
-                    "task_id": i.task_id,
-                })
+            f.items.iter().map(move |i| RssItemDto {
+                feed_id: f.id,
+                feed_title: f.title.clone(),
+                guid: i.guid.clone(),
+                title: i.title.clone(),
+                url: i.url.clone(),
+                pub_date: i.pub_date.clone(),
+                task_id: i.task_id.clone(),
             })
         })
         .collect();
-    Json(serde_json::json!({ "items": items })).into_response()
+    Json(RssItemsList { items }).into_response()
 }
 
 async fn rss_rule_add(
@@ -2543,27 +2582,18 @@ async fn rss_rule_add(
     }
 }
 
+/// `GET /rss/rules` 响应包（原 json! 逐字段镜像 rss::RssRule——两形状
+/// 逐键相同，直接复用 crate 类型序列化；None 字段序列化为 null）。
+#[derive(serde::Serialize, TS)]
+#[ts(export)]
+pub struct RssRulesList {
+    pub rules: Vec<smart_dl_rss::RssRule>,
+}
+
 async fn rss_rules_list(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     let st = state.rss_state().lock();
-    let rules: Vec<serde_json::Value> = st
-        .rules
-        .iter()
-        .map(|r| {
-            serde_json::json!({
-                "id": r.id,
-                "name": r.name,
-                "enabled": r.enabled,
-                "must_contain": r.must_contain,
-                "must_not_contain": r.must_not_contain,
-                "feed_id": r.feed_id,
-                "tags": r.tags,
-                "dest": r.dest,
-                "use_regex": r.use_regex,
-                "episode_filter": r.episode_filter,
-            })
-        })
-        .collect();
-    Json(serde_json::json!({ "rules": rules })).into_response()
+    let rules: Vec<smart_dl_rss::RssRule> = st.rules.clone();
+    Json(RssRulesList { rules }).into_response()
 }
 
 async fn rss_rule_remove(

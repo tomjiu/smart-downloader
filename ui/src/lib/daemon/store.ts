@@ -22,6 +22,7 @@ import type {
   SettingsApplyReport,
   Stats,
   TaskListItem,
+  TaskLogs,
   TaskSnapshot,
 } from "./types";
 
@@ -112,16 +113,10 @@ export class DaemonClient {
   remove(id: string, deleteData = false) {
     return req(`/tasks/${id}?delete_data=${deleteData}`, { method: "DELETE" });
   }
-  /// P1 修复（Issue #115）：对齐后端实际返回（state/ops.rs task_logs——
-  /// { task_id, state, source, error, events: [{ at_ms, op, detail }] }）。
-  /// 旧形状 { logs: [{ ts, level, message }] } 从未与后端对过，接上即错。
-  taskLogs(id: string): Promise<{
-    task_id: string;
-    state: string;
-    source: unknown;
-    error: string | null;
-    events: { at_ms: number; op: string; detail: string | null }[];
-  }> {
+  /// P1 修复（Issue #115）：对齐后端实际返回（旧形状 { logs: [{ ts, level,
+  /// message }] } 从未与后端对过，接上即错）。ts-rs 化（第二批）：类型直接
+  /// 来自 Rust TaskLogs DTO——source 由 unknown 收紧为 string（脱敏串）。
+  taskLogs(id: string): Promise<TaskLogs> {
     return req(`/tasks/${id}/logs`);
   }
   /// P0-1 修复（Issue #115）：字段名对齐 http.rs LimitReq

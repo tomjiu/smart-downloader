@@ -47,13 +47,29 @@ pub struct TaskRecord {
 }
 
 /// 任务操作日志条目（`GET /tasks/:id/logs` 返回）。
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, TS)]
+#[ts(export)]
 pub struct TaskEvent {
     /// Unix 毫秒时间戳。
     pub at_ms: u64,
     /// 操作名：add / pause / resume / remove / restored。
     pub op: String,
     pub detail: Option<String>,
+}
+
+/// `GET /tasks/:id/logs` 响应（原 serde_json::json! 动态构建，DTO 化后
+/// 纳入 ts-rs 生成——字段名漂移编译期报错）。wire 与原 json! 逐键一致：
+/// error/events 内 detail 的 None 序列化为 null（非省略）。
+#[derive(Clone, Debug, serde::Serialize, TS)]
+#[ts(export)]
+pub struct TaskLogs {
+    pub task_id: String,
+    /// 状态标签（state_label 口径，如 "Downloading"）。
+    pub state: String,
+    /// 脱敏后的来源串（redacted_debug）。
+    pub source: String,
+    pub error: Option<String>,
+    pub events: Vec<TaskEvent>,
 }
 
 fn now_ms() -> u64 {

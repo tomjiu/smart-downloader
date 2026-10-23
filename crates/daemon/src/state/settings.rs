@@ -147,93 +147,222 @@ pub struct SettingsApplyReport {
 // GET /settings 快照
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// GET /settings 快照 DTO（原 serde_json::json! 动态构建；DTO 化后纳入
+// ts-rs 生成，UI 手写 Settings 类型退役。wire 逐键一致：全部字段恒序列化
+// （无 skip），Option 仅 meta.persist_path（None = 未指定 --config → null）。
+// ---------------------------------------------------------------------------
+
+/// 带宽域：基准限速（用户语义值）+ 备用限速调度窗口 + 引擎实际生效值。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsBandwidthDto {
+    pub max_download_kb_s: u32,
+    pub max_upload_kb_s: u32,
+    pub alt_enabled: bool,
+    pub alt_max_download_kb_s: u32,
+    pub alt_max_upload_kb_s: u32,
+    /// 窗口起点 `HH:MM`（本地时区）。
+    pub alt_from: String,
+    /// 窗口终点 `HH:MM`（本地时区）。
+    pub alt_to: String,
+    /// 适用星期（0=周日 .. 6=周六）；空 = 每天适用。
+    pub alt_days: Vec<u8>,
+    /// 备用窗口当前是否命中（只读展示）。
+    pub alt_active_now: bool,
+    /// 引擎实际生效限速（备用窗口命中时 = 备用值）。
+    pub effective_max_download_kb_s: u32,
+    pub effective_max_upload_kb_s: u32,
+}
+
+/// 连接域：代理（脱敏回显——明文凭据不出设置面）+ BT 监听。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsConnectionDto {
+    pub proxy: String,
+    pub bt_listen_port: u16,
+    pub bt_max_connections: u32,
+}
+
+/// BT 域：发现/传输协议开关 + tracker/做种执法。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsBittorrentDto {
+    pub enable_dht: bool,
+    pub enable_lsd: bool,
+    pub enable_upnp: bool,
+    pub enable_pex: bool,
+    pub enable_utp: bool,
+    /// 加密策略：allow / require / disable。
+    pub encrypt: String,
+    pub extra_trackers: Vec<String>,
+    pub max_share_ratio: f64,
+    pub max_seeding_time_min: u32,
+    /// 存储模式：true = 新任务预分配（batch5，重启生效）。
+    pub storage_allocate: bool,
+    /// 当前构建是否装配 BT 引擎（feature bt）。
+    pub bt_available: bool,
+}
+
+/// 下载域：默认落盘目录 + 预检严格度 + 重定向预算。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsDownloadDto {
+    pub dest_root: String,
+    pub disk_precheck_strict: bool,
+    /// HTTP 重定向最大跳数（batch5，1..=100，重启生效）。
+    pub max_redirects: u32,
+}
+
+/// 清理域：Completed 自动清扫。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsCleanupDto {
+    pub auto_remove_completed_days: u32,
+    /// true = 清扫时保留已下载数据（默认）。
+    pub auto_remove_keep_data: bool,
+}
+
+/// 完成后处理域：移动 + 外部钩子（E27）。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsPostDownloadDto {
+    pub move_to: String,
+    pub hook: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsWebhookDto {
+    pub url: String,
+}
+
+/// 调度域：错峰 + 全终态动作（Task 46）。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsSchedulerDto {
+    pub start_jitter_seconds: u32,
+    /// 全部任务终态后的动作：none/exit/shutdown/sleep/hibernate；每进程
+    /// 会话最多触发一次；空任务表不触发。
+    pub completion_action: String,
+}
+
+/// 队列域（S1）：各引擎同时在传任务上限；0 = 不限。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsQueueDto {
+    pub max_active_bt: u32,
+    pub max_active_http: u32,
+    pub max_active_ftp: u32,
+}
+
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsMetaDto {
+    /// 持久化目标；None = 未指定 --config（PUT 仅运行时生效）。
+    pub persist_path: Option<String>,
+}
+
+/// `GET /settings` 全量快照。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsSnapshot {
+    pub bandwidth: SettingsBandwidthDto,
+    pub connection: SettingsConnectionDto,
+    pub bittorrent: SettingsBittorrentDto,
+    pub download: SettingsDownloadDto,
+    pub cleanup: SettingsCleanupDto,
+    pub post_download: SettingsPostDownloadDto,
+    pub webhook: SettingsWebhookDto,
+    pub scheduler: SettingsSchedulerDto,
+    pub queue: SettingsQueueDto,
+    pub meta: SettingsMetaDto,
+}
+
 impl DaemonState {
     /// 全量设置快照（`GET /settings`）：权威配置（live_config）为底，运行时
     /// 可变值（限速/备用/队列/清理等）以 state 当前值为准——两者在
     /// apply_settings/refresh_config 维护下保持同步。
-    pub fn settings_snapshot(&self) -> serde_json::Value {
+    pub fn settings_snapshot(&self) -> SettingsSnapshot {
         let cfg = self.live_config.lock().clone().unwrap_or_default();
         let base = *self.base_limits.lock();
         let alt = self.alt_cfg.lock().clone();
         let effective = *self.global_limits.lock();
         let queue = self.queue_cfg.lock().clone();
-        serde_json::json!({
-            "bandwidth": {
-                // 基准限速（用户语义值）；引擎实际值见 effective_*
-                "max_download_kb_s": base.max_download_kb_s,
-                "max_upload_kb_s": base.max_upload_kb_s,
-                "alt_enabled": alt.alt_enabled,
-                "alt_max_download_kb_s": alt.alt_max_download_kb_s,
-                "alt_max_upload_kb_s": alt.alt_max_upload_kb_s,
-                "alt_from": alt.alt_from,
-                "alt_to": alt.alt_to,
-                "alt_days": alt.alt_days,
-                // 备用窗口当前是否命中（只读展示）
-                "alt_active_now": self
-                    .alt_active
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                "effective_max_download_kb_s": effective.max_download_kb_s,
-                "effective_max_upload_kb_s": effective.max_upload_kb_s,
+        let cleanup = self.cleanup.lock().clone();
+        SettingsSnapshot {
+            bandwidth: SettingsBandwidthDto {
+                max_download_kb_s: base.max_download_kb_s,
+                max_upload_kb_s: base.max_upload_kb_s,
+                alt_enabled: alt.alt_enabled,
+                alt_max_download_kb_s: alt.alt_max_download_kb_s,
+                alt_max_upload_kb_s: alt.alt_max_upload_kb_s,
+                alt_from: alt.alt_from,
+                alt_to: alt.alt_to,
+                alt_days: alt.alt_days,
+                alt_active_now: self.alt_active.load(std::sync::atomic::Ordering::Relaxed),
+                effective_max_download_kb_s: effective.max_download_kb_s,
+                effective_max_upload_kb_s: effective.max_upload_kb_s,
             },
-            "connection": {
+            connection: SettingsConnectionDto {
                 // batch8（P2）：脱敏回显——代理 URL 可带 user:pass@（与
                 // /config 快照同口径），明文凭据不出设置面。
-                "proxy": smart_dl_core::types::redact_url(&cfg.download.proxy),
-                "bt_listen_port": cfg.bt.listen_port,
-                "bt_max_connections": cfg.bt.max_connections,
+                proxy: smart_dl_core::types::redact_url(&cfg.download.proxy),
+                bt_listen_port: cfg.bt.listen_port,
+                bt_max_connections: cfg.bt.max_connections,
             },
-            "bittorrent": {
-                "enable_dht": cfg.bt.enable_dht,
-                "enable_lsd": cfg.bt.enable_lsd,
-                "enable_upnp": cfg.bt.enable_upnp,
-                "enable_pex": cfg.bt.enable_pex,
-                "enable_utp": cfg.bt.enable_utp,
-                "encrypt": cfg.bt.encrypt,
-                "extra_trackers": cfg.bt.extra_trackers,
-                "max_share_ratio": cfg.bt.max_share_ratio,
-                "max_seeding_time_min": cfg.bt.max_seeding_time_min,
-                "storage_allocate": cfg.bt.storage_allocate,
-                "bt_available": self.engines.contains_key(&EngineKind::Bt),
+            bittorrent: SettingsBittorrentDto {
+                enable_dht: cfg.bt.enable_dht,
+                enable_lsd: cfg.bt.enable_lsd,
+                enable_upnp: cfg.bt.enable_upnp,
+                enable_pex: cfg.bt.enable_pex,
+                enable_utp: cfg.bt.enable_utp,
+                encrypt: cfg.bt.encrypt,
+                extra_trackers: cfg.bt.extra_trackers,
+                max_share_ratio: cfg.bt.max_share_ratio,
+                max_seeding_time_min: cfg.bt.max_seeding_time_min,
+                storage_allocate: cfg.bt.storage_allocate,
+                bt_available: self.engines.contains_key(&EngineKind::Bt),
             },
-            "download": {
-                "dest_root": self.default_dest_root.lock().display().to_string(),
-                "disk_precheck_strict": self.disk_precheck_strict,
-                "max_redirects": cfg.download.max_redirects,
+            download: SettingsDownloadDto {
+                dest_root: self.default_dest_root.lock().display().to_string(),
+                disk_precheck_strict: self.disk_precheck_strict,
+                max_redirects: cfg.download.max_redirects,
             },
-            "cleanup": {
-                "auto_remove_completed_days": self.cleanup.lock().auto_remove_completed_days,
-                "auto_remove_keep_data": self.cleanup.lock().auto_remove_keep_data,
+            cleanup: SettingsCleanupDto {
+                auto_remove_completed_days: cleanup.auto_remove_completed_days,
+                auto_remove_keep_data: cleanup.auto_remove_keep_data,
             },
-            "post_download": {
-                "move_to": self
+            post_download: SettingsPostDownloadDto {
+                move_to: self
                     .post_move_to
                     .lock()
                     .as_deref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default(),
-                "hook": self.post_hook.lock().clone().unwrap_or_default(),
+                hook: self.post_hook.lock().clone().unwrap_or_default(),
             },
-            "webhook": {
-                "url": self.webhook_url.lock().clone().unwrap_or_default(),
+            webhook: SettingsWebhookDto {
+                url: self.webhook_url.lock().clone().unwrap_or_default(),
             },
-            "scheduler": {
-                "start_jitter_seconds": self
+            scheduler: SettingsSchedulerDto {
+                start_jitter_seconds: self
                     .start_jitter_secs
                     .load(std::sync::atomic::Ordering::Relaxed),
-                "completion_action": self.completion_action.lock().clone(),
+                completion_action: self.completion_action.lock().clone(),
             },
-            "queue": {
-                "max_active_bt": queue.max_active_bt,
-                "max_active_http": queue.max_active_http,
-                "max_active_ftp": queue.max_active_ftp,
+            queue: SettingsQueueDto {
+                max_active_bt: queue.max_active_bt,
+                max_active_http: queue.max_active_http,
+                max_active_ftp: queue.max_active_ftp,
             },
-            "meta": {
+            meta: SettingsMetaDto {
                 // 持久化目标；None = 未指定 --config（PUT 仅运行时生效）
-                "persist_path": (*self.config_path.lock())
+                persist_path: (*self.config_path.lock())
                     .as_ref()
                     .map(|p| p.display().to_string()),
             },
-        })
+        }
     }
 }
 
