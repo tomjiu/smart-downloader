@@ -17,8 +17,6 @@ import type {
   ConnectionsReq,
   FilePriorityEntry,
   FilePrioritiesOut,
-  GlobalLimitReq,
-  GlobalLimits,
   LimitReq,
   PeerResults,
   PiecePriorityReq,
@@ -41,7 +39,6 @@ import type {
   SuperSeedingReq,
   TagsReq,
   TaskListItem,
-  TaskLogs,
   TaskSnapshot,
   TrackerEntry,
   TrackersReq,
@@ -134,12 +131,6 @@ export class DaemonClient {
   }
   remove(id: string, deleteData = false) {
     return req(`/tasks/${id}?delete_data=${deleteData}`, { method: "DELETE" });
-  }
-  /// P1 修复（Issue #115）：对齐后端实际返回（旧形状 { logs: [{ ts, level,
-  /// message }] } 从未与后端对过，接上即错）。ts-rs 化（第二批）：类型直接
-  /// 来自 Rust TaskLogs DTO——source 由 unknown 收紧为 string（脱敏串）。
-  taskLogs(id: string): Promise<TaskLogs> {
-    return req(`/tasks/${id}/logs`);
   }
   /// P0-1 修复（Issue #115）：字段名对齐 http.rs LimitReq
   /// （down_kb_s / up_kb_s）。旧字段名 max_download_kb_s / max_upload_kb_s
@@ -404,28 +395,6 @@ export class DaemonClient {
   // 全局
   stats(): Promise<Stats> {
     return req("/stats");
-  }
-  config(): Promise<Record<string, unknown>> {
-    return req("/config");
-  }
-  globalLimits(): Promise<GlobalLimits> {
-    return req("/config/limit");
-  }
-  setGlobalLimits(down: number | null, up: number | null): Promise<GlobalLimits> {
-    const body: GlobalLimitReq = { max_download_kb_s: down, max_upload_kb_s: up };
-    return req("/config/limit", {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-  }
-  version(): Promise<{ name: string; version: string; features?: string[] }> {
-    return req("/version");
-  }
-  providers(): Promise<{ providers: { name: string; enabled: boolean; authenticated?: boolean }[] }> {
-    return req("/providers");
-  }
-  listEvents(limit = 200): Promise<{ events: SchedulerEventEnvelope[] }> {
-    return req(`/events?limit=${limit}`);
   }
 
   // S1 设置面
