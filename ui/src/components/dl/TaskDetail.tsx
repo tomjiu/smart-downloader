@@ -273,10 +273,10 @@ export default function TaskDetail({
                 </b>
                 <div style={{ display: "grid", gap: 8 }}>
                   {task.files.slice(0, FILES_SHOWN).map((f) => (
-                    <div key={f.path}>
+                    <div key={f.rel_path}>
                       <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, gap: 8 }}>
                         <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                          {f.path}
+                          {f.rel_path}
                         </span>
                         <span style={{ flex: "none", fontVariantNumeric: "tabular-nums", color: "var(--fg-3)" }}>
                           {fmtBytes(f.done)} / {fmtBytes(f.size)}

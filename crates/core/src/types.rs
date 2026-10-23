@@ -3,6 +3,7 @@
 use crate::task::DownloadTask;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use ts_rs::TS;
 
 /// 用户提交的下载源（§4）。
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -199,7 +200,8 @@ pub enum Capability {
 }
 
 /// 引擎种类（用于配额与任务标注）。
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub enum EngineKind {
     Bt,
     Http,
@@ -275,7 +277,8 @@ pub enum EngineState {
 }
 
 /// 单文件进度。
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct FileProgress {
     pub rel_path: String,
     pub done: u64,

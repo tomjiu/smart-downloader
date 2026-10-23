@@ -3,10 +3,21 @@
 /// NEXT_PUBLIC_DAEMON 或 localStorage 覆盖；Bearer token 可选。
 
 import type {
+  AddRssRuleReq,
+  AddTaskReq,
+  BatchTaskReq,
+  ConnectionsReq,
+  GlobalLimitReq,
+  GlobalLimits,
+  LimitReq,
+  PiecePriorityReq,
   RssFeed,
+  RssFeedUpdateReq,
   RssItem,
   RssRule,
   SchedulerEventEnvelope,
+  SequentialReq,
+  SetProxyReq,
   Settings,
   SettingsApplyReport,
   Stats,
@@ -81,7 +92,15 @@ export class DaemonClient {
   getTask(id: string): Promise<TaskSnapshot> {
     return req(`/tasks/${id}`);
   }
-  addTask(body: Record<string, unknown>): Promise<{ task_ids: string[] }> {
+  /// ts-rs 生成（#147 §六）：请求体类型来自 Rust 结构体——字段名漂移在
+  /// 编译期报错（旧 addTask 的 Record<string, unknown> 无任何防护）。
+  /// 响应：单任务 = task_ids[0]；metalink = 逐 file 展开（task_ids 多项 +
+  /// count；task_id = 首个，向后兼容）。
+  addTask(body: Partial<AddTaskReq>): Promise<{
+    task_id?: string;
+    task_ids: string[];
+    count?: number;
+  }> {
     return req("/tasks", { method: "POST", body: JSON.stringify(body) });
   }
   pause(id: string) {
@@ -109,11 +128,12 @@ export class DaemonClient {
   /// （down_kb_s / up_kb_s）。旧字段名 max_download_kb_s / max_upload_kb_s
   /// 被 serde 双 #[serde(default)] Option 静默丢弃 → 双 None → 空操作返 200，
   /// UI 显示「限速已应用」但限速从未生效（AddTaskReq 的 down_kb_s 是对的，
-  /// 仅此处写错）。
+  /// 仅此处写错）。ts-rs 后此类型直接来自 Rust，同类漂移编译期即红。
   taskLimit(id: string, down?: number, up?: number) {
+    const body: LimitReq = { down_kb_s: down, up_kb_s: up };
     return req(`/tasks/${id}/limit`, {
       method: "POST",
-      body: JSON.stringify({ down_kb_s: down, up_kb_s: up }),
+      body: JSON.stringify(body),
     });
   }
   /// 批量操作（Issue #115 Phase 1 接入；后端 POST /tasks/batch）。
@@ -125,38 +145,43 @@ export class DaemonClient {
     action: "pause" | "resume" | "remove",
     opts?: { deleteData?: boolean },
   ): Promise<unknown> {
+    const body: BatchTaskReq = {
+      action,
+      ids,
+      delete_data: opts?.deleteData ?? false,
+    };
     return req(`/tasks/batch`, {
       method: "POST",
-      body: JSON.stringify({
-        action,
-        ids,
-        delete_data: opts?.deleteData ?? false,
-      }),
+      body: JSON.stringify(body),
     });
   }
   taskSequential(id: string, on: boolean) {
+    const body: SequentialReq = { sequential: on };
     return req(`/tasks/${id}/sequential`, {
       method: "POST",
-      body: JSON.stringify({ sequential: on }),
+      body: JSON.stringify(body),
     });
   }
   taskConnections(id: string, maxConnections: number) {
+    const body: ConnectionsReq = { max_connections: maxConnections };
     return req(`/tasks/${id}/connections`, {
       method: "POST",
-      body: JSON.stringify({ max_connections: maxConnections }),
+      body: JSON.stringify(body),
     });
   }
   taskProxy(id: string, proxy: string | null) {
+    const body: SetProxyReq = { proxy };
     return req(`/tasks/${id}/proxy`, {
       method: "POST",
-      body: JSON.stringify({ proxy }),
+      body: JSON.stringify(body),
     });
   }
   /// 首尾块优先（batch5 对标 qB）：每文件首/末块优先级；prio 0..=7（0=恢复）
   taskPieceFirstLast(id: string, priority: number) {
+    const body: PiecePriorityReq = { priority };
     return req(`/tasks/${id}/piece-priority`, {
       method: "POST",
-      body: JSON.stringify({ priority }),
+      body: JSON.stringify(body),
     });
   }
 
@@ -177,22 +202,15 @@ export class DaemonClient {
     return req(`/rss/feeds/${id}`, { method: "DELETE" });
   }
   rssUpdateFeed(id: number, intervalOverrideSecs: number) {
+    const body: RssFeedUpdateReq = {
+      interval_override_secs: intervalOverrideSecs,
+    };
     return req(`/rss/feeds/${id}`, {
       method: "PATCH",
-      body: JSON.stringify({ interval_override_secs: intervalOverrideSecs }),
+      body: JSON.stringify(body),
     });
   }
-  rssAddRule(body: {
-    name: string;
-    enabled: boolean;
-    must_contain: string[];
-    must_not_contain: string[];
-    feed_id: number | null;
-    tags: string[];
-    dest: string | null;
-    use_regex: boolean;
-    episode_filter: string | null;
-  }): Promise<{ id: number }> {
+  rssAddRule(body: AddRssRuleReq): Promise<{ id: number }> {
     return req("/rss/rules", { method: "POST", body: JSON.stringify(body) });
   }
   rssRemoveRule(id: number) {
@@ -209,13 +227,14 @@ export class DaemonClient {
   config(): Promise<Record<string, unknown>> {
     return req("/config");
   }
-  globalLimits(): Promise<GlobalLimitsShape> {
+  globalLimits(): Promise<GlobalLimits> {
     return req("/config/limit");
   }
-  setGlobalLimits(down: number | null, up: number | null): Promise<GlobalLimitsShape> {
+  setGlobalLimits(down: number | null, up: number | null): Promise<GlobalLimits> {
+    const body: GlobalLimitReq = { max_download_kb_s: down, max_upload_kb_s: up };
     return req("/config/limit", {
       method: "POST",
-      body: JSON.stringify({ max_download_kb_s: down, max_upload_kb_s: up }),
+      body: JSON.stringify(body),
     });
   }
   version(): Promise<{ name: string; version: string; features?: string[] }> {
@@ -317,7 +336,5 @@ export class DaemonClient {
     };
   }
 }
-
-type GlobalLimitsShape = { max_download_kb_s: number; max_upload_kb_s: number };
 
 export const client = new DaemonClient();

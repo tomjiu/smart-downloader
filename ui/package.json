@@ -7,7 +7,8 @@
     "build": "next build",
     "lint": "next lint",
     "start": "next start",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "gen:types": "cargo test -p smart-dl-core -p smart-dl-provider -p smart-dl-daemon --lib export_bindings"
   },
   "dependencies": {
     "next": "15.5.4",

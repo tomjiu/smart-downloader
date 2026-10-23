@@ -4,12 +4,14 @@
 use serde::{Deserialize, Serialize};
 use smart_dl_core::state_machine::TaskState;
 use smart_dl_provider::ProviderRuntime;
+use ts_rs::TS;
 
 use crate::health::HealthEventKind;
 
 /// 调度器事件（D36 9 类 + ProviderStatus）。
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[ts(export)]
 pub enum SchedulerEvent {
     TaskCreated {
         task_id: String,
@@ -148,7 +150,8 @@ pub fn known_event_type_labels() -> Vec<String> {
 }
 
 /// 带 monotonic seq 的事件信封（D36）。
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct Envelope {
     pub seq: u64,
     pub event: SchedulerEvent,

@@ -4,9 +4,11 @@
 use crate::ownership::FallbackPolicy;
 use crate::types::EngineKind;
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// 评估阶段（§10 三阶段评估 D7）。
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub enum EvalPhase {
     MetadataPending,
     PeerDiscovery,
@@ -14,7 +16,8 @@ pub enum EvalPhase {
 }
 
 /// 对外任务状态（§10，D32：无 PausingAwait/Stalled 值）。
-#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub enum TaskState {
     Queued,
     Evaluating(EvalPhase),

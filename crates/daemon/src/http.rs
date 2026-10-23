@@ -24,10 +24,12 @@ use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use ts_rs::TS;
 
 use crate::state::{known_engine_labels, known_state_labels, BatchAction, ListQuery};
 
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export, optional_fields)]
 pub struct AddTaskReq {
     #[serde(default)]
     pub url: Option<String>,
@@ -244,7 +246,8 @@ pub struct RemoveTrackerQuery {
 /// 任务级限速（`POST /tasks/:id/limit`，P1 能力增强）。
 /// 字段语义：`None` = 不调整该方向；`0` = 不限速；`n` = 上限 n KiB/s。
 /// 合并口径见 `DaemonState::set_task_limits`（快照返回合并后全量配置）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export, optional_fields)]
 pub struct LimitReq {
     #[serde(default)]
     pub down_kb_s: Option<u32>,
@@ -282,7 +285,8 @@ async fn task_limit(
 /// 任务级顺序下载（`POST /tasks/:id/sequential`，边下边播）。
 /// HTTP = 在飞段窗口收紧（运行中任务下轮拾取）；BT = sequential_download flag
 /// （即时生效）；FTP = 不支持（409）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export)]
 pub struct SequentialReq {
     pub sequential: bool,
 }
@@ -290,7 +294,8 @@ pub struct SequentialReq {
 /// 任务级连接数上限（`POST /tasks/:id/connections`，S1-c，qbit 每任务连接数）：
 /// `n > 0` = 上限；`n == 0` = 复位会话级默认。仅 BT 任务（其余 409）；
 /// 即时生效（handle 级参数，metadata 未就绪也可设）；持久化 + 恢复重放。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export)]
 pub struct ConnectionsReq {
     pub max_connections: u32,
 }
@@ -574,7 +579,8 @@ async fn security_ban_import(
 }
 
 /// 首尾块优先请求（batch5）：`{"priority": 7}`（0..=7；0 = 恢复默认）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export)]
 pub struct PiecePriorityReq {
     pub priority: i32,
 }
@@ -677,10 +683,12 @@ async fn task_sequential(
 /// = 设置任务专用 client（覆盖全局）；`{"proxy": null}` 或 `{}` = 清除回共享
 /// client。仅 HTTP 任务（其余 409）；非法 URL 400（不发起连接，纯本地构建
 /// 试水）；下载中任务立即生效（旧循环检查点退出，进度凭段账本恢复）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export, optional_fields)]
 pub struct SetProxyReq {
     /// None（缺省/null）= 清除；空串拒绝（与 add 口径一致）。
     #[serde(default)]
+    #[ts(optional = nullable)]
     pub proxy: Option<String>,
 }
 
@@ -714,19 +722,23 @@ async fn task_set_proxy(
 /// 任务重命名（`POST /tasks/:id/name`，E15）：`{"name": "..."}` = 设置
 /// （V3 校验同 add，非法路径分量 400）；`{"name": null}` 或 `{}` = 清除
 /// 显式名（回退派生链）。显示层改名——落盘路径 add 时已定，不迁移文件。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export, optional_fields)]
 pub struct RenameTaskReq {
     /// None（缺省/null）= 清除；空白拒绝（与 add 口径一致）。
     #[serde(default)]
+    #[ts(optional = nullable)]
     pub name: Option<String>,
 }
 
 /// 任务标签设置（E18，`POST /tasks/:id/tags`）：**替换式**全量覆盖。
 /// `tags` 缺省/null 或空数组 = 清除全部；逐项 trim/去重，单项 1..=64 字符、
 /// 最多 16 个（超限 400）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export, optional_fields)]
 pub struct TagsReq {
     #[serde(default)]
+    #[ts(optional = nullable)]
     pub tags: Option<Vec<String>>,
 }
 
@@ -1279,11 +1291,15 @@ async fn config_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResp
 /// 成功：200 + 当前生效 `{max_download_kb_s, max_upload_kb_s}`；
 /// 下发失败（如 BT settings_pack 错误）：500。不落盘——重启回到配置文件口径；
 /// `GET /config` 快照的两键随生效值同步刷新，`global_limits_changed` 事件广播。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export, optional_fields)]
 pub struct GlobalLimitReq {
+    /// null = 不调整该方向（UI 侧传 null 语义）。
     #[serde(default)]
+    #[ts(optional = nullable)]
     pub max_download_kb_s: Option<u32>,
     #[serde(default)]
+    #[ts(optional = nullable)]
     pub max_upload_kb_s: Option<u32>,
 }
 
@@ -1948,7 +1964,8 @@ async fn list_tasks(
 
 /// 批量操作请求（E7）：action ∈ {pause, resume, remove}；`delete_data` 仅
 /// remove 生效；ids 上限 100、非空；逐项执行单项失败不短路（恒 200 + 逐项结果）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export, optional_fields)]
 struct BatchTaskReq {
     action: String,
     #[serde(default)]
@@ -1964,7 +1981,8 @@ struct BatchTaskReq {
 /// 条件选择器（E19）：与 `GET /tasks` 过滤参数同口径——`state`/`engine`
 /// 走合法标签校验（逗号分隔多值，大小写不敏感）；`tag` 逗号分隔任意串；
 /// `search` 子串。至少提供一个条件（全空 → 400，防 `{}` 误匹配全量任务）。
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, TS)]
+#[ts(export, optional_fields)]
 struct BatchSelect {
     #[serde(default)]
     state: Option<String>,
@@ -2347,7 +2365,8 @@ struct AddRssFeedReq {
     url: String,
 }
 
-#[derive(serde::Deserialize)]
+#[derive(serde::Deserialize, TS)]
+#[ts(export, optional_fields)]
 struct AddRssRuleReq {
     name: String,
     #[serde(default = "default_rule_enabled")]
@@ -2357,16 +2376,19 @@ struct AddRssRuleReq {
     #[serde(default)]
     must_not_contain: Vec<String>,
     #[serde(default)]
+    #[ts(optional = nullable)]
     feed_id: Option<u64>,
     #[serde(default)]
     tags: Vec<String>,
     #[serde(default)]
+    #[ts(optional = nullable)]
     dest: Option<String>,
     /// batch5：关键词按正则解释（qB「使用正则表达式」对标）。
     #[serde(default)]
     use_regex: bool,
     /// batch5：集数过滤（qB「集数过滤」对标），如 `1x02;1x04-1x06`。
     #[serde(default)]
+    #[ts(optional = nullable)]
     episode_filter: Option<String>,
 }
 
@@ -2435,7 +2457,8 @@ async fn rss_feeds_list(State(state): State<Arc<DaemonState>>) -> impl IntoRespo
 }
 
 /// 订阅设置更新请求（batch5.1）：interval_override_secs（0 = 跟随全局）。
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export)]
 pub struct RssFeedUpdateReq {
     #[serde(default)]
     pub interval_override_secs: u64,

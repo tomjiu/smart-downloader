@@ -21,6 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use ts_rs::TS;
 
 use crate::events::SchedulerEvent;
 use crate::ws::WsHub;
@@ -113,16 +114,21 @@ impl TaskRecord {
 }
 
 /// 任务快照（GET /tasks/:id，跳号补拉入口）。
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, TS)]
+#[ts(export)]
 pub struct TaskSnapshot {
     pub task_id: String,
     /// 状态字符串（`Downloading(Http)` → `"Downloading"`；API 消费者无需解析枚举负载）。
     pub state: String,
     pub source: String,
+    /// 线格式为路径字符串（serde 对 PathBuf 透传字符串；ts-rs 无 PathBuf 内建映射）。
+    #[ts(type = "string")]
     pub dest_root: PathBuf,
+    #[ts(optional)]
     pub engine: Option<String>,
     pub done: u64,
     pub total: u64,
+    #[ts(optional)]
     pub error: Option<String>,
     /// 文件级进度（实时读引擎 status().files；单文件/无文件引擎为空数组）。
     /// FTP 目录任务与 BT 多文件任务在此处行为一致（都从引擎状态链透出）。
@@ -132,55 +138,69 @@ pub struct TaskSnapshot {
     /// 恒 0（对齐 `pause()` 清零语义，防 <200ms 平滑窗口的陈旧值毛刺）。
     /// None = 引擎不可达/任务未接入引擎，序列化时省略。
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub rates: Option<TaskRates>,
     /// 累计统计（E33，BT 透出）：任务全生命周期累计下行/上行字节——BT 来自
     /// libtorrent all_time_download/all_time_upload（随 resume data 跨会话
     /// 持久），与 rates 取自同一次引擎快照。HTTP/FTP 等单向引擎无对等统计
     /// 恒 0（序列化省略）。累计非瞬时值，暂停不清零（与 rates 语义相反）。
     #[serde(skip_serializing_if = "is_zero_u64")]
+    #[ts(optional = nullable)]
     pub total_downloaded: u64,
     #[serde(skip_serializing_if = "is_zero_u64")]
+    #[ts(optional = nullable)]
     pub total_uploaded: u64,
     /// 分享率（E33）：total_uploaded / total_downloaded，down 为 0 时 None
     /// （无数据/尚未产生下行，纯上传侧比率无意义）。None 序列化省略。
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub share_ratio: Option<f64>,
     /// 任务级限速配置（KiB/s；None = 未设置走全局）。set 语义见
     /// `DaemonState::set_task_limits`。
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub limits: Option<smart_dl_core::task::TaskLimits>,
     /// 任务名（E7 透出：E6 显式名 / FTP URL 派生 / xunlei import；None = 引擎
     /// 派生链未回填，序列化时省略）。与列表 `TaskSummary::name` 同口径。
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub name: Option<String>,
     /// 用户标签（E18）。与列表 `TaskSummary::tags` 同口径（空省略）。
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[ts(optional = nullable)]
     pub tags: Vec<String>,
     /// BT 子文件优先级表（None = 未设置走 libtorrent 默认 4；Some = 持久化
     /// 全量快照，下标 = 文件序）。set 语义见 `DaemonState::set_task_file_priorities`。
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub file_priorities: Option<Vec<u32>>,
     /// 顺序下载（边下边播）。set 语义见 `DaemonState::set_task_sequential`；
     /// false = 默认并行策略（不序列化，快照向后兼容）。
     #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[ts(optional = nullable)]
     pub sequential: bool,
     /// 任务级连接数上限（S1-c，仅 BT 消费；None = 未设置走会话默认，
     /// 序列化省略）。set 语义见 `DaemonState::set_task_max_connections`。
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub max_connections: Option<u32>,
     /// 定时启动时刻（E23，unix 秒；0 = 未调度，序列化省略）。与列表
     /// `TaskSummary::start_at_unix` 同口径。
     #[serde(skip_serializing_if = "is_zero_u64")]
+    #[ts(optional = nullable)]
     pub start_at_unix: u64,
     /// 已执行自动重试次数（E30；0 = 无，序列化省略）。与列表同口径。
     #[serde(skip_serializing_if = "is_zero_u64")]
+    #[ts(optional = nullable)]
     pub retries: u64,
     /// 自动重试次数上限（E30；0 = 不自动重试，序列化省略）。与列表同口径。
     #[serde(skip_serializing_if = "is_zero_u64")]
+    #[ts(optional = nullable)]
     pub max_retries: u64,
     /// 自动重试到期时刻（E30，unix 秒；0 = 无重试安排，序列化省略）。
     /// 非 0 且状态 Queued = 重试等待中，列表据此可展示「重试中」。
     #[serde(skip_serializing_if = "is_zero_u64")]
+    #[ts(optional = nullable)]
     pub next_retry_at_unix: u64,
 }
 
@@ -188,7 +208,8 @@ pub struct TaskSnapshot {
 /// HTTP/FTP 为引擎侧增量采样值（`RateSample`，快照按需查询与轮询器共用
 /// 同一采样点，<200ms 窗口沿用平滑值），BT 为 FFI 实时值。字段名与
 /// `DaemonStats` 聚合口径一致。
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, TS)]
+#[ts(export)]
 pub struct TaskRates {
     /// 下行速率（B/s）。
     pub down_bytes_s: u64,
@@ -208,7 +229,8 @@ pub fn share_ratio(uploaded: u64, downloaded: u64) -> Option<f64> {
 }
 
 /// 列表条目。
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize, TS)]
+#[ts(export)]
 pub struct TaskSummary {
     pub task_id: String,
     /// 状态字符串（同上）。
@@ -220,21 +242,27 @@ pub struct TaskSummary {
     /// 任务名（E6 显式名 / FTP 单文件 URL 派生 / xunlei import；None = 引擎派生链
     /// （E4 CD → URL 末段）尚未回填，序列化时省略）。
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     pub name: Option<String>,
     /// 用户标签（E18）：空 = 无标签（序列化省略，不产生噪声字段）。
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[ts(optional = nullable)]
     pub tags: Vec<String>,
     /// 定时启动时刻（E23，unix 秒；0 = 未调度，序列化省略）：未到期任务
     /// 停留 Queued 且不入引擎，列表据此可展示「定时中」。
     #[serde(skip_serializing_if = "is_zero_u64")]
+    #[ts(optional = nullable)]
     pub start_at_unix: u64,
     /// 自动重试预算/进度（E30）：`retries`/`max_retries`/`next_retry_at_unix`
     /// 均 0 省略；非 0 = 任务配置了自动重试（或已安排重试）。
     #[serde(skip_serializing_if = "is_zero_u64")]
+    #[ts(optional = nullable)]
     pub retries: u64,
     #[serde(skip_serializing_if = "is_zero_u64")]
+    #[ts(optional = nullable)]
     pub max_retries: u64,
     #[serde(skip_serializing_if = "is_zero_u64")]
+    #[ts(optional = nullable)]
     pub next_retry_at_unix: u64,
 }
 
@@ -330,7 +358,8 @@ pub struct BatchOutcome {
 /// 速率来自引擎快照缓存（`engine_status`，serve 装配 2s 轮询口径），非实时值；
 /// 覆盖 HTTP/FTP（引擎侧增量采样）与 BT（FFI 实时值）的活跃任务
 /// （Downloading/Seeding/Queued），暂停/终态速率清零。
-#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, TS)]
+#[ts(export)]
 pub struct DaemonStats {
     /// 任务总数。
     pub total: usize,
@@ -720,7 +749,8 @@ pub struct DaemonState {
 /// 全局限速总阀门当前值（E16，KiB/s；0 = 不限）。
 /// `max_download_kb_s` = 所有引擎合计下行上限；`max_upload_kb_s` = BT 合计
 /// 上行上限（HTTP/FTP 无上传方向）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, TS)]
+#[ts(export)]
 pub struct GlobalLimits {
     pub max_download_kb_s: u32,
     pub max_upload_kb_s: u32,

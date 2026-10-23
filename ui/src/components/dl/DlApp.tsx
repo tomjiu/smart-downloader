@@ -286,11 +286,14 @@ export default function DlApp() {
         if (type === "speed") {
           const tid = String(env.event.task_id ?? "");
           if (tid) {
+            // ts-rs 精确联合（#147 §六）：speed 变体字段为必填 number；
+            // 取值须在 setRates 回调外完成——属性路径 narrowing 不进闭包。
+            const { down_rate, up_rate } = env.event;
             setRates((cur) => ({
               ...cur,
               [tid]: {
-                down: Number(env.event.down_rate ?? 0),
-                up: Number(env.event.up_rate ?? 0),
+                down: Number(down_rate ?? 0),
+                up: Number(up_rate ?? 0),
                 ts: Date.now(),
               },
             }));

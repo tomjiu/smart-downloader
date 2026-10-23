@@ -6,6 +6,7 @@ use crate::state_machine::TaskState;
 use crate::types::{DownloadSource, EngineKind};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use ts_rs::TS;
 
 /// 任务 id（v1 字符串句柄）。
 pub type TaskId = String;
@@ -68,7 +69,8 @@ fn is_zero_i32(v: &i32) -> bool {
 /// 任务级限速（KiB/s）。语义：`None` = 不调整（保持现状/走全局）；
 /// `Some(0)` = 不限速；`Some(n)` = 上限 n KiB/s。仅对传输方向有意义的一侧生效：
 /// HTTP/FTP 仅 down（up 会被引擎拒绝），BT 双向均可。
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[ts(export)]
 pub struct TaskLimits {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub down_kb_s: Option<u32>,
