@@ -19,12 +19,15 @@ import type {
   FilePriorityEntry,
   FilePrioritiesOut,
   FilePriorityReq,
+  GlobalLimitReq,
+  GlobalLimits,
   LimitReq,
   PeerResults,
   PiecePriorityReq,
   PriorityReq,
   ProbeOut,
   ProbeReq,
+  ProviderStatusDto,
   QueuePriorityOut,
   RemovedUrl,
   RenameTaskReq,
@@ -404,6 +407,27 @@ export class DaemonClient {
   }
 
   // 全局
+  // ---- 全局限速总阀门（E16，运行时热改不落盘）与 Provider 状态（#161 UI 接入）----
+  /// 当前生效限速（POST 双缺省 = 纯查询语义，见 http.rs GlobalLimitReq 注释）。
+  globalLimits(): Promise<GlobalLimits> {
+    const body: GlobalLimitReq = {};
+    return req("/config/limit", { method: "POST", body: JSON.stringify(body) });
+  }
+  /// 热改总阀门：null/缺省 = 不调整该方向；0 = 不限；响应 = 生效值。
+  /// 注意：运行时阀门，不落盘——重启回到设置页的持久化基准。请求体走
+  /// 生成的 GlobalLimitReq（字段名漂移编译期报错）。
+  setGlobalLimits(limits: GlobalLimitReq): Promise<GlobalLimits> {
+    const body: GlobalLimitReq = {
+      max_download_kb_s: limits.max_download_kb_s ?? null,
+      max_upload_kb_s: limits.max_upload_kb_s ?? null,
+    };
+    return req("/config/limit", { method: "POST", body: JSON.stringify(body) });
+  }
+  /// Provider 运行态快照（健康/配额/冷却）。
+  providers(): Promise<ProviderStatusDto[]> {
+    return req("/providers");
+  }
+
   stats(): Promise<Stats> {
     return req("/stats");
   }
