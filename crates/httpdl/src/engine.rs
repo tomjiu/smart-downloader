@@ -20,7 +20,7 @@ use smart_dl_core::identity::ContentIdentity;
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
     Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
-    EngineTaskId, PeerInfo,
+    EngineTaskId, HttpEngineExt, PeerInfo,
 };
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -1109,6 +1109,12 @@ impl DownloadEngine for HttpEngine {
         ]
     }
 
+    /// TD-2 Step 2：HTTP 扩展访问器——`engine.http()` 拿 [`HttpEngineExt`]
+    /// 面（能力询问取代 EngineKind 判断）。
+    fn http(&self) -> Option<&dyn HttpEngineExt> {
+        Some(self)
+    }
+
     async fn add(&self, task: &DownloadTask) -> Result<EngineTaskId, EngineError> {
         let (url, mut headers, backup_url, proxy, auth) = match &task.source {
             DownloadSource::Http {
@@ -1811,3 +1817,8 @@ impl DownloadEngine for HttpEngine {
         Err(EngineError::Unsupported)
     }
 }
+
+// TD-2 Step 2（docs/design/ENGINE-TRAIT-SPLIT.md）：HTTP 扩展面接入。
+// 方法经扩展的转发默认到达上方主 trait 覆写（set_task_proxy——任务级
+// 代理热改，epoch+1 重入语义）；Step 3 主 trait 收缩时本体迁入扩展。
+impl HttpEngineExt for HttpEngine {}

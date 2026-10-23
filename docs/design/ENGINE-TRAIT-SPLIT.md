@@ -1,6 +1,8 @@
 # TD-2 设计提案：`DownloadEngine` trait 拆分（最小契约 + 扩展 trait）
 
-> 状态：**提案——待 tomjiu 决策后实施**
+> 状态：**Step 1 已合并（#131）；Step 2 已落地（零破坏基础设施，本仓库
+> `crates/core/src/types.rs` 的 `BtEngineExt`/`HttpEngineExt` + 访问器）；Step 3
+> （主 trait 收缩 + daemon 调用点迁移）待拍板后实施**
 > 来源：ARCHITECTURE-REVIEW §6 建议 5 / BACKEND A0 TD-2 / 审查 README 优先级 #8
 > 本文档由 TD-2 前置修复（引擎「撒谎」消除，见下）随批产出
 
@@ -116,9 +118,15 @@ bt.force_recheck(&tid).await?;
 1. **Step 1（已完成，本批）**：消灭「撒谎」——`HttpEngine` 与 trait 默认的
    BT 语义方法全部返回 `Unsupported`。行为零变化（daemon 全部调用点已按
    kind 守卫，回归全绿）。
-2. **Step 2**：core 增加 `BtEngineExt`/`HttpEngineExt` + 访问器默认 `None`；
-   `BtEngine`/`HttpEngine` 实现访问器。**trait 面暂不动**（40 方法保持），
-   daemon 侧新代码开始走扩展。零破坏。
+2. **Step 2（已落地）**：core 增加 `BtEngineExt`/`HttpEngineExt` + 访问器默认
+   `None`；`BtEngine`/`HttpEngine` 实现访问器。**trait 面暂不动**（40 方法保持），
+   daemon 侧新代码开始走扩展。零破坏。实施细节与初稿的一处改良：扩展方法的
+   默认实现为**转发**（`DownloadEngine::xxx(self, …)`）而非无默认——引擎侧
+   空 impl 即接入、行为按构造等价；`XunleiBtEngine`（共用 Bt 槽位的部分实现
+   引擎）与 daemon 测试替身 `FakeEngine` 可在 Step 3 迁移调用点前一行接入，
+   行为逐字节不变（已在 `BtEngineExt` 文档注明）。验收测试：
+   `core/tests/engine_ext_defaults.rs`（默认 None）+
+   `daemon/tests/engine_ext_accessors.rs`（bt feature 真 引擎 Some/转发等价）。
 3. **Step 3**：把 5 个 BT 概念必需方法移入 `BtEngineExt`，trait 收缩到
    最小契约；ops.rs 的 52 处判断逐域改写（peers/trackers/webseed/priorities
    /recheck 五个域先行）。全量测试回归 + 锁模型复查（不改锁，只改调用形状）。

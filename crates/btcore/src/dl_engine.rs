@@ -18,8 +18,8 @@
 use crate::{BtCore, TorrentStatus};
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
-    BtSessionPatch, Capability, DownloadEngine, DownloadSource, EngineError, EngineKind,
-    EngineState, EngineStatus, EngineTaskId, FileProgress, PeerInfo, TrackerEntry,
+    BtEngineExt, BtSessionPatch, Capability, DownloadEngine, DownloadSource, EngineError,
+    EngineKind, EngineState, EngineStatus, EngineTaskId, FileProgress, PeerInfo, TrackerEntry,
 };
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -551,6 +551,13 @@ impl DownloadEngine for BtEngine {
         ]
     }
 
+    /// TD-2 Step 2：BT 扩展访问器——`engine.bt()` 拿 [`BtEngineExt`] 面
+    /// （能力询问取代 EngineKind 判断）。方法体见上方主 trait 覆写，
+    /// 经扩展的转发默认到达。
+    fn bt(&self) -> Option<&dyn BtEngineExt> {
+        Some(self)
+    }
+
     async fn add(&self, task: &DownloadTask) -> Result<EngineTaskId, EngineError> {
         // v1 落盘约束：任务级 dest 仅接受默认 "." 或与全局 save_path 一致
         if task.dest_root != Path::new(".") && task.dest_root != self.save_path {
@@ -1059,3 +1066,8 @@ impl DownloadEngine for BtEngine {
             .map_err(|e| EngineError::Other(core_err(&e)))
     }
 }
+
+// TD-2 Step 2（docs/design/ENGINE-TRAIT-SPLIT.md）：BT 扩展面接入。
+// 全部方法经扩展的转发默认到达上方主 trait 覆写（行为按构造等价，
+// 零新增代码路径）；Step 3 主 trait 收缩时本体迁入扩展、转发删除。
+impl BtEngineExt for BtEngine {}
