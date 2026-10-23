@@ -63,7 +63,7 @@ export default function Toolbar({
             className="dl-btn dl-btn--primary"
             aria-expanded={adding}
             aria-controls="dl-add-bar"
-            title={adding ? "收起新建任务栏（Esc）" : "展开新建任务栏"}
+            title={adding ? "收起新建任务栏" : "展开新建任务栏"}
             data-testid="new-task-btn"
             onClick={onNew}
           >

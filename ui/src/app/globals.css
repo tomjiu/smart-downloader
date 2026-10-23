@@ -191,6 +191,12 @@ body {
   cursor: not-allowed;
 }
 
+/* hidden 属性兜底：display 类规则（如 .dl-card 的 grid）会覆盖 UA 样式表
+   的 [hidden]——表单常驻挂载 + hidden 切换（NewTaskForm）依赖此规则 */
+[hidden] {
+  display: none !important;
+}
+
 /* ── 第二梯队（种源管理等）：多行输入与列表件 ── */
 .dl-textarea {
   background: var(--bg);

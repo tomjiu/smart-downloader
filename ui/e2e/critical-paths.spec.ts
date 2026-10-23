@@ -250,4 +250,58 @@ test.describe.serial('关键路径 e2e（真实 daemon + 真实下载）', () =>
     await expect(page.getByTestId('task-name').first()).toContainText('e2e-改名验证', { timeout: 10_000 });
     expect(pageErrors, '页面不得有未捕获异常').toEqual([]);
   });
+
+  test('7. 新建表单：探测预览 + 校验和闸门 + 选项透传 + 收起不丢稿（Wave B）', async ({ page, request }) => {
+    const pageErrors: string[] = [];
+    page.on('pageerror', (e) => pageErrors.push(String(e)));
+    await page.goto('/');
+    await page.getByTestId('new-task-btn').click();
+    const urlInput = page.getByTestId('add-url-input');
+    await expect(urlInput).toBeVisible();
+    await expect(urlInput).toBeFocused();
+
+    // 7a. 探测预览：大小/落盘名/断点续传（真实探测，不建任务）
+    await urlInput.fill(`${FILE}/small.bin`);
+    await page.getByTestId('probe-btn').click();
+    const probe = page.getByTestId('probe-result');
+    await expect(probe).toBeVisible({ timeout: 10_000 });
+    await expect(probe).toContainText('small.bin');
+    await expect(probe).toContainText('1.0 MiB');
+    // 预览不建任务：任务列表仍空
+    await expect(page.getByTestId('task-row')).toHaveCount(0);
+
+    // 7b. 校验和闸门：非法长度 → 提交禁用 + 错误提示；修正 → 恢复
+    await page.getByTestId('advanced-toggle').click();
+    const checksum = page.getByTestId('checksum-input');
+    await checksum.fill('zz');
+    await expect(page.getByText('SHA-256 须为 64 位十六进制（当前 2 位）')).toBeVisible();
+    await expect(page.getByTestId('add-submit')).toBeDisabled();
+    await checksum.fill(''); // 清空（本用例不测哈希失败链——避免任务落入校验失败重试）
+
+    // 7c. 自动重试透传：填 3 → 提交 → 任务快照 max_retries=3（API 回显）
+    await page.getByTestId('auto-retry-input').fill('3');
+    await page.getByTestId('add-submit').click();
+    await expect(urlInput).toBeHidden({ timeout: 10_000 });
+    const row = page.getByTestId('task-row').first();
+    await expect(row).toHaveAttribute('data-task-state', 'Completed', { timeout: 30_000 });
+    const list = (await request.get(`${BASE}/tasks`).then((r) => r.json())) as Array<{
+      task_id: string;
+    }>;
+    const snap = (await request.get(`${BASE}/tasks/${list[0].task_id}`).then((r) => r.json())) as {
+      max_retries?: number;
+    };
+    expect(snap.max_retries, 'auto_retry 必须落到任务配置（API 回显）').toBe(3);
+
+    // 7d. Esc 不收表单（防误触丢稿）+ 收起不丢稿（常驻挂载）
+    await page.getByTestId('new-task-btn').click();
+    await urlInput.fill(`${FILE}/another-url-draft.bin`);
+    await urlInput.press('Escape');
+    await expect(urlInput).toBeVisible(); // Esc 后表单仍在
+    await page.getByRole('button', { name: '取消', exact: true }).click();
+    await expect(urlInput).toBeHidden();
+    await page.getByTestId('new-task-btn').click();
+    await expect(urlInput).toHaveValue(`${FILE}/another-url-draft.bin`, { timeout: 5_000 });
+    // 草稿不提交——清场（afterEach 删任务）；这里只验证草稿留存
+    expect(pageErrors, '页面不得有未捕获异常').toEqual([]);
+  });
 });

@@ -263,7 +263,6 @@ export default function TaskDetail({
                         setEditingName(false);
                       }
                     }}
-                    onBlur={() => setEditingName(false)}
                   />
                   <button
                     type="button"
@@ -271,7 +270,6 @@ export default function TaskDetail({
                     aria-label="保存任务名"
                     data-testid="rename-save"
                     disabled={!nameDraft.trim() || nameDraft.trim() === (task.name ?? displayName(task))}
-                    onMouseDown={(e) => e.preventDefault()}
                     onClick={saveName}
                   >
                     <Icon name="check" size={13} />
@@ -331,14 +329,12 @@ export default function TaskDetail({
                           setEditingTags(false);
                         }
                       }}
-                      onBlur={() => setEditingTags(false)}
                     />
                     <button
                       type="button"
                       className="dl-btn dl-btn--primary"
                       aria-label="保存标签"
                       data-testid="tags-save"
-                      onMouseDown={(e) => e.preventDefault()}
                       onClick={saveTags}
                     >
                       <Icon name="check" size={12} />

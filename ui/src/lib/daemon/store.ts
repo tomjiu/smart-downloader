@@ -18,6 +18,8 @@ import type {
   PeerResults,
   PiecePriorityReq,
   PriorityReq,
+  ProbeOut,
+  ProbeReq,
   QueuePriorityOut,
   RemovedUrl,
   RenameTaskReq,
@@ -324,6 +326,13 @@ export class DaemonClient {
     a.remove();
     setTimeout(() => URL.revokeObjectURL(blobUrl), 30_000);
     return name;
+  }
+
+  /// 探测预览（E31，第二梯队新建表单）：不建任务，取大小/建议名/
+  /// Range 支持（headers/proxy/auth 同 add 语义随探测下发——预览即验证
+  /// 反防盗链配置是否有效）。非 2xx 抛错误（req 统一错误提取）。
+  probe(body: Partial<ProbeReq>): Promise<ProbeOut> {
+    return req("/probe", { method: "POST", body: JSON.stringify(body) });
   }
 
   // ---- RSS ----
