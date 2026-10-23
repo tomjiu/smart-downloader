@@ -36,6 +36,7 @@ use serde::Deserialize;
 use serde_json::json;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use ts_rs::TS;
 
 /// 登录页会话状态（axum State 共享）。
 pub struct LoginSession {
@@ -259,7 +260,10 @@ async fn status(State(sess): State<Arc<LoginSession>>) -> impl IntoResponse {
     }
 }
 
-#[derive(Deserialize)]
+/// #161 契约守卫：登录页端点也是 wire 契约（消费方为本 crate 渲染的
+/// 内嵌页面 JS），统一纳入 ts-rs 免特例。
+#[derive(Deserialize, TS)]
+#[ts(export)]
 struct PwdReq {
     username: String,
     password: String,
@@ -275,7 +279,9 @@ async fn pwd_login(
     }
 }
 
-#[derive(Deserialize)]
+/// #161 契约守卫：同 PwdReq。
+#[derive(Deserialize, TS)]
+#[ts(export)]
 struct SmsSendReq {
     phone: String,
 }
@@ -294,7 +300,9 @@ async fn sms_send(
     }
 }
 
-#[derive(Deserialize)]
+/// #161 契约守卫：同 PwdReq。
+#[derive(Deserialize, TS)]
+#[ts(export)]
 struct SmsVerifyReq {
     phone: String,
     code: String,

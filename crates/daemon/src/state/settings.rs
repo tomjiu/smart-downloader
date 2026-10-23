@@ -25,8 +25,9 @@ use smart_dl_core::types::BtSessionPatch;
 use ts_rs::TS;
 
 /// `PUT /settings` 请求体：各域可选，域内字段可选（None = 不调整）。
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, TS)]
 #[serde(default)]
+#[ts(export, optional_fields)]
 pub struct SettingsReq {
     pub bandwidth: Option<BandwidthReq>,
     pub connection: Option<ConnectionReq>,
@@ -41,8 +42,9 @@ pub struct SettingsReq {
     pub persist: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, TS)]
 #[serde(default)]
+#[ts(export, optional_fields)]
 pub struct BandwidthReq {
     pub max_download_kb_s: Option<u32>,
     pub max_upload_kb_s: Option<u32>,
@@ -54,8 +56,9 @@ pub struct BandwidthReq {
     pub alt_days: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, TS)]
 #[serde(default)]
+#[ts(export, optional_fields)]
 pub struct ConnectionReq {
     /// 全局代理 URL；空串 = 清除代理（直连）。
     pub proxy: Option<String>,
@@ -63,8 +66,9 @@ pub struct ConnectionReq {
     pub bt_max_connections: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, TS)]
 #[serde(default)]
+#[ts(export, optional_fields)]
 pub struct BtSessionReq {
     pub enable_dht: Option<bool>,
     pub enable_lsd: Option<bool>,
@@ -83,8 +87,9 @@ pub struct BtSessionReq {
     pub storage_allocate: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, TS)]
 #[serde(default)]
+#[ts(export, optional_fields)]
 pub struct DownloadReq {
     pub dest_root: Option<String>,
     pub disk_precheck_strict: Option<bool>,
@@ -92,28 +97,32 @@ pub struct DownloadReq {
     pub max_redirects: Option<u32>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, TS)]
 #[serde(default)]
+#[ts(export, optional_fields)]
 pub struct CleanupReq {
     pub auto_remove_completed_days: Option<u32>,
     pub auto_remove_keep_data: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, TS)]
 #[serde(default)]
+#[ts(export, optional_fields)]
 pub struct PostDownloadReq {
     pub move_to: Option<String>,
     pub hook: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, TS)]
 #[serde(default)]
+#[ts(export, optional_fields)]
 pub struct WebhookReq {
     pub url: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, TS)]
 #[serde(default)]
+#[ts(export, optional_fields)]
 pub struct SchedulerReq {
     pub start_jitter_seconds: Option<u32>,
     /// 全部任务终态后动作（Task 46）：none/exit/shutdown/sleep/hibernate；
@@ -121,8 +130,9 @@ pub struct SchedulerReq {
     pub completion_action: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, TS)]
 #[serde(default)]
+#[ts(export, optional_fields)]
 pub struct QueueReq {
     pub max_active_bt: Option<u32>,
     pub max_active_http: Option<u32>,

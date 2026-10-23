@@ -37,6 +37,7 @@ import type {
   SetProxyReq,
   Settings,
   SettingsApplyReport,
+  SettingsReq,
   Stats,
   SuperSeedingReq,
   TagsReq,
@@ -411,10 +412,9 @@ export class DaemonClient {
   settings(): Promise<Settings> {
     return req("/settings");
   }
-  putSettings(
-    patch: Record<string, unknown>,
-    persist = true,
-  ): Promise<SettingsApplyReport> {
+  /// 请求体走生成的 SettingsReq（#161：PUT /settings 全 Option 静默忽略
+  /// 未知键——UI 拼错字段名 = 空操作，字段名漂移必须在编译期报错）。
+  putSettings(patch: SettingsReq, persist = true): Promise<SettingsApplyReport> {
     return req(`/settings?persist=${persist}`, {
       method: "PUT",
       body: JSON.stringify(patch),
