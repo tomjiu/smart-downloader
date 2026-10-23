@@ -2481,7 +2481,11 @@ async fn providers(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
 
 // ===== RSS 订阅自动下载（qbit RSS 对标，v1）=====
 
-#[derive(serde::Deserialize)]
+/// #161 审查发现：与当初 P0（max_download_kb_s vs down_kb_s 静默丢弃）完全同构
+/// 的风险点——UI 发 `{ url }` 当前恰好对得上，但任何一方改名 TS 编译期不报错，
+/// RSS 订阅静默失效。纳入 ts-rs 生成，让字段名漂移回到编译期。
+#[derive(serde::Deserialize, TS)]
+#[ts(export)]
 struct AddRssFeedReq {
     url: String,
 }
