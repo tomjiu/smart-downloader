@@ -28,9 +28,9 @@
 | bclink 多协议 URL 统一解析 | r1 ANALYSIS §2 | `r1/src/bclink_url_parser.py` | 通用化并入 `core/src/sniffer.rs`（scheme 直判 + 网盘分享识别）+ `core/src/source_parse/`（thunder/qqdl/ed2k） | ✅（以 sniffer 形态落地） |
 | P2SP 多源合并下载 | r1 ANALYSIS §3 | `r1/src/p2sp_downloader.py` | httpdl 多连接/镜像/备用源兜底 + F5.1 web seed 注入（BT+直链混合） | ✅（等价能力已有） |
 | LT-Seeding 长效做种协议 | r1 ANALYSIS §4.1 + r2 BCSP 云端 announce | `r1/src/lt_seed_protocol.py`、`r2/src/lt_seed_cloud_client.py` | — | 📋 需 btcore 自研扩展协议门控（libtorrent 无此概念），远期 |
-| 自适应磁盘缓存 | r1 ANALYSIS §4.3 | `r1/src/adaptive_disk_cache.py` | `core/src/strategy.rs::DiskCacheAdvice`（纯函数建议器，7 单测）+ `btcore::strategy` 门面 | ✅ |
+| 自适应磁盘缓存 | r1 ANALYSIS §4.3 | `r1/src/adaptive_disk_cache.py` | `btcore/src/strategy.rs::DiskCacheAdvice`（纯函数建议器，7 单测；原在 core，建议 7 迁回） | ✅ |
 | 4 优先级磁盘缓存桶 | r2 ANALYSIS §磁盘 | `r2/src/disk_cache_priority.py` | 并入 `strategy.rs`（CacheProfile→优先级桶参数建议） | ✅ |
-| 分级反吸血过滤器 | r1 ANALYSIS §4.7 | `r1/src/anti_leech_filter.py` | `core/src/strategy.rs::AntiLeechAdvice`（choking/ban 参数建议，7 单测覆盖两 advice） | ✅ |
+| 分级反吸血过滤器 | r1 ANALYSIS §4.7 | `r1/src/anti_leech_filter.py` | `btcore/src/strategy.rs::AntiLeechAdvice`（choking/ban 参数建议，7 单测覆盖两 advice） | ✅ |
 | Peer 广播优化 + 增量 PEX + NAT 打洞 | r1 §4.5 + r2 `pex_full_protocol.py`/`repeater_ws_protocol.py` | 同左 | — | 🔶 原型待接（集成点：btcore pex 扩展；libtorrent 2.x 内建 PEX，增量版属自研扩展） |
 | UTP 拥塞诊断 | r1 §4.6 | `r1/src/utp_diagnostics.py` | — | 🔶 原型待接（诊断工具，非运行时组件） |
 | 多源 Peer 发现扩展 | r1 §4.8 | `r1/src/peer_discovery_extender.py` | 概念并入 `core/src/sniffer.rs` 多源发现规则 + HTTP 镜像发现已有 | ✅（等价） |
@@ -90,7 +90,7 @@
 | # | 落地物 | 文件 | 测试 |
 |---|--------|------|------|
 | 1 | 协议嗅探引擎（FileCentipede） | `crates/core/src/sniffer.rs`（606 行） | 13 |
-| 2 | BitComet 策略建议器（缓存+反吸血） | `crates/core/src/strategy.rs`（329 行）+ `crates/btcore/src/strategy.rs` 门面 | 7 |
+| 2 | BitComet 策略建议器（缓存+反吸血） | `crates/btcore/src/strategy.rs`（329 行本体，Task 5-d 曾回退 core、建议 7 迁回，门面回收） | 7 |
 | 3 | 夸克网盘 Provider 全链 | `crates/provider/src/quark/`（4 文件 1077 行） | 10 |
 | 4 | 迅雷原生登录三模式（用户需求 Q1） | `provider/src/xunlei/{login_flow,login_page}.rs` + HTML + daemon `xunlei_login.rs` + CLI | 9（含 2 个 mock e2e） |
 | 5 | ed2k 链接解析 | `core/src/source_parse/ed2k.rs` | 含于 core 88 测试 |
