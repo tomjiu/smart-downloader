@@ -755,8 +755,12 @@ impl DaemonState {
         if !matches!(st.state, smart_dl_core::types::EngineState::Seeding) {
             return;
         }
-        let ratio_limit = engine.seeding_ratio_limit();
-        let time_limit_min = engine.seeding_time_limit();
+        // 能力询问（TD-2 Step 3）：做种限制只在 BT 扩展面上；非 BT 引擎
+        // 双 None → 提前返回（与旧主 trait 默认 None 同构）。
+        let (ratio_limit, time_limit_min) = match engine.bt() {
+            Some(bt) => (bt.seeding_ratio_limit(), bt.seeding_time_limit()),
+            None => (None, None),
+        };
         if ratio_limit.is_none() && time_limit_min.is_none() {
             return;
         }

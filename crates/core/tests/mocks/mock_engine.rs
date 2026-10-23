@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{Capability, DownloadEngine, EngineError, EngineKind, EngineStatus};
-use std::net::SocketAddr;
 
 pub struct MockEngine {
     pub id: String,
@@ -129,26 +128,7 @@ impl DownloadEngine for MockEngine {
         Ok(())
     }
 
-    async fn peers(
-        &self,
-        _id: &String,
-    ) -> Result<Vec<smart_dl_core::types::PeerInfo>, EngineError> {
-        Ok(Vec::new())
-    }
-
     async fn update_sources(&self, _id: &String, _urls: Vec<String>) -> Result<(), EngineError> {
         Ok(())
-    }
-
-    async fn add_url_seed(&self, _id: &String, _url: &str) -> Result<(), EngineError> {
-        Ok(())
-    }
-
-    async fn ban_peer(&self, _id: &String, _peer: SocketAddr) -> Result<(), EngineError> {
-        Ok(())
-    }
-
-    async fn read_piece(&self, _id: &String, _idx: u32) -> Result<Vec<u8>, EngineError> {
-        Ok(Vec::new())
     }
 }

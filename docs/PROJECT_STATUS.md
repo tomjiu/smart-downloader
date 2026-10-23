@@ -49,7 +49,7 @@
 
 - `crates/daemon/src/main.rs` — 服务/客户端入口
 - `crates/daemon/src/cli.rs` — 命令集（含 `import-xunlei`）
-- `crates/core/src/types.rs` — `DownloadEngine` trait（M3/M5/M6 消费）
+- `crates/core/src/types.rs` — `DownloadEngine` 最小契约 + `BtEngineExt`/`HttpEngineExt` 扩展 trait（TD-2，`docs/design/ENGINE-TRAIT-SPLIT.md`）
 - `crates/core/src/source_parse/normalize.rs` — 链接归一化
 - `docs/CAPABILITY_MAP.md` — 远期能力地图（BiglyBT/aria2/eMule 对标）
 
@@ -252,7 +252,7 @@ Release 页面：
 
 ### 云分析推荐工作流
 
-1. **通用下载器主线**：从 `crates/core/src/types.rs` 的 `DownloadEngine` trait 开始，理解 add/pause/resume/status/remove/peers 统一抽象
+1. **通用下载器主线**：从 `crates/core/src/types.rs` 的 `DownloadEngine` trait 开始，理解 add/pause/resume/status/remove 统一抽象（BT/HTTP 语义方法在 `BtEngineExt`/`HttpEngineExt` 扩展面上，`bt()`/`http()` 能力询问）
 2. **Windows 迅雷绑定**：`crates/xunlei-ffi/src/` 全套，已验证可编译运行
 3. **macOS 逆向**：`docs/research/xunlei/macos_abi_reverse.md` + `research_bin/macos/` 二进制
 4. **登录方案**：`docs/research/xunlei/CREDENTIAL_HUNTING.md` + `crates/provider/src/xunlei/client.rs`

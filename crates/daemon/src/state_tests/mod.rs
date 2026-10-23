@@ -2,6 +2,7 @@
 //! 外壳 use super::* 使各测试 mod 的 `use super::*` 名字解析与原结构一致：
 //! 子模块 glob 可见父模块（外壳）私有 use 导入 → 最终全部指向 state 模块。
 use super::*;
+use smart_dl_core::types::{BtEngineExt, HttpEngineExt};
 // 技术债 #2 第三步：测试区按 mod 拆分至本目录（一 mod 一文件，纯移动）。
 // 路径不变：state_tests::{tests,bt_alert_tests,...}；子 mod 的
 // `use super::*` 现指向本外壳，glob 解析链与原单文件结构同构。
@@ -340,55 +341,7 @@ impl DownloadEngine for FakeEngine {
         Ok(())
     }
 
-    async fn set_task_proxy(
-        &self,
-        id: &EngineTaskId,
-        proxy: Option<String>,
-    ) -> Result<(), smart_dl_core::types::EngineError> {
-        self.proxy_sets.lock().push((id.to_string(), proxy));
-        Ok(())
-    }
-
     /// 连接数上限（S1-c）：记录 (engine_tid, n) 供断言；恒成功。
-    async fn set_max_connections(
-        &self,
-        id: &EngineTaskId,
-        n: u32,
-    ) -> Result<(), smart_dl_core::types::EngineError> {
-        self.max_conn.lock().push((id.to_string(), n));
-        Ok(())
-    }
-
-    fn seeding_ratio_limit(&self) -> Option<f64> {
-        *self.seeding_ratio_limit.lock()
-    }
-
-    fn seeding_time_limit(&self) -> Option<u32> {
-        *self.seeding_time_limit.lock()
-    }
-
-    async fn ban_ip(&self, ip: &str) -> Result<(), smart_dl_core::types::EngineError> {
-        self.do_ban(ip).await
-    }
-
-    async fn unban_ip(&self, ip: &str) -> Result<(), smart_dl_core::types::EngineError> {
-        self.bans.lock().retain(|b| b != ip);
-        Ok(())
-    }
-
-    async fn ban_ip_range(
-        &self,
-        start: &str,
-        end: &str,
-    ) -> Result<(), smart_dl_core::types::EngineError> {
-        self.do_ban(&format!("{start}-{end}")).await
-    }
-    async fn peers(
-        &self,
-        _id: &EngineTaskId,
-    ) -> Result<Vec<smart_dl_core::types::PeerInfo>, smart_dl_core::types::EngineError> {
-        Ok(vec![])
-    }
     async fn update_sources(
         &self,
         _id: &EngineTaskId,
@@ -396,16 +349,6 @@ impl DownloadEngine for FakeEngine {
     ) -> Result<(), smart_dl_core::types::EngineError> {
         Ok(())
     }
-    async fn add_url_seed(
-        &self,
-        id: &EngineTaskId,
-        url: &str,
-    ) -> Result<(), smart_dl_core::types::EngineError> {
-        // 记录（engine_tid, url）供测试断言逐条转发
-        self.url_seeds.lock().push((id.clone(), url.to_string()));
-        Ok(())
-    }
-
     async fn set_limits(
         &self,
         id: &EngineTaskId,
@@ -430,64 +373,15 @@ impl DownloadEngine for FakeEngine {
         Ok(())
     }
 
-    async fn set_file_priorities(
-        &self,
-        id: &EngineTaskId,
-        priorities: &[(usize, u32)],
-    ) -> Result<(), smart_dl_core::types::EngineError> {
-        // readback 错误态同步反映到 set（真实 BT 引擎 metadata 未就绪时
-        // set/read 同样失败）——pending 重放测试依赖该一致性
-        if let Some(Err(e)) = &*self.prio_readback.lock() {
-            return Err(e.clone());
-        }
-        self.prio_calls
-            .lock()
-            .push((id.clone(), priorities.to_vec()));
-        Ok(())
+    /// TD-2 Step 3：按构造 kind 条件声明扩展面——Bt 槽替身暴露 BT 面、
+    /// Http 槽替身暴露 HTTP 面（Ftp/Sftp 替身两面皆无），与真引擎的槽位
+    /// 能力语义一致；daemon 侧 bt()/http() 能力询问对替身与真引擎同构。
+    fn bt(&self) -> Option<&dyn BtEngineExt> {
+        (self.kind == EngineKind::Bt).then_some(self)
     }
 
-    async fn file_priorities(
-        &self,
-        _id: &EngineTaskId,
-    ) -> Result<Vec<Option<u32>>, smart_dl_core::types::EngineError> {
-        match &*self.prio_readback.lock() {
-            None => Ok(vec![Some(4)]), // 默认就绪：单文件表
-            Some(Ok(v)) => Ok(v.clone()),
-            Some(Err(e)) => Err(e.clone()),
-        }
-    }
-    async fn add_peer(
-        &self,
-        _id: &EngineTaskId,
-        _peer: std::net::SocketAddr,
-    ) -> Result<(), smart_dl_core::types::EngineError> {
-        Ok(())
-    }
-    async fn ban_peer(
-        &self,
-        _id: &EngineTaskId,
-        _peer: std::net::SocketAddr,
-    ) -> Result<(), smart_dl_core::types::EngineError> {
-        Ok(())
-    }
-    async fn read_piece(
-        &self,
-        _id: &EngineTaskId,
-        _idx: u32,
-    ) -> Result<Vec<u8>, smart_dl_core::types::EngineError> {
-        Ok(vec![])
-    }
-
-    async fn add_xunlei_resume(
-        &self,
-        data: Vec<u8>,
-    ) -> Result<EngineTaskId, smart_dl_core::types::EngineError> {
-        self.xunlei.lock().push(data);
-        Ok(format!(
-            "xr{}",
-            self.counter
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-        ))
+    fn http(&self) -> Option<&dyn HttpEngineExt> {
+        (self.kind == EngineKind::Http).then_some(self)
     }
 }
 
@@ -525,3 +419,120 @@ mod task_rename_tests;
 mod tests;
 mod torrent_tests;
 mod webseed_tests;
+
+#[async_trait::async_trait]
+impl BtEngineExt for FakeEngine {
+    /// 连接数上限（S1-c）：记录 (engine_tid, n) 供断言；恒成功。
+    async fn set_max_connections(
+        &self,
+        id: &EngineTaskId,
+        n: u32,
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        self.max_conn.lock().push((id.to_string(), n));
+        Ok(())
+    }
+    fn seeding_ratio_limit(&self) -> Option<f64> {
+        *self.seeding_ratio_limit.lock()
+    }
+    fn seeding_time_limit(&self) -> Option<u32> {
+        *self.seeding_time_limit.lock()
+    }
+    async fn ban_ip(&self, ip: &str) -> Result<(), smart_dl_core::types::EngineError> {
+        self.do_ban(ip).await
+    }
+    async fn unban_ip(&self, ip: &str) -> Result<(), smart_dl_core::types::EngineError> {
+        self.bans.lock().retain(|b| b != ip);
+        Ok(())
+    }
+    async fn ban_ip_range(
+        &self,
+        start: &str,
+        end: &str,
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        self.do_ban(&format!("{start}-{end}")).await
+    }
+    async fn peers(
+        &self,
+        _id: &EngineTaskId,
+    ) -> Result<Vec<smart_dl_core::types::PeerInfo>, smart_dl_core::types::EngineError> {
+        Ok(vec![])
+    }
+    async fn add_url_seed(
+        &self,
+        id: &EngineTaskId,
+        url: &str,
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        // 记录（engine_tid, url）供测试断言逐条转发
+        self.url_seeds.lock().push((id.clone(), url.to_string()));
+        Ok(())
+    }
+    async fn set_file_priorities(
+        &self,
+        id: &EngineTaskId,
+        priorities: &[(usize, u32)],
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        // readback 错误态同步反映到 set（真实 BT 引擎 metadata 未就绪时
+        // set/read 同样失败）——pending 重放测试依赖该一致性
+        if let Some(Err(e)) = &*self.prio_readback.lock() {
+            return Err(e.clone());
+        }
+        self.prio_calls
+            .lock()
+            .push((id.clone(), priorities.to_vec()));
+        Ok(())
+    }
+    async fn file_priorities(
+        &self,
+        _id: &EngineTaskId,
+    ) -> Result<Vec<Option<u32>>, smart_dl_core::types::EngineError> {
+        match &*self.prio_readback.lock() {
+            None => Ok(vec![Some(4)]), // 默认就绪：单文件表
+            Some(Ok(v)) => Ok(v.clone()),
+            Some(Err(e)) => Err(e.clone()),
+        }
+    }
+    async fn add_peer(
+        &self,
+        _id: &EngineTaskId,
+        _peer: std::net::SocketAddr,
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        Ok(())
+    }
+    async fn ban_peer(
+        &self,
+        _id: &EngineTaskId,
+        _peer: std::net::SocketAddr,
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        Ok(())
+    }
+    async fn read_piece(
+        &self,
+        _id: &EngineTaskId,
+        _idx: u32,
+    ) -> Result<Vec<u8>, smart_dl_core::types::EngineError> {
+        Ok(vec![])
+    }
+    async fn add_xunlei_resume(
+        &self,
+        data: Vec<u8>,
+    ) -> Result<EngineTaskId, smart_dl_core::types::EngineError> {
+        self.xunlei.lock().push(data);
+        Ok(format!(
+            "xr{}",
+            self.counter
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl HttpEngineExt for FakeEngine {
+    async fn set_task_proxy(
+        &self,
+        id: &EngineTaskId,
+        proxy: Option<String>,
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        self.proxy_sets.lock().push((id.to_string(), proxy));
+        Ok(())
+    }
+}

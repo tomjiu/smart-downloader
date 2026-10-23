@@ -26,8 +26,8 @@ impl DaemonState {
                     let already = self.bt_bans.lock().contains(&c);
                     if already {
                         Ok(()) // 幂等：已封禁直接成功
-                    } else if let Some(eng) = engine.as_ref() {
-                        match eng.ban_ip(&c).await {
+                    } else if let Some(bt) = engine.as_ref().and_then(|e| e.bt()) {
+                        match bt.ban_ip(&c).await {
                             Ok(()) => {
                                 // 引擎成功后确认式入列（双重 contains 防御并发窗口）
                                 let mut bans = self.bt_bans.lock();
@@ -69,8 +69,8 @@ impl DaemonState {
                     let present = self.bt_bans.lock().contains(&c);
                     if !present {
                         Ok(()) // 幂等：未封禁也算成功
-                    } else if let Some(eng) = engine.as_ref() {
-                        match eng.unban_ip(&c).await {
+                    } else if let Some(bt) = engine.as_ref().and_then(|e| e.bt()) {
+                        match bt.unban_ip(&c).await {
                             Ok(()) => {
                                 self.bt_bans.lock().retain(|b| b != &c);
                                 removed = true;
@@ -116,12 +116,11 @@ impl DaemonState {
                 ));
                 continue;
             };
-            if engine.is_none() {
+            let Some(bt) = engine.as_ref().and_then(|e| e.bt()) else {
                 errors.push("BT 引擎不可用（feature 未启用）".into());
                 break;
-            }
-            let eng = engine.as_ref().unwrap();
-            match eng.ban_ip_range(&a, &b).await {
+            };
+            match bt.ban_ip_range(&a, &b).await {
                 Ok(()) => {
                     let entry = format!("{a}-{b}");
                     let mut bans = self.bt_bans.lock();

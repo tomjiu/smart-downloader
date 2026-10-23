@@ -20,10 +20,9 @@ use smart_dl_core::identity::ContentIdentity;
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
     Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
-    EngineTaskId, HttpEngineExt, PeerInfo,
+    EngineTaskId, HttpEngineExt,
 };
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1625,38 +1624,6 @@ impl DownloadEngine for HttpEngine {
     /// - 暂停 / 终态（Completed/Error）任务：只改配置字段——下次 resume/
     ///   spawn 自然用新 client；对已完成任务改 proxy 无传输意义但保持配置
     ///   回显一致（审计口径：API 写了什么快照就是什么）。
-    async fn set_task_proxy(
-        &self,
-        id: &EngineTaskId,
-        proxy: Option<String>,
-    ) -> Result<(), EngineError> {
-        // 先试水新 client（非法 → 拒绝且零副作用；合法 → 构建产物即弃，
-        // spawn_download 会按任务字段重建——构建成本 ~µs 级，不值得跨锁传）
-        if let Some(p) = &proxy {
-            let _ = build_proxied_client(p).map_err(EngineError::Other)?;
-        }
-        let restart = {
-            let mut tasks = self.inner.tasks.lock();
-            let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
-            t.proxy = proxy;
-            let running = t.state == EngineState::Downloading;
-            if running {
-                t.epoch += 1;
-            }
-            running
-        };
-        if restart {
-            // 锁外取当前 gen/epoch（set 与 spawn 间无 await 点，无竞态窗口）
-            let (gen, epoch) = {
-                let tasks = self.inner.tasks.lock();
-                let t = tasks.get(id).ok_or(EngineError::NotFound)?;
-                (t.gen, t.epoch)
-            };
-            self.spawn_download(id.clone(), gen, epoch);
-        }
-        Ok(())
-    }
-
     /// 引擎级全局代理热改（S1 设置面）：`Some(url)` = 后续新建任务走该代理
     /// （逐任务 client 构建时合并，任务级代理仍优先）；`None` = 清除回启动
     /// 口径（启动时已烘入共享 client 的代理不受影响）。非法 URL 试水拒绝
@@ -1671,13 +1638,6 @@ impl DownloadEngine for HttpEngine {
         }
         *self.global_proxy.write() = normalized;
         Ok(())
-    }
-
-    async fn peers(&self, _id: &EngineTaskId) -> Result<Vec<PeerInfo>, EngineError> {
-        // TD-2（审查建议 5 最小修复）：不再「撒谎」返回空表——HTTP 引擎无
-        // peer 概念，返回 Unsupported 才是 trait 契约语义（daemon 层已在
-        // ops.rs 按 EngineKind 守卫，本修复不影响现有调用方）。
-        Err(EngineError::Unsupported)
     }
 
     async fn update_sources(
@@ -1802,23 +1762,54 @@ impl DownloadEngine for HttpEngine {
         }
         Ok(())
     }
-
-    async fn add_url_seed(&self, _id: &EngineTaskId, _url: &str) -> Result<(), EngineError> {
-        // 同 peers：web seed 注入是 BT 语义，HTTP 静默 Ok 属契约违规。
-        Err(EngineError::Unsupported)
-    }
-
-    async fn ban_peer(&self, _id: &EngineTaskId, _peer: SocketAddr) -> Result<(), EngineError> {
-        // 同 peers：封禁 peer 是 BT 语义。
-        Err(EngineError::Unsupported)
-    }
-
-    async fn read_piece(&self, _id: &EngineTaskId, _idx: u32) -> Result<Vec<u8>, EngineError> {
-        Err(EngineError::Unsupported)
-    }
 }
 
 // TD-2 Step 2（docs/design/ENGINE-TRAIT-SPLIT.md）：HTTP 扩展面接入。
 // 方法经扩展的转发默认到达上方主 trait 覆写（set_task_proxy——任务级
 // 代理热改，epoch+1 重入语义）；Step 3 主 trait 收缩时本体迁入扩展。
-impl HttpEngineExt for HttpEngine {}
+#[async_trait::async_trait]
+impl HttpEngineExt for HttpEngine {
+    /// 任务级代理热改（E8 trait 扩展，仅 HTTP 引擎支持）。
+    ///
+    /// 语义分档：
+    /// - `Some(url)` 非法（reqwest 解析失败）→ `Other`，**不动现任务**（配置
+    ///   错误在调用方定性为入参 400，任务保持原状继续原 client 传输）。
+    /// - 下载中（`Downloading`）任务：锁内换 `proxy` 字段 + epoch+1，锁外
+    ///   `spawn_download` 重入（resume 同款路径）——新循环捕获新 client（从
+    ///   段账本恢复已完成段），旧循环在下一 gen/epoch 检查点自杀且永不
+    ///   finalize（并发收尾幂等，P4 既有收敛语义）。
+    /// - 暂停 / 终态（Completed/Error）任务：只改配置字段——下次 resume/
+    ///   spawn 自然用新 client；对已完成任务改 proxy 无传输意义但保持配置
+    ///   回显一致（审计口径：API 写了什么快照就是什么）。
+    async fn set_task_proxy(
+        &self,
+        id: &EngineTaskId,
+        proxy: Option<String>,
+    ) -> Result<(), EngineError> {
+        // 先试水新 client（非法 → 拒绝且零副作用；合法 → 构建产物即弃，
+        // spawn_download 会按任务字段重建——构建成本 ~µs 级，不值得跨锁传）
+        if let Some(p) = &proxy {
+            let _ = build_proxied_client(p).map_err(EngineError::Other)?;
+        }
+        let restart = {
+            let mut tasks = self.inner.tasks.lock();
+            let t = tasks.get_mut(id).ok_or(EngineError::NotFound)?;
+            t.proxy = proxy;
+            let running = t.state == EngineState::Downloading;
+            if running {
+                t.epoch += 1;
+            }
+            running
+        };
+        if restart {
+            // 锁外取当前 gen/epoch（set 与 spawn 间无 await 点，无竞态窗口）
+            let (gen, epoch) = {
+                let tasks = self.inner.tasks.lock();
+                let t = tasks.get(id).ok_or(EngineError::NotFound)?;
+                (t.gen, t.epoch)
+            };
+            self.spawn_download(id.clone(), gen, epoch);
+        }
+        Ok(())
+    }
+}

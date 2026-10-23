@@ -19,7 +19,7 @@ use parking_lot::Mutex;
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
     Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
-    EngineTaskId, PeerInfo,
+    EngineTaskId,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -1082,32 +1082,12 @@ impl DownloadEngine for SftpEngine {
         Ok(())
     }
 
-    async fn peers(&self, _id: &EngineTaskId) -> Result<Vec<PeerInfo>, EngineError> {
-        Ok(vec![])
-    }
-
     async fn update_sources(
         &self,
         _id: &EngineTaskId,
         _urls: Vec<String>,
     ) -> Result<(), EngineError> {
         Ok(())
-    }
-
-    async fn add_url_seed(&self, _id: &EngineTaskId, _url: &str) -> Result<(), EngineError> {
-        Ok(())
-    }
-
-    async fn ban_peer(
-        &self,
-        _id: &EngineTaskId,
-        _peer: std::net::SocketAddr,
-    ) -> Result<(), EngineError> {
-        Ok(())
-    }
-
-    async fn read_piece(&self, _id: &EngineTaskId, _idx: u32) -> Result<Vec<u8>, EngineError> {
-        Err(EngineError::Unsupported)
     }
 }
 

@@ -10,7 +10,7 @@ mod integration;
 
 use integration::http_server::{patterned, sha256_of};
 use smart_dl_core::identity::ContentIdentity;
-use smart_dl_core::types::{DownloadEngine, DownloadSource, EngineState};
+use smart_dl_core::types::{DownloadEngine, DownloadSource, EngineState, HttpEngineExt};
 use smart_dl_httpdl::HttpEngine;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
