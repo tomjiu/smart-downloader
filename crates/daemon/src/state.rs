@@ -783,10 +783,16 @@ pub struct PersistedTask {
     pub paused: bool,
 }
 
+mod bans;
 mod bt_alerts;
+mod bt_ops;
+mod completion;
+mod control;
+mod create;
 mod lifecycle;
-mod ops;
+mod meta;
 mod persistence;
+mod query;
 mod settings;
 
 // 路径稳定 re-export：外部引用（serve.rs/bt.rs/http.rs/events.rs）与
@@ -796,9 +802,9 @@ pub(crate) use bt_alerts::btih_of;
 #[cfg(feature = "bt")]
 pub use bt_alerts::{torrent_infohash, torrent_precheck_total, torrent_total_size};
 pub use bt_alerts::{FileMeta, TorrentMeta};
+pub use create::{canonical_http_url, ensure_dest_root, precheck_space};
 #[cfg(test)]
 use lifecycle::ct_eq;
-pub use ops::{canonical_http_url, ensure_dest_root, precheck_space};
 pub use persistence::write_tasks_atomic;
 pub use settings::{SettingsApplyReport, SettingsReq};
 
