@@ -3,14 +3,24 @@
 /// NEXT_PUBLIC_DAEMON 或 localStorage 覆盖；Bearer token 可选。
 
 import type {
+  AddedCount,
+  AddPeersReq,
   AddRssRuleReq,
   AddTaskReq,
+  AnnounceReq,
   BatchTaskReq,
   ConnectionsReq,
+  FilePriorityEntry,
+  FilePrioritiesOut,
   GlobalLimitReq,
   GlobalLimits,
   LimitReq,
+  PeerResults,
   PiecePriorityReq,
+  PriorityReq,
+  QueuePriorityOut,
+  RemovedUrl,
+  RenameTaskReq,
   RssFeed,
   RssFeedUpdateReq,
   RssItem,
@@ -21,9 +31,14 @@ import type {
   Settings,
   SettingsApplyReport,
   Stats,
+  SuperSeedingReq,
+  TagsReq,
   TaskListItem,
   TaskLogs,
   TaskSnapshot,
+  TrackerEntry,
+  TrackersReq,
+  WebseedReq,
 } from "./types";
 
 const LS_KEY = "dl.daemon.base";
@@ -178,6 +193,137 @@ export class DaemonClient {
       method: "POST",
       body: JSON.stringify(body),
     });
+  }
+
+  /// 重命名（E6 派生链旁路——用户显式名持久化）。响应 = 更新后快照。
+  taskRename(id: string, name: string): Promise<TaskSnapshot> {
+    const body: RenameTaskReq = { name };
+    return req(`/tasks/${id}/name`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+  /// 标签设置（E18）：null = 清空；返回归一化后的标签全集。
+  taskTags(id: string, tags: string[] | null): Promise<{ tags: string[] }> {
+    const body: TagsReq = { tags };
+    return req(`/tasks/${id}/tags`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+
+  /// 队列优先级（第二梯队）：绝对值或相对移动（top/bottom/up/down，
+  /// 二选一——同给以 value 优先，见 http.rs PriorityReq 注释）。
+  taskPriority(
+    id: string,
+    opts: { priority?: number; action?: "top" | "bottom" | "up" | "down" },
+  ): Promise<QueuePriorityOut> {
+    const body: PriorityReq = { priority: opts.priority, action: opts.action };
+    return req(`/tasks/${id}/priority`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+  /// 子文件优先级（仅 BT）：priority 语义同 libtorrent——0=不下载 /
+  /// 1=低 / 4=默认 / 7=最高；响应 = 各文件优先级快照（与 files 下标对齐）。
+  taskFilePriority(
+    id: string,
+    priorities: FilePriorityEntry[],
+  ): Promise<FilePrioritiesOut> {
+    return req(`/tasks/${id}/files/priority`, {
+      method: "POST",
+      body: JSON.stringify({ priorities }),
+    });
+  }
+
+  // ---- BT 种源管理（第二梯队；全部仅 BT 任务，其余 409）----
+  /// tracker 表（E29）：GET 裸数组（url + tier，tier 小者优先）。
+  listTrackers(id: string): Promise<TrackerEntry[]> {
+    return req(`/tasks/${id}/trackers`);
+  }
+  /// 批量追加 tracker：逐 URL 校验，非法 400；返回成功计数。
+  addTrackers(id: string, urls: string[]): Promise<AddedCount> {
+    const body: TrackersReq = { urls };
+    return req(`/tasks/${id}/trackers`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+  /// 精确删除 tracker（URL 全文匹配；无匹配 404）。
+  removeTracker(id: string, url: string): Promise<RemovedUrl> {
+    return req(`/tasks/${id}/trackers?url=${encodeURIComponent(url)}`, {
+      method: "DELETE",
+    });
+  }
+  /// 手动注入 peer（`ip:port`，支持 IPv6 `[::1]:6881`）：部分成功语义，
+  /// 逐条回执（ok / error）。注意：409（全失败且非 BT）也会带 results 体。
+  addPeers(id: string, addrs: string[]): Promise<PeerResults> {
+    const body: AddPeersReq = { addrs };
+    return req(`/tasks/${id}/peers`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+  /// 注入 web seed（云盘直链，URL 须原样带签名）。
+  addWebseeds(id: string, urls: string[]): Promise<AddedCount> {
+    const body: WebseedReq = { urls };
+    return req(`/tasks/${id}/webseeds`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+  /// 超级种子开关（做种态生效）。响应 = 快照。
+  taskSuperSeeding(id: string, enabled: boolean): Promise<TaskSnapshot> {
+    const body: SuperSeedingReq = { enabled };
+    return req(`/tasks/${id}/super-seeding`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+  /// 强制宣告（tracker / dht 至少一项 true，否则 400）。响应 = 快照。
+  taskAnnounce(id: string, tracker: boolean, dht: boolean): Promise<TaskSnapshot> {
+    const body: AnnounceReq = { tracker, dht };
+    return req(`/tasks/${id}/announce`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+  /// 强制重新校验（全量 hash 重算，进度将回零重走）。响应 = 快照。
+  taskRecheck(id: string): Promise<TaskSnapshot> {
+    return req(`/tasks/${id}/recheck`, { method: "POST" });
+  }
+  /// 生成 magnet URI（含当前 tracker 表与 name）。
+  taskMagnet(id: string): Promise<{ magnet: string }> {
+    return req(`/tasks/${id}/magnet`);
+  }
+  /// 导出 .torrent（二进制下载：blob → a[download]，文件名取 Content-Disposition）。
+  /// 独立于 req<T>（非 JSON 响应）；鉴权头同源透传。
+  async exportTorrent(id: string): Promise<string> {
+    const res = await fetch(url(`/tasks/${id}/export`), {
+      headers: headers(),
+    });
+    if (!res.ok) {
+      let msg = `${res.status}`;
+      try {
+        const body = await res.json();
+        if (body?.error) msg = body.error;
+      } catch {
+        /* 非 JSON 错误体 */
+      }
+      throw new Error(msg);
+    }
+    const cd = res.headers.get("Content-Disposition") ?? "";
+    const m = /filename="?([^";]+)"?/.exec(cd);
+    const name = m?.[1] ?? `${id}.torrent`;
+    const blobUrl = URL.createObjectURL(await res.blob());
+    const a = document.createElement("a");
+    a.href = blobUrl;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(blobUrl), 30_000);
+    return name;
   }
 
   // ---- RSS ----

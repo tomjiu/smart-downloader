@@ -217,7 +217,10 @@ pub enum EngineKind {
 pub type EngineTaskId = String;
 
 /// BT 任务 tracker 表项（E29 运行时增删查；tier 同 libtorrent 语义，小者优先）。
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+/// TS 导出（#143 第二梯队种源管理）：GET /tasks/:id/trackers 响应元素——
+/// 字段名漂移（url/tier）在 UI 编译期报错。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, TS)]
+#[ts(export)]
 pub struct TrackerEntry {
     pub url: String,
     pub tier: i32,

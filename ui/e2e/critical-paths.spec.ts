@@ -195,4 +195,59 @@ test.describe.serial('关键路径 e2e（真实 daemon + 真实下载）', () =>
     expect(pageErrors, 'null name 渲染不得抛异常').toEqual([]);
     await page.unrouteAll();
   });
+
+  test('6. 详情抽屉第二梯队：队列优先级 + 重命名 + 标签 + Esc 分层', async ({ page, request }) => {
+    const pageErrors: string[] = [];
+    page.on('pageerror', (e) => pageErrors.push(String(e)));
+    await page.goto('/');
+    await addTaskViaUi(page, `${FILE}/small.bin`);
+    const row = page.getByTestId('task-row').first();
+    await expect(row).toBeVisible({ timeout: 10_000 });
+    await expect(row).toHaveAttribute('data-task-state', 'Completed', { timeout: 30_000 });
+
+    // 双击开详情抽屉
+    await row.dblclick();
+    const drawer = page.locator('.dl-drawer');
+    await expect(drawer).toBeVisible({ timeout: 5_000 });
+
+    // 6a. 队列优先级：置底 → 反馈 + 信息卡出现「队列优先级」行
+    //    （文本在信息行 span 与卡片标题 b 各出现一次——strict mode 需 .first()）
+    await page.getByTestId('prio-bottom').click();
+    await expect(page.getByText('队列优先级已调整')).toBeVisible({ timeout: 5_000 });
+    await expect(drawer.getByText('队列优先级', { exact: true }).first()).toBeVisible();
+
+    // 6b. 重命名：铅笔 → 行内输入 → Enter 保存 → 抽屉标题与 API 回显
+    await page.getByTestId('rename-start').click();
+    const renameInput = page.getByTestId('rename-input');
+    await expect(renameInput).toBeFocused();
+    await renameInput.fill('e2e-改名验证');
+    await renameInput.press('Enter');
+    await expect(page.getByText('任务名已更新')).toBeVisible({ timeout: 5_000 });
+    const list = (await request.get(`${BASE}/tasks`).then((r) => r.json())) as Array<{
+      task_id: string;
+      name?: string | null;
+    }>;
+    expect(list[0]?.name, '重命名必须落到任务名（API 回显）').toBe('e2e-改名验证');
+
+    // 6c. 标签：编辑 → 逗号分隔两项 → Enter 保存 → 徽章渲染
+    await page.getByTestId('tags-edit').click();
+    const tagsInput = page.getByTestId('tags-input');
+    await expect(tagsInput).toBeFocused();
+    await tagsInput.fill('电影, 高清');
+    await tagsInput.press('Escape'); // Esc 分层：编辑取消，抽屉不关
+    await expect(drawer).toBeVisible();
+    await expect(page.getByTestId('tags-input')).toBeHidden();
+    await page.getByTestId('tags-edit').click();
+    await page.getByTestId('tags-input').fill('电影, 高清');
+    await page.getByTestId('tags-save').click();
+    await expect(page.getByText('标签已保存')).toBeVisible({ timeout: 5_000 });
+    await expect(drawer.locator('.dl-badge--info', { hasText: '电影' })).toBeVisible();
+    await expect(drawer.locator('.dl-badge--info', { hasText: '高清' })).toBeVisible();
+
+    // 6d. 关抽屉后列表行名同步（onChanged → 列表刷新链路）
+    await page.keyboard.press('Escape');
+    await expect(drawer).toBeHidden({ timeout: 5_000 });
+    await expect(page.getByTestId('task-name').first()).toContainText('e2e-改名验证', { timeout: 10_000 });
+    expect(pageErrors, '页面不得有未捕获异常').toEqual([]);
+  });
 });
