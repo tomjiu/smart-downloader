@@ -304,34 +304,39 @@ pub struct PeerInfo {
     pub flags: String,
 }
 
-/// 引擎统一抽象（§4）。M3/M5/M6 消费本 trait，不得改签名。
+/// 引擎统一抽象（§4 / TD-2 最小契约，`docs/design/ENGINE-TRAIT-SPLIT.md`）：
+/// 生命周期（add/pause/resume/status/remove）+ 身份（id/kind/capabilities）
+/// + 双语义换源（update_sources）+ 通用可选能力默认（限速/顺序下载/
+/// 全局代理）+ 扩展面访问器（`bt()`/`http()` 能力询问）。
+///
+/// BT 语义方法（peer/piece/tracker/做种/封禁等 26 个）只在 [`BtEngineExt`]
+/// 上存在；HTTP 语义方法（任务级代理）只在 [`HttpEngineExt`] 上存在。
+/// 调用方经 `engine.bt().ok_or(...)?` 一次完成能力询问——**禁止**按
+/// `EngineKind` 手工判断（「新增引擎能力漏改 N 处判断」类缺陷结构性消失）。
+///
+/// 契约纪律：新增必需方法会被 `core/tests/engine_min_contract.rs`
+/// （最小契约 canary）在编译期拦截；通用可选能力一律给默认实现
+/// （`Unsupported`），BT/HTTP 语义方法进对应扩展 trait。
 #[async_trait::async_trait]
 pub trait DownloadEngine: Send + Sync {
     fn id(&self) -> &str;
+
     fn kind(&self) -> EngineKind;
+
     fn capabilities(&self) -> Vec<Capability>;
 
     async fn add(&self, task: &DownloadTask) -> Result<EngineTaskId, EngineError>;
+
     async fn pause(&self, id: &EngineTaskId) -> Result<(), EngineError>;
+
     async fn resume(&self, id: &EngineTaskId) -> Result<(), EngineError>;
+
     async fn status(&self, id: &EngineTaskId) -> Result<EngineStatus, EngineError>;
+
     async fn remove(&self, id: &EngineTaskId, delete_data: bool) -> Result<(), EngineError>;
-    async fn peers(&self, id: &EngineTaskId) -> Result<Vec<PeerInfo>, EngineError>;
+
     async fn update_sources(&self, id: &EngineTaskId, urls: Vec<String>)
         -> Result<(), EngineError>;
-    async fn add_url_seed(&self, id: &EngineTaskId, url: &str) -> Result<(), EngineError>;
-    async fn add_peer(
-        &self,
-        _id: &EngineTaskId,
-        _peer: std::net::SocketAddr,
-    ) -> Result<(), EngineError> {
-        // TD-2（审查建议 5）：默认不再「撒谎」返回 Ok——peer 直连注入是
-        // BT 语义，未实现的引擎应显式报 Unsupported（BtEngine 覆写提供
-        // 真实实现；调用方 daemon 均按 EngineKind 守卫或 best-effort 忽略）。
-        Err(EngineError::Unsupported)
-    }
-    async fn ban_peer(&self, id: &EngineTaskId, peer: SocketAddr) -> Result<(), EngineError>;
-    async fn read_piece(&self, id: &EngineTaskId, idx: u32) -> Result<Vec<u8>, EngineError>;
 
     /// 任务级限速（KiB/s）。`None` 方向 = 不调整；`Some(0)` = 不限；
     /// `Some(n)` = 上限 n KiB/s。引擎无该方向（如 HTTP 无上传）时报
@@ -359,6 +364,71 @@ pub trait DownloadEngine: Send + Sync {
         Err(EngineError::Unsupported)
     }
 
+    /// 任务级顺序下载开关（边下边播）。HTTP = 收紧在飞段窗口（新建任务立即
+    /// 生效；运行中任务自下一次重下轮起生效）；BT = sequential_download flag
+    /// （即时生效，metadata 未就绪也可设）；不支持引擎（FTP）→ `Unsupported`。
+    async fn set_sequential(&self, _id: &EngineTaskId, _on: bool) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// 引擎级全局代理热改（S1 设置面）：`Some(url)` = 引擎后续新建连接走该
+    /// 代理；`None` = 清除回直连。BT = settings_pack 全量重放（立即）；HTTP =
+    /// 运行时全局代理并入逐任务 client 构建（新任务生效，存量任务不受扰）。
+    /// 非法 URL → `Other`（调用方定性入参错误，引擎状态不变）。不支持引擎 →
+    /// `Unsupported`。
+    async fn set_global_proxy(&self, _proxy: Option<&str>) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    /// BT 扩展访问器（TD-2，`docs/design/ENGINE-TRAIT-SPLIT.md`）：
+    /// BT 语义引擎返回 [`BtEngineExt`] 扩展面，其余引擎保持默认 `None`。
+    /// 调用方 `engine.bt().ok_or(...)?` 一次完成能力询问——取代按
+    /// `EngineKind` 手工判断；BT 方法只在扩展 trait 上存在（Step 3 已收缩：主 trait 不再有 BT 语义方法）。
+    fn bt(&self) -> Option<&dyn BtEngineExt> {
+        None
+    }
+
+    /// HTTP 扩展访问器（TD-2 Step 2）：同 [`Self::bt`]——HTTP 语义引擎
+    /// 返回 [`HttpEngineExt`] 扩展面，其余 `None`。
+    fn http(&self) -> Option<&dyn HttpEngineExt> {
+        None
+    }
+}
+
+/// BT 扩展能力面（TD-2 Step 3，`docs/design/ENGINE-TRAIT-SPLIT.md`）：
+/// peer / piece / tracker / 做种 / 封禁等 **BT 语义**方法的唯一归宿（26 个）。
+///
+/// 默认实现 = `Unsupported` / `None`（[`DownloadEngine::bt`] 返回 `Some`
+/// 即声明具备 BT 面；未覆写的方法按「该引擎不支持此能力」处理——与
+/// 收缩前主 trait 的可选能力默认语义一致）。完整实现见 `BtEngine`；
+/// 部分实现见 `XunleiBtEngine`（peers/add_url_seed/ban_peer/read_piece/
+/// add_xunlei_resume）与 daemon 测试替身 `FakeEngine`。
+#[async_trait::async_trait]
+pub trait BtEngineExt: DownloadEngine {
+    async fn peers(&self, _id: &EngineTaskId) -> Result<Vec<PeerInfo>, EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    async fn add_url_seed(&self, _id: &EngineTaskId, _url: &str) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    async fn add_peer(
+        &self,
+        _id: &EngineTaskId,
+        _peer: std::net::SocketAddr,
+    ) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    async fn ban_peer(&self, _id: &EngineTaskId, _peer: SocketAddr) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
+    async fn read_piece(&self, _id: &EngineTaskId, _idx: u32) -> Result<Vec<u8>, EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
     /// 任务级子文件优先级批量设置（BT 多文件）。`priorities` =
     /// (文件下标, 0..=7)，0=不下载 / 1=低 / 4=默认 / 7=最高（libtorrent 语义）。
     /// 需要 metadata 的引擎（BT）在 metadata 未就绪时返回 `EngineError::Other`。
@@ -372,13 +442,6 @@ pub trait DownloadEngine: Send + Sync {
 
     /// 读取当前各文件优先级（下标即文件序）。非 BT / 不支持 → `Unsupported`。
     async fn file_priorities(&self, _id: &EngineTaskId) -> Result<Vec<Option<u32>>, EngineError> {
-        Err(EngineError::Unsupported)
-    }
-
-    /// 任务级顺序下载开关（边下边播）。HTTP = 收紧在飞段窗口（新建任务立即
-    /// 生效；运行中任务自下一次重下轮起生效）；BT = sequential_download flag
-    /// （即时生效，metadata 未就绪也可设）；不支持引擎（FTP）→ `Unsupported`。
-    async fn set_sequential(&self, _id: &EngineTaskId, _on: bool) -> Result<(), EngineError> {
         Err(EngineError::Unsupported)
     }
 
@@ -479,20 +542,6 @@ pub trait DownloadEngine: Send + Sync {
         None
     }
 
-    /// 任务级代理热改（E8）：`Some(url)` = 切任务专用 client（覆盖全局，语义
-    /// 与 add 时设定一致）；`None` = 清除回引擎共享 client。HTTP 引擎实现：
-    /// 非法 URL → `Other`（调用方定性入参错误，不动现任务）；下载中任务
-    /// epoch+1 重入——旧循环在 gen/epoch 检查点自杀，新循环从段账本恢复并
-    /// 用新 client；暂停/终态任务只改配置（下次 spawn 生效）。不支持引擎
-    /// （BT 代理属会话级 / FTP）→ `Unsupported`。
-    async fn set_task_proxy(
-        &self,
-        _id: &EngineTaskId,
-        _proxy: Option<String>,
-    ) -> Result<(), EngineError> {
-        Err(EngineError::Unsupported)
-    }
-
     /// 批量追加 tracker（E29，BT 任务；announce/webseed 无关，metadata 未
     /// 就绪也可设）。不支持引擎（HTTP/FTP）→ `Unsupported`。
     async fn add_trackers(&self, _id: &EngineTaskId, _urls: &[String]) -> Result<(), EngineError> {
@@ -524,194 +573,24 @@ pub trait DownloadEngine: Send + Sync {
     async fn apply_bt_session(&self, _patch: BtSessionPatch) -> Result<(), EngineError> {
         Err(EngineError::Unsupported)
     }
-
-    /// 引擎级全局代理热改（S1 设置面）：`Some(url)` = 引擎后续新建连接走该
-    /// 代理；`None` = 清除回直连。BT = settings_pack 全量重放（立即）；HTTP =
-    /// 运行时全局代理并入逐任务 client 构建（新任务生效，存量任务不受扰）。
-    /// 非法 URL → `Other`（调用方定性入参错误，引擎状态不变）。不支持引擎 →
-    /// `Unsupported`。
-    async fn set_global_proxy(&self, _proxy: Option<&str>) -> Result<(), EngineError> {
-        Err(EngineError::Unsupported)
-    }
-
-    /// BT 扩展访问器（TD-2 Step 2，`docs/design/ENGINE-TRAIT-SPLIT.md`）：
-    /// BT 语义引擎返回 [`BtEngineExt`] 扩展面，其余引擎保持默认 `None`。
-    /// 调用方 `engine.bt().ok_or(...)?` 一次完成能力询问——取代按
-    /// `EngineKind` 手工判断；BT 方法只在扩展 trait 上存在（Step 2 两侧
-    /// 并存过渡，Step 3 主 trait 收缩后完全成立）。
-    fn bt(&self) -> Option<&dyn BtEngineExt> {
-        None
-    }
-
-    /// HTTP 扩展访问器（TD-2 Step 2）：同 [`Self::bt`]——HTTP 语义引擎
-    /// 返回 [`HttpEngineExt`] 扩展面，其余 `None`。
-    fn http(&self) -> Option<&dyn HttpEngineExt> {
-        None
-    }
 }
 
-/// BT 扩展能力面（TD-2 设计提案 Step 2，`docs/design/ENGINE-TRAIT-SPLIT.md`）：
-/// peer / piece / tracker / 做种 / 封禁等 **BT 语义**方法的归宿（26 个）。
-///
-/// Step 2 形态：本扩展与 [`DownloadEngine`] 的同名方法**并存**（主 trait 面
-/// 暂不收缩，零破坏）——扩展方法的默认实现为**转发**（`DownloadEngine::xxx(self, …)`），
-/// 因此引擎侧 `impl BtEngineExt for XxxEngine {}` 空 impl 即接入，行为按
-/// 构造等价（引擎在主 trait 上的既有覆写即真实本体）。Step 3 将把本体迁入
-/// 本扩展、主 trait 收缩到最小契约（9 必需 + 通用可选默认）。
-///
-/// 部分实现 BT 面的引擎（`XunleiBtEngine`——Windows 迅雷 SDK，与 BtEngine
-/// 共用 `EngineKind::Bt` 槽位；daemon 测试替身 `FakeEngine`）可在 Step 3 的
-/// daemon 调用点迁移前以空 impl 接入，转发保证行为逐字节不变。
-#[async_trait::async_trait]
-pub trait BtEngineExt: DownloadEngine {
-    /// 语义与文档见 [`DownloadEngine::peers`]（Step 2 转发默认）。
-    async fn peers(&self, id: &EngineTaskId) -> Result<Vec<PeerInfo>, EngineError> {
-        DownloadEngine::peers(self, id).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::add_url_seed`]（Step 2 转发默认）。
-    async fn add_url_seed(&self, id: &EngineTaskId, url: &str) -> Result<(), EngineError> {
-        DownloadEngine::add_url_seed(self, id, url).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::add_peer`]（Step 2 转发默认）。
-    async fn add_peer(&self, id: &EngineTaskId, peer: SocketAddr) -> Result<(), EngineError> {
-        DownloadEngine::add_peer(self, id, peer).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::ban_peer`]（Step 2 转发默认）。
-    async fn ban_peer(&self, id: &EngineTaskId, peer: SocketAddr) -> Result<(), EngineError> {
-        DownloadEngine::ban_peer(self, id, peer).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::read_piece`]（Step 2 转发默认）。
-    async fn read_piece(&self, id: &EngineTaskId, idx: u32) -> Result<Vec<u8>, EngineError> {
-        DownloadEngine::read_piece(self, id, idx).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::set_file_priorities`]（Step 2 转发默认）。
-    async fn set_file_priorities(
-        &self,
-        id: &EngineTaskId,
-        priorities: &[(usize, u32)],
-    ) -> Result<(), EngineError> {
-        DownloadEngine::set_file_priorities(self, id, priorities).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::file_priorities`]（Step 2 转发默认）。
-    async fn file_priorities(&self, id: &EngineTaskId) -> Result<Vec<Option<u32>>, EngineError> {
-        DownloadEngine::file_priorities(self, id).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::set_max_connections`]（Step 2 转发默认）。
-    async fn set_max_connections(&self, id: &EngineTaskId, n: u32) -> Result<(), EngineError> {
-        DownloadEngine::set_max_connections(self, id, n).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::set_super_seeding`]（Step 2 转发默认）。
-    async fn set_super_seeding(&self, id: &EngineTaskId, on: bool) -> Result<(), EngineError> {
-        DownloadEngine::set_super_seeding(self, id, on).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::force_reannounce`]（Step 2 转发默认）。
-    async fn force_reannounce(&self, id: &EngineTaskId) -> Result<(), EngineError> {
-        DownloadEngine::force_reannounce(self, id).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::force_dht_announce`]（Step 2 转发默认）。
-    async fn force_dht_announce(&self, id: &EngineTaskId) -> Result<(), EngineError> {
-        DownloadEngine::force_dht_announce(self, id).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::force_recheck`]（Step 2 转发默认）。
-    async fn force_recheck(&self, id: &EngineTaskId) -> Result<(), EngineError> {
-        DownloadEngine::force_recheck(self, id).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::export_torrent`]（Step 2 转发默认）。
-    async fn export_torrent(&self, id: &EngineTaskId) -> Result<Vec<u8>, EngineError> {
-        DownloadEngine::export_torrent(self, id).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::magnet_uri`]（Step 2 转发默认）。
-    async fn magnet_uri(&self, id: &EngineTaskId) -> Result<String, EngineError> {
-        DownloadEngine::magnet_uri(self, id).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::ban_ip`]（Step 2 转发默认）。
-    async fn ban_ip(&self, ip: &str) -> Result<(), EngineError> {
-        DownloadEngine::ban_ip(self, ip).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::unban_ip`]（Step 2 转发默认）。
-    async fn unban_ip(&self, ip: &str) -> Result<(), EngineError> {
-        DownloadEngine::unban_ip(self, ip).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::ban_ip_range`]（Step 2 转发默认）。
-    async fn ban_ip_range(&self, start: &str, end: &str) -> Result<(), EngineError> {
-        DownloadEngine::ban_ip_range(self, start, end).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::set_piece_first_last`]（Step 2 转发默认）。
-    async fn set_piece_first_last(&self, id: &EngineTaskId, prio: i32) -> Result<(), EngineError> {
-        DownloadEngine::set_piece_first_last(self, id, prio).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::set_session_storage_allocate`]（Step 2 转发默认）。
-    async fn set_session_storage_allocate(&self, alloc: bool) -> Result<(), EngineError> {
-        DownloadEngine::set_session_storage_allocate(self, alloc).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::seeding_ratio_limit`]（Step 2 转发默认）。
-    fn seeding_ratio_limit(&self) -> Option<f64> {
-        DownloadEngine::seeding_ratio_limit(self)
-    }
-
-    /// 语义与文档见 [`DownloadEngine::seeding_time_limit`]（Step 2 转发默认）。
-    fn seeding_time_limit(&self) -> Option<u32> {
-        DownloadEngine::seeding_time_limit(self)
-    }
-
-    /// 语义与文档见 [`DownloadEngine::add_trackers`]（Step 2 转发默认）。
-    async fn add_trackers(&self, id: &EngineTaskId, urls: &[String]) -> Result<(), EngineError> {
-        DownloadEngine::add_trackers(self, id, urls).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::remove_tracker`]（Step 2 转发默认）。
-    async fn remove_tracker(&self, id: &EngineTaskId, url: &str) -> Result<(), EngineError> {
-        DownloadEngine::remove_tracker(self, id, url).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::list_trackers`]（Step 2 转发默认）。
-    async fn list_trackers(&self, id: &EngineTaskId) -> Result<Vec<TrackerEntry>, EngineError> {
-        DownloadEngine::list_trackers(self, id).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::add_xunlei_resume`]（Step 2 转发默认）。
-    async fn add_xunlei_resume(&self, data: Vec<u8>) -> Result<EngineTaskId, EngineError> {
-        DownloadEngine::add_xunlei_resume(self, data).await
-    }
-
-    /// 语义与文档见 [`DownloadEngine::apply_bt_session`]（Step 2 转发默认）。
-    async fn apply_bt_session(&self, patch: BtSessionPatch) -> Result<(), EngineError> {
-        DownloadEngine::apply_bt_session(self, patch).await
-    }
-}
-
-/// HTTP 扩展能力面（TD-2 Step 2，`docs/design/ENGINE-TRAIT-SPLIT.md`）：
-/// 任务级代理热改等 **HTTP 语义**方法。形态与 [`BtEngineExt`] 对称——
-/// Step 2 转发默认 + 空 impl 接入；Step 3 主 trait 收缩时本体迁入。
+/// HTTP 扩展能力面（TD-2 Step 3，`docs/design/ENGINE-TRAIT-SPLIT.md`）：
+/// **HTTP 语义**方法的唯一归宿。[`DownloadEngine::http`] 返回 `Some`
+/// 即声明实现本面（实现者必须提供全部方法——面窄，无默认）。
 #[async_trait::async_trait]
 pub trait HttpEngineExt: DownloadEngine {
-    /// 语义与文档见 [`DownloadEngine::set_task_proxy`]（Step 2 转发默认）。
+    /// 任务级代理热改（E8）：`Some(url)` = 切任务专用 client（覆盖全局，语义
+    /// 与 add 时设定一致）；`None` = 清除回引擎共享 client。HTTP 引擎实现：
+    /// 非法 URL → `Other`（调用方定性入参错误，不动现任务）；下载中任务
+    /// epoch+1 重入——旧循环在 gen/epoch 检查点自杀，新循环从段账本恢复并
+    /// 用新 client；暂停/终态任务只改配置（下次 spawn 生效）。不支持引擎
+    /// （BT 代理属会话级 / FTP）→ `Unsupported`。
     async fn set_task_proxy(
         &self,
-        id: &EngineTaskId,
-        proxy: Option<String>,
-    ) -> Result<(), EngineError> {
-        DownloadEngine::set_task_proxy(self, id, proxy).await
-    }
+        _id: &EngineTaskId,
+        _proxy: Option<String>,
+    ) -> Result<(), EngineError>;
 }
 
 /// BT 会话级设置补丁（S1）：`apply_bt_session` 入参。字段独立可选——

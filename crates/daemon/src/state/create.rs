@@ -1018,9 +1018,12 @@ impl DaemonState {
         // 清理临时文件（best-effort）
         let _ = std::fs::remove_dir_all(&tmp_dir);
 
-        // 6. 通过 btcore 导入
-        let engine_tid = self
-            .engine_for(EngineKind::Bt)?
+        // 6. 通过 btcore 导入（能力询问：BT 扩展面）
+        let engine = self.engine_for(EngineKind::Bt)?;
+        let bt = engine.bt().ok_or_else(|| {
+            DaemonError::Engine("BT 引擎未提供扩展面（add_xunlei_resume）".into())
+        })?;
+        let engine_tid = bt
             .add_xunlei_resume(fastresume_bytes)
             .await
             .map_err(|e| DaemonError::Engine(e.to_string()))?;
@@ -1090,11 +1093,13 @@ impl DaemonState {
         // 8. peer 注入（best-effort）：把 cfg 里的 bt:// 地址注入引擎
         if let Ok(cfg_obj) = XlbtCfg::parse(&cfg) {
             let engine = self.engine_for(EngineKind::Bt)?;
-            for peer_str in cfg_obj.peers {
-                if let Some((ip, port)) = parse_bt_peer(&peer_str) {
-                    let addr = format!("{}:{}", ip, port);
-                    if let Ok(addr) = addr.parse::<std::net::SocketAddr>() {
-                        let _ = engine.add_peer(&engine_tid, addr).await;
+            if let Some(bt) = engine.bt() {
+                for peer_str in cfg_obj.peers {
+                    if let Some((ip, port)) = parse_bt_peer(&peer_str) {
+                        let addr = format!("{}:{}", ip, port);
+                        if let Ok(addr) = addr.parse::<std::net::SocketAddr>() {
+                            let _ = bt.add_peer(&engine_tid, addr).await;
+                        }
                     }
                 }
             }

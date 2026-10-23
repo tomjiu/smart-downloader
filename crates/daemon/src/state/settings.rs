@@ -811,7 +811,9 @@ impl DaemonState {
     /// BT 引擎）静默跳过；其余错误降级为 warn（会话级设置尽力而为，不阻塞
     /// 设置保存——与限速阀门 fail-fast 语义区分）。
     pub(super) async fn dispatch_bt_patch(&self, patch: &BtSessionPatch) {
-        if let Some(bt) = self.engines.get(&EngineKind::Bt).cloned() {
+        // 能力询问（TD-2 Step 3）：注册表借用 + bt() 一步到位——引擎缺失
+        // 或无 BT 面（Unsupported 旧口径）均静默跳过。
+        if let Some(bt) = self.engines.get(&EngineKind::Bt).and_then(|e| e.bt()) {
             match bt.apply_bt_session(patch.clone()).await {
                 Ok(()) => {}
                 Err(EngineError::Unsupported) => {}

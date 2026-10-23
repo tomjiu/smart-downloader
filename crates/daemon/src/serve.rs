@@ -5,7 +5,7 @@ use crate::http;
 use crate::lockfile::InstanceLock;
 use crate::state::DaemonState;
 #[cfg(feature = "bt")]
-use smart_dl_core::types::DownloadEngine as _; // batch5：set_session_storage_allocate（trait 方法需在作用域）
+use smart_dl_core::types::BtEngineExt as _; // TD-2 Step 3：set_session_storage_allocate 迁入扩展 trait（方法需在作用域）
 use smart_dl_provider::RemoteProvider;
 use std::path::PathBuf;
 use std::sync::Arc;

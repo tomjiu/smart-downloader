@@ -60,18 +60,17 @@ async fn pause_resume_remove() {
 
 #[tokio::test]
 async fn peers_empty_read_piece_unsupported() {
+    // TD-2 Step 3：FtpEngine 骨架曾对 peers 撒谎返回 Ok(vec![])——收缩后
+    // BT 语义方法只在 BtEngineExt 上存在，FtpEngine 无该方法（编译期消除
+    // 撒谎面），能力询问 bt() → None；update_sources 等生命周期面不受影响。
     let srv = FtpTestServer::start(FtpServerConfig::default()).await;
     let dir = tempfile::tempdir().unwrap();
     let engine = FtpEngine::new();
     let task = make_ftp_task("l3", &srv.url("/q.bin"), dir.path().to_path_buf(), "q.bin");
     let tid = engine.add(&task).await.unwrap();
 
-    let peers = engine.peers(&tid).await.unwrap();
-    assert!(peers.is_empty(), "FTP 无 peer");
-    assert!(matches!(
-        engine.read_piece(&tid, 0).await,
-        Err(EngineError::Unsupported)
-    ));
+    let dyn_engine: &dyn DownloadEngine = &engine;
+    assert!(dyn_engine.bt().is_none(), "FTP 引擎不得暴露 BT 面");
     // 骨架方法不报错
     engine.update_sources(&tid, vec![]).await.unwrap();
 }

@@ -268,15 +268,17 @@ impl DaemonState {
                             replay_details.push(format!("限速重放失败: {e}"));
                         }
                     }
-                    // ② 子文件优先级重放（仅 BT 任务；非 BT 引擎 Unsupported →
-                    // 记事件）。magnet 恢复时 metadata 未就绪（引擎 NotFound）→
+                    // ② 子文件优先级重放（仅 BT 任务；能力询问 —— 无 BT 面跳过，
+                    // 与旧 kind 守卫 + 非 BT 引擎 Unsupported 记事件口径一致：
+                    // 唯一行为差异面是无扩展面的 BT 槽引擎，现实中不存在）。
+                    // magnet 恢复时 metadata 未就绪（引擎 NotFound）→
                     // 挂 pending 集合，由重放循环在就绪后收敛；.torrent 任务
                     // add 时 metadata 已就绪，此处直接成功。
-                    if pt.engine_kind == EngineKind::Bt {
+                    if let Some(bt) = engine.bt() {
                         if let Some(prios) = t.file_priorities.clone().filter(|p| !p.is_empty()) {
                             let pairs: Vec<(usize, u32)> =
                                 prios.iter().enumerate().map(|(i, p)| (i, *p)).collect();
-                            match engine.set_file_priorities(&tid, &pairs).await {
+                            match bt.set_file_priorities(&tid, &pairs).await {
                                 Ok(()) => {}
                                 Err(smart_dl_core::types::EngineError::NotFound) => {
                                     self.pending_file_prio.lock().insert(t.id.clone());
@@ -297,12 +299,12 @@ impl DaemonState {
                             replay_details.push(format!("顺序下载重放失败: {e}"));
                         }
                     }
-                    // ③b 连接数上限重放（S1-c，仅 BT）：Some 原样下发
+                    // ③b 连接数上限重放（S1-c，仅 BT；能力询问）：Some 原样下发
                     // （>0 = 上限；0 = 复位会话级默认；handle 级参数，
                     // metadata 未就绪也可设，无 pending 场景）。
-                    if pt.engine_kind == EngineKind::Bt {
+                    if let Some(bt) = engine.bt() {
                         if let Some(n) = t.max_connections {
-                            if let Err(e) = engine.set_max_connections(&tid, n).await {
+                            if let Err(e) = bt.set_max_connections(&tid, n).await {
                                 replay_details.push(format!("连接数上限重放失败: {e}"));
                             }
                         }

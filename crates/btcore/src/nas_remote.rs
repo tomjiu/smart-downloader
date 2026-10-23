@@ -496,30 +496,6 @@ impl DownloadEngine for NasRemoteEngine {
     ) -> Result<(), EngineError> {
         Err(EngineError::Unsupported)
     }
-
-    async fn add_url_seed(&self, _id: &EngineTaskId, _url: &str) -> Result<(), EngineError> {
-        // v1 不支持追加种子源（引擎侧未校准追加语义）
-        Err(EngineError::Unsupported)
-    }
-
-    async fn peers(
-        &self,
-        _id: &EngineTaskId,
-    ) -> Result<Vec<smart_dl_core::types::PeerInfo>, EngineError> {
-        Ok(vec![]) // NAS 引擎无 peer 概念暴露
-    }
-
-    async fn ban_peer(
-        &self,
-        _id: &EngineTaskId,
-        _peer: std::net::SocketAddr,
-    ) -> Result<(), EngineError> {
-        Err(EngineError::Unsupported)
-    }
-
-    async fn read_piece(&self, _id: &EngineTaskId, _idx: u32) -> Result<Vec<u8>, EngineError> {
-        Err(EngineError::Unsupported)
-    }
 }
 
 #[cfg(test)]

@@ -701,84 +701,12 @@ impl DownloadEngine for BtEngine {
         Ok(())
     }
 
-    async fn peers(&self, id: &EngineTaskId) -> Result<Vec<PeerInfo>, EngineError> {
-        self.core
-            .peers(id)
-            .map(|ps| {
-                ps.into_iter()
-                    .map(|p| PeerInfo {
-                        ip: p.ip,
-                        port: p.port,
-                        peer_id: p.peer_id,
-                        client: p.client,
-                        progress_ppm: p.progress_ppm,
-                        down_rate: p.down_rate.max(0) as u64,
-                        up_rate: p.up_rate.max(0) as u64,
-                        total_download: p.total_download.max(0) as u64,
-                        total_upload: p.total_upload.max(0) as u64,
-                        last_active_sec: p.last_active_sec.max(0) as u64,
-                        flags: format!("{:08x}", p.flags),
-                    })
-                    .collect()
-            })
-            .map_err(|e| EngineError::Other(core_err(&e)))
-    }
-
     async fn update_sources(
         &self,
         _id: &EngineTaskId,
         _urls: Vec<String>,
     ) -> Result<(), EngineError> {
         Err(EngineError::Unsupported)
-    }
-
-    async fn add_url_seed(&self, id: &EngineTaskId, url: &str) -> Result<(), EngineError> {
-        self.core
-            .add_url_seed(id, url)
-            .map_err(|e| EngineError::Other(core_err(&e)))
-    }
-
-    /// tracker 运行时增删查（E29）：批量追加 / URL 精确删除（无匹配
-    /// NotFound 定性）/ 列举当前 announce 表。
-    async fn add_trackers(&self, id: &EngineTaskId, urls: &[String]) -> Result<(), EngineError> {
-        for url in urls {
-            self.core.add_tracker(id, url).map_err(bt_engine_err)?;
-        }
-        Ok(())
-    }
-
-    async fn remove_tracker(&self, id: &EngineTaskId, url: &str) -> Result<(), EngineError> {
-        self.core.remove_tracker(id, url).map_err(bt_engine_err)
-    }
-
-    async fn list_trackers(&self, id: &EngineTaskId) -> Result<Vec<TrackerEntry>, EngineError> {
-        self.core.list_trackers(id).map_err(bt_engine_err)
-    }
-
-    async fn add_peer(
-        &self,
-        id: &EngineTaskId,
-        peer: std::net::SocketAddr,
-    ) -> Result<(), EngineError> {
-        self.core
-            .add_peer(id, &peer.ip().to_string(), peer.port())
-            .map_err(|e| EngineError::Other(core_err(&e)))
-    }
-
-    /// 任务上下文封禁 peer（Task 46 真实现）：session 级 ip_filter（libtorrent
-    /// 2.x 无 per-endpoint ban；作用域 = 全 session，与 qbit「永久封禁」一致）。
-    /// id 仅用于任务存在性验证（NotFound 语义）。
-    async fn ban_peer(&self, id: &EngineTaskId, peer: SocketAddr) -> Result<(), EngineError> {
-        self.core
-            .ban_ip(Some(id), &peer.ip().to_string())
-            .map_err(bt_engine_err)
-    }
-
-    async fn read_piece(&self, id: &EngineTaskId, idx: u32) -> Result<Vec<u8>, EngineError> {
-        self.core
-            .read_piece(id, idx as i32)
-            .map(|o| o.unwrap_or_default())
-            .map_err(|e| EngineError::Other(core_err(&e)))
     }
 
     /// BT per-torrent 限速（trait 扩展）。`id` = engine_tid = infohash（add 返回
@@ -831,6 +759,117 @@ impl DownloadEngine for BtEngine {
         self.core
             .apply_network(proxy_cfg.as_ref(), net.down_kb_s, net.up_kb_s)
             .map_err(|e| EngineError::Other(format!("bt apply_network: {e:?}")))
+    }
+
+    /// 引擎级全局代理热改（S1 trait 扩展）：更新 network 快照后整包 re-apply
+    /// （settings_pack 全量语义，限速原样重放）；None = 清除代理（直连）。
+    async fn set_global_proxy(&self, proxy: Option<&str>) -> Result<(), EngineError> {
+        let net = {
+            let mut n = self.network.lock();
+            n.proxy_url = proxy
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            n.clone()
+        };
+        let proxy_cfg = match net.proxy_url.as_deref() {
+            Some(u) => match crate::ffi::parse_proxy(u) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    return Err(EngineError::Other(format!(
+                        "bt proxy 解析失败 {u:?}: {e:?}"
+                    )))
+                }
+            },
+            None => None,
+        };
+        self.core
+            .apply_network(proxy_cfg.as_ref(), net.down_kb_s, net.up_kb_s)
+            .map_err(|e| EngineError::Other(format!("bt apply_network: {e:?}")))
+    }
+
+    /// 任务级顺序下载（trait 扩展）：libtorrent sequential_download flag。
+    /// 2.0.x = torrent_flags（on/off 均可）；2.1 = set_sequential_range（仅 on）。
+    /// metadata 未就绪也可设（handle 级 flag，随 metadata 到达持续生效）。
+    async fn set_sequential(&self, id: &EngineTaskId, on: bool) -> Result<(), EngineError> {
+        self.core.set_sequential(id, on).map_err(bt_engine_err)
+    }
+}
+
+// TD-2 Step 2（docs/design/ENGINE-TRAIT-SPLIT.md）：BT 扩展面接入。
+// 全部方法经扩展的转发默认到达上方主 trait 覆写（行为按构造等价，
+// 零新增代码路径）；Step 3 主 trait 收缩时本体迁入扩展、转发删除。
+#[async_trait::async_trait]
+impl BtEngineExt for BtEngine {
+    async fn peers(&self, id: &EngineTaskId) -> Result<Vec<PeerInfo>, EngineError> {
+        self.core
+            .peers(id)
+            .map(|ps| {
+                ps.into_iter()
+                    .map(|p| PeerInfo {
+                        ip: p.ip,
+                        port: p.port,
+                        peer_id: p.peer_id,
+                        client: p.client,
+                        progress_ppm: p.progress_ppm,
+                        down_rate: p.down_rate.max(0) as u64,
+                        up_rate: p.up_rate.max(0) as u64,
+                        total_download: p.total_download.max(0) as u64,
+                        total_upload: p.total_upload.max(0) as u64,
+                        last_active_sec: p.last_active_sec.max(0) as u64,
+                        flags: format!("{:08x}", p.flags),
+                    })
+                    .collect()
+            })
+            .map_err(|e| EngineError::Other(core_err(&e)))
+    }
+
+    async fn add_url_seed(&self, id: &EngineTaskId, url: &str) -> Result<(), EngineError> {
+        self.core
+            .add_url_seed(id, url)
+            .map_err(|e| EngineError::Other(core_err(&e)))
+    }
+
+    /// tracker 运行时增删查（E29）：批量追加 / URL 精确删除（无匹配
+    /// NotFound 定性）/ 列举当前 announce 表。
+    async fn add_trackers(&self, id: &EngineTaskId, urls: &[String]) -> Result<(), EngineError> {
+        for url in urls {
+            self.core.add_tracker(id, url).map_err(bt_engine_err)?;
+        }
+        Ok(())
+    }
+
+    async fn remove_tracker(&self, id: &EngineTaskId, url: &str) -> Result<(), EngineError> {
+        self.core.remove_tracker(id, url).map_err(bt_engine_err)
+    }
+
+    async fn list_trackers(&self, id: &EngineTaskId) -> Result<Vec<TrackerEntry>, EngineError> {
+        self.core.list_trackers(id).map_err(bt_engine_err)
+    }
+
+    async fn add_peer(
+        &self,
+        id: &EngineTaskId,
+        peer: std::net::SocketAddr,
+    ) -> Result<(), EngineError> {
+        self.core
+            .add_peer(id, &peer.ip().to_string(), peer.port())
+            .map_err(|e| EngineError::Other(core_err(&e)))
+    }
+
+    /// 任务上下文封禁 peer（Task 46 真实现）：session 级 ip_filter（libtorrent
+    /// 2.x 无 per-endpoint ban；作用域 = 全 session，与 qbit「永久封禁」一致）。
+    /// id 仅用于任务存在性验证（NotFound 语义）。
+    async fn ban_peer(&self, id: &EngineTaskId, peer: SocketAddr) -> Result<(), EngineError> {
+        self.core
+            .ban_ip(Some(id), &peer.ip().to_string())
+            .map_err(bt_engine_err)
+    }
+
+    async fn read_piece(&self, id: &EngineTaskId, idx: u32) -> Result<Vec<u8>, EngineError> {
+        self.core
+            .read_piece(id, idx as i32)
+            .map(|o| o.unwrap_or_default())
+            .map_err(|e| EngineError::Other(core_err(&e)))
     }
 
     /// BT 会话级设置热改（S1 trait 扩展）：发现/传输/连接三组按需下发。
@@ -910,32 +949,6 @@ impl DownloadEngine for BtEngine {
         Ok(())
     }
 
-    /// 引擎级全局代理热改（S1 trait 扩展）：更新 network 快照后整包 re-apply
-    /// （settings_pack 全量语义，限速原样重放）；None = 清除代理（直连）。
-    async fn set_global_proxy(&self, proxy: Option<&str>) -> Result<(), EngineError> {
-        let net = {
-            let mut n = self.network.lock();
-            n.proxy_url = proxy
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            n.clone()
-        };
-        let proxy_cfg = match net.proxy_url.as_deref() {
-            Some(u) => match crate::ffi::parse_proxy(u) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    return Err(EngineError::Other(format!(
-                        "bt proxy 解析失败 {u:?}: {e:?}"
-                    )))
-                }
-            },
-            None => None,
-        };
-        self.core
-            .apply_network(proxy_cfg.as_ref(), net.down_kb_s, net.up_kb_s)
-            .map_err(|e| EngineError::Other(format!("bt apply_network: {e:?}")))
-    }
-
     /// BT 子文件优先级批量设置（trait 扩展；需 metadata 就绪）。
     /// NotFound（torrent/metadata 缺失）按 `EngineError::NotFound` 透传，
     /// 供 state 层区分「任务不存在」与「metadata 未就绪」。
@@ -957,13 +970,6 @@ impl DownloadEngine for BtEngine {
     async fn file_priorities(&self, id: &EngineTaskId) -> Result<Vec<Option<u32>>, EngineError> {
         let prios = self.core.file_priorities(id).map_err(bt_engine_err)?;
         Ok(prios.into_iter().map(|p| Some(p as u32)).collect())
-    }
-
-    /// 任务级顺序下载（trait 扩展）：libtorrent sequential_download flag。
-    /// 2.0.x = torrent_flags（on/off 均可）；2.1 = set_sequential_range（仅 on）。
-    /// metadata 未就绪也可设（handle 级 flag，随 metadata 到达持续生效）。
-    async fn set_sequential(&self, id: &EngineTaskId, on: bool) -> Result<(), EngineError> {
-        self.core.set_sequential(id, on).map_err(bt_engine_err)
     }
 
     /// 任务级连接数上限（S1-c）：>0 = 上限；0 = 复位会话级默认。
@@ -1066,8 +1072,3 @@ impl DownloadEngine for BtEngine {
             .map_err(|e| EngineError::Other(core_err(&e)))
     }
 }
-
-// TD-2 Step 2（docs/design/ENGINE-TRAIT-SPLIT.md）：BT 扩展面接入。
-// 全部方法经扩展的转发默认到达上方主 trait 覆写（行为按构造等价，
-// 零新增代码路径）；Step 3 主 trait 收缩时本体迁入扩展、转发删除。
-impl BtEngineExt for BtEngine {}

@@ -13,8 +13,8 @@ use tokio::sync::Mutex;
 
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
-    Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
-    EngineTaskId, FileProgress, PeerInfo,
+    BtEngineExt, Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState,
+    EngineStatus, EngineTaskId, FileProgress, PeerInfo,
 };
 use xunlei_ffi::{query::TaskState as XlTaskState, task::TaskId as XlTaskId, XunleiHandle};
 
@@ -299,12 +299,6 @@ impl DownloadEngine for XunleiBtEngine {
         Ok(())
     }
 
-    async fn peers(&self, _id: &EngineTaskId) -> Result<Vec<PeerInfo>, EngineError> {
-        // xunlei SDK 不提供任务级 peer 列表查询（仅统计数）。
-        // 已注入的 peer 可通过内部跟踪补充，v1 先返回空。
-        Ok(vec![])
-    }
-
     async fn update_sources(
         &self,
         _id: &EngineTaskId,
@@ -313,6 +307,21 @@ impl DownloadEngine for XunleiBtEngine {
         Err(EngineError::Unsupported)
     }
 
+    /// TD-2 Step 3：声明 BT 扩展面。迅雷为**部分实现**（peers/add_url_seed/
+    /// ban_peer/read_piece/add_xunlei_resume 有真实现，其余走扩展默认
+    /// `Unsupported`——与收缩前主 trait 默认行为逐字节一致）。
+    fn bt(&self) -> Option<&dyn BtEngineExt> {
+        Some(self)
+    }
+}
+
+#[async_trait::async_trait]
+impl BtEngineExt for XunleiBtEngine {
+    async fn peers(&self, _id: &EngineTaskId) -> Result<Vec<PeerInfo>, EngineError> {
+        // xunlei SDK 不提供任务级 peer 列表查询（仅统计数）。
+        // 已注入的 peer 可通过内部跟踪补充，v1 先返回空。
+        Ok(vec![])
+    }
     async fn add_url_seed(&self, id: &EngineTaskId, url: &str) -> Result<(), EngineError> {
         let xl_id = self.get_xl_task_id(id).await?;
         self.handle
@@ -320,7 +329,6 @@ impl DownloadEngine for XunleiBtEngine {
             .await
             .map_err(|e| EngineError::Other(format!("xunlei add server failed: {e}")))
     }
-
     async fn ban_peer(&self, id: &EngineTaskId, peer: SocketAddr) -> Result<(), EngineError> {
         let xl_id = self.get_xl_task_id(id).await?;
         self.handle
@@ -328,11 +336,9 @@ impl DownloadEngine for XunleiBtEngine {
             .await
             .map_err(|e| EngineError::Other(format!("xunlei discard peer failed: {e}")))
     }
-
     async fn read_piece(&self, _id: &EngineTaskId, _idx: u32) -> Result<Vec<u8>, EngineError> {
         Err(EngineError::Unsupported)
     }
-
     async fn add_xunlei_resume(&self, _data: Vec<u8>) -> Result<EngineTaskId, EngineError> {
         Err(EngineError::Other(
             "XunleiBtEngine 不支持 fastresume 导入，请使用 libtorrent 引擎".into(),

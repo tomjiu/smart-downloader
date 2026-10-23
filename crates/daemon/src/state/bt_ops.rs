@@ -18,13 +18,15 @@ impl DaemonState {
         id: &str,
         priorities: &[(usize, u32)],
     ) -> Result<Vec<Option<u32>>, DaemonError> {
-        let (engine, tid) = {
+        let (engine, tid, kind) = {
             let rec = self
                 .tasks
                 .lock()
                 .get(id)
                 .cloned()
                 .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            // kind 预拒先于引擎解析（错误形态保真）：非 BT 任务即使其引擎
+            // 未加载也应拿 409 而非「引擎未加载」（启用该 feature 也无济于事）。
             if rec.engine_kind != EngineKind::Bt {
                 return Err(DaemonError::UnsupportedOp(format!(
                     "仅 BT 任务支持子文件优先级（{id} 为 {:?}）",
@@ -35,12 +37,17 @@ impl DaemonState {
                 .engine_tid
                 .clone()
                 .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
-            (self.engine_for(rec.engine_kind)?, tid)
+            (self.engine_for(rec.engine_kind)?, tid, rec.engine_kind)
         };
+        // 能力询问（TD-2 Step 3）：BT 语义方法只在 BtEngineExt 上存在——
+        // 结构 enforcement（Bt 槽引擎必挂扩展面，理论不可达的防御分支）。
+        let bt = engine.bt().ok_or_else(|| {
+            DaemonError::UnsupportedOp(format!("仅 BT 任务支持子文件优先级（{id} 为 {kind:?}）"))
+        })?;
         // metadata 就绪探测 + 文件数锚定（当前优先级表长度 = 引擎侧文件数）。
         // 引擎 NotFound（torrent/metadata 缺失）→ 409「metadata 未就绪」，
         // 与任务记录级 404（tasks 表无此 id）语义分离。
-        let current = engine.file_priorities(&tid).await.map_err(|e| match e {
+        let current = bt.file_priorities(&tid).await.map_err(|e| match e {
             smart_dl_core::types::EngineError::NotFound => DaemonError::UnsupportedOp(
                 "BT 任务 metadata 未就绪（或引擎句柄不存在），无法设置子文件优先级".into(),
             ),
@@ -59,11 +66,10 @@ impl DaemonState {
                 )));
             }
         }
-        engine
-            .set_file_priorities(&tid, priorities)
+        bt.set_file_priorities(&tid, priorities)
             .await
             .map_err(|e| DaemonError::Engine(e.to_string()))?;
-        let snapshot = engine
+        let snapshot = bt
             .file_priorities(&tid)
             .await
             .map_err(|e| DaemonError::Engine(e.to_string()))?;
@@ -129,7 +135,7 @@ impl DaemonState {
     /// `UnsupportedOp` 409，同 set_max_connections 预拒惯例）。仅下发引擎
     /// flag（做种态生效、下载中无效果），不改记录状态、不落盘。
     pub async fn set_task_super_seeding(&self, id: &str, on: bool) -> Result<(), DaemonError> {
-        let (engine, tid, kind) = {
+        let (engine, tid) = {
             let rec = self
                 .tasks
                 .lock()
@@ -140,26 +146,19 @@ impl DaemonState {
                 .engine_tid
                 .clone()
                 .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
-            (self.engine_for(rec.engine_kind)?, tid, rec.engine_kind)
+            (self.engine_for(rec.engine_kind)?, tid)
         };
-        if kind != EngineKind::Bt {
-            return Err(DaemonError::UnsupportedOp(format!(
-                "任务 {id} 的引擎不支持超级种子（仅 BT 任务）"
-            )));
-        }
-        engine
-            .set_super_seeding(&tid, on)
-            .await
-            .map_err(|e| match e {
-                smart_dl_core::types::EngineError::Unsupported => {
-                    DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持超级种子"))
-                }
-                // batch6-P2：句柄已不存在 → NotFound 语义而非 500
-                smart_dl_core::types::EngineError::NotFound => {
-                    DaemonError::NotFound(id.to_string())
-                }
-                other => DaemonError::Engine(other.to_string()),
-            })?;
+        let bt = engine.bt().ok_or_else(|| {
+            DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持超级种子（仅 BT 任务）"))
+        })?;
+        bt.set_super_seeding(&tid, on).await.map_err(|e| match e {
+            smart_dl_core::types::EngineError::Unsupported => {
+                DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持超级种子"))
+            }
+            // batch6-P2：句柄已不存在 → NotFound 语义而非 500
+            smart_dl_core::types::EngineError::NotFound => DaemonError::NotFound(id.to_string()),
+            other => DaemonError::Engine(other.to_string()),
+        })?;
         {
             let mut tasks = self.tasks.lock();
             if let Some(rec) = tasks.get_mut(id) {
@@ -169,19 +168,14 @@ impl DaemonState {
         Ok(())
     }
 
-    /// 强制宣告/重新校验/导出（Task 46）：公共前置——BT 任务预拒 + 引擎句柄
-    /// 解析（同 set_task_super_seeding 惯例）。
+    /// 强制宣告/重新校验/导出（Task 46）：公共前置——BT 能力询问 + 引擎句柄
+    /// 解析（返回 `BtEngineExt` 借用，直接承载 BT 语义调用；错误消息与
+    /// 旧 kind 预拒守卫逐字一致）。
     async fn bt_op_engine(
         &self,
         id: &str,
         op_name: &str,
-    ) -> Result<
-        (
-            std::sync::Arc<dyn smart_dl_core::types::DownloadEngine>,
-            String,
-        ),
-        DaemonError,
-    > {
+    ) -> Result<(&'_ dyn smart_dl_core::types::BtEngineExt, String), DaemonError> {
         let rec = self
             .tasks
             .lock()
@@ -197,7 +191,17 @@ impl DaemonState {
                 "任务 {id} 的引擎不支持 {op_name}（仅 BT 任务）"
             )));
         }
-        Ok((self.engine_for(EngineKind::Bt)?, tid))
+        // 从注册表直接借用（返回引用无法由 engine_for 的克隆构造）。
+        let engine = self.engines.get(&EngineKind::Bt).ok_or_else(|| {
+            DaemonError::InvalidSource(format!(
+                "引擎未加载: {:?}（编译时启用对应 feature）",
+                EngineKind::Bt
+            ))
+        })?;
+        let bt = engine.bt().ok_or_else(|| {
+            DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持 {op_name}（仅 BT 任务）"))
+        })?;
+        Ok((bt, tid))
     }
 
     /// 强制宣告（Task 46，qbit/BitComet 任务右键对标）：tracker 宣告与
@@ -214,10 +218,10 @@ impl DaemonState {
                 "announce 请求无效：tracker 与 dht 至少一项为 true".into(),
             ));
         }
-        let (engine, tid) = self.bt_op_engine(id, "强制宣告").await?;
+        let (bt, tid) = self.bt_op_engine(id, "强制宣告").await?;
         let mut errs: Vec<String> = Vec::new();
         if tracker {
-            if let Err(e) = engine.force_reannounce(&tid).await {
+            if let Err(e) = bt.force_reannounce(&tid).await {
                 // batch6-P2：句柄已不存在（引擎侧被摘）→ NotFound 语义而非 500
                 if matches!(e, smart_dl_core::types::EngineError::NotFound) {
                     return Err(DaemonError::NotFound(id.to_string()));
@@ -226,7 +230,7 @@ impl DaemonState {
             }
         }
         if dht {
-            if let Err(e) = engine.force_dht_announce(&tid).await {
+            if let Err(e) = bt.force_dht_announce(&tid).await {
                 if matches!(e, smart_dl_core::types::EngineError::NotFound) {
                     return Err(DaemonError::NotFound(id.to_string()));
                 }
@@ -261,8 +265,8 @@ impl DaemonState {
     /// 校验期下载/做种挂起，完成后自动恢复。仅下发引擎，不改记录态（状态
     /// 推进由 bt_events 轮询自然回流）。
     pub async fn recheck_task(&self, id: &str) -> Result<(), DaemonError> {
-        let (engine, tid) = self.bt_op_engine(id, "强制重新校验").await?;
-        engine.force_recheck(&tid).await.map_err(|e| match e {
+        let (bt, tid) = self.bt_op_engine(id, "强制重新校验").await?;
+        bt.force_recheck(&tid).await.map_err(|e| match e {
             // batch6-P2：句柄已不存在 → NotFound 语义而非 500
             smart_dl_core::types::EngineError::NotFound => DaemonError::NotFound(id.to_string()),
             other => DaemonError::Engine(other.to_string()),
@@ -284,9 +288,8 @@ impl DaemonState {
                 "piece 优先级须在 0..=7（收到的 {prio}）"
             )));
         }
-        let (engine, tid) = self.bt_op_engine(id, "首尾块优先").await?;
-        engine
-            .set_piece_first_last(&tid, prio)
+        let (bt, tid) = self.bt_op_engine(id, "首尾块优先").await?;
+        bt.set_piece_first_last(&tid, prio)
             .await
             .map_err(|e| match e {
                 smart_dl_core::types::EngineError::Unsupported => {
@@ -310,8 +313,8 @@ impl DaemonState {
     /// 字节。magnet 任务 metadata 未就绪 → 409（batch5：NotReady/Unsupported
     /// 统一映射，原 Other → 500 与文档承诺 409 相悖）；任务不在引擎 → 404。
     pub async fn export_task_torrent(&self, id: &str) -> Result<Vec<u8>, DaemonError> {
-        let (engine, tid) = self.bt_op_engine(id, "导出种子").await?;
-        engine.export_torrent(&tid).await.map_err(|e| match e {
+        let (bt, tid) = self.bt_op_engine(id, "导出种子").await?;
+        bt.export_torrent(&tid).await.map_err(|e| match e {
             smart_dl_core::types::EngineError::Unsupported => {
                 DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持导出种子"))
             }
@@ -323,8 +326,8 @@ impl DaemonState {
 
     /// 生成 magnet URI（Task 46）：btih + dn + 全量 tracker。
     pub async fn task_magnet_uri(&self, id: &str) -> Result<String, DaemonError> {
-        let (engine, tid) = self.bt_op_engine(id, "生成磁链").await?;
-        engine.magnet_uri(&tid).await.map_err(|e| match e {
+        let (bt, tid) = self.bt_op_engine(id, "生成磁链").await?;
+        bt.magnet_uri(&tid).await.map_err(|e| match e {
             smart_dl_core::types::EngineError::Unsupported => {
                 DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持生成磁链"))
             }
@@ -485,7 +488,6 @@ impl DaemonState {
             (
                 std::sync::Arc<dyn smart_dl_core::types::DownloadEngine>,
                 String,
-                EngineKind,
             ),
             DaemonError,
         > = {
@@ -494,13 +496,11 @@ impl DaemonState {
                 None => Err(DaemonError::NotFound(id.to_string())),
                 Some(rec) => match rec.engine_tid.clone() {
                     None => Err(DaemonError::NotFound(id.to_string())),
-                    Some(tid) => self
-                        .engine_for(rec.engine_kind)
-                        .map(|e| (e, tid, rec.engine_kind)),
+                    Some(tid) => self.engine_for(rec.engine_kind).map(|e| (e, tid)),
                 },
             }
         };
-        let (engine, tid, kind) = match resolved {
+        let (engine, tid) = match resolved {
             Ok(v) => v,
             Err(e) => {
                 let msg = e.to_string();
@@ -510,16 +510,17 @@ impl DaemonState {
                     .collect();
             }
         };
-        if kind != EngineKind::Bt {
+        // 能力询问：无 BT 面（非 BT 任务）→ 逐条 Err（与旧 kind 预拒同文案）
+        let Some(bt) = engine.bt() else {
             return addrs
                 .into_iter()
                 .map(|a| (a.to_string(), Err("仅 BT 任务支持添加 peer".into())))
                 .collect();
-        }
+        };
         let mut results = Vec::with_capacity(addrs.len());
         for a in addrs {
             let key = a.to_string();
-            let r = engine.add_peer(&tid, a).await;
+            let r = bt.add_peer(&tid, a).await;
             results.push((key, r.map_err(|e| e.to_string())));
         }
         let ok = results.iter().filter(|(_, r)| r.is_ok()).count();
@@ -537,13 +538,14 @@ impl DaemonState {
     /// `n > 0` = 上限；`n == 0` = 复位会话级连接数默认。写入记录字段
     /// （持久化 + 恢复重放，metadata 未就绪也可设）+ 引擎即时下发。
     pub async fn set_task_max_connections(&self, id: &str, n: u32) -> Result<(), DaemonError> {
-        let (engine, tid) = {
+        let (engine, tid, kind) = {
             let rec = self
                 .tasks
                 .lock()
                 .get(id)
                 .cloned()
                 .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            // kind 预拒先于引擎解析（错误形态保真，同 set_task_file_priorities）。
             if rec.engine_kind != EngineKind::Bt {
                 return Err(DaemonError::UnsupportedOp(format!(
                     "任务 {id} 非 BT 任务（{:?}），不支持连接数上限",
@@ -554,17 +556,19 @@ impl DaemonState {
                 .engine_tid
                 .clone()
                 .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
-            (self.engine_for(rec.engine_kind)?, tid)
+            (self.engine_for(rec.engine_kind)?, tid, rec.engine_kind)
         };
-        engine
-            .set_max_connections(&tid, n)
-            .await
-            .map_err(|e| match e {
-                smart_dl_core::types::EngineError::Unsupported => {
-                    DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持连接数上限"))
-                }
-                other => DaemonError::Engine(other.to_string()),
-            })?;
+        let bt = engine.bt().ok_or_else(|| {
+            DaemonError::UnsupportedOp(format!(
+                "任务 {id} 非 BT 任务（{kind:?}），不支持连接数上限"
+            ))
+        })?;
+        bt.set_max_connections(&tid, n).await.map_err(|e| match e {
+            smart_dl_core::types::EngineError::Unsupported => {
+                DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持连接数上限"))
+            }
+            other => DaemonError::Engine(other.to_string()),
+        })?;
         {
             let mut tasks = self.tasks.lock();
             if let Some(rec) = tasks.get_mut(id) {
@@ -612,6 +616,8 @@ impl DaemonState {
                 .engine_tid
                 .clone()
                 .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            // kind 预拒先于引擎解析（错误形态保真）：BT 任务即使 BT 引擎
+            // 未加载也应拿 409（启用 bt feature 也不会让 BT 任务支持任务级代理）。
             if rec.engine_kind != EngineKind::Http {
                 return Err(DaemonError::UnsupportedOp(format!(
                     "任务 {id}（{:?}）不支持任务级代理——仅 HTTP 任务（BT 代理属会话级配置）",
@@ -620,8 +626,11 @@ impl DaemonState {
             }
             (self.engine_for(rec.engine_kind)?, tid)
         };
-        engine
-            .set_task_proxy(&tid, proxy.clone())
+        // 能力询问：仅 HTTP 任务暴露 HttpEngineExt（Bt 槽引擎理论不可达分支）
+        let http = engine.http().ok_or_else(|| {
+            DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持任务级代理"))
+        })?;
+        http.set_task_proxy(&tid, proxy.clone())
             .await
             .map_err(|e| match e {
                 smart_dl_core::types::EngineError::Unsupported => {
@@ -660,7 +669,7 @@ impl DaemonState {
         }
         let mut done = Vec::new();
         for id in pending {
-            let (engine, tid, prios) = {
+            let (bt, tid, prios) = {
                 let tasks = self.tasks.lock();
                 let Some(rec) = tasks.get(&id) else {
                     self.pending_file_prio.lock().remove(&id);
@@ -674,17 +683,23 @@ impl DaemonState {
                     self.pending_file_prio.lock().remove(&id);
                     continue;
                 };
-                match self.engine_for(rec.engine_kind) {
-                    Ok(e) => (e, tid, prios),
-                    Err(_) => continue, // 引擎暂不可用：下轮再试
-                }
+                // 注册表借用（引擎 Arc 存活于 self.engines，借用可跨 await 持有；
+                // 引擎缺失 → 下轮再试，无 BT 面 → 永不收敛项移除 pending）
+                let Some(engine) = self.engines.get(&rec.engine_kind) else {
+                    continue; // 引擎暂不可用：下轮再试（旧 engine_for Err 同口径）
+                };
+                let Some(bt) = engine.bt() else {
+                    self.pending_file_prio.lock().remove(&id);
+                    continue;
+                };
+                (bt, tid, prios)
             };
             // 就绪性探测：readback 成功且非空 = metadata 已就绪
-            match engine.file_priorities(&tid).await {
+            match bt.file_priorities(&tid).await {
                 Ok(cur) if !cur.is_empty() => {
                     let pairs: Vec<(usize, u32)> =
                         prios.iter().enumerate().map(|(i, p)| (i, *p)).collect();
-                    match engine.set_file_priorities(&tid, &pairs).await {
+                    match bt.set_file_priorities(&tid, &pairs).await {
                         Ok(()) => {
                             self.pending_file_prio.lock().remove(&id);
                             if let Some(rec) = self.tasks.lock().get_mut(&id) {
@@ -731,10 +746,15 @@ impl DaemonState {
             )));
         }
         let engine = self.engine_for(EngineKind::Bt)?;
+        let bt = engine.bt().ok_or_else(|| {
+            DaemonError::UnsupportedOp(format!(
+                "仅 BT 任务支持注入 web seed（{id} 为 {:?}）",
+                rec.engine_kind
+            ))
+        })?;
         let mut added = 0usize;
         for url in urls {
-            engine
-                .add_url_seed(&tid, url)
+            bt.add_url_seed(&tid, url)
                 .await
                 .map_err(|e| DaemonError::Engine(e.to_string()))?;
             added += 1;
@@ -764,8 +784,13 @@ impl DaemonState {
             .clone()
             .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
         let engine = self.engine_for(EngineKind::Bt)?;
-        engine
-            .list_trackers(&tid)
+        let bt = engine.bt().ok_or_else(|| {
+            DaemonError::UnsupportedOp(format!(
+                "仅 BT 任务支持 tracker 管理（{id} 为 {:?}）",
+                rec.engine_kind
+            ))
+        })?;
+        bt.list_trackers(&tid)
             .await
             .map_err(|e| DaemonError::Engine(e.to_string()))
     }
@@ -802,8 +827,13 @@ impl DaemonState {
             .clone()
             .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
         let engine = self.engine_for(EngineKind::Bt)?;
-        engine
-            .add_trackers(&tid, urls)
+        let bt = engine.bt().ok_or_else(|| {
+            DaemonError::UnsupportedOp(format!(
+                "仅 BT 任务支持 tracker 管理（{id} 为 {:?}）",
+                rec.engine_kind
+            ))
+        })?;
+        bt.add_trackers(&tid, urls)
             .await
             .map_err(|e| DaemonError::Engine(e.to_string()))?;
         if let Some(rec) = self.tasks.lock().get_mut(id) {
@@ -831,15 +861,18 @@ impl DaemonState {
             .clone()
             .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
         let engine = self.engine_for(EngineKind::Bt)?;
-        engine
-            .remove_tracker(&tid, url)
-            .await
-            .map_err(|e| match e {
-                smart_dl_core::types::EngineError::NotFound => {
-                    DaemonError::NotFound(format!("tracker 不存在: {url}"))
-                }
-                other => DaemonError::Engine(other.to_string()),
-            })?;
+        let bt = engine.bt().ok_or_else(|| {
+            DaemonError::UnsupportedOp(format!(
+                "仅 BT 任务支持 tracker 管理（{id} 为 {:?}）",
+                rec.engine_kind
+            ))
+        })?;
+        bt.remove_tracker(&tid, url).await.map_err(|e| match e {
+            smart_dl_core::types::EngineError::NotFound => {
+                DaemonError::NotFound(format!("tracker 不存在: {url}"))
+            }
+            other => DaemonError::Engine(other.to_string()),
+        })?;
         if let Some(rec) = self.tasks.lock().get_mut(id) {
             rec.push_event("tracker", Some(format!("-{url}")));
         }

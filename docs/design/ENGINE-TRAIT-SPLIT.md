@@ -1,8 +1,9 @@
 # TD-2 设计提案：`DownloadEngine` trait 拆分（最小契约 + 扩展 trait）
 
-> 状态：**Step 1 已合并（#131）；Step 2 已落地（零破坏基础设施，本仓库
-> `crates/core/src/types.rs` 的 `BtEngineExt`/`HttpEngineExt` + 访问器）；Step 3
-> （主 trait 收缩 + daemon 调用点迁移）待拍板后实施**
+> 状态：**三步全部落地——Step 1 已合并（#131，撒谎修复）；Step 2 已合并
+> （#157，零破坏基础设施：`BtEngineExt`/`HttpEngineExt` + 访问器）；Step 3
+> 已落地（主 trait 40 → 15 收缩 + daemon 调用点全量能力询问化，终态
+> 9 必需 + 4 通用默认 + 2 访问器 / BtExt 26 / HttpExt 1）**
 > 来源：ARCHITECTURE-REVIEW §6 建议 5 / BACKEND A0 TD-2 / 审查 README 优先级 #8
 > 本文档由 TD-2 前置修复（引擎「撒谎」消除，见下）随批产出
 
@@ -127,9 +128,17 @@ bt.force_recheck(&tid).await?;
    行为逐字节不变（已在 `BtEngineExt` 文档注明）。验收测试：
    `core/tests/engine_ext_defaults.rs`（默认 None）+
    `daemon/tests/engine_ext_accessors.rs`（bt feature 真 引擎 Some/转发等价）。
-3. **Step 3**：把 5 个 BT 概念必需方法移入 `BtEngineExt`，trait 收缩到
-   最小契约；ops.rs 的 52 处判断逐域改写（peers/trackers/webseed/priorities
-   /recheck 五个域先行）。全量测试回归 + 锁模型复查（不改锁，只改调用形状）。
+3. **Step 3（已落地）**：BT 概念方法（4 必需 + 21 默认）与 `set_task_proxy`
+   全部迁入扩展 trait，主 trait 收缩到最小契约（9 必需 + 限速/全局限速/
+   顺序下载/全局代理 4 通用默认 + `bt()`/`http()` 访问器 = 15 方法）；
+   daemon 27 处引擎级调用点全部改为 `bt()`/`http()` 能力询问（错误消息与
+   旧 kind 守卫逐字一致；3 处保留 kind 预拒在引擎解析之前——错误形态
+   保真：非 BT/HTTP 任务即使引擎未加载也应拿 409 而非「引擎未加载」）。
+   `XunleiBtEngine`（部分实现，5 真方法 + 扩展默认）与 `FakeEngine`
+   （按构造 kind 条件暴露扩展面）一并接入；`HttpEngine`/`FtpEngine`/
+   `SftpEngine`/`NasRemoteEngine`/`MockEngine` 的 4 方法撒谎桩删除。
+   防回潮：`core/tests/engine_min_contract.rs` 最小契约 canary（新增必需
+   方法编译期拦截）。全量测试回归 + 锁模型复查（不改锁，只改调用形状）。
 
 ### 2.4 明确不做
 

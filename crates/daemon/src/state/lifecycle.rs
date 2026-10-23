@@ -426,14 +426,23 @@ impl DaemonState {
                 return;
             }
         };
+        // 能力询问：无 BT 扩展面与引擎不可用同口径（全量挂待重试集）
+        let Some(bt) = engine.bt() else {
+            tracing::warn!(
+                "IP 封禁重放暂缓：BT 引擎无扩展面——{} 条挂入待重试集，30s tick 重发",
+                bans.len()
+            );
+            *self.ban_replay_failed.lock() = bans.clone();
+            return;
+        };
         let mut ok = 0usize;
         let mut failed = Vec::new();
         for entry in &bans {
             let res = match entry.split_once('-') {
                 // 区间条目（batch5）："a-b"；split_once 对 IPv6 冒号无影响
                 //（用 '-' 分隔持久化格式，v6 字面量自身不含 '-'）
-                Some((a, b)) => engine.ban_ip_range(a, b).await,
-                None => engine.ban_ip(entry).await,
+                Some((a, b)) => bt.ban_ip_range(a, b).await,
+                None => bt.ban_ip(entry).await,
             };
             match res {
                 Ok(()) => ok += 1,
@@ -460,6 +469,9 @@ impl DaemonState {
         let Ok(engine) = self.engine_for(EngineKind::Bt) else {
             return; // 引擎不可用：保留待重试集，下轮再试
         };
+        let Some(bt) = engine.bt() else {
+            return; // 无 BT 扩展面：同引擎不可用口径
+        };
         let _gate = self.ban_ops.lock().await;
         let mut remaining = Vec::new();
         let mut ok = 0usize;
@@ -470,8 +482,8 @@ impl DaemonState {
                 continue;
             }
             let res = match entry.split_once('-') {
-                Some((a, b)) => engine.ban_ip_range(a, b).await,
-                None => engine.ban_ip(entry).await,
+                Some((a, b)) => bt.ban_ip_range(a, b).await,
+                None => bt.ban_ip(entry).await,
             };
             match res {
                 Ok(()) => ok += 1,
