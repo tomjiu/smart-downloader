@@ -239,9 +239,14 @@ export default function DlApp() {
           const fresh = await client.getTask(t.task_id);
           // 引用稳定：表格消费的字段（done/total/state/error/name/limits/
           // rates/累计统计）未变 → 沿用旧快照对象（行级 memo 浅比较生效）。
-          // 审计修复（2026-10-21）：旧比较漏 rates/limits/累计字段——做种任务
-          // done/total 恒定 → 快照冻结 → 上传速率列与 E33 累计统计永不更新
-          // （后端每 2s 提供新值被引用复用静默丢弃；注释声称包含但代码没有）。
+          // 审计修复（2026-10-21，PR #146）+ #147 §一勘误：速率数据是双路
+          // —— SSE Speed 事件为新鲜时主源（#117 起有生产者：BT 做种分支
+          // 只发 Speed、HTTP Downloading 分支发 Speed+Progress；setRates
+          // 每事件新建对象，不受引用复用影响）；本快照轮询是 SSE 过期/
+          // 断连后的回落源，且是 TaskDetail 累计上传统计的唯一源。旧比较
+          // 漏 rates/limits/累计字段 → 快照侧新值被引用复用静默丢弃（回落
+          // 源冻结 + 累计统计冻结）。做种速率列不可见的另一半根因（渲染
+          // 门 down>0）见 TasksTable 速率单元格注释，随 #147 一并修复。
           const sameRates = (a?: { down_bytes_s: number; up_bytes_s: number } | null, b?: { down_bytes_s: number; up_bytes_s: number } | null) =>
             (a?.down_bytes_s ?? 0) === (b?.down_bytes_s ?? 0) &&
             (a?.up_bytes_s ?? 0) === (b?.up_bytes_s ?? 0);

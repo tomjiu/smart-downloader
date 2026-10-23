@@ -3,9 +3,12 @@
 > **本文档是项目中「什么是真的」的唯一入口。**
 > 其他 `docs/review/*.md` 是历史审查记录，**会过期**；冲突时以本文档为准。
 >
-> 最后更新：2026-10-21 · main @ `3653b96` · 版本 **0.2.3**
+> 最后更新：2026-10-21 · 核对基线 main @ `d6bb3ff` · 版本 **0.2.3**
 >
-> 数据口径：行数 = `git ls-files` 过滤后 `wc -l`；测试 = `cargo test --workspace --exclude smart-dl-btcore`（Linux 本地实测）。
+> 数据口径：**所有数字均可复现**，命令见 §1.1「复现命令」；测试数取自
+> CI（同命令同环境，避免本地漂移）。行数为 `wc -l` 口径（含空行）。
+> ⚠️ Windows PowerShell `Measure-Object -Line` **不计空行**，同仓库会少
+> ~5,700 行——跨平台核对请统一用 §1.1 的 git 命令。
 
 ---
 
@@ -14,12 +17,30 @@
 | 项 | 值 |
 |---|---|
 | 版本 | **0.2.3**（workspace + desktop + tauri.conf 三处一致） |
-| crates | 8 个：`core` `btcore` `httpdl` `provider` `daemon` `xunlei-ffi` `xunlei-convert` `rss` |
-| 源码 | `crates/` **83,604 行** Rust（含测试；src/ 为主 57,942 行） |
-| UI | `ui/src/` **20 文件 / 6,271 行** TS/TSX/CSS |
-| 测试 | **98 套件 / 1,092 通过 / 0 失败**（`cargo test --workspace --exclude smart-dl-btcore`，2026-10-21 实测） |
-| 集成测试文件 | daemon 33 个、httpdl 30 个 |
+| crates | 9 个：`core` `btcore` `httpdl` `provider` `daemon` `xunlei-ffi` `xunlei-convert` `rss` `storage`（#138 新增） |
+| 源码 | `crates/` **83,762 行** Rust（含测试；其中 `src/` 28,709 行——旧值 57,942 系 glob 口径错误，#147 §二修正） |
+| UI | `ui/src/` **20 文件 / 6,327 行** TS/TSX/CSS |
+| 测试 | **192 套件 / 2,101 通过 / 0 失败**（CI ubuntu @ `ab254c6`，逐 crate 特性矩阵）+ **BT 集成 48 套件 / 523 通过**（libtorrent job） |
+| 集成测试文件 | daemon 35 个、httpdl 34 个 |
 | License | Apache-2.0 / MIT 双许可（#114 补） |
+
+#### 1.1 复现命令（口径写死，任何人任何平台同结果）
+
+```bash
+# 行数（wc -l 含空行；git ls-files 保证与 checkout 平台无关）
+git ls-files 'crates/**/*.rs' | xargs wc -l | tail -1        # crates 总行数
+git ls-files 'crates/*/src/**/*.rs' | xargs wc -l | tail -1  # 仅 src/（不含 tests/）
+git ls-files 'ui/src/**/*.ts' 'ui/src/**/*.tsx' 'ui/src/**/*.css' | xargs wc -l | tail -1
+
+# 测试（与 CI ubuntu job 完全同口径；Windows 本地跑同命令因条件编译会少 ~10 例，属正常）
+cargo test -p smart-dl-core
+cargo test -p smart-dl-daemon
+cargo test -p smart-dl-daemon --features "ftp,nas"
+cargo test -p smart-dl-daemon --features sftp
+cargo test -p smart-dl-httpdl --features ftp
+cargo test -p smart-dl-httpdl --features sftp
+cargo test -p smart-dl-provider
+```
 
 ### 构建状态
 
@@ -125,22 +146,23 @@ ftp://  ftps://  sftp://  http(s)://  metalink  .torrent
 
 ## 5. 待处理（open PR / issue）
 
-### PR 需 rebase（3）—— ✅ 已全部 rebase 完成（2026-10-21，响应 #143）
+### 2026-10-21 批次合并记录（响应 #143，全部已合）
 
-| PR | rebase 结果 | 本地验证 |
+| PR | 内容 | 备注 |
 |---|---|---|
-| **#138** TD-3 I/O 下沉（`session/output` → 独立 `storage` crate） | ✅ 冲突 3 处解毕（rss/storage 依赖并存；bt_alerts 取 #130 新解析 + storage 导入；lock 重生） | 1,081 通过 / fmt / clippy 零告警 |
-| **#137** BtEngine 适配器 → btcore | ✅ 仅 1 处冲突（parking_lot）；sniffer/xltd 零引用自动合并 | 1,092 通过 + `check --features bt` 过 |
-| **#129** Playwright e2e | ✅ TaskRow 补齐 6 个行级 testid + 虚拟滚动契约文档化 | **真实 daemon 实跑 5/5 全绿（46.9s）** |
+| #144 | STATUS.md 单一事实来源 + 文档一致性 | 本文件 |
+| #145 | 契约矩阵 15 → **24 条**（超额完成 #143 要求的 23） | 边界+正例成对覆盖 |
+| #146 | 快照引用比较补全 rates/limits/累计 | #147 §一勘误描述 + 渲染门补修 |
+| #129 | Playwright e2e 5 条关键路径 | 真实 daemon 实跑 5/5 |
+| #137 | BtEngine 适配器 → btcore | rebase 后合入 |
+| #138 | TD-3 I/O 下沉 storage crate | crates 8 → 9 |
 
 ### Issue 未关闭
 
 | # | 内容 | 状态 |
 |---|---|---|
-| 115 | UI 重构 Phase 1 | ✅ #116 已合，可关 |
-| 120 | `remove_with` 静默失败 + daemon 孤儿进程加固 | 🟡 `remove_with` 已修（#123）；**Job Object / PDEATHSIG 未做** |
-| 121 | 实机测试四维度 | 🟡 A 完成 15/23（#124）、B/C/D 完成（#125）、e2e 待 #129 |
-| 127 | UI 实测 6 问题 | ✅ #116 全修，可关 |
+| 143 | 合并后检查四部分 | §一~§四 全部落地；余「main 分支保护」待 repo admin（tomjiu） |
+| 147 | 合并结果核验 3 项修正 | 本 PR 处理（描述勘误 / 统计口径 / e2e 解耦） |
 
 ---
 
@@ -150,9 +172,8 @@ ftp://  ftps://  sftp://  http(s)://  metalink  .torrent
 
 | 任务 | 理由 |
 |---|---|
-| **ts-rs 生成 TS 类型**（REALTEST-PLAN §A-1 方案 1） | **根治字段名不一致**：编译期报错而非运行时静默。当前 UI 类型手写，`max_download_kb_s` vs `down_kb_s` 的错误无法被发现 |
-| 补齐契约矩阵 8 条（#2/#3 torrent/metalink_b64、#11 sequential、#13 proxy、#14 piece-priority、#15 super-seeding、#18 batch、#20 trackers、#23 settings 生效） | 现有 15/23 |
-| CI 加 contract-matrix job | 防止回退 |
+| **ts-rs 生成 TS 类型**（REALTEST-PLAN §A-1 方案 1，#147 §六再次点名） | **根治字段名不一致**：编译期报错而非运行时静默。当前 UI 类型手写，`max_download_kb_s` vs `down_kb_s` 的错误无法被发现 |
+| ~~补齐契约矩阵 8 条~~ | ✅ #145 完成 24 条（超额）；随 `cargo test -p smart-dl-daemon` 在 CI 常驻，回退即红 |
 
 ### 第二梯队：UI 功能补全（约 1 周）
 
@@ -178,8 +199,8 @@ ftp://  ftps://  sftp://  http(s)://  metalink  .torrent
 | 2 | 幽灵依赖 + 死代码治理 | ✅ #134（-1,080 行） |
 | 3 | LICENSE 双许可落地 | ✅ #114 |
 | 4 | 未接线模块处置 | ✅ 全 5 项 |
-| 6 | TD-3 I/O 下沉 storage crate | 🟡 #138 待 rebase |
-| 8 | BtEngine → btcore | 🟡 #137 待 rebase |
+| 6 | TD-3 I/O 下沉 storage crate | ✅ #138 已合 |
+| 8 | BtEngine → btcore | ✅ #137 已合 |
 | 9 | RSS 独立 crate | ✅ #132 |
 | 5 | **拆分 `DownloadEngine` trait**（40 方法 → EngineCore 13 + BtEngineOps + HttpEngineOps） | ❌ #131 仅提案 |
 | 7 | `core/strategy.rs` 迁回 btcore | ❌ 未做 |
