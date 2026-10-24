@@ -1,0 +1,58 @@
+# Soak nightly（#168）：真实场景长跑——不阻塞 PR，只做持续保障。
+#  - failure-inject：全部故障注入场景（本地确定性源，快、稳定）
+#  - soak-http --local：20 分钟本地长跑（确定性，绿/红有明确语义）
+#  - soak-http（公网）：15 分钟真实公网长跑（公网 429 容忍度 2：
+#    免费测速端点的配额波动不是代码缺陷；超 2 个失败需人工归因）
+#  - 产物：采样 CSV + daemon 日志上传 artifact（事后趋势分析用）
+# 手动触发：workflow_dispatch（可自定时长参数）
+name: soak
+
+on:
+  schedule:
+    - cron: '0 18 * * *'   # 每日 UTC 18:00
+  workflow_dispatch:
+
+jobs:
+  soak:
+    name: failure-inject + soak-http
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release daemon
+        run: cargo build --release -p smart-dl-daemon
+
+      - name: Failure injection (all scenarios)
+        run: ./scripts/soak/soak-failure-inject.sh all
+
+      - name: Soak HTTP local (20 min, deterministic)
+        run: ./scripts/soak/soak-http.sh 20 6 --local
+        env:
+          SOAK_SAMPLE_SEC: "60"
+          SOAK_WAVE_TIMEOUT_SEC: "600"
+          SOAK_ARTIFACTS: /tmp/soak-artifacts
+
+      - name: Soak HTTP real network (15 min)
+        run: ./scripts/soak/soak-http.sh 15 4
+        env:
+          SOAK_SAMPLE_SEC: "60"
+          SOAK_WAVE_TIMEOUT_SEC: "600"
+          SOAK_MAX_FAILED: "2"   # 公网端点配额波动容忍（超限仍红，需人工归因）
+          SOAK_ARTIFACTS: /tmp/soak-artifacts
+
+      - name: Upload soak artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-artifacts
+          path: |
+            /tmp/soak-artifacts/
+            /tmp/soak-*/
+          retention-days: 14
+          if-no-files-found: ignore

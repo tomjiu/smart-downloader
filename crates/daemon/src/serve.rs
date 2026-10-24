@@ -66,6 +66,9 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     // read_timeout 防对端断流挂死（idle 语义，单次读超时即断）；刻意不设总超时，
     // 避免误杀正常的长耗时大文件下载。
     let mut client_builder = reqwest::Client::builder()
+        // soak #168：默认 UA（httpdl 单源常量；thinkbroadband 等公网源 403 无 UA
+        // 请求，任务级 headers 显式 UA 仍可覆盖）
+        .user_agent(smart_dl_httpdl::engine::USER_AGENT)
         .connect_timeout(Duration::from_secs(10))
         .read_timeout(Duration::from_secs(30))
         // batch5（重定向深度可配，qB 对标）：全局 client 策略 limited(n)，
