@@ -141,6 +141,11 @@ pub fn proxy_auth_of(url: &str) -> Option<(String, String)> {
     Some((u.to_string(), p.to_string()))
 }
 
+/// HTTP 引擎默认 User-Agent（soak #168 实测发现：thinkbroadband 等公网源
+/// 对无 UA 请求返回 403；reqwest 默认不发 UA）。产品 UA（诚实标识，非浏览器
+/// 伪装）；任务级 headers 里的显式 UA 仍可覆盖（reqwest 请求级优先）。
+pub const USER_AGENT: &str = concat!("smart-dl/", env!("CARGO_PKG_VERSION"));
+
 /// 任务级代理 client 构建（E5）：配置与 serve.rs 全局 client 同口径——
 /// connect 10s + read 30s（H-9：不设总超时护长下载）；proxy URL 非法返回 Err
 /// （daemon add 时调用本函数校验，spawn 时重建失败则任务标 Error）。
@@ -153,6 +158,7 @@ pub fn build_proxied_client(proxy_url: &str) -> Result<reqwest::Client, String> 
         None => proxy,
     };
     reqwest::Client::builder()
+        .user_agent(USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(10))
         .read_timeout(std::time::Duration::from_secs(30))
         // A5（cookie jar）：任务级 client 各自独立 jar（与全局 client 隔离），
