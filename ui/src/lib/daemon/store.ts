@@ -22,6 +22,7 @@ import type {
   GlobalLimitReq,
   GlobalLimits,
   LimitReq,
+  ListTasksQuery,
   PeerResults,
   PiecePriorityReq,
   PriorityReq,
@@ -112,7 +113,22 @@ export class DaemonClient {
   /// list_tasks 实际返回 TaskSummary 轻量形状（无 done/total/rates），
   /// 旧声明 TaskSnapshot[] 是类型级谎言（结构性兼容侥幸过编译，
   /// 但误导后续消费——若读 done/total 将拿到 undefined）。
-  listTasks(): Promise<TaskListItem[]> {
+  /// #161 P3：q 支持服务端过滤/搜索（?state=&engine=&search=&tag=，
+  /// 参数形状由生成的 ListTasksQuery 锁定；未提供/全空 = 全量，
+  /// 行为与形状同旧）。分页（limit/offset + X-Total-Count）留待
+  /// 服务端排序支持后再接（客户端排序与分页组合语义不成立）。
+  listTasks(q?: ListTasksQuery): Promise<TaskListItem[]> {
+    if (q) {
+      const p = new URLSearchParams();
+      if (q.state) p.set("state", q.state);
+      if (q.engine) p.set("engine", q.engine);
+      if (q.search) p.set("search", q.search);
+      if (q.tag) p.set("tag", q.tag);
+      if (typeof q.limit === "number") p.set("limit", String(q.limit));
+      if (typeof q.offset === "number") p.set("offset", String(q.offset));
+      const s = p.toString();
+      if (s) return req(`/tasks?${s}`);
+    }
     return req("/tasks");
   }
   getTask(id: string): Promise<TaskSnapshot> {

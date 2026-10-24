@@ -3,6 +3,8 @@
 /// [视图工具栏(48px) + 内容(flex:1) + 状态栏(28px)]。
 /// 信息架构：导航归侧栏（结构性），动作归工具栏（上下文性）。
 /// - 数据轮询：列表 + stats（1s）+ 任务详情快照（1s 并发，表格进度/ETA 数据源）
+///   #161 P3：列表过滤/搜索改服务端执行（?state=&search=，防抖 300ms），
+///   侧栏分段计数与状态栏计数改由 /stats 全量聚合派生
 /// - SSE 事件流：速率 / 完成 / 失败 toast
 /// - 快捷键：Ctrl/Cmd+1..5 切视图、/ 聚焦搜索（Slack/GitHub 惯例）
 /// - 侧栏折叠：localStorage["dl.side"] 持久化；≤900px 初始自动图标栏
@@ -17,6 +19,7 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
+  ListTasksQuery,
   SchedulerEventEnvelope,
   Stats,
   TaskListItem,
@@ -37,7 +40,7 @@ import SettingsView from "./SettingsView";
 import SecurityView from "./SecurityView";
 import TaskDetail from "./TaskDetail";
 import NewTaskForm from "./NewTaskForm";
-import Toolbar, { TASK_FILTERS, type TaskFilterKey, type ViewKey } from "./Toolbar";
+import Toolbar, { type TaskFilterKey, type ViewKey } from "./Toolbar";
 import Sidebar from "./Sidebar";
 import StatusBar from "./StatusBar";
 import { ConfirmDialog, TableSkeleton } from "./Common";
@@ -45,22 +48,19 @@ import { Icon } from "./Icon";
 
 type SpeedPoint = { down: number; up: number };
 
-function matchFilter(t: TaskListItem, f: TaskFilterKey): boolean {
-  switch (f) {
-    case "active":
-      return ["Downloading", "Seeding", "Transferring", "FallbackProvider"].includes(t.state);
-    case "queued":
-      return ["Queued", "Evaluating"].includes(t.state);
-    case "paused":
-      return t.state === "Paused";
-    case "done":
-      return ["Completed", "Stopped", "Seeding"].includes(t.state);
-    case "failed":
-      return t.state === "Failed";
-    default:
-      return true;
-  }
-}
+/// 服务端列表过滤（#161 P3）的分段 → 状态标签映射：过滤/搜索改在
+/// daemon 侧执行（GET /tasks?state=&search=），浏览器不再每秒拉全量后
+/// 自行过滤。标签与 state.rs known_state_labels / state_label 口径一致
+/// （即 TaskState 变体名）；漂移会在请求期 400 暴露（非静默）。
+/// 注：Seeding 同时属「进行中」（上传中）与「已完成」（下完整做种）两段
+/// —— any-of 语义下两段均含，与旧客户端过滤口径一致。
+const SEGMENT_STATES: Record<Exclude<TaskFilterKey, "all">, string> = {
+  active: "Downloading,Seeding,Transferring,FallbackProvider",
+  queued: "Queued,Evaluating",
+  paused: "Paused",
+  done: "Completed,Stopped,Seeding",
+  failed: "Failed",
+};
 
 /// SSE 速率新鲜度 TTL（与 TasksTable.RATE_TTL_MS 同口径；DlApp 侧的
 /// 过期清理 interval 消费）。
@@ -97,6 +97,13 @@ export default function DlApp() {
   const [toasts, setToasts] = useState<{ id: number; kind: string; text: string }[]>([]);
   const [filter, setFilter] = useState<TaskFilterKey>("all");
   const [query, setQuery] = useState("");
+  /// 搜索防抖（#161 P3 服务端过滤配套）：输入停顿 300ms 才发起请求，
+  /// 避免逐键打点 daemon。
+  const [debouncedQuery, setDebouncedQuery] = useState("");
+  useEffect(() => {
+    const h = setTimeout(() => setDebouncedQuery(query.trim()), 300);
+    return () => clearTimeout(h);
+  }, [query]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [adding, setAdding] = useState(false);
@@ -158,10 +165,20 @@ export default function DlApp() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  /// 当前视图的列表请求参数（#161 P3）：null = 未过滤全量视图（同旧
+  /// 行为）；过滤/搜索由 daemon 执行，浏览器只收所见集。参数变化 →
+  /// refresh 重建 → 轮询 effect 重跑（即时拉新视图，不等下一拍）。
+  const listParams = useMemo<ListTasksQuery | null>(() => {
+    const state = filter !== "all" ? SEGMENT_STATES[filter] : undefined;
+    const search = debouncedQuery || undefined;
+    return state === undefined && search === undefined ? null : { state, search };
+  }, [filter, debouncedQuery]);
+  const filtered = listParams !== null;
+
   const refresh = useCallback(async () => {
     // 审计修复（40-e P1-4）：失败保留旧数据——双请求都失败才判断连。
     const [t, s] = await Promise.all([
-      client.listTasks().catch(() => null),
+      client.listTasks(listParams ?? undefined).catch(() => null),
       client.stats().catch(() => null),
     ]);
     if (t !== null) {
@@ -206,7 +223,7 @@ export default function DlApp() {
       }
     }
     setConnected(t !== null || s !== null);
-  }, []);
+  }, [listParams]);
 
   /// 详情快照轮询：仅对当前列表中的任务并发拉取（表格进度/大小/ETA 数据源）。
   /// 节拍 2s 独立于列表轮询（1s）：任务量大时减半请求压力；tasks 最新引用
@@ -274,9 +291,17 @@ export default function DlApp() {
     if (Object.keys(next).length > 0) setSnapshots(next);
   }, []);
 
+  /// 列表轮询（1s）：refresh 依赖 listParams——过滤/搜索切换即重拉新视图
+  ///（重置节拍，无额外等待）。
   useEffect(() => {
     refresh();
     const iv = setInterval(refresh, 1000);
+    return () => clearInterval(iv);
+  }, [refresh]);
+
+  /// SSE 事件流（速率/完成/失败 toast）：与轮询分离——过滤/搜索切换
+  /// 只重置轮询节拍，事件流不重连。
+  useEffect(() => {
     const unsub = client.subscribeEvents(
       (env) => {
         setEvents((cur) => {
@@ -319,11 +344,8 @@ export default function DlApp() {
       },
       setConnected,
     );
-    return () => {
-      clearInterval(iv);
-      unsub();
-    };
-  }, [refresh, toast]);
+    return unsub;
+  }, [toast]);
 
   /// 快照轮询独立节拍（2s）：挂载一次，读 ref 最新列表。
   useEffect(() => {
@@ -352,43 +374,43 @@ export default function DlApp() {
     return () => clearInterval(iv);
   }, []);
 
-  /// 选集随任务列表收缩（已移除任务的选中项清除）。
+  /// 选集随任务列表收缩（已移除任务的选中项清除）。#161 P3 起列表可能是
+  /// 过滤子集——无法区分「不在视图」与「已删除」，不能据此外推；仅在
+  /// 未过滤视图修剪，显式删除路径（onAction/onBatch 的 remove）单点反选
+  /// 兜底，跨视图残留选中由批量 API 逐项结果容错。
   useEffect(() => {
+    if (filtered) return;
     setSelected((cur) => {
       const alive = new Set(tasks.map((t) => t.task_id));
       const next = new Set([...cur].filter((id) => alive.has(id)));
       return next.size === cur.size ? cur : next;
     });
-  }, [tasks]);
+  }, [tasks, filtered]);
 
-  /// 过滤分段计数（侧栏导航项徽章）。
+  /// 过滤分段计数（侧栏导航项徽章）：#161 P3 起列表请求已被过滤，不能
+  /// 再当计数源——改由 /stats 全量聚合（by_state 键同 TaskListItem.state
+  /// 口径）派生；stats 与列表同拍轮询，新鲜度等同。Seeding 同属两段的
+  /// 口径与 SEGMENT_STATES 一致。
   const counts = useMemo(() => {
-    const c = Object.fromEntries(TASK_FILTERS.map((f) => [f.key, 0])) as Record<TaskFilterKey, number>;
-    for (const t of tasks) {
-      for (const f of TASK_FILTERS) {
-        if (matchFilter(t, f.key)) c[f.key] += 1;
-      }
-    }
-    return c;
-  }, [tasks]);
+    const bs = stats?.by_state ?? {};
+    const seg = (ks: string[]) => ks.reduce((a, k) => a + (bs[k] ?? 0), 0);
+    return {
+      all: stats?.total ?? 0,
+      active: seg(["Downloading", "Seeding", "Transferring", "FallbackProvider"]),
+      queued: seg(["Queued", "Evaluating"]),
+      paused: bs["Paused"] ?? 0,
+      done: seg(["Completed", "Stopped", "Seeding"]),
+      failed: bs["Failed"] ?? 0,
+    } as Record<TaskFilterKey, number>;
+  }, [stats]);
 
-  const shown = useMemo(
-    () =>
-      tasks.filter(
-        (t) =>
-          matchFilter(t, filter) &&
-          (!query ||
-            displayName(t).toLowerCase().includes(query.toLowerCase()) ||
-            t.source.toLowerCase().includes(query.toLowerCase())),
-      ),
-    [tasks, filter, query],
-  );
-
+  /// 显示集 = 服务端过滤后的列表（#161 P3：过滤/搜索已在 daemon 执行，
+  /// 客户端不再二次过滤——避免双重口径遮蔽服务端语义漂移）。
   /// 排序在过滤/搜索之后应用（显示序 = 用户所见序；Shift 范围选择按此序）。
   const sorted = useMemo(() => {
-    if (!sort) return shown;
+    if (!sort) return tasks;
     const dir = sort.dir === "asc" ? 1 : -1;
-    return [...shown].sort((a, b) => {
+    return [...tasks].sort((a, b) => {
       const va = taskSortValue(a, snapshots[a.task_id], rates[a.task_id], sort.key);
       const vb = taskSortValue(b, snapshots[b.task_id], rates[b.task_id], sort.key);
       if (typeof va === "string" || typeof vb === "string") {
@@ -396,7 +418,7 @@ export default function DlApp() {
       }
       return (va - vb) * dir;
     });
-  }, [shown, sort, snapshots, rates]);
+  }, [tasks, sort, snapshots, rates]);
 
   const act = useCallback(
     async (fn: () => Promise<unknown>) => {
@@ -422,7 +444,19 @@ export default function DlApp() {
           body: `确定删除「${name}」吗？任务记录将从列表移除（已下载文件默认保留）。`,
           confirmText: "删除",
           danger: true,
-          run: () => act(() => client.remove(id)),
+          /// #161 P3：列表可能为过滤子集，选集修剪不再全能——删除时
+          /// 单点反选，避免跨视图残留幽灵选中。
+          run: async () => {
+            await act(async () => {
+              await client.remove(id);
+              setSelected((cur) => {
+                if (!cur.has(id)) return cur;
+                const next = new Set(cur);
+                next.delete(id);
+                return next;
+              });
+            });
+          },
         });
         return;
       }
@@ -567,7 +601,7 @@ export default function DlApp() {
             </>
           )}
           {view === "stats" && (
-            <StatsView stats={stats} history={historyRef.current} tasks={tasks} />
+            <StatsView stats={stats} history={historyRef.current} />
           )}
           {view === "rss" && <RssView onToast={toast} />}
           {view === "logs" && <LogsView events={events} />}
@@ -578,7 +612,7 @@ export default function DlApp() {
           </main>
         </div>
 
-        <StatusBar tasks={tasks} stats={stats} selectedCount={selected.size} />
+        <StatusBar stats={stats} selectedCount={selected.size} />
       </div>
 
       {detail && (
