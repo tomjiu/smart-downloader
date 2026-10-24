@@ -12,9 +12,23 @@
 
 import { Icon } from "./Icon";
 import { useCallback, useEffect, useMemo, useState } from "react";
-import type { Settings, ThemeKey } from "@/lib/daemon/types";
+import type { Settings, SettingsReq, ThemeKey } from "@/lib/daemon/types";
 import { DEFAULT_THEME, THEME_KEYS, THEME_META } from "@/lib/daemon/types";
 import { client, getBase, getToken, setBase, setToken } from "@/lib/daemon/store";
+
+/// #161 P0 同构收口：设置域字段名编译期校验。
+/// 后端 PUT /settings 各域全 Option + serde(default)——拼错字段名 = 静默
+/// 空操作（当初 max_download_kb_s/down_kb_s P0 的原始现场）。此组类型让
+/// patch/patchMany/DEFAULTS 的 [domain, key] 组合对生成的 SettingsReq 做
+/// mapped-type 联动校验：任一侧改名，此处编译期报错。
+type SettingsDomain = keyof SettingsReq;
+type SettingsField<D extends SettingsDomain> = keyof NonNullable<SettingsReq[D]>;
+/// 二元组首列与次列联动：["bandwidth", "max_download_kb_s"] 合法、
+/// ["bandwidth", "typo"] 编译错；跨域组合（download 视图组含 scheduler 项）
+/// 每项独立校验，不限制同组同域（DEFAULTS 按视图分组而非后端域）。
+type PatchEntry = {
+  [D in SettingsDomain]: [D, SettingsField<D>, unknown];
+}[SettingsDomain];
 
 const WEEKDAYS = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
 
@@ -52,7 +66,9 @@ const PRESETS: Array<{
   name: string;
   desc: string;
   icon: string;
-  entries: Array<[string, string, unknown]>;
+  /// PatchEntry 联动校验（#161）：预设里的 [域, 字段] 组合对生成的
+  /// SettingsReq 编译期校验，防止预设静默失效。
+  entries: PatchEntry[];
 }> = [
   {
     key: "eco",
@@ -125,7 +141,7 @@ const PRESETS: Array<{
 /// P1-6（Issue #127）：后端出厂默认（与 config.rs 各 Default impl 单源对齐——
 /// 后续后端加字段需同步此处）。恢复默认 = 写入表单标记脏（可审阅可放弃），
 /// 不直接落盘。
-const DEFAULTS: Record<string, Array<[string, string, unknown]>> = {
+const DEFAULTS: Record<string, PatchEntry[]> = {
   bandwidth: [
     ["bandwidth", "max_download_kb_s", 0],
     ["bandwidth", "max_upload_kb_s", 0],
@@ -211,7 +227,11 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
     localStorage.setItem("dl.theme", theme);
   }, [theme]);
 
-  const patch = (domain: string, key: string, value: unknown) => {
+  const patch = <D extends SettingsDomain>(
+    domain: D,
+    key: SettingsField<D>,
+    value: unknown,
+  ) => {
     setS((cur) =>
       cur
         ? ({
@@ -220,7 +240,7 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           } as Settings)
         : cur,
     );
-    setDirty((d) => ({ ...d, [`${domain}.${key}`]: value }));
+    setDirty((d) => ({ ...d, [`${domain}.${String(key)}`]: value }));
   };
 
   const num = (v: string) => (v === "" ? undefined : Number(v) || 0);
@@ -229,11 +249,13 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
     if (Object.keys(dirty).length === 0) return;
     setBusy(true);
     try {
-      // 组装域级补丁（后端按域合并应用）
-      const body: Record<string, Record<string, unknown>> = {};
+      // 组装域级补丁（后端按域合并应用）。dirty 的键在写入时已经过
+      // patch/patchMany 的 mapped-type 编译期校验，此处动态重组后断言安全。
+      const body = {} as SettingsReq;
+      const dom = body as unknown as Record<string, Record<string, unknown>>;
       for (const [k, v] of Object.entries(dirty)) {
         const [d, f] = k.split(".");
-        (body[d] ??= {})[f] = v;
+        (dom[d] ??= {})[f] = v;
       }
       const report = await client.putSettings(body, true);
       const parts: string[] = [];
@@ -257,7 +279,8 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
     !search.trim() || keywords.some((k) => k.toLowerCase().includes(search.trim().toLowerCase()));
 
   /// 一次 patch 多项（P1-6 preset / 恢复默认共用）：批量写入域字段并标记脏。
-  const patchMany = (entries: Array<[string, string, unknown]>) => {
+  /// 入参 PatchEntry 联动校验 [域, 字段] 组合（#161）。
+  const patchMany = (entries: PatchEntry[]) => {
     setS((cur) => {
       if (!cur) return cur;
       const next: Record<string, unknown> = { ...(cur as unknown as Record<string, unknown>) };

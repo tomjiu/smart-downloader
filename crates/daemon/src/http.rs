@@ -1081,7 +1081,9 @@ async fn task_fallback(
 
 /// `POST /bt/metadata`（B-1）：magnet → .torrent 元数据抓取（预览/预取 sidecar，
 /// 不建任务、不进 registry）。单并发（进行中 → 409）。
-#[derive(Deserialize)]
+/// #161 契约守卫：纳入 ts-rs（wire 契约无类型 = 字段改名静默失效）。
+#[derive(Deserialize, TS)]
+#[ts(export, optional_fields)]
 pub struct MagnetMetaReq {
     pub magnet: String,
     /// 抓取总超时（秒）；缺省 60，clamp 5..=600。
@@ -1448,7 +1450,9 @@ async fn settings_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoRe
 }
 
 /// `PUT /settings` 查询参数：`?persist=`（缺省 true；body 内 `persist` 字段优先）。
-#[derive(Deserialize)]
+/// #161 契约守卫：query 参数同属 wire 契约（UI 手拼 ?persist= 漂移同样静默失效）。
+#[derive(Deserialize, TS)]
+#[ts(export, optional_fields)]
 struct SettingsQuery {
     persist: Option<bool>,
 }
@@ -1617,7 +1621,9 @@ async fn health_endpoint() -> impl IntoResponse {
 
 /// 删除任务（引擎 remove + 目录记录移除；`?delete_data=true` 同步删除已下载
 /// 数据（E7：BT 删种子数据 / HTTP 删落盘文件），缺省 false 保留文件）。
-#[derive(Deserialize, Default)]
+/// #161 契约守卫：wire 契约（?delete_data=）纳入 ts-rs。
+#[derive(Deserialize, Default, TS)]
+#[ts(export, optional_fields)]
 struct RemoveTaskQuery {
     #[serde(default)]
     delete_data: bool,
@@ -1975,7 +1981,9 @@ async fn task_snapshot(
 /// `GET /tasks` 查询参数（E7，全部可选；无参数时行为/形状与 E7 之前一致）。
 /// `state`/`engine` 逗号分隔多值（大小写不敏感）；`limit`/`offset` 分页，
 /// 提供分页参数时响应附 `X-Total-Count`（过滤后总数）。
-#[derive(Deserialize, Default)]
+/// #161 契约守卫：wire 契约（?state=&engine=&limit=&offset=&search=）纳入 ts-rs。
+#[derive(Deserialize, Default, TS)]
+#[ts(export, optional_fields)]
 struct ListTasksQuery {
     #[serde(default)]
     state: Option<String>,
@@ -2151,7 +2159,9 @@ const BATCH_IDS_CAP: usize = 100;
 /// `GET /events` 查询参数（E10）：`after` seq 游标（默认 0 = 全量重同步）、
 /// `limit` 页长（默认 100）、`task_id`/`type` 可选过滤（`type` 逗号分隔多值，
 /// 大小写不敏感，对齐 E7 风格）。
-#[derive(Deserialize, Default)]
+/// #161 契约守卫：wire 契约（?after=&task_id=&type=）纳入 ts-rs。
+#[derive(Deserialize, Default, TS)]
+#[ts(export, optional_fields)]
 struct ListEventsQuery {
     #[serde(default)]
     after: Option<u64>,
@@ -2219,7 +2229,9 @@ async fn list_events(
 /// 调试友好）/ `task_id` / `type` 过滤（语义同 GET /events）。无 after 时读
 /// `Last-Event-ID` 请求头（EventSource 断线重连自动携带），都无 = 0（全量
 /// 历史重放）；头解析失败视为未携带（EventSource 只发合法值）。
-#[derive(Deserialize, Default)]
+/// #161 契约守卫：wire 契约（SSE ?after=&token= 等）纳入 ts-rs。
+#[derive(Deserialize, Default, TS)]
+#[ts(export, optional_fields)]
 struct EventsStreamQuery {
     #[serde(default)]
     after: Option<u64>,
@@ -2521,7 +2533,9 @@ fn default_rule_enabled() -> bool {
     true
 }
 
-#[derive(serde::Deserialize)]
+/// #161 契约守卫：wire 契约（?feed_id=）纳入 ts-rs。
+#[derive(serde::Deserialize, TS)]
+#[ts(export, optional_fields)]
 struct RssItemsQuery {
     #[serde(default)]
     feed_id: Option<u64>,

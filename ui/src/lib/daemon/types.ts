@@ -39,6 +39,8 @@ export type { AddRssRuleReq } from "./generated/AddRssRuleReq";
 export type { TaskLogs } from "./generated/TaskLogs";
 export type { TaskEvent } from "./generated/TaskEvent";
 export type { SettingsSnapshot as Settings } from "./generated/SettingsSnapshot";
+export type { SettingsReq } from "./generated/SettingsReq";
+export type { MagnetMetaReq } from "./generated/MagnetMetaReq";
 export type { SettingsBandwidthDto as SettingsBandwidth } from "./generated/SettingsBandwidthDto";
 export type { RssFeedDto as RssFeed } from "./generated/RssFeedDto";
 export type { RssItemDto as RssItem } from "./generated/RssItemDto";
