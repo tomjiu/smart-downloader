@@ -1,7 +1,8 @@
 "use client";
 /// 底部状态栏（Issue #115 Phase 1：28px）。
 /// 本期内容：任务计数 · 选中数 · 会话流量。
-/// Batch D 槽位预留：/health /version /metrics（后续批次填）。
+/// 注：/health /version /metrics 三条端点后端已就绪（http.rs），UI 侧尚未
+/// 接入——是否展示属 #161 待办，而非等后端实现（2026-10-23 核实，防误导）。
 
 import type { Stats, TaskListItem } from "@/lib/daemon/types";
 import { fmtBytes } from "@/lib/daemon/format";
@@ -31,7 +32,7 @@ export default function StatusBar({
           ↓ {fmtBytes(stats.session_down_bytes)} · ↑ {fmtBytes(stats.session_up_bytes)}
         </span>
       )}
-      {/* Batch D 槽位：版本/健康/指标 —— 后续批次填 */}
+      {/* 版本号硬编码 v0.2：GET /version 已可用但未接（#161 P2 待办） */}
       <span className="dl-status-dim">v0.2</span>
     </footer>
   );

@@ -42,6 +42,7 @@ export type { SettingsSnapshot as Settings } from "./generated/SettingsSnapshot"
 export type { SettingsBandwidthDto as SettingsBandwidth } from "./generated/SettingsBandwidthDto";
 export type { RssFeedDto as RssFeed } from "./generated/RssFeedDto";
 export type { RssItemDto as RssItem } from "./generated/RssItemDto";
+export type { AddRssFeedReq } from "./generated/AddRssFeedReq";
 export type { RssRule } from "./generated/RssRule";
 export type { RssFeedsList } from "./generated/RssFeedsList";
 export type { RssItemsList } from "./generated/RssItemsList";

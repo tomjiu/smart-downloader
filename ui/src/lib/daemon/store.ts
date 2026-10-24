@@ -5,6 +5,7 @@
 import type {
   AddedCount,
   AddPeersReq,
+  AddRssFeedReq,
   AddRssRuleReq,
   AddTaskReq,
   AnnounceReq,
@@ -17,6 +18,7 @@ import type {
   ConnectionsReq,
   FilePriorityEntry,
   FilePrioritiesOut,
+  FilePriorityReq,
   LimitReq,
   PeerResults,
   PiecePriorityReq,
@@ -228,9 +230,10 @@ export class DaemonClient {
     id: string,
     priorities: FilePriorityEntry[],
   ): Promise<FilePrioritiesOut> {
+    const body: FilePriorityReq = { priorities };
     return req(`/tasks/${id}/files/priority`, {
       method: "POST",
-      body: JSON.stringify({ priorities }),
+      body: JSON.stringify(body),
     });
   }
 
@@ -367,8 +370,15 @@ export class DaemonClient {
   rssRules(): Promise<{ rules: RssRule[] }> {
     return req("/rss/rules");
   }
-  rssAddFeed(url: string) {
-    return req("/rss/feeds", { method: "POST", body: JSON.stringify({ url }) });
+  /// 响应 { id, title, item_count }（201）；同名/无效源 409/400。
+  /// 请求体走生成的 AddRssFeedReq（#161：字段名漂移编译期报错）。
+  rssAddFeed(url: string): Promise<{
+    id: number;
+    title: string;
+    item_count: number;
+  }> {
+    const body: AddRssFeedReq = { url };
+    return req("/rss/feeds", { method: "POST", body: JSON.stringify(body) });
   }
   rssRemoveFeed(id: number) {
     return req(`/rss/feeds/${id}`, { method: "DELETE" });
