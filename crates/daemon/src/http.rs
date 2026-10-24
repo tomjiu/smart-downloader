@@ -2472,20 +2472,32 @@ async fn resume_task(
     }
 }
 
+/// `GET /providers` 列表条目（原 json! 动态构建，DTO 化纳入 ts-rs 生成——
+/// #161 UI 接入配套；wire 键序/值不变，逐键一致）。
+#[derive(serde::Serialize, TS)]
+#[ts(export)]
+pub struct ProviderStatusDto {
+    pub provider: String,
+    pub enabled: bool,
+    pub authenticated: bool,
+    pub quota_remaining: u64,
+    pub busy: u32,
+    pub backoff_until: Option<u64>,
+    pub last_error: Option<String>,
+}
+
 async fn providers(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
-    let rows: Vec<serde_json::Value> = state
+    let rows: Vec<ProviderStatusDto> = state
         .provider_status()
-        .iter()
-        .map(|(name, rt)| {
-            serde_json::json!({
-                "provider": name,
-                "enabled": rt.enabled,
-                "authenticated": rt.authenticated,
-                "quota_remaining": rt.quota_remaining,
-                "busy": rt.busy,
-                "backoff_until": rt.backoff_until,
-                "last_error": rt.last_error,
-            })
+        .into_iter()
+        .map(|(name, rt)| ProviderStatusDto {
+            provider: name,
+            enabled: rt.enabled,
+            authenticated: rt.authenticated,
+            quota_remaining: rt.quota_remaining,
+            busy: rt.busy,
+            backoff_until: rt.backoff_until,
+            last_error: rt.last_error,
         })
         .collect();
     Json(rows)

@@ -18,6 +18,7 @@ export type { TaskRates } from "./generated/TaskRates";
 export type { FileProgress as TaskFile } from "./generated/FileProgress";
 export type { DaemonStats as Stats } from "./generated/DaemonStats";
 export type { GlobalLimits } from "./generated/GlobalLimits";
+export type { ProviderStatusDto } from "./generated/ProviderStatusDto";
 export type { SchedulerEvent } from "./generated/SchedulerEvent";
 export type { Envelope as SchedulerEventEnvelope } from "./generated/Envelope";
 export type { SettingsApplyReport } from "./generated/SettingsApplyReport";
