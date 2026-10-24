@@ -96,13 +96,10 @@ jobs:
             exit 1
           fi
 
-      # 契约类型守卫（#161 P2）：wire 结构体（Req/Out/Dto/Query 后缀 + serde）
-      # 必须 TS derive + #[ts(export)] + 生成文件在库。drift check 只兜
-      # 「已生成类型的漂移」，本步骤兜「新增结构体漏挂 TS」——当初 P0
-      # （max_download_kb_s/down_kb_s 静默丢弃）的同构回归防线。
-      - name: wire contract TS derive guard
-        if: runner.os == 'Linux'
-        run: python3 scripts/ci/check-ts-derive.py
+      # 契约类型守卫（#161 P2 → #171 收口）：原独立 Python step 已退役，
+      # 规则超集合并进 `cargo test`（crates/daemon/tests/contract_ts_guard.rs，
+      # 随下方 test daemon 各特性组合 + 双平台自动运行，本地即拦）。drift
+      # check 兜「已生成类型的漂移」，守卫测试兜「新增结构体漏挂 TS」。
 
   bt-integration:
     # libtorrent native 集成测试（此前 if:false 占位，配方已脚本化并本地实测）：
