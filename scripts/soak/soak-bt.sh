@@ -34,10 +34,15 @@ SAMPLE_INTERVAL=${SOAK_SAMPLE_SEC:-60}
 KEEP=${SOAK_KEEP:-0}
 
 # ── LT 环境门（#168：BT 是主打功能，但环境缺失时明确跳过而非假绿/假红）──
+# 接受两种布局：Task-35 手工配方（build/{lt_kernel.lib,seed_main}）与
+# bt-linux-setup.sh 标准产物（lib/{liblt_kernel.a,seed_main}）——后者是
+# build.rs 告警与 CI 指引的官方搭建路径，门不得只认旧布局。
 if ! (command -v "$HOME/bt-native/build/seed_main" >/dev/null 2>&1 \
-      || [ -f "$HOME/bt-native/build/lt_kernel.lib" ]); then
+      || [ -f "$HOME/bt-native/build/lt_kernel.lib" ] \
+      || [ -x "$HOME/bt-native/lib/seed_main" ] \
+      || [ -f "$HOME/bt-native/lib/liblt_kernel.a" ]); then
   echo "⛔ LT 链接环境缺失（~/bt-native）：soak-bt 跳过（exit 77）"
-  echo "   搭建：bash scripts/bt_env.sh 之后的步骤（见该文件头注释）"
+  echo "   搭建：bash scripts/ci/bt-linux-setup.sh --no-root ~/bt-native（或见 scripts/bt_env.sh 头注）"
   exit 77
 fi
 # shellcheck disable=SC1091
@@ -45,10 +50,31 @@ fi
 
 [ -x "$DAEMON" ] || { echo "❌ daemon 不存在（cargo build -p smart-dl-daemon --release --features bt）"; exit 2; }
 
-# Debian netinst torrent（官方、合法、~630MB；镜像与 SHA256SUMS 同目录）
-TORRENT_URL=${SOAK_TORRENT_URL:-"https://cdimage.debian.org/debian-cd/current/amd64/bt-cd/debian-13.5.0-amd64-netinst.iso.torrent"}
+# Debian netinst torrent（官方、合法、~630MB；镜像与 SHA256SUMS 同目录）。
+# 版本不硬编码：Debian 点版本约 2 个月一轮，硬编码 URL 会周期性 404
+#（实测 13.5.0 已腐烂，当前 13.7.0）。默认从 bt-cd/ 目录列表动态发现
+# 最新 netinst 种子；发现失败回落 404 报错并提示 SOAK_TORRENT_URL 手动指定。
+if [ -z "${SOAK_TORRENT_URL:-}" ]; then
+  BTCD_DIR="https://cdimage.debian.org/debian-cd/current/amd64/bt-cd/"
+  DISCOVERED=$(curl -sL --max-time 30 "$BTCD_DIR" \
+    | grep -o 'href="debian-[0-9.]*-amd64-netinst\.iso\.torrent"' \
+    | head -1 | sed 's/href="//;s/"//')
+  if [ -n "$DISCOVERED" ]; then
+    TORRENT_URL="$BTCD_DIR$DISCOVERED"
+    echo "== 动态发现种子: $DISCOVERED"
+  else
+    echo "❌ [bt] 无法从 $BTCD_DIR 发现 netinst 种子（目录列表不可达？）"
+    echo "   手动指定: SOAK_TORRENT_URL=<官方 .torrent URL> $0"
+    exit 1
+  fi
+else
+  TORRENT_URL=$SOAK_TORRENT_URL
+fi
 BASE=$(dirname "${TORRENT_URL%/*}")/..   # 上跳到 release 根（SHA256SUMS 所在）
-SUMS_URL=${SOAK_SUMS_URL:-"$(echo "$TORRENT_URL" | sed 's|bt-cd/[^/]*$|SHA256SUMS|')"}
+# SUMS 与种子同目录（bt-cd/SHA256SUMS，含 .iso 与 .torrent 双哈希）；
+# 只替换文件名保留目录——原 sed 连 bt-cd/ 一起替换成 amd64/SHA256SUMS，
+# 该路径 404（目录级 SUMS 不存在，各镜像子目录各有一份）
+SUMS_URL=${SOAK_SUMS_URL:-"$(echo "$TORRENT_URL" | sed 's|/[^/]*$|/SHA256SUMS|')"}
 ISO_NAME=$(basename "${TORRENT_URL}" .torrent)
 
 WORK=$(mktemp -d /tmp/soak-bt.XXXXXX)
@@ -99,12 +125,18 @@ echo "== daemon 已启动 pid=$DPID（bt on, DHT on, ratio-limit 0.5）=="
 proc_rss() { awk '/^VmRSS/{print $2}' "/proc/$1/status" 2>/dev/null || echo 0; }
 proc_fds() { ls "/proc/$1/fd" 2>/dev/null | wc -l; }
 
-# ── 加种子（.torrent URL 直接建任务；引擎经磁力/torrent 归一化路径）─────────
+# ── 加种子（先拉 .torrent 文件，base64 后走 torrent_b64 入口）───────────────
+# 不能直接 POST url：<.torrent URL> 会被 normalize_user_link 当普通 HTTP 下载
+# （实测 60948 字节 = 种子文件本身）；BT 任务的正确入口是 torrent_b64
+#（优先级 torrent > metalink > url，见 http.rs AddTaskReq）。
+curl -sL --max-time 60 -o "$WORK/seed.torrent" "$TORRENT_URL" || fail "种子文件拉取失败"
+[ -s "$WORK/seed.torrent" ] || fail "种子文件为空（URL 404？）"
+TB64=$(base64 -w0 "$WORK/seed.torrent")
 TID=$(curl -s -X POST "$API/tasks" -H 'Content-Type: application/json' \
-  -d "{\"url\":\"$TORRENT_URL\",\"dest\":\"$WORK/dl\"}" \
+  -d "{\"torrent_b64\":\"$TB64\",\"dest\":\"$WORK/dl\"}" \
   | python3 -c "import sys,json; print(json.load(sys.stdin).get('task_id',''))")
 [ -n "$TID" ] || fail "BT 任务创建失败（检查 daemon 日志 bt feature 是否启用）"
-echo "== BT 任务已建: $TID（$ISO_NAME）=="
+echo "== BT 任务已建: $TID（$ISO_NAME，torrent_b64 入口）=="
 
 snap_field() {
   curl -s "$API/tasks/$1" | python3 -c "
@@ -140,8 +172,15 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
     ST2=$(snap_field "$TID" state)
     [ "$ST2" != "Failed" ] || fail "fastresume 恢复失败（state=Failed）"
     DONE2=$(snap_field "$TID" done); DONE2=${DONE2:-0}
-    [ "$DONE2" -ge "$DONE_AT_KILL" ] || fail "fastresume 后进度回退: $DONE2 < $DONE_AT_KILL（未复用已完成段）"
-    pass "kill -9 → fastresume 恢复：进度 $DONE_AT_KILL → $DONE2（无重下）"
+    # 回退容忍 ≤5%：daemon 的 crash 契约是「周期 fastresume 间隔 300s +
+    # libtorrent 写队列刷盘」（serve.rs P4 G4：crash 最多丢一个间隔），
+    # 恢复点 = 上次快照 ∪ 磁盘 recheck，可比击杀点略低（实测 99.2% 击杀
+    # → 98.8% 恢复，差值 = 未刷盘写队列）。零回退断言超出产品契约；
+    # >5% 回退（≈ 快照机制失效/从头重下）仍判失败。
+    REGRESS=$(( DONE_AT_KILL - DONE2 ))
+    [ "$REGRESS" -le $(( DONE_AT_KILL / 20 )) ] \
+      || fail "fastresume 后进度大幅回退: $DONE2 < $DONE_AT_KILL（回退 $REGRESS 字节，超出 5% 容忍——快照机制疑似失效）"
+    pass "kill -9 → fastresume 恢复：进度 $DONE_AT_KILL → $DONE2（回退 $REGRESS 字节，≤5% 契约内）"
     KILLED=1
   fi
 
