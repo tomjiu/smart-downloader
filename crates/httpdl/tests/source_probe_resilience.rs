@@ -24,12 +24,12 @@ use std::sync::atomic::Ordering;
 const MB: u64 = 1024 * 1024;
 const SIZE: u64 = 8 * MB;
 
-/// 已关闭端口的 URL（连接即 refused，探测必然快速失败）。
-async fn dead_url() -> String {
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = l.local_addr().unwrap();
-    drop(l);
-    format!("http://{addr}/file")
+/// 死源 URL（确定性 refused）：特权端口 1——非 root 进程无法 bind（CAP_NET_BIND_SERVICE
+/// 限制）→ 系统上永无监听者 → 连接必得 ECONNREFUSED，无时序依赖。
+/// 原实现 bind `:0` 后 drop 再复用该端口：同测试二进制并行时 OS 可能把刚回收的
+/// 端口分配给其他测试的活 listener → 「死源」变活 → 断言失败（#165 CI 偶发根因）。
+fn dead_url() -> String {
+    "http://127.0.0.1:1/file".to_string()
 }
 
 async fn alive_server(etag: &'static str) -> HttpTestServer {
@@ -48,7 +48,7 @@ async fn alive_server(etag: &'static str) -> HttpTestServer {
 async fn update_sources_survives_dead_first_url() {
     let a = alive_server("etag-a").await;
     let b = alive_server("etag-b").await; // 同内容不同 etag → etag_changed → 新代次重下
-    let dead = dead_url().await;
+    let dead = dead_url();
     let dir = tempfile::tempdir().unwrap();
     let engine = HttpEngine::new(reqwest::Client::new());
     let task = make_http_task_sha256(
@@ -93,8 +93,8 @@ async fn update_sources_all_dead_rejects() {
         &sha256_of(&patterned(SIZE)),
     );
     let tid = engine.add(&task).await.expect("add 应成功");
-    let d1 = dead_url().await;
-    let d2 = dead_url().await;
+    let d1 = dead_url();
+    let d2 = dead_url();
     let r = engine.update_sources(&tid, vec![d1, d2]).await;
     assert!(r.is_err(), "全部候选死亡必须拒绝换源");
 }
@@ -103,7 +103,7 @@ async fn update_sources_all_dead_rejects() {
 #[tokio::test]
 async fn add_falls_back_to_alive_backup_when_primary_dead() {
     let b = alive_server("etag-b3").await;
-    let dead = dead_url().await;
+    let dead = dead_url();
     let dir = tempfile::tempdir().unwrap();
     let engine = HttpEngine::new(reqwest::Client::new());
     let task = make_http_task_backup(
@@ -137,8 +137,8 @@ async fn add_falls_back_to_alive_backup_when_primary_dead() {
 /// 4. add：主源、备用源均死 → 任务拒绝（双错信息）。
 #[tokio::test]
 async fn add_all_dead_rejects() {
-    let dead1 = dead_url().await;
-    let dead2 = dead_url().await;
+    let dead1 = dead_url();
+    let dead2 = dead_url();
     let dir = tempfile::tempdir().unwrap();
     let engine = HttpEngine::new(reqwest::Client::new());
     let task = make_http_task_backup(
