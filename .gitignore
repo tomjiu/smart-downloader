@@ -78,4 +78,6 @@ desktop/src-tauri/native/
 .vcpkg-cache/
 libtorrent-rasterbar-dev_*.deb
 ui/package-lock.json
-tsbuildinfo
+# ts-rs/tsc 增量构建缓存（#162 曾两次混入提交：当时写的裸 `tsbuildinfo`
+# 模式匹配不到实际文件名 tsconfig.tsbuildinfo——gitignore 无子串匹配）
+*.tsbuildinfo
