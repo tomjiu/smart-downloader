@@ -3,7 +3,7 @@
 /// 交互打磨批：tone 变量名修正（--warning/--success 不存在 → --warn/--ok，
 /// 旧值无效回落 currentColor）；状态分布用中文标签（与表格徽章口径一致）。
 
-import type { GlobalLimits, ProviderStatusDto, Stats, TaskListItem } from "@/lib/daemon/types";
+import type { GlobalLimits, ProviderStatusDto, Stats } from "@/lib/daemon/types";
 import { fmtBytes, fmtSpeed } from "@/lib/daemon/format";
 import SpeedChart, { type SpeedPoint } from "./SpeedChart";
 import { Icon, type IconName } from "./Icon";
@@ -50,11 +50,9 @@ function StatCard({
 export default function StatsView({
   stats,
   history,
-  tasks,
 }: {
   stats: Stats | null;
   history: SpeedPoint[];
-  tasks: TaskListItem[];
 }) {
   // ---- #161 P2：全局限速总阀门 + Provider 状态（视图内自取，SecurityView 模式）----
   const [limits, setLimits] = useState<GlobalLimits | null>(null);
@@ -125,7 +123,7 @@ export default function StatsView({
         <StatCard icon="cloud-download" tone="var(--accent)" label="总下载速度" value={fmtSpeed(st.down_bytes_s)} sub={`会话累计 ${fmtBytes(st.session_down_bytes)}`} />
         <StatCard icon="arrow-up" tone="var(--info)" label="总上传速度" value={fmtSpeed(st.up_bytes_s)} sub={`会话累计 ${fmtBytes(st.session_up_bytes)}`} />
         <StatCard icon="play" tone="var(--warn)" label="活跃任务" value={String(active)} sub={`共 ${st.total} 个任务`} fill={st.total ? (active / st.total) * 100 : 0} />
-        <StatCard icon="layers" tone="var(--ok)" label="累计完成任务" value={String(doneCount)} sub={`列表共 ${tasks.length} 项`} fill={tasks.length ? (doneCount / tasks.length) * 100 : 0} />
+        <StatCard icon="layers" tone="var(--ok)" label="累计完成任务" value={String(doneCount)} sub={`共 ${st.total} 项任务`} fill={st.total ? (doneCount / st.total) * 100 : 0} />
       </div>
 
       <div className="dl-card">

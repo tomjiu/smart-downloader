@@ -25,6 +25,7 @@ export type { SettingsApplyReport } from "./generated/SettingsApplyReport";
 export type { EngineKind } from "./generated/EngineKind";
 export type { TaskState } from "./generated/TaskState";
 export type { AddTaskReq } from "./generated/AddTaskReq";
+export type { ListTasksQuery } from "./generated/ListTasksQuery";
 export type { LimitReq } from "./generated/LimitReq";
 export type { SequentialReq } from "./generated/SequentialReq";
 export type { ConnectionsReq } from "./generated/ConnectionsReq";
