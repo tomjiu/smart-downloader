@@ -757,6 +757,69 @@ async fn create_file_priorities_rejected_for_magnet_400() {
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
+/// R18（缺陷④）回归：文件级进度透出——多文件 BT 任务 files 数组必须给出
+/// 逐文件 rel_path + size（旧实现只合成 1 条空路径聚合条目，
+/// 「BT 多文件与 FTP 目录任务行为一致」契约未兑现，UI 文件列表无从渲染）。
+#[tokio::test]
+async fn torrent_task_files_exposes_per_file_progress() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "torrent_b64": multi_file_torrent_b64(),
+            "file_priorities": [ { "index": 1, "priority": 0 } ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // files 数组：逐文件真名（torrent name 前缀 + 相对路径）+ 尺寸
+    let mut files = None;
+    for _ in 0..20 {
+        let resp = client
+            .get(format!("{base}/tasks/{tid}"))
+            .send()
+            .await
+            .unwrap();
+        let snap: serde_json::Value = resp.json().await.unwrap();
+        let fs = snap["files"].as_array().cloned();
+        if let Some(fs) = &fs {
+            if fs.len() == 2 {
+                files = Some(fs.clone());
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let files = files.expect("2s 内 files 必须透出 2 条逐文件条目");
+    assert_eq!(
+        serde_json::json!(&files[0]["rel_path"]),
+        serde_json::json!("test/a.bin"),
+        "rel_path = torrent 名 + 相对路径（与 FTP 目录任务口径一致）"
+    );
+    assert_eq!(
+        serde_json::json!(&files[1]["rel_path"]),
+        serde_json::json!("test/b.bin")
+    );
+    assert_eq!(
+        serde_json::json!(&files[0]["size"]),
+        serde_json::json!(1024)
+    );
+    assert_eq!(
+        serde_json::json!(&files[1]["size"]),
+        serde_json::json!(2048)
+    );
+}
+
 // ============ 持久化 + 恢复重放（P1-3：file_priorities 生命周期）============
 
 /// serve_bt 的外置目录变体：save = dir（调用方持有 tempdir 保活），可选注入

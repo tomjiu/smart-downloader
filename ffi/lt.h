@@ -96,6 +96,11 @@ lt_err lt_piece_count(lt_session* s, const char* ih, int* out);
 lt_err lt_bitfield(lt_session* s, const char* ih, uint8_t* buf, size_t cap, size_t* out_len); /* 位打包，LSB 先 */
 lt_err lt_file_count(lt_session* s, const char* ih, int* out);
 lt_err lt_file_progress(lt_session* s, const char* ih, int64_t* done_arr, int64_t* size_arr, int n);
+/* 全部文件相对路径（'/' 连接），'\n' 分隔，一次性批量导出（两段式：
+   buf=null/cap 不足 → out_len=所需字节，BUFFER_TOO_SMALL）。
+   单文件 torrent = 1 项（文件名本身）。需要 metadata。
+   R18：文件级进度透出的名字源（lt_file_progress 有进度无名）。 */
+lt_err lt_file_paths(lt_session* s, const char* ih, char* buf, size_t cap, size_t* out_len);
 
 /* —— 子文件优先级（BT 多文件；P1 任务级能力）——
    priority 语义同 libtorrent：0 = 不下载（skip）、1 = 低、4 = 默认、7 = 最高。

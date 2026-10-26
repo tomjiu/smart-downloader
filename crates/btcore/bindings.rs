@@ -362,6 +362,16 @@ unsafe extern "C" {
     ) -> lt_err;
 }
 unsafe extern "C" {
+    #[doc = " 全部文件相对路径（'/' 连接），'\\n' 分隔，一次性批量导出（两段式：buf=null/cap 不足 → out_len=所需字节，BUFFER_TOO_SMALL）。单文件 torrent = 1 项（文件名本身）。需要 metadata。"]
+    pub fn lt_file_paths(
+        s: *mut lt_session,
+        ih: *const ::std::os::raw::c_char,
+        buf: *mut ::std::os::raw::c_char,
+        cap: usize,
+        out_len: *mut usize,
+    ) -> lt_err;
+}
+unsafe extern "C" {
     pub fn lt_set_file_priorities(
         s: *mut lt_session,
         ih: *const ::std::os::raw::c_char,
