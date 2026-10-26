@@ -19,9 +19,9 @@ wait_ready() { for i in $(seq 1 50); do curl -sf -o /dev/null -H 'Range: bytes=0
 VA=9934; VB=9935; VC=9936
 # A：die-after=2 —— 就绪探测(1) + add 探测(2) 后死亡，首段即 404 → 重试风暴 → 复活完成
 # （注：本地环回单连接即可下完 64MB，多段死亡场景非确定性；段级续传已由 soak kill -9 验证）
-node $(dirname "$0")/revive-server.mjs $VA $WORK/ma 2 64 > va.log 2>&1 &
-node $(dirname "$0")/revive-server.mjs $VB $WORK/mb 2 64 > vb.log 2>&1 &
-node $(dirname "$0")/revive-server.mjs $VC $WORK/mc 2 64 > vc.log 2>&1 &
+node $REPO/scripts/manual/realtest/revive-server.mjs $VA $WORK/ma 2 64 > va.log 2>&1 &
+node $REPO/scripts/manual/realtest/revive-server.mjs $VB $WORK/mb 2 64 > vb.log 2>&1 &
+node $REPO/scripts/manual/realtest/revive-server.mjs $VC $WORK/mc 2 64 > vc.log 2>&1 &
 wait_ready $VA && wait_ready $VB && wait_ready $VC || { echo "FATAL: 复活服务器未就绪"; exit 1; }
 cat > config.toml << EOF
 [server]

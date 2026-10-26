@@ -10,7 +10,7 @@ cleanup() { pkill -f "smart-dl-daemon serve.*$DPORT" 2>/dev/null; kill %1 %2 2>/
 trap cleanup EXIT
 
 node $REPO/ui/e2e/file-server.mjs $FPORT &>/dev/null &
-node $(dirname "$0")/rss-server.mjs $RPORT $FPORT &>/dev/null &
+node $REPO/scripts/manual/realtest/rss-server.mjs $RPORT $FPORT &>/dev/null &
 for i in $(seq 1 50); do curl -sf -o /dev/null "http://127.0.0.1:$RPORT/feed.xml" && break; sleep 0.2; done
 curl -sf -o /dev/null "http://127.0.0.1:$RPORT/feed.xml" || { echo "FATAL: rss server 未就绪"; exit 1; }
 curl -sf -o /dev/null -H 'Range: bytes=0-0' "http://127.0.0.1:$FPORT/small.bin" || { echo "FATAL: file server 未就绪"; exit 1; }

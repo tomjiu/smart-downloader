@@ -13,7 +13,7 @@ assert() { if [ "$2" = "$3" ]; then PASS=$((PASS+1)); echo "PASS: $1 = [$3]"; el
 wait_ready() { for i in $(seq 1 50); do curl -sf -o /dev/null -H 'Range: bytes=0-0' "http://127.0.0.1:$1$2" && return 0; sleep 0.2; done; return 1; }
 
 node $REPO/ui/e2e/file-server.mjs $FPORT &>/dev/null &
-node $(dirname "$0")/webhook-server.mjs $WPORT $WORK/webhook-events.jsonl > ws.log 2>&1 &
+node $REPO/scripts/manual/realtest/webhook-server.mjs $WPORT $WORK/webhook-events.jsonl > ws.log 2>&1 &
 wait_ready $FPORT /small.bin && wait_ready $WPORT /small.bin || { echo "FATAL: 服务器未就绪"; exit 1; }
 
 mkdir -p $WORK/moved
