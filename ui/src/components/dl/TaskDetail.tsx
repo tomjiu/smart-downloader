@@ -97,6 +97,9 @@ export default function TaskDetail({
         // 审查修复（P2）：顺序下载开关回读快照字段——原实现恒初始化 false，
         // 已开启的任务显示"已关闭"且首点误发 true。
         setSeq(Boolean(t.sequential));
+        // 体检 #182 C-1：队列优先级从快照回读（原仅 set 响应回显——抽屉
+        // 重开/页面刷新后丢显）。快照 0 = 默认（序列化省略 → undefined）。
+        setQueuePrio(t.queue_priority ?? 0);
         // 重置乐观覆盖（快照是权威值；任务切换时也须清）。
         setFilePrioOverride({});
       } catch {

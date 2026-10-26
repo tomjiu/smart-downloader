@@ -31,4 +31,8 @@ start_at_unix?: number,
  * 自动重试预算/进度（E30）：`retries`/`max_retries`/`next_retry_at_unix`
  * 均 0 省略；非 0 = 任务配置了自动重试（或已安排重试）。
  */
-retries?: number, max_retries?: number, next_retry_at_unix?: number, };
+retries?: number, max_retries?: number, next_retry_at_unix?: number, 
+/**
+ * 队列优先级（体检 #182 C-1）：同 TaskSnapshot 口径（0 = 默认省略）。
+ */
+queue_priority?: number, };
