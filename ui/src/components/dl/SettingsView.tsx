@@ -395,10 +395,10 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           </button>
         </h3>
         <div className="dl-form-grid">
-          <label className="dl-field-label">
+          <label className="dl-field-label" htmlFor="set-a11y-1">
             全局下载限速 (KiB/s) <Effective kind="now" />
           </label>
-          <input
+          <input id="set-a11y-1"
             className="dl-input"
             type="number"
             min={0}
@@ -407,10 +407,10 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           />
           <div className="dl-field-help">所有引擎（HTTP/FTP/BT）合计下行上限；0 = 不限</div>
 
-          <label className="dl-field-label">
+          <label className="dl-field-label" htmlFor="set-a11y-2">
             全局上传限速 (KiB/s) <Effective kind="now" />
           </label>
-          <input
+          <input id="set-a11y-2"
             className="dl-input"
             type="number"
             min={0}
@@ -433,25 +433,25 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
         </div>
         {s.bandwidth.alt_enabled && (
           <div className="dl-form-grid">
-            <label className="dl-field-label">备用下载限速 (KiB/s)</label>
-            <input
+            <label className="dl-field-label" htmlFor="set-a11y-3">备用下载限速 (KiB/s)</label>
+            <input id="set-a11y-3"
               className="dl-input"
               type="number"
               min={0}
               value={s.bandwidth.alt_max_download_kb_s}
               onChange={(e) => patch("bandwidth", "alt_max_download_kb_s", num(e.target.value) ?? 0)}
             />
-            <label className="dl-field-label">备用上传限速 (KiB/s)</label>
-            <input
+            <label className="dl-field-label" htmlFor="set-a11y-4">备用上传限速 (KiB/s)</label>
+            <input id="set-a11y-4"
               className="dl-input"
               type="number"
               min={0}
               value={s.bandwidth.alt_max_upload_kb_s}
               onChange={(e) => patch("bandwidth", "alt_max_upload_kb_s", num(e.target.value) ?? 0)}
             />
-            <label className="dl-field-label">起止时间（本地时区）</label>
+            <label className="dl-field-label" htmlFor="set-a11y-5">起止时间（本地时区）</label>
             <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-              <input
+              <input id="set-a11y-5"
                 className="dl-input"
                 type="time"
                 value={s.bandwidth.alt_from}
@@ -506,10 +506,10 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           </button>
         </h3>
         <div className="dl-form-grid">
-          <label className="dl-field-label">
+          <label className="dl-field-label" htmlFor="set-a11y-6">
             全局代理 <Effective kind="new" />
           </label>
-          <input
+          <input id="set-a11y-6"
             className="dl-input"
             placeholder="http://host:port · socks5://user:pass@host:port · 留空 = 直连"
             value={s.connection.proxy}
@@ -517,10 +517,10 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           />
           <div className="dl-field-help">BT 会话立即重放生效；HTTP 逐任务 client 构建时合并（新任务生效，任务级代理优先）</div>
 
-          <label className="dl-field-label">
+          <label className="dl-field-label" htmlFor="set-a11y-7">
             BT 监听端口 <Effective kind="now" />
           </label>
-          <input
+          <input id="set-a11y-7"
             className="dl-input"
             type="number"
             min={0}
@@ -531,10 +531,10 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           />
           <div className="dl-field-help">0 = 内核默认（6881 系）；非 BT 构建下该项仅持久化</div>
 
-          <label className="dl-field-label">
+          <label className="dl-field-label" htmlFor="set-a11y-8">
             BT 全局连接数上限 <Effective kind="now" />
           </label>
-          <input
+          <input id="set-a11y-8"
             className="dl-input"
             type="number"
             min={0}
@@ -573,8 +573,8 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           <Switch label="PEX" on={s.bittorrent.enable_pex} onChange={(v) => patch("bittorrent", "enable_pex", v)} />
           <label className="dl-field-label">uTP 传输<Effective kind="now" /></label>
           <Switch label="uTP" on={s.bittorrent.enable_utp} onChange={(v) => patch("bittorrent", "enable_utp", v)} />
-          <label className="dl-field-label">MSE 加密策略<Effective kind="now" /></label>
-          <select
+          <label className="dl-field-label" htmlFor="set-a11y-9">MSE 加密策略<Effective kind="now" /></label>
+          <select id="set-a11y-9"
             className="dl-input"
             value={s.bittorrent.encrypt}
             onChange={(e) => patch("bittorrent", "encrypt", e.target.value)}
@@ -584,8 +584,8 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
             <option value="require">强制加密</option>
           </select>
           <div className="dl-field-help">开关热改即时生效（新发现任务对 PEX 全量生效）；私有 tracker 建议关闭 DHT/PEX/LSD</div>
-          <label className="dl-field-label">做种分享率上限<Effective kind="now" /></label>
-          <input
+          <label className="dl-field-label" htmlFor="set-a11y-10">做种分享率上限<Effective kind="now" /></label>
+          <input id="set-a11y-10"
             className="dl-input"
             type="number"
             min={0}
@@ -594,8 +594,8 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
             value={s.bittorrent.max_share_ratio}
             onChange={(e) => patch("bittorrent", "max_share_ratio", num(e.target.value) ?? 0)}
           />
-          <label className="dl-field-label">做种时长上限（分钟）<Effective kind="now" /></label>
-          <input
+          <label className="dl-field-label" htmlFor="set-a11y-11">做种时长上限（分钟）<Effective kind="now" /></label>
+          <input id="set-a11y-11"
             className="dl-input"
             type="number"
             min={0}
@@ -611,8 +611,8 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
             onChange={(v) => patch("bittorrent", "storage_allocate", v)}
           />
           <div className="dl-field-help">开 = 新 BT 任务预分配完整文件大小（磁盘占用即时到位、碎片更少）；关 = 稀疏按需增长；fastresume 恢复任务保留原模式</div>
-          <label className="dl-field-label">新任务自动追加 tracker<Effective kind="now" /></label>
-          <textarea
+          <label className="dl-field-label" htmlFor="set-a11y-12">新任务自动追加 tracker<Effective kind="now" /></label>
+          <textarea id="set-a11y-12"
             className="dl-input"
             rows={3}
             placeholder={"udp://tracker.example:6969/announce\nhttp://t2.example/announce"}
@@ -644,12 +644,12 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
         </button>
         </h3>
         <div className="dl-form-grid">
-          <label className="dl-field-label">BT 同时传输上限</label>
-          <input className="dl-input" type="number" min={0} value={s.queue.max_active_bt} onChange={(e) => patch("queue", "max_active_bt", num(e.target.value) ?? 0)} />
-          <label className="dl-field-label">HTTP 同时传输上限</label>
-          <input className="dl-input" type="number" min={0} value={s.queue.max_active_http} onChange={(e) => patch("queue", "max_active_http", num(e.target.value) ?? 0)} />
-          <label className="dl-field-label">FTP 同时传输上限</label>
-          <input className="dl-input" type="number" min={0} value={s.queue.max_active_ftp} onChange={(e) => patch("queue", "max_active_ftp", num(e.target.value) ?? 0)} />
+          <label className="dl-field-label" htmlFor="set-a11y-13">BT 同时传输上限</label>
+          <input id="set-a11y-13" className="dl-input" type="number" min={0} value={s.queue.max_active_bt} onChange={(e) => patch("queue", "max_active_bt", num(e.target.value) ?? 0)} />
+          <label className="dl-field-label" htmlFor="set-a11y-14">HTTP 同时传输上限</label>
+          <input id="set-a11y-14" className="dl-input" type="number" min={0} value={s.queue.max_active_http} onChange={(e) => patch("queue", "max_active_http", num(e.target.value) ?? 0)} />
+          <label className="dl-field-label" htmlFor="set-a11y-15">FTP 同时传输上限</label>
+          <input id="set-a11y-15" className="dl-input" type="number" min={0} value={s.queue.max_active_ftp} onChange={(e) => patch("queue", "max_active_ftp", num(e.target.value) ?? 0)} />
           <div className="dl-field-help">0 = 不限（禁用排队）；超配额自动排队，槽位空闲按提交顺序递补；手动恢复 = 强制开始</div>
         </div>
       </section>
@@ -669,14 +669,14 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
         </button>
         </h3>
         <div className="dl-form-grid">
-          <label className="dl-field-label">默认下载目录 <Effective kind="now" /></label>
-          <input className="dl-input" value={s.download.dest_root} onChange={(e) => patch("download", "dest_root", e.target.value)} />
+          <label className="dl-field-label" htmlFor="set-a11y-16">默认下载目录 <Effective kind="now" /></label>
+          <input id="set-a11y-16" className="dl-input" value={s.download.dest_root} onChange={(e) => patch("download", "dest_root", e.target.value)} />
           <div className="dl-field-help">目录不存在会自动创建；新任务默认落此目录</div>
           <label className="dl-field-label">磁盘预检严格模式 <Effective kind="restart" /></label>
           <Switch label="严格预检" on={s.download.disk_precheck_strict} onChange={(v) => patch("download", "disk_precheck_strict", v)} />
           <div className="dl-field-help">开 = 空间不可探测时拒绝入队（防预检被绕过）；关 = 告警放行</div>
-          <label className="dl-field-label">HTTP 重定向最大跳数 <Effective kind="restart" /></label>
-          <input
+          <label className="dl-field-label" htmlFor="set-a11y-17">HTTP 重定向最大跳数 <Effective kind="restart" /></label>
+          <input id="set-a11y-17"
             className="dl-input"
             type="number"
             min={1}
@@ -685,15 +685,15 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
             onChange={(e) => patch("download", "max_redirects", num(e.target.value) ?? 10)}
           />
           <div className="dl-field-help">1..=100；默认 10（reqwest 默认值），仅启动时烘入 client</div>
-          <label className="dl-field-label">错峰随机延迟（秒）<Effective kind="now" /></label>
-          <input className="dl-input" type="number" min={0} value={s.scheduler.start_jitter_seconds} onChange={(e) => patch("scheduler", "start_jitter_seconds", num(e.target.value) ?? 0)} />
+          <label className="dl-field-label" htmlFor="set-a11y-18">错峰随机延迟（秒）<Effective kind="now" /></label>
+          <input id="set-a11y-18" className="dl-input" type="number" min={0} value={s.scheduler.start_jitter_seconds} onChange={(e) => patch("scheduler", "start_jitter_seconds", num(e.target.value) ?? 0)} />
           <div className="dl-field-help">新任务在 0..=N 秒内随机延迟启动；0 = 关闭</div>
 
           {/* P1-6（Issue #127）：完成后动作——后端 Task 46 已支持（PUT /settings
               scheduler.completion_action，热更），UI 此前未暴露 = 「下载完成后
               关机」无入口。 */}
-          <label className="dl-field-label">全部任务完成后 <Effective kind="now" /></label>
-          <select
+          <label className="dl-field-label" htmlFor="set-a11y-19">全部任务完成后 <Effective kind="now" /></label>
+          <select id="set-a11y-19"
             className="dl-input"
             aria-label="全部任务完成后动作"
             data-testid="completion-action"
@@ -727,14 +727,14 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
         </button>
         </h3>
         <div className="dl-form-grid">
-          <label className="dl-field-label">完成 Webhook <Effective kind="now" /></label>
-          <input className="dl-input" placeholder="https://… 任务完成时 POST 通知；留空禁用" value={s.webhook.url} onChange={(e) => patch("webhook", "url", e.target.value)} />
-          <label className="dl-field-label">完成后移动到 <Effective kind="now" /></label>
-          <input className="dl-input" placeholder="目录路径；留空禁用（BT 目录任务整体移动）" value={s.post_download.move_to} onChange={(e) => patch("post_download", "move_to", e.target.value)} />
-          <label className="dl-field-label">完成后钩子程序 <Effective kind="now" /></label>
-          <input className="dl-input" placeholder="可执行程序路径；上下文经 SD_* 环境变量传入" value={s.post_download.hook} onChange={(e) => patch("post_download", "hook", e.target.value)} />
-          <label className="dl-field-label">自动清理已完成任务（天）<Effective kind="now" /></label>
-          <input className="dl-input" type="number" min={0} value={s.cleanup.auto_remove_completed_days} onChange={(e) => patch("cleanup", "auto_remove_completed_days", num(e.target.value) ?? 0)} />
+          <label className="dl-field-label" htmlFor="set-a11y-20">完成 Webhook <Effective kind="now" /></label>
+          <input id="set-a11y-20" className="dl-input" placeholder="https://… 任务完成时 POST 通知；留空禁用" value={s.webhook.url} onChange={(e) => patch("webhook", "url", e.target.value)} />
+          <label className="dl-field-label" htmlFor="set-a11y-21">完成后移动到 <Effective kind="now" /></label>
+          <input id="set-a11y-21" className="dl-input" placeholder="目录路径；留空禁用（BT 目录任务整体移动）" value={s.post_download.move_to} onChange={(e) => patch("post_download", "move_to", e.target.value)} />
+          <label className="dl-field-label" htmlFor="set-a11y-22">完成后钩子程序 <Effective kind="now" /></label>
+          <input id="set-a11y-22" className="dl-input" placeholder="可执行程序路径；上下文经 SD_* 环境变量传入" value={s.post_download.hook} onChange={(e) => patch("post_download", "hook", e.target.value)} />
+          <label className="dl-field-label" htmlFor="set-a11y-23">自动清理已完成任务（天）<Effective kind="now" /></label>
+          <input id="set-a11y-23" className="dl-input" type="number" min={0} value={s.cleanup.auto_remove_completed_days} onChange={(e) => patch("cleanup", "auto_remove_completed_days", num(e.target.value) ?? 0)} />
           <div className="dl-field-help">0 = 禁用；清扫间隔 10 分钟</div>
           <label className="dl-field-label">清理时保留文件</label>
           <Switch label="保留文件" on={s.cleanup.auto_remove_keep_data} onChange={(v) => patch("cleanup", "auto_remove_keep_data", v)} />
@@ -768,8 +768,8 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
         
         </h3>
         <div className="dl-form-grid">
-          <label className="dl-field-label">daemon 地址</label>
-          <input
+          <label className="dl-field-label" htmlFor="set-a11y-24">daemon 地址</label>
+          <input id="set-a11y-24"
             className="dl-input"
             placeholder="留空 = 同源（内嵌 UI / 桌面端）；如 http://127.0.0.1:8787"
             value={base}
@@ -778,8 +778,8 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
               setBase(e.target.value.trim());
             }}
           />
-          <label className="dl-field-label">Bearer Token</label>
-          <input
+          <label className="dl-field-label" htmlFor="set-a11y-25">Bearer Token</label>
+          <input id="set-a11y-25"
             className="dl-input"
             type="password"
             placeholder="未配置 http_token 时留空"
