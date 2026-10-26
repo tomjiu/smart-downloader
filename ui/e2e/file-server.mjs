@@ -31,8 +31,41 @@ const FILES = {
 
 const byteAt = (i) => i % 251;
 
+/** RSS 订阅源（体检 e2e：RSS 全链路）。内容确定性，标题带序号便于规则断言。 */
+const RSS_XML = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>HC Feed</title>
+    <link>http://127.0.0.1:${PORT}/feed.xml</link>
+    <description>health-check feed</description>
+    <item>
+      <title>HC 第 1 集 720p</title>
+      <link>http://127.0.0.1:${PORT}/small.bin?ep=1</link>
+      <guid isPermaLink="false">hc-ep-1</guid>
+      <pubDate>Mon, 26 Oct 2026 00:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>HC 第 2 集 1080p</title>
+      <link>http://127.0.0.1:${PORT}/small.bin?ep=2</link>
+      <guid isPermaLink="false">hc-ep-2</guid>
+      <pubDate>Mon, 26 Oct 2026 01:00:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>HC 番外 特典</title>
+      <link>http://127.0.0.1:${PORT}/small.bin?sp</link>
+      <guid isPermaLink="false">hc-sp</guid>
+      <pubDate>Mon, 26 Oct 2026 02:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>`;
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
+  if (url.pathname === '/feed.xml') {
+    res.writeHead(200, { 'Content-Type': 'application/rss+xml; charset=utf-8' });
+    res.end(RSS_XML);
+    return;
+  }
   const f = FILES[url.pathname];
   if (!f) {
     res.writeHead(404, { 'Content-Type': 'text/plain' });
