@@ -364,10 +364,12 @@ export class DaemonClient {
     const body: BansReq = { ips };
     return req("/security/bans", { method: "POST", body: JSON.stringify(body) });
   }
-  /// 批量解禁（幂等）。
+  /// 批量解禁（幂等）。体检 #182 卫生项：改走 POST /security/bans/unban
+  /// 规范通道（原 DELETE + body 违反 HTTP 语义——规范无定义，AI/多数
+  /// 客户端不发 DELETE body；daemon 保留 DELETE 路由仅为兼容既有调用方）。
   unbanIps(ips: string[]): Promise<BansOut> {
     const body: BansReq = { ips };
-    return req("/security/bans", { method: "DELETE", body: JSON.stringify(body) });
+    return req("/security/bans/unban", { method: "POST", body: JSON.stringify(body) });
   }
   /// IP 段批量导入（DAT PeerGuardian / P2P 格式文本；部分成功语义）。
   /// 注意：全失败时 400（错误体含 imported/errors）——req 统一抛错，
