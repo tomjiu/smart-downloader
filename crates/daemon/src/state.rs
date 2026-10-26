@@ -146,8 +146,9 @@ pub struct TaskSnapshot {
     pub total: u64,
     #[ts(optional)]
     pub error: Option<String>,
-    /// 文件级进度（实时读引擎 status().files；单文件/无文件引擎为空数组）。
-    /// FTP 目录任务与 BT 多文件任务在此处行为一致（都从引擎状态链透出）。
+    /// 文件级进度（实时读引擎 status().files）。BT 多文件 / FTP 目录 /
+    /// HTTP 单文件（体检 #182 C-2 起 httpdl 透出 [rel_path=落盘名, done,
+    /// size]）三口径一致；无文件概念的引擎为空数组。
     pub files: Vec<FileProgress>,
     /// 实时速率（E13）：取自与 `done`/`total` 同一次引擎快照，非 `engine_status`
     /// 轮询缓存（缓存 2s 龄且仅活跃任务有写入，快照应即时）。记录级 Paused
