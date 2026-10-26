@@ -117,6 +117,16 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 | `/events/stream` | GET | 事件流（SSE：历史重放 + 活流尾随，Last-Event-ID 断线续传） |
 | `/ws` | GET | 事件流（WebSocket，背压保护） |
 
+事件通道选型：**Web UI 用 SSE**（`/events/stream`，EventSource 原生断线续传）；
+**桌面壳/脚本等非浏览器消费者用 WS**（`/ws`，双向 + 背压保护 + 连接即推全量
+快照）；事后对账/补拉用 REST（`/events` 游标分页）。三通道共用同一 Envelope
+与 WsHub 环形缓冲（契约详见 `docs/IMPLEMENTED.md` E12/M7）。
+
+以下端点为 **daemon-only**（无 Web UI 入口，面向脚本/运维/CLI 消费）：
+`/nas/*`（NAS 版迅雷引擎托管，Linux-only）、`/tasks/xunlei-import`（CLI 子命令
+`xunlei-import` 使用）、`/config`（GET 只读快照，UI 设置页走 `/settings`）、
+`/metrics`（Prometheus 抓取）。
+
 ## 配置
 
 TOML 配置（默认 `./config.toml`，任务状态 `./tasks.json`）：`[download]`（dest_root/并发/限速/代理/disk_precheck_strict 磁盘预检严格模式/fsync_per_segment 段落盘策略——true 每段 fsync（默认，崩溃一致性最严）；false 批量模式，累计 fsync_batch_segments 段或 fsync_batch_interval_ms 毫秒先到者一次「数据 fsync+账本落盘」，机械盘吞吐推荐，WAL 语义不变；基准见 scripts/manual/fsync_bench.sh）、`[bt]`（save_path/DHT/LSD/UPnP/做种）、`[provider]`（fallback 链）、`[server]`（bind/token）、`[webhook]`（任务完成通知 URL，POST JSON，fire-and-forget）、`[cleanup]`（auto_remove_completed_days 已完成任务 N 天后自动清扫，0 = 禁用；auto_remove_keep_data 默认保留文件）、`[post_download]`（完成后自动处理：move_to 移动到目标目录 + hook 外部程序，环境变量 SD_TASK_ID/SD_TASK_NAME/SD_FILE_PATH/SD_ENGINE 传任务上下文；空 = 禁用）、`[scheduler]`（start_jitter_seconds 错峰随机延迟上限，秒；0 = 关）。支持热重载。
