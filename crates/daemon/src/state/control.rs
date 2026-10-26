@@ -668,6 +668,23 @@ impl DaemonState {
                     // 已在目标态（活跃→活跃）：不迁移，但本轮回填/缓存仍生效
                     None
                 } else {
+                    // R5 缺陷兜底（优先级启动竞态）：进入 Downloading（引擎侧
+                    // checking/metadata 就绪后的首次活跃报告）时把持久化优先级
+                    // 重入 pending——重放循环 2s 内原样重放，对冲 libtorrent
+                    // 启动序列对已设 skip 的非确定性回退（实测：同脚本两跑
+                    // total_wanted 16MB/24MB 分叉，skip 的 b.bin 一跑被全量
+                    // 下完）。幂等（重放值与引擎一致时无感）；无持久化优先级
+                    // 的任务不受影响。
+                    if matches!(to, TaskState::Downloading(_)) {
+                        let has_prio = rec
+                            .task
+                            .file_priorities
+                            .as_ref()
+                            .is_some_and(|p| !p.is_empty());
+                        if has_prio {
+                            self.pending_file_prio.lock().insert(id.clone());
+                        }
+                    }
                     // 错误随快照整体入缓存（st.error），无需单独写点
                     rec.task.state = to.clone();
                     Some((from, to))

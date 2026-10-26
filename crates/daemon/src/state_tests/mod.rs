@@ -33,6 +33,10 @@ pub struct FakeEngine {
     /// Some(Err(e)) = 返回该错误（metadata 未就绪模拟）；Some(Ok(v)) = 返回 v。
     prio_readback:
         parking_lot::Mutex<Option<Result<Vec<Option<u32>>, smart_dl_core::types::EngineError>>>,
+    /// R8：模拟「set 后 readback 恒旧值」（libtorrent 异步记账/启动竞态）——
+    /// true 时 set_file_priorities 不再更新 prio_readback，daemon 侧
+    /// verify-and-reapply 循环每轮读到漂移值。
+    prio_stale: parking_lot::Mutex<bool>,
     /// 已下发的 pause 调用（P4 G5 暂停意图重放测试用）。
     paused: parking_lot::Mutex<Vec<String>>,
     /// 已下发的 resume 调用（P4 G5 运行态恢复重放测试用）。
@@ -84,6 +88,7 @@ impl FakeEngine {
             status_files: parking_lot::Mutex::new(Vec::new()),
             prio_calls: parking_lot::Mutex::new(Vec::new()),
             prio_readback: parking_lot::Mutex::new(None),
+            prio_stale: parking_lot::Mutex::new(false),
             paused: parking_lot::Mutex::new(Vec::new()),
             resumed: parking_lot::Mutex::new(Vec::new()),
             removed: parking_lot::Mutex::new(Vec::new()),
@@ -252,6 +257,12 @@ impl FakeEngine {
         *self.prio_readback.lock() = v;
     }
 
+    /// R8：编程「set 后 readback 恒旧值」模式（漂移模拟）。
+    #[allow(dead_code)]
+    pub fn set_prio_stale(&self, stale: bool) {
+        *self.prio_stale.lock() = stale;
+    }
+
     /// 读取已下发的连接数上限调用记录（S1-c 断言用）。
     // 跨 feature 门测试共享的 mock 观测器：主调用点在 bt 门内（Bt fake），
     // 默认 feature 组合下无调用点（同 set_status_files 豁免惯例）。
@@ -405,6 +416,7 @@ mod metrics_tests;
 mod name_backfill_tests;
 mod persist_tests;
 mod post_download_tests;
+mod prio_convergence_tests;
 mod queue_gate_tests;
 mod rate_cache_tests;
 mod remove_hardening_tests;
@@ -473,12 +485,31 @@ impl BtEngineExt for FakeEngine {
     ) -> Result<(), smart_dl_core::types::EngineError> {
         // readback 错误态同步反映到 set（真实 BT 引擎 metadata 未就绪时
         // set/read 同样失败）——pending 重放测试依赖该一致性
-        if let Some(Err(e)) = &*self.prio_readback.lock() {
-            return Err(e.clone());
+        {
+            let guard = self.prio_readback.lock();
+            if let Some(Err(e)) = &*guard {
+                return Err(e.clone());
+            }
         }
         self.prio_calls
             .lock()
             .push((id.clone(), priorities.to_vec()));
+        // R8 收敛语义：set 后 readback 反映合并值（模拟已收敛引擎的快速
+        // 路径）——daemon 侧 verify-and-reapply 循环据此立即收敛；
+        // 需要模拟「旧值漂移」的测试用 prio_stale 阻断该更新。
+        if !*self.prio_stale.lock() {
+            let base = match &*self.prio_readback.lock() {
+                Some(Ok(v)) => v.clone(),
+                _ => vec![Some(4)], // 默认就绪：单文件表（与 file_priorities 默认一致）
+            };
+            let mut merged = base;
+            for (i, p) in priorities {
+                if *i < merged.len() {
+                    merged[*i] = Some(*p);
+                }
+            }
+            *self.prio_readback.lock() = Some(Ok(merged));
+        }
         Ok(())
     }
     async fn file_priorities(

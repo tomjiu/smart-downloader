@@ -69,11 +69,71 @@ impl DaemonState {
         bt.set_file_priorities(&tid, priorities)
             .await
             .map_err(|e| DaemonError::Engine(e.to_string()))?;
-        let snapshot = bt
-            .file_priorities(&tid)
-            .await
-            .map_err(|e| DaemonError::Engine(e.to_string()))?;
-        // 持久化全量快照：readback 的 None（内核未定值）按 libtorrent 默认
+        // ── 收敛循环（R5 实测缺陷修复，2026-10 多文件本地 swarm）────────────
+        // 两个真实故障模式：
+        //  ① libtorrent 异步记账：设后立即查可能读到旧值（lt_kernel.cpp
+        //     lt_set_file_priorities 注释明示，以 file_prio_alert 为准）——旧
+        //     实现把首次 readback 直接进持久化记录，恢复重放时反噬用户 skip；
+        //  ② 任务启动初期设置非确定性丢失：同脚本两跑 total_wanted 16MB/24MB
+        //     分叉（skip 的 b.bin 一跑未下、一跑全量下完）。
+        // 策略：有界 verify-and-reapply——每轮 readback 与「请求合并后的期望值」
+        // 比对，漂移即全量重设；连续两轮收敛（≈800ms 无漂移）提前离场。
+        // 更晚的回退（如大种子 checking 完成时）由轮询推进路径的
+        // 「进入 Downloading 重入 pending」兜底重放（control.rs）。
+        // 持久化与响应均取期望值（意图优先），绝不持久化与请求矛盾的旧 readback。
+        const PRIO_VERIFY_ROUNDS: usize = 6;
+        const PRIO_VERIFY_INTERVAL_MS: u64 = 400;
+        let mut snapshot: Vec<Option<u32>> = Vec::new();
+        let mut drift_count: usize = 0;
+        let mut converged_streak: usize = 0;
+        for round in 0..PRIO_VERIFY_ROUNDS {
+            if round > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(PRIO_VERIFY_INTERVAL_MS)).await;
+            }
+            let cur = bt
+                .file_priorities(&tid)
+                .await
+                .map_err(|e| DaemonError::Engine(e.to_string()))?;
+            // 期望值 = readback ∪ 请求（请求覆盖对应下标；越界下标已被上面
+            // 文件数锚定拒绝，不会出现 *i >= expect.len()，防御性跳过）
+            let mut expect = cur.clone();
+            for (i, p) in priorities {
+                if *i < expect.len() {
+                    expect[*i] = Some(*p);
+                }
+            }
+            if cur.is_empty() || cur != expect {
+                drift_count += 1;
+                converged_streak = 0;
+                // 漂移：全量重设（readback 基 + 请求覆盖），下轮复验
+                let full: Vec<(usize, u32)> = expect
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, p)| p.map(|p| (i, p)))
+                    .collect();
+                if !full.is_empty() {
+                    bt.set_file_priorities(&tid, &full)
+                        .await
+                        .map_err(|e| DaemonError::Engine(e.to_string()))?;
+                }
+            } else {
+                converged_streak += 1;
+                // 连续两轮收敛（≈800ms 无漂移）→ 可信收敛提前离场；
+                // 更晚的回退由轮询推进的「进入 Downloading 重入 pending」
+                // 兜底重放（control.rs）。
+                if converged_streak >= 2 {
+                    snapshot = expect;
+                    break;
+                }
+            }
+            snapshot = expect;
+        }
+        if drift_count > 0 {
+            tracing::warn!(
+                "任务 {id} 子文件优先级经历 {drift_count} 轮漂移重设（libtorrent 异步记账/启动竞态），已收敛"
+            );
+        }
+        // 持久化全量快照：期望值的 None（内核未定值）按 libtorrent 默认
         // 优先级 4 归一，保证重放值与引擎语义一致。
         let persisted: Vec<u32> = snapshot.iter().map(|p| p.unwrap_or(4)).collect();
         {

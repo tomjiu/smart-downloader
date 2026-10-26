@@ -55,6 +55,14 @@ pub struct AddTaskReq {
     /// flag；缺省 = 默认并行策略。
     #[serde(default)]
     pub sequential: bool,
+    /// 初始子文件优先级（R5，仅 torrent_b64 入口）：建任务时在引擎 add 的
+    /// 暂停窗口内应用（resume 前），根治「创建后补设」与启动序列的竞态
+    //（实测：本地极速下载在补设前完成，skip 非确定性丢失）。
+    /// 下标越界（对 torrent 文件数）或 priority>7 → 400；未提及下标取默认 4。
+    /// magnet 入口携带 → 400（metadata 未就绪，请建任务后经
+    /// `POST /tasks/:id/files/priority` 设置）。
+    #[serde(default)]
+    pub file_priorities: Vec<FilePriorityEntry>,
     /// 任务级代理 URL（E5，仅 HTTP 任务生效）：`http(s)://` / `socks5://` /
     /// `socks4://`，可带 `user:pass@`；缺省 = 走全局 `[download] proxy`（若有）。
     /// 非法代理 URL → 400；BT/FTP 任务携带此字段被忽略。
@@ -1780,6 +1788,16 @@ async fn add_task(
                 format!("auto_retry 取值 0..=10，收到 {auto_retry}") })),
         );
     }
+    // R5：初始子文件优先级仅 torrent_b64 入口支持（引擎 add 暂停窗口内应用，
+    // 根治创建后补设的启动序列竞态）。magnet 的 metadata 未就绪、
+    // url/metalink 非 BT ——携带但无 torrent_b64 → 400。
+    if !req.file_priorities.is_empty() && req.torrent_b64.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error":
+                "file_priorities 仅支持 torrent_b64 入口（magnet 请建任务后经 POST /tasks/:id/files/priority 设置）" })),
+        );
+    }
 
     // 源三选一（优先级 torrent > metalink > url）；统一产出任务 id 列表
     // （单源任务 = 单元素；metalink = 逐 <file> 展开，B1）。
@@ -1789,6 +1807,11 @@ async fn add_task(
             Ok(bytes) => {
                 #[cfg(feature = "bt")]
                 {
+                    let file_prios: Vec<(usize, u32)> = req
+                        .file_priorities
+                        .iter()
+                        .map(|e| (e.index, e.priority))
+                        .collect();
                     state
                         .add_torrent_task_opts(
                             bytes,
@@ -1796,6 +1819,7 @@ async fn add_task(
                             req.sequential,
                             req.start_at_unix,
                             req.auto_retry.unwrap_or(0),
+                            file_prios,
                         )
                         .await
                         .map(|id| vec![id])
