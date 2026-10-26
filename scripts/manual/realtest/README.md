@@ -34,6 +34,7 @@ scripts/manual/realtest/rt-01-filter-stats.sh   # 单跑任意一条
 | `rt-10-bt-restart-replay.sh` | BT 优先级跨 kill -9 重启重放（需 LT 环境 + bt 构建） | kill -9 → 重启 → 续传完成 → skip 跨重启存活（#178 缺陷①闭环） |
 | `rt-11-bt-sequential.sh` | BT 顺序下载（需 LT 环境 + bt 构建） | sequential=true 建任务完成 + 双文件 SHA256 + 运行中端点幂等切换 |
 | `rt-12-bt-webseed.sh` | BT web seed BEP-19 P2SP（需 LT 环境 + bt 构建） | 零 peer 死 tracker 纯 HTTP 源完成下载 + SHA256 一致 + added 回执 |
+| `rt-13-bt-magnet-public.sh` | BT 磁力链接公网 swarm 抓取（需 LT 环境 + bt 构建 + 公网） | Debian 官方 swarm magnet → 元数据（infohash bencode 交叉校验/total/files/save_to 同 hash）+ 抓取产物建任务真实下载（磁盘余量不足自动 SKIP 下载段） |
 
 ## 组件服务器（本地、确定性）
 
