@@ -30,6 +30,10 @@ scripts/manual/realtest/rt-01-filter-stats.sh   # 单跑任意一条
 | `rt-06-cleanup-settings.sh` | E20 清扫设置面 | PUT /settings 热更立即生效 + config.toml 持久化回写、保留期内不清扫 |
 | `rt-07-queue-quota.sh` | S1 并发队列配额 | max_active_http=2 门控（6 任务恰 2 传）、暂停 FIFO 递补、配额释放递补 |
 | `rt-08-events-channels.sh` | 事件三通道 | SSE data 帧、REST 补拉 type 过滤（单/多值/400）、WS 建连 + 帧推送 |
+| `rt-09-bt-multifile-priority.sh` | BT 多文件子文件优先级（需 LT 环境 + bt 构建） | 创建时 file_priorities 暂停窗口应用（readback [4,0,4]/total 排除/SHA256/三 400/set 意图合并）——**#178 修复的 e2e 实证** |
+| `rt-10-bt-restart-replay.sh` | BT 优先级跨 kill -9 重启重放（需 LT 环境 + bt 构建） | kill -9 → 重启 → 续传完成 → skip 跨重启存活（#178 缺陷①闭环） |
+| `rt-11-bt-sequential.sh` | BT 顺序下载（需 LT 环境 + bt 构建） | sequential=true 建任务完成 + 双文件 SHA256 + 运行中端点幂等切换 |
+| `rt-12-bt-webseed.sh` | BT web seed BEP-19 P2SP（需 LT 环境 + bt 构建） | 零 peer 死 tracker 纯 HTTP 源完成下载 + SHA256 一致 + added 回执 |
 
 ## 组件服务器（本地、确定性）
 
@@ -49,3 +53,11 @@ scripts/manual/realtest/rt-01-filter-stats.sh   # 单跑任意一条
    会被静默忽略（serde 标准行为，但易踩）
 4. **add 路径同步探测源站**：死源 URL 直接 400 拒绝（auto_retry 无从触发；
    重试只覆盖「添加时活、下载中死」场景——符合语义，文档化于 rt-04 头注）
+5. **BT 任务级 dest 不支持**（v1 全局落盘语义）：显式 dest ≠ 全局目录 →
+   engine error（文档口径；rt-09/10/11 均用全局目录）
+6. **peer 表不跨 daemon 重启持久**：hermetic 测试（无 tracker）重启后须
+   重注入；真实场景由 tracker/PEX 重发现兜底（rt-10 头注）
+7. **纯做种者 + 有限 max_share_ratio = 立即暂停**（batch6-P2「qbit 同口径」：
+   downloaded==0 && uploaded>0 → ratio=∞ ≥ 任意阈值）——导入完整数据做种
+   的场景配 ratio limit 会被秒停；rt 系列配置一律不设 max_share_ratio
+8. **优雅停机后做种任务重启不自动恢复**（Paused + engine_tid=None）
