@@ -115,8 +115,11 @@ export class DaemonClient {
   /// 但误导后续消费——若读 done/total 将拿到 undefined）。
   /// #161 P3：q 支持服务端过滤/搜索（?state=&engine=&search=&tag=，
   /// 参数形状由生成的 ListTasksQuery 锁定；未提供/全空 = 全量，
-  /// 行为与形状同旧）。分页（limit/offset + X-Total-Count）留待
-  /// 服务端排序支持后再接（客户端排序与分页组合语义不成立）。
+  /// 行为与形状同旧）。
+  /// R14：q.sort/q.order 下推服务端排序（?sort=&order=；服务端为排序
+  /// 唯一权威——与 #173 过滤下推同模式，避免双重口径）。分页
+  /// （limit/offset + X-Total-Count）语义自 R13 起成立，UI 接入待虚拟
+  /// 滚动场景评估后再定（当前全量拉取 + 虚拟滚动的内存/DOM 表现已达标）。
   listTasks(q?: ListTasksQuery): Promise<TaskListItem[]> {
     if (q) {
       const p = new URLSearchParams();
@@ -124,6 +127,8 @@ export class DaemonClient {
       if (q.engine) p.set("engine", q.engine);
       if (q.search) p.set("search", q.search);
       if (q.tag) p.set("tag", q.tag);
+      if (q.sort) p.set("sort", q.sort);
+      if (q.order) p.set("order", q.order);
       if (typeof q.limit === "number") p.set("limit", String(q.limit));
       if (typeof q.offset === "number") p.set("offset", String(q.offset));
       const s = p.toString();
