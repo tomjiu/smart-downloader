@@ -412,6 +412,7 @@ mod rss_persist_tests;
 mod scheduled_tests;
 mod seeding_limit_tests;
 mod sftp_tests;
+mod sort_tests;
 mod tags_tests;
 mod task_proxy_set_tests;
 mod task_proxy_tests;

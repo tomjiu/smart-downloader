@@ -176,6 +176,131 @@ async fn list_tasks_search_e2e() {
     assert_eq!(arr[0]["task_id"], ids[0].as_str());
 }
 
+/// R13 `?sort=&order=` e2e：名称排序回程（升/降）、仅 order=desc 最新优先、
+/// 非法 sort/order → 400（含合法值全集）、空白 sort 宽容（= 未提供）、
+/// 与分页共存（X-Total-Count 反映总数，排序后切片）。
+#[tokio::test]
+async fn list_tasks_sort_e2e() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    // 3 任务，创建序 charlie → alpha → bravo（名称乱序，判别力明确）
+    let names = ["charlie.bin", "alpha.bin", "bravo.bin"];
+    let mut ids = Vec::new();
+    for (i, name) in names.iter().enumerate() {
+        let srv = TestServer::start(patterned(8 * 1024)).await;
+        let dest = std::env::temp_dir().join(format!("r13-sort-{i}"));
+        let resp = client
+            .post(format!("{base}/tasks"))
+            .json(&serde_json::json!({
+                "url": srv.url(),
+                "dest": dest.to_str().unwrap(),
+                "name": name,
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+        ids.push(
+            resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+
+    async fn list_ids(client: &reqwest::Client, base: &str, qs: &str) -> Vec<String> {
+        let v: serde_json::Value = client
+            .get(format!("{base}/tasks{qs}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["task_id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    let want_asc = vec![ids[1].clone(), ids[2].clone(), ids[0].clone()]; // alpha, bravo, charlie
+    let want_desc = vec![ids[0].clone(), ids[2].clone(), ids[1].clone()]; // charlie, bravo, alpha
+
+    // 名称升序（显式 order）
+    assert_eq!(
+        list_ids(&client, &base, "?sort=name&order=asc").await,
+        want_asc
+    );
+    // 名称升序（order 缺省 = asc）
+    assert_eq!(list_ids(&client, &base, "?sort=name").await, want_asc);
+    // 名称降序
+    assert_eq!(
+        list_ids(&client, &base, "?sort=name&order=desc").await,
+        want_desc
+    );
+    // 仅 order=desc（无 sort）：最新优先（创建序倒序）
+    assert_eq!(
+        list_ids(&client, &base, "?order=desc").await,
+        vec![ids[2].clone(), ids[1].clone(), ids[0].clone()]
+    );
+    // 空白 sort（%20）宽容：= 未提供 → 创建序
+    assert_eq!(
+        list_ids(&client, &base, "?sort=%20&order=desc").await,
+        vec![ids[2].clone(), ids[1].clone(), ids[0].clone()],
+        "空白 sort 视为未提供，order 仍生效"
+    );
+
+    // 非法 sort → 400（错误信息含合法值全集）
+    let resp = client
+        .get(format!("{base}/tasks?sort=bogus"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("created") && body.contains("eta"),
+        "400 信息须含合法值全集，实际: {body}"
+    );
+
+    // 非法 order → 400
+    let resp = client
+        .get(format!("{base}/tasks?sort=name&order=sideways"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // 排序 + 分页共存：排序后切片 + X-Total-Count = 总数（非页长）
+    let resp = client
+        .get(format!("{base}/tasks?sort=name&order=asc&limit=2&offset=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()
+            .get("x-total-count")
+            .and_then(|v| v.to_str().ok()),
+        Some("3")
+    );
+    let arr: serde_json::Value = resp.json().await.unwrap();
+    let got: Vec<&str> = arr
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["task_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        got,
+        vec![ids[2].as_str(), ids[0].as_str()],
+        "offset=1 跳过 alpha"
+    );
+}
+
 /// E15 重命名 e2e：设置 → 200 快照带新名 → 列表/搜索（E14）联动 →
 /// 清除（null 与 {} 两形态）→ name 省略；空白 400 / 非法路径分量 400 /
 /// 未知任务 404。落盘路径不受影响属引擎 add 时决策（不在 API 可断言面）。

@@ -72,6 +72,9 @@ impl DaemonState {
             offset: 0,
             search: q.search.clone(),
             tags: q.tags.clone(),
+            // 批量执行集不走用户排序：恒创建序（执行顺序确定性）
+            sort: None,
+            order: Default::default(),
         });
         const SELECT_CAP: usize = 1000;
         if rows.len() > SELECT_CAP {
