@@ -1344,7 +1344,7 @@ async fn run_magnet_fetch(
     magnet: &str,
     opts: &smart_dl_btcore::magnet::FetchOpts,
     save_to: Option<&std::path::Path>,
-) -> Result<serde_json::Value, (StatusCode, String)> {
+) -> Result<MagnetMetaOut, (StatusCode, String)> {
     use smart_dl_btcore::magnet::{fetch_metadata, FetchError};
 
     // S2：先清扫历史遗留（进程死亡残骸），再建本进程 scratch
