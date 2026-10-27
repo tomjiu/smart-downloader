@@ -739,13 +739,17 @@ impl DaemonState {
         torrent_bytes: Vec<u8>,
         dest_root: Option<String>,
     ) -> Result<TaskId, DaemonError> {
-        self.add_torrent_task_opts(torrent_bytes, dest_root, false, None, 0)
+        self.add_torrent_task_opts(torrent_bytes, dest_root, false, None, 0, Vec::new())
             .await
     }
 
     /// 顺序下载变体：`sequential` 写入任务 + 引擎 add 后立即下发 flag。
     /// `start_at_unix`（E23）：Some(未来) = 延迟入引擎，到点由调度循环激活。
     /// `auto_retry`（batch5，E30 贯通 BT）：同 magnet 入口。
+    /// `file_priorities`（R5）：初始子文件优先级（(下标, 0..=7)）——写入
+    /// 任务记录并在引擎 add 的暂停窗口内应用（resume 前，dl_engine），
+    /// 根治「创建后补设」与启动序列的竞态；下标对 torrent 文件数越界或
+    /// priority>7 → InvalidSource；未提及下标取默认 4。
     #[cfg(feature = "bt")]
     pub async fn add_torrent_task_opts(
         &self,
@@ -754,6 +758,7 @@ impl DaemonState {
         sequential: bool,
         start_at_unix: Option<u64>,
         auto_retry: u32,
+        file_priorities: Vec<(usize, u32)>,
     ) -> Result<TaskId, DaemonError> {
         // B10：目标目录预检（创建/可写）；dest 未指定 → 默认落盘目录（与 HTTP/BT-magnet 一致）
         let def = self.default_dest_root.lock().to_string_lossy().into_owned();
@@ -769,6 +774,38 @@ impl DaemonState {
         if let Some(total) = torrent_precheck_total(&torrent_bytes) {
             precheck_space(&dest_root, total, self.disk_precheck_strict)?;
         }
+        // R5：初始子文件优先级 → 稠密全量表（未提及下标取默认 4）。校验
+        // priority 范围 + 下标对 torrent 文件数（解析失败拿到文件数 →
+        // 交由引擎 add 的 FFI 两段式校验拒，不在此阻断）。
+        let initial_prios: Option<Vec<u32>> = if file_priorities.is_empty() {
+            None
+        } else {
+            let nf = smart_dl_core::torrent_meta::parse_torrent(&torrent_bytes)
+                .map(|s| s.files.len())
+                .unwrap_or(usize::MAX);
+            let mut dense: Vec<u32> = Vec::new();
+            for (idx, prio) in &file_priorities {
+                if *prio > 7 {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "file_priorities 优先级 {prio} 越界（0..=7：0=不下载 1=低 4=默认 7=最高）"
+                    )));
+                }
+                if *idx >= nf {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "file_priorities 下标 {idx} 越界（该 torrent 共 {nf} 个文件）"
+                    )));
+                }
+                if dense.len() <= *idx {
+                    dense.resize(idx + 1, 4);
+                }
+                dense[*idx] = *prio;
+            }
+            // 尾部未提及的文件补默认 4（全量快照口径，与 set 端点持久化一致）
+            if dense.len() < nf {
+                dense.resize(nf, 4);
+            }
+            Some(dense)
+        };
         let canonical = CanonicalId {
             kind: CanonicalKind::Bt,
             identity: ih.clone(),
@@ -813,7 +850,7 @@ impl DaemonState {
                 max_retries: auto_retry,
             },
             created_at: std::time::Instant::now(),
-            file_priorities: None,
+            file_priorities: initial_prios,
             sequential,
             metadata: TaskMetadata {
                 name: None,
