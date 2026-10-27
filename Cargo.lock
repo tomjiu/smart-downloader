@@ -2757,7 +2757,6 @@ dependencies = [
  "sha1 0.10.7",
  "tempfile",
  "thiserror 1.0.69",
- "tokio",
  "ts-rs",
  "url",
  "uuid",
