@@ -171,8 +171,12 @@ export default function DlApp() {
     danger: boolean;
     run: () => Promise<void>;
   } | null>(null);
-  const historyRef = useRef<SpeedPoint[]>([]);
-  const [historyTick, setHistoryTick] = useState(0);
+  /// 速率曲线历史（不可变更新：新数组引用驱动 SpeedChart useMemo 重算）。
+  /// 修复：旧实现 historyRef 原地 push + historyTick 驱动重渲染——但
+  /// StatsView 拿到的 history 引用永不变，SpeedChart 的 useMemo([data])
+  /// 引用相等短路，曲线在挂载后永久冻结（切走再切回才重算）。
+  /// 无变化返旧引用：速率未变时跳过重渲染（保留原优化意图）。
+  const [history, setHistory] = useState<SpeedPoint[]>([]);
 
   const toast = useCallback((t: { kind: string; text: string }) => {
     const id = Date.now() + Math.random();
@@ -296,13 +300,16 @@ export default function DlApp() {
     }
     if (s) {
       setStats(s);
-      const h = historyRef.current;
-      const last = h[h.length - 1];
-      if (!last || last.down !== s.down_bytes_s || last.up !== s.up_bytes_s) {
-        h.push({ down: s.down_bytes_s, up: s.up_bytes_s });
-        if (h.length > 180) h.splice(0, h.length - 180);
-        setHistoryTick((x) => x + 1);
-      }
+      // 不可变更新：新点 → 新数组引用（SpeedChart memo 重算）；
+      // 速率未变 → 返回旧引用（跳过重渲染）。上限 180 点滑动窗口。
+      setHistory((h) => {
+        const last = h[h.length - 1];
+        if (last && last.down === s.down_bytes_s && last.up === s.up_bytes_s) {
+          return h;
+        }
+        const next = [...h, { down: s.down_bytes_s, up: s.up_bytes_s }];
+        return next.length > 180 ? next.slice(next.length - 180) : next;
+      });
     }
     setConnected(t !== null || s !== null);
   }, [listParams]);
@@ -699,15 +706,11 @@ export default function DlApp() {
               )}
             </>
           )}
-          {view === "stats" && (
-            <StatsView stats={stats} history={historyRef.current} />
-          )}
+          {view === "stats" && <StatsView stats={stats} history={history} />}
           {view === "rss" && <RssView onToast={toast} />}
           {view === "logs" && <LogsView events={events} />}
           {view === "settings" && <SettingsView onToast={toast} />}
           {view === "security" && <SecurityView onToast={toast} />}
-          {/* historyTick 驱动曲线重绘 */}
-          <span hidden>{historyTick}</span>
           </main>
         </div>
 
