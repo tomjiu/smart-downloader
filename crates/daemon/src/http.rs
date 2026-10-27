@@ -160,7 +160,7 @@ pub struct ProbeOut {
 /// download.bin，逐候选 sanitize_rel 终审）。探测失败（网络/非 2xx/416
 /// 之外状态）→ 502；入参非法 → 400。url 不回显（请求方自持；凭据不二次暴露）。
 async fn probe_endpoint(
-    State(_state): State<Arc<DaemonState>>,
+    State(state): State<Arc<DaemonState>>,
     Json(req): Json<ProbeReq>,
 ) -> Response {
     let url = req.url.trim();
@@ -183,7 +183,17 @@ async fn probe_endpoint(
                     .into_response()
             }
         },
-        _ => reqwest::Client::new(),
+        // soak #168 补遗（#169 评审项）：非代理探测改用引擎同源 client（bootstrap
+        // = serve 注入的全局 client 克隆，UA/cookie/重定向与任务下载完全一致——
+        // 探测即真实预览；原裸 Client::new() 无 UA，thinkbroadband 类源会
+        // 「探测 403 而下载成功」行为割裂）。None 兜底（测试/非 serve 上下文）
+        // 同样带产品 UA，与 RSS/metalink 的 bootstrap 口径一致。
+        _ => state.bootstrap_client_opt().unwrap_or_else(|| {
+            reqwest::Client::builder()
+                .user_agent(smart_dl_httpdl::engine::USER_AGENT)
+                .build()
+                .unwrap_or_default()
+        }),
     };
     let mut headers: Vec<(String, String)> = req
         .headers
