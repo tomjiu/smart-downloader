@@ -75,6 +75,28 @@ scripts/m0/02_build.ps1     # 构建 ffi 内核 + workspace
 | `xunlei-import` | 迅雷任务导入（隐含 bt） |
 | `nas` | NAS 版迅雷引擎托管（Linux-only） |
 
+### UI e2e（Playwright，真实 daemon + 真实下载 + 真实 UI 产物）
+
+不进 CI（浏览器依赖重，本地/实机跑——与 scripts/manual/ 手工脚本同一姿态）。
+串行执行：全部用例共享同一 daemon（真实状态累积），afterEach 清场。
+
+```bash
+cargo build -p smart-dl-daemon          # debug 即可
+cd ui && npm install && npm run build   # 产出 ui/out（e2e 走真实产物，不用 dev server）
+npx playwright install chromium         # 首次
+npm run test:e2e                        # 主套件
+npx playwright test -c e2e-restart/playwright.config.ts   # 重启韧性独立套件（自带 daemon 生命周期）
+```
+
+| 套件 | 覆盖 |
+|------|------|
+| `critical-paths.spec.ts` | 8 条关键路径：核心下载/限速行为证明/暂停恢复/删除确认/null 名兜底/详情矩阵/新建表单/封禁页 |
+| `sort-server.spec.ts` | 服务端排序回程：表头三态 + 网络层参数证据 + 过滤排序组合 + UI/API 三方一致 |
+| `view-persist.spec.ts` | 视图状态持久化：sort/filter 重载恢复 + 损坏值容错 |
+| `bulk-load.spec.ts` | 120 任务重负载全生命周期：风暴/虚拟滚动护栏/统计一致/toast 双护栏/批量/清场 |
+| `keyboard-nav.spec.ts` | 键盘导航：↑/↓ 跨虚拟窗口接力 + Enter/Esc 焦点归还 + Space 选中 |
+| `e2e-restart/`（独立） | daemon kill -9 重启后 SSE live 流自愈（seq 归零探测） |
+
 ### CLI 速查
 
 ```bash
@@ -113,8 +135,8 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 | `/metrics` | GET | Prometheus 指标（text/plain；任务按状态/引擎计数 + 聚合速率） |
 | `/providers` | GET | Provider 状态 |
 | `/probe` | POST | 探测预览：不建任务取 URL 元数据（大小/服务端文件名/Range/ETag/Last-Modified/Content-Type + `suggest_name`；headers/代理/Basic 凭据同 add 语义；v1 仅 HTTP 源） |
-| `/events` | GET | 事件历史查询（seq 游标分页 + task_id/type 过滤 + 缺口报警） |
-| `/events/stream` | GET | 事件流（SSE：历史重放 + 活流尾随，Last-Event-ID 断线续传） |
+| `/events` | GET | 事件历史查询（seq 游标分页 + task_id/type 过滤 + 缺口报警 + `latest_seq` 已发布最大 seq——live 边界：增量消费方先取此值再以 `after=` 订阅/轮询，只收增量） |
+| `/events/stream` | GET | 事件流（SSE：`after=` 游标历史重放 + 活流尾随，Last-Event-ID 断线续传；Web UI 以 `after=latest_seq` 仅订阅增量——历史事件对用户是历史而非现场，不弹现场提示） |
 | `/ws` | GET | 事件流（WebSocket，背压保护） |
 
 事件通道选型：**Web UI 用 SSE**（`/events/stream`，EventSource 原生断线续传）；
