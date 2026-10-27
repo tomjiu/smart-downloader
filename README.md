@@ -92,7 +92,7 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/tasks` | GET / POST | 任务列表（`?state=`/`?engine=` 过滤、`?search=` 关键字、`?tag=` 标签 any-of、`?limit`/`?offset` 分页 + `X-Total-Count`）/ 建任务（HTTP、FTP 目录、magnet、.torrent；能力字段：任务级代理/自定义 headers/Basic 凭据/顺序下载/trackers/限速/校验 sha256·sha1·md5/`backup_url`+`backup_md5`/显式 `name`/`conflict_policy`/`start_at_unix` 定时/`auto_retry` 自动重试预算） |
+| `/tasks` | GET / POST | 任务列表（`?state=`/`?engine=` 过滤、`?search=` 关键字、`?tag=` 标签 any-of、`?sort=`/`?order=` 服务端排序【created·name·state·progress·size·speed·eta × asc·desc，排序在分页前应用；仅 `?order=desc` = 最新优先】、`?limit`/`?offset` 分页 + `X-Total-Count`）/ 建任务（HTTP、FTP 目录、magnet、.torrent；能力字段：任务级代理/自定义 headers/Basic 凭据/顺序下载/trackers/限速/校验 sha256·sha1·md5/`backup_url`+`backup_md5`/显式 `name`/`conflict_policy`/`start_at_unix` 定时/`auto_retry` 自动重试预算） |
 | `/tasks/batch` | POST | 批量操作：显式 `ids`（≤100，pause/resume/remove）或条件 `select`（state/engine/tag/search 任一，仅 pause/resume 非破坏动作） |
 | `/tasks/:id` | GET / DELETE | 快照（files 明细 + 实时速率 + 累计流量/分享率 + 标签 + 顺序下载标志）/ 删除（`?delete_data=true` 引擎侧同删已下载数据） |
 | `/tasks/:id/pause` · `/resume` | POST | 生命周期（定时等待中任务：pause = 取消自动启动，resume = 立即激活；终态 Failed 任务 resume = 手动重试重新接入引擎） |

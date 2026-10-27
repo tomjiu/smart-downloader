@@ -26,7 +26,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use ts_rs::TS;
 
-use crate::state::{known_engine_labels, known_state_labels, BatchAction, ListQuery};
+use crate::state::{
+    known_engine_labels, known_sort_keys, known_state_labels, BatchAction, ListOrder, ListQuery,
+    ListSort,
+};
 
 #[derive(Deserialize, TS)]
 #[ts(export, optional_fields)]
@@ -2076,6 +2079,14 @@ struct ListTasksQuery {
     /// E18：标签 any-of 过滤（逗号分隔多值；大小写不敏感；空白段丢弃）。
     #[serde(default)]
     tag: Option<String>,
+    /// R13：排序键（created/name/state/progress/size/speed/eta；缺省/空白 =
+    /// 创建序）。非法值 → 400（与 state/engine 校验同口径，含合法值全集）。
+    #[serde(default)]
+    sort: Option<String>,
+    /// R13：排序方向（asc/desc；缺省 = asc）。允许仅给 order 不给 sort
+    /// （语义 = 创建序倒序，最新优先）。
+    #[serde(default)]
+    order: Option<String>,
 }
 
 /// `limit` 上限（防一次性拉全表打爆内存；UI 每页 50 量级，500 留足余量）。
@@ -2108,7 +2119,45 @@ fn parse_label_list(
     Ok(labels)
 }
 
-/// 校验查询参数 → ListQuery（400 语义：state/engine 值非法或 limit 越界）。
+/// 排序键解析（R13）：trim 后空白 = 未提供；非法值 → Err（含合法值全集）。
+fn parse_sort_key(raw: &Option<String>) -> Result<Option<ListSort>, String> {
+    let Some(raw) = raw else { return Ok(None) };
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let key = match t.to_ascii_lowercase().as_str() {
+        "created" => ListSort::Created,
+        "name" => ListSort::Name,
+        "state" => ListSort::State,
+        "progress" => ListSort::Progress,
+        "size" => ListSort::Size,
+        "speed" => ListSort::Speed,
+        "eta" => ListSort::Eta,
+        other => {
+            return Err(format!(
+                "未知 sort 值 {other:?}（合法值: {}）",
+                known_sort_keys().join(", ")
+            ))
+        }
+    };
+    Ok(Some(key))
+}
+
+/// 排序方向解析（R13）：缺省 = Asc；非法值 → Err。
+fn parse_sort_order(raw: &Option<String>) -> Result<ListOrder, String> {
+    match raw {
+        None => Ok(ListOrder::Asc),
+        Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(ListOrder::Asc),
+            "asc" => Ok(ListOrder::Asc),
+            "desc" => Ok(ListOrder::Desc),
+            other => Err(format!("未知 order 值 {other:?}（合法值: asc, desc）")),
+        },
+    }
+}
+
+/// 校验查询参数 → ListQuery（400 语义：state/engine/sort/order 值非法或 limit 越界）。
 fn validate_list_query(q: &ListTasksQuery) -> Result<ListQuery, String> {
     let states = parse_label_list(&q.state, &known_state_labels(), "state")?;
     let engines = parse_label_list(&q.engine, &known_engine_labels(), "engine")?;
@@ -2142,12 +2191,16 @@ fn validate_list_query(q: &ListTasksQuery) -> Result<ListQuery, String> {
                     .collect()
             })
             .unwrap_or_default(),
+        // R13：排序下推（sort/order 解析失败 → 400，与 state/engine 同口径）
+        sort: parse_sort_key(&q.sort)?,
+        order: parse_sort_order(&q.order)?,
     })
 }
 
-/// 任务列表（E7 过滤/分页；E14 增 `?search=` 关键字过滤）：无参数 → 全量数组
-/// （兼容不变）；有分页参数 → 附 `X-Total-Count`（过滤后总数，含 search 过滤）。
-/// 排序恒为创建序（task_id 数值后缀）。
+/// 任务列表（E7 过滤/分页；E14 增 `?search=`；R13 增 `?sort=&order=`）：无参数
+/// → 全量数组（兼容不变）；有分页参数 → 附 `X-Total-Count`（过滤后总数，含
+/// search 过滤）。默认排序 = 创建序（task_id 数值后缀）；R13 起可选服务端排序
+/// （排序在过滤后、分页前应用——分页语义成立的前提，详见 ListSort 文档）。
 async fn list_tasks(
     Query(q): Query<ListTasksQuery>,
     State(state): State<Arc<DaemonState>>,
@@ -2216,6 +2269,9 @@ fn parse_batch_select(s: &BatchSelect) -> Result<ListQuery, String> {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(str::to_string),
+        // 批量条件选择不走排序（恒全量执行，无分页语义）
+        sort: None,
+        order: Default::default(),
         tags: s
             .tag
             .as_deref()

@@ -293,10 +293,53 @@ pub struct TaskSummary {
     pub queue_priority: i32,
 }
 
+/// 列表排序键（R13 `?sort=`）。`None` = 创建序（兼容不变，与既有行为
+/// 逐字节等同）；有值时在**过滤之后、分页之前**应用（分页语义成立的前提）。
+/// 排序值口径：
+/// - `Created`：task_id 数值后缀（即创建序本身，供 `?order=desc` 反转为最新优先）
+/// - `Name`：展示名 = 显式名 → 来源末段派生（与 UI `displayName` 同链），
+///   Unicode 简单小写比较（UI 侧 localeCompare("zh-Hans-CN") 存在口径差，
+///   服务端不依赖 locale —— 文档声明）
+/// - `State`：状态标签串（英文枚举名，字典序）
+/// - `Progress`/`Size`/`Speed`/`Eta`：引擎快照缓存（`engine_status`，轮询器
+///   写入；非活跃任务无缓存或字段为 0 → 按 0/无穷处理）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListSort {
+    Created,
+    Name,
+    State,
+    Progress,
+    Size,
+    Speed,
+    Eta,
+}
+
+/// 合法排序键全集（HTTP 层 `?sort=` 校验依据；与 `ListSort` 变体同步——
+/// 新增变体时编译期漏项由测试锁定）。
+pub fn known_sort_keys() -> Vec<String> {
+    [
+        "created", "name", "state", "progress", "size", "speed", "eta",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// 排序方向（R13）：`Asc` 为默认（`?sort=created` 与无参数行为等同）。
+/// 允许仅给 `?order=desc` 不给 `sort` —— 语义 = 创建序倒序（最新优先，
+/// 真实用户高频需求）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ListOrder {
+    #[default]
+    Asc,
+    Desc,
+}
+
 /// 列表过滤/分页查询（E7）。`states`/`engines` 空 = 不过滤；匹配均大小写不敏感。
 /// `limit`/`offset` 由 HTTP 层校验（limit 1..=500，offset ≥ 0 由类型保证）后下推。
 /// `search`（E14）：关键字子串匹配任务名或来源 URL（均大小写不敏感；
 /// None/空串 = 不过滤），语料经 `DownloadSource::search_urls` 脱敏。
+/// `sort`/`order`（R13）：见 [`ListSort`]/[`ListOrder`]；None + Asc = 既有创建序。
 #[derive(Clone, Debug, Default)]
 pub struct ListQuery {
     pub states: Vec<String>,
@@ -307,6 +350,10 @@ pub struct ListQuery {
     /// 标签 any-of 过滤（E18）：空 = 不过滤；命中任一标签即保留（维度内
     /// OR、与 states/engines/search 维度间 AND）；大小写不敏感。
     pub tags: Vec<String>,
+    /// 排序键（R13）：None = 创建序（兼容不变）。
+    pub sort: Option<ListSort>,
+    /// 排序方向（R13）：默认 Asc；仅当 sort 为 None 时对创建序生效。
+    pub order: ListOrder,
 }
 
 /// 合法状态标签全集（E7 `?state=` 校验依据；与 `state_label` 输出同步——
