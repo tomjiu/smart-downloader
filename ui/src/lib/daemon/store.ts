@@ -46,6 +46,7 @@ import type {
   SuperSeedingReq,
   TagsReq,
   TaskListItem,
+  TaskLogs,
   TaskSnapshot,
   TrackerEntry,
   TrackersReq,
@@ -133,6 +134,10 @@ export class DaemonClient {
   }
   getTask(id: string): Promise<TaskSnapshot> {
     return req(`/tasks/${id}`);
+  }
+  /// 任务操作日志（体检 #182 P2 补全：端点已备而 UI 未接——抽屉内直查）。
+  getTaskLogs(id: string): Promise<TaskLogs> {
+    return req(`/tasks/${id}/logs`);
   }
   /// ts-rs 生成（#147 §六）：请求体类型来自 Rust 结构体——字段名漂移在
   /// 编译期报错（旧 addTask 的 Record<string, unknown> 无任何防护）。
