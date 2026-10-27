@@ -1,5 +1,5 @@
 //! B-1 HTTP API：`POST /bt/metadata`（magnet → .torrent 抓取）。
-//! - feature `bt`：400（坏 magnet）/ 408（不可达 infohash 超时）语义；
+//! - feature `bt`：400（坏 magnet）/ 504（不可达 infohash 超时）语义；
 //!   成功路径（真实 seeder）由 btcore/tests/magnet_metadata.rs 覆盖。
 //! - 无 `bt`：端点恒 400（提示编译开关）。
 
@@ -415,12 +415,14 @@ mod bt_enabled {
                 );
                 continue;
             }
-            // 第一个请求完成：超时 → 408（permit 随 handler 结束归还）
+            // 第一个请求完成：超时 → 504（permit 随 handler 结束归还）。
+            // 408→504（超合并验证 F2）：Chromium 对「复用连接+长等待后收到 408」
+            // 吞咽响应并透明重试 → fetch 永不决出；504 不在重试集且语义更准。
             let first = first.await.unwrap();
             assert_eq!(
                 first.status(),
-                reqwest::StatusCode::REQUEST_TIMEOUT,
-                "超时 → 408"
+                reqwest::StatusCode::GATEWAY_TIMEOUT,
+                "超时 → 504"
             );
             let body: serde_json::Value = first.json().await.unwrap();
             assert!(body["error"].as_str().unwrap().contains("超时"));
@@ -448,7 +450,7 @@ mod bt_enabled {
         let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
         let _ser = ENDPOINT_SER.lock().await;
         // V15：越界 save_to 在抓取开始前 400 快速失败（若校验回归，此处会等满
-        // 5s 得到 408，断言失败）。不占门禁（校验在 try_acquire 之前）。
+        // 5s 得到 504，断言失败）。不占门禁（校验在 try_acquire 之前）。
         let addr = serve_with_bt().await;
         let client = reqwest::Client::new();
         for bad in ["/etc/crontab", "../escape.torrent"] {
