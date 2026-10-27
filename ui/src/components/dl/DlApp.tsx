@@ -27,12 +27,7 @@ import type {
   TaskSnapshot,
 } from "@/lib/daemon/types";
 import { client } from "@/lib/daemon/store";
-import TasksTable, {
-  displayName,
-  taskSortValue,
-  type TaskAction,
-  type TableSort,
-} from "./TasksTable";
+import TasksTable, { displayName, type TaskAction, type TableSort } from "./TasksTable";
 import StatsView from "./StatsView";
 import LogsView from "./LogsView";
 import RssView from "./RssView";
@@ -171,8 +166,15 @@ export default function DlApp() {
   const listParams = useMemo<ListTasksQuery | null>(() => {
     const state = filter !== "all" ? SEGMENT_STATES[filter] : undefined;
     const search = debouncedQuery || undefined;
-    return state === undefined && search === undefined ? null : { state, search };
-  }, [filter, debouncedQuery]);
+    // R14：排序下推服务端（SortKey 与服务端 sort 键一一对应；
+    // null = 默认创建序）。服务端为排序唯一权威——表头切换 →
+    // listParams 重建 → refresh 重建 → 轮询 effect 即时重拉新序。
+    const sortQ =
+      sort !== null ? { sort: sort.key, order: sort.dir } : undefined;
+    return state === undefined && search === undefined && sortQ === undefined
+      ? null
+      : { state, search, ...sortQ };
+  }, [filter, debouncedQuery, sort]);
   const filtered = listParams !== null;
 
   const refresh = useCallback(async () => {
@@ -404,21 +406,11 @@ export default function DlApp() {
     } as Record<TaskFilterKey, number>;
   }, [stats]);
 
-  /// 显示集 = 服务端过滤后的列表（#161 P3：过滤/搜索已在 daemon 执行，
-  /// 客户端不再二次过滤——避免双重口径遮蔽服务端语义漂移）。
-  /// 排序在过滤/搜索之后应用（显示序 = 用户所见序；Shift 范围选择按此序）。
-  const sorted = useMemo(() => {
-    if (!sort) return tasks;
-    const dir = sort.dir === "asc" ? 1 : -1;
-    return [...tasks].sort((a, b) => {
-      const va = taskSortValue(a, snapshots[a.task_id], rates[a.task_id], sort.key);
-      const vb = taskSortValue(b, snapshots[b.task_id], rates[b.task_id], sort.key);
-      if (typeof va === "string" || typeof vb === "string") {
-        return String(va).localeCompare(String(vb), "zh-Hans-CN") * dir;
-      }
-      return (va - vb) * dir;
-    });
-  }, [tasks, sort, snapshots, rates]);
+  /// 显示集 = 服务端过滤 + 排序后的列表（#161 P3 过滤下推 + R14 排序下推：
+  /// 两者均由 daemon 执行，客户端不再二次过滤/二次排序——避免双重口径
+  /// 遮蔽服务端语义漂移；列表轮询 1s 携带 sort/order 重拉，序随引擎快照
+  /// 缓存更新，新鲜度与旧客户端实时重排等同）。显示序 = 用户所见序，
+  /// Shift 范围选择按此序。
 
   const act = useCallback(
     async (fn: () => Promise<unknown>) => {
@@ -515,9 +507,9 @@ export default function DlApp() {
 
   const toggleAll = useCallback(
     (on: boolean) => {
-      setSelected(on ? new Set(sorted.map((t) => t.task_id)) : new Set());
+      setSelected(on ? new Set(tasks.map((t) => t.task_id)) : new Set());
     },
-    [sorted],
+    [tasks],
   );
 
   const onSelectRow = useCallback(
@@ -584,7 +576,7 @@ export default function DlApp() {
                 <TableSkeleton />
               ) : (
                 <TasksTable
-                  tasks={sorted}
+                  tasks={tasks}
                   snapshots={snapshots}
                   rates={rates}
                   selected={selected}
