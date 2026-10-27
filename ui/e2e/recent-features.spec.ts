@@ -44,11 +44,13 @@ async function waitState(page: Page, id: string, state: string, timeoutMs = 30_0
 
 test.describe.serial('近期功能 e2e（#173 过滤 + #164 全局限速/Provider）', () => {
   test.afterEach(async ({ request }) => {
-    // 清场：删光任务 + 全局限速复位（0 = 不限），保住下一条用例干净起点
+    // 清场：删光任务（含数据——delete_data 是唯一合法参；此前的 ?purge=true
+    // 是无效参被 serde 静默忽略 → 数据残留 → 后续套件同名任务断点续传瞬完，
+    // 超合并验证 F3 根因）+ 全局限速复位（0 = 不限），保住下一条用例干净起点
     const res = await request.get(`${BASE}/tasks`);
     if (res.ok()) {
       for (const t of await res.json()) {
-        await request.delete(`${BASE}/tasks/${t.task_id}?purge=true`);
+        await request.delete(`${BASE}/tasks/${t.task_id}?delete_data=true`);
       }
     }
     await request.post(`${BASE}/config/limit`, { data: { max_download_kb_s: 0 } });

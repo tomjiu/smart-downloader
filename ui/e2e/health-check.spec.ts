@@ -17,16 +17,20 @@
  * RSS 源来自 file-server.mjs /feed.xml（3 条确定性条目）。
  */
 import { test, expect, type Page, type APIRequestContext } from '@playwright/test';
-import { statSync, readdirSync } from 'node:fs';
+import { statSync } from 'node:fs';
 import { join } from 'node:path';
 
 const BASE = process.env.E2E_BASE_URL!;
 const FILE = process.env.E2E_FILE_BASE!;
 const FEED = `${FILE}/feed.xml`;
 
-async function addTaskViaUi(page: Page, url: string) {
+async function addTaskViaUi(page: Page, url: string, name?: string) {
   await page.getByTestId('new-task-btn').click();
   await page.getByTestId('add-url-input').fill(url);
+  // 唯一显式名：串行共享 daemon 下，跨套件/同套件多任务的派生名会碰撞到同一
+  // .part 文件（超合并验证 F5：并发互踩→凭据不可信→随机 Failed/瞬完）。
+  // 显式名 = 独立落盘路径 = 确定性。
+  if (name) await page.locator('#ntf-name').fill(name);
   await page.getByTestId('add-submit').click();
   await expect(page.getByTestId('add-url-input')).toBeHidden({ timeout: 10_000 });
 }
@@ -216,9 +220,11 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
 
   test('HC-4 批量操作（暂停/恢复/删除 ×3 任务）', async ({ page, request }) => {
     await page.goto(BASE!);
-    // 3 个慢速任务（512 KiB/s → 持续 Downloading 窗口充足）
+    // 3 个慢速任务（512 KiB/s → 持续 Downloading 窗口充足）；
+    // 唯一显式名：三个任务各自独立 .part，不再互踩（也不吃 critical #4
+    // UI 删除（keep_data 默认）残留的 delete.bin.part 断点）
     for (let i = 0; i < 3; i++) {
-      await addTaskViaUi(page, `${FILE}/delete.bin?hc=${i}`);
+      await addTaskViaUi(page, `${FILE}/delete.bin?hc=${i}`, `hc4-batch-${i}.bin`);
     }
     await expect(page.getByTestId('task-row')).toHaveCount(3, { timeout: 15_000 });
     await waitStates(request, new Set(['Downloading']), 20_000);
@@ -242,7 +248,7 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
 
   test('HC-5 任务详情按钮矩阵（重命名/标签/优先级/限速 → API 回读）', async ({ page, request }) => {
     await page.goto(BASE!);
-    await addTaskViaUi(page, `${FILE}/delete.bin?hc5`);
+    await addTaskViaUi(page, `${FILE}/delete.bin?hc5`, 'hc5-detail.bin');
     await expect(page.getByTestId('task-row')).toHaveCount(1, { timeout: 15_000 });
     const id = (await (await request.get(`${BASE}/tasks`)).json())[0].task_id as string;
     // 打开详情（双击行——产品口径，见 critical-paths #6）
@@ -302,7 +308,9 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
 
   test('HC-7 三方一致性（UI = API = 磁盘）', async ({ page, request }) => {
     await page.goto(BASE!);
-    await addTaskViaUi(page, `${FILE}/small.bin`);
+    // 唯一显式名：磁盘断言可精确指向目标文件（dirFiles[0] 扫描会抓到其他
+    // 套件残留的 .part/.progress 孤儿——bisect2 中 HC-7 即因此误挂）
+    await addTaskViaUi(page, `${FILE}/small.bin`, 'hc7-check.bin');
     await waitStates(request, new Set(['Completed']), 30_000);
     // UI：状态列已完成（API 状态名 Completed——扁平字符串口径，曾误写 Done）
     await expect(page.getByTestId('task-state').first()).toHaveText(/完成|Completed/);
@@ -318,12 +326,10 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
     };
     expect(s.total).toBe(1024 * 1024);
     expect(s.done).toBe(s.total);
-    // 磁盘：dest_root 下文件存在且 1MiB
-    // 【体检发现 C-2】HTTP 单文件任务 files 恒空、dest_root 是目录——
-    // 实际落盘路径不透出，只能扫目录（BT/FTP 目录任务才有 files.rel_path）
-    const dirFiles = readdirSync(s.dest_root).filter((f) => !f.startsWith('.'));
-    expect(dirFiles.length).toBeGreaterThanOrEqual(1);
-    let p = join(s.dest_root, dirFiles[0]);
+    // 磁盘：显式名 → 路径可推导（不再扫描目录首个文件）
+    // 【体检发现 C-2】HTTP 单文件任务 files 恒空——落盘路径不透出；显式名
+    // 即 dest_root/<name>，确定性断言取代脆弱扫描。
+    let p = join(s.dest_root, 'hc7-check.bin');
     const st = statSync(p);
     expect(st.isFile()).toBeTruthy();
     expect(st.size).toBe(1024 * 1024);
@@ -332,7 +338,7 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
   test('HC-8 SSE 实时性（零手动刷新自动推进）', async ({ page, request }) => {
     await page.goto(BASE!);
     await expect(page.getByTestId('task-row')).toHaveCount(0);
-    await addTaskViaUi(page, `${FILE}/small.bin`);
+    await addTaskViaUi(page, `${FILE}/small.bin`, 'hc8-sse.bin');
     // 不刷新页面：行自动出现（SSE task_created）并推进到 Done
     await expect(page.getByTestId('task-row')).toHaveCount(1, { timeout: 10_000 });
     await expect(page.getByTestId('task-state').first()).toHaveText(/完成|Completed/, {

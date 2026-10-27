@@ -11,8 +11,9 @@ import { test, expect, type APIRequestContext } from '@playwright/test';
 const BASE = process.env.E2E_BASE_URL!;
 const FILE = process.env.E2E_FILE_BASE!;
 
-async function addViaApi(request: APIRequestContext, url: string): Promise<string> {
-  const r = await request.post(`${BASE}/tasks`, { data: { url } });
+async function addViaApi(request: APIRequestContext, url: string, name?: string): Promise<string> {
+  // 唯一显式名：同套件并发任务不碰撞同一 .part（超合并验证 F5 同款加固）
+  const r = await request.post(`${BASE}/tasks`, { data: name ? { url, name } : { url } });
   expect(r.ok()).toBeTruthy();
   return ((await r.json()) as { task_ids: string[] }).task_ids[0];
 }
@@ -41,10 +42,10 @@ test.describe.serial('统计一致性 + 排序 + 虚拟滚动', () => {
 
   test('统计页聚合与 /stats API 对齐（活跃/完成 + 侧栏徽章）', async ({ page, request }) => {
     // 2 个完成 + 1 个下载中
-    await addViaApi(request, `${FILE}/small.bin?s1`);
-    await addViaApi(request, `${FILE}/small.bin?s2`);
+    await addViaApi(request, `${FILE}/small.bin?s1`, 'st-s1.bin');
+    await addViaApi(request, `${FILE}/small.bin?s2`, 'st-s2.bin');
     // limit.bin 128MB@4MiB/s≈32s——保证统计断言期间仍在下载（delete.bin 8MB 会在断言前完成）
-    await addViaApi(request, `${FILE}/limit.bin?s3`);
+    await addViaApi(request, `${FILE}/limit.bin?s3`, 'st-l3.bin');
     // 等两个 small 完成
     const deadline = Date.now() + 30_000;
     for (;;) {
@@ -93,8 +94,8 @@ test.describe.serial('统计一致性 + 排序 + 虚拟滚动', () => {
   });
 
   test('表头排序：名称/状态升降切换不崩（aria-sort 断言）', async ({ page, request }) => {
-    await addViaApi(request, `${FILE}/small.bin?o1`);
-    await addViaApi(request, `${FILE}/small.bin?o2`);
+    await addViaApi(request, `${FILE}/small.bin?o1`, 'st-o1.bin');
+    await addViaApi(request, `${FILE}/small.bin?o2`, 'st-o2.bin');
     await page.goto(BASE!);
     await expect(page.getByTestId('task-row')).toHaveCount(2, { timeout: 15_000 });
 

@@ -1401,7 +1401,11 @@ async fn run_magnet_fetch(
                 FetchError::Magnet(_) | FetchError::Summary(_) => {
                     (StatusCode::BAD_REQUEST, e.to_string())
                 }
-                FetchError::Timeout { .. } => (StatusCode::REQUEST_TIMEOUT, e.to_string()),
+                // 504（非 408）：Chromium 网络栈对「复用连接 + 长等待后收到 408」
+                // 有特殊处理——响应被吞咽并透明重试，fetch 永不决出（UI 按钮
+                // 永久转圈；超合并验证 F2 实证：字节级响应合规但浏览器不认）。
+                // 504 不在重试集，语义亦更准（上游 swarm 未按时交付）。
+                FetchError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, e.to_string()),
                 FetchError::Ffi(_) | FetchError::Other(_) => {
                     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
                 }

@@ -340,6 +340,16 @@ test.describe.serial('关键路径 e2e（真实 daemon + 真实下载）', () =>
     if (bansAfter.banned.includes('1.2.3.4')) {
       // bt 构建：真实封禁成功 → UI 列表显示该条目（不再空态）
       await expect(page.getByText('1.2.3.4').first()).toBeVisible({ timeout: 5_000 });
+      // 清场（超合并验证 F1）+ 解禁 UI 路径覆盖：走行级「解禁」按钮
+      // （#187 规范通道；串行共享 daemon 下封禁表是跨套件全局态，残留会
+      // 毒害后续 health-check HC-1 的空态断言）。解禁后 UI 自行刷新列表。
+      await page.getByTestId('ban-remove').first().click();
+      await expect(page.getByText('暂无封禁项')).toBeVisible({ timeout: 5_000 });
+      // API 双确认：封禁表确已清空（不只是 UI 视图）
+      const bansFinal = (await request.get(`${BASE}/security/bans`).then((r) => r.json())) as {
+        banned: string[];
+      };
+      expect(bansFinal.banned).toEqual([]);
     } else {
       // 无 bt 构建：全部失败不入表 → 空态保持
       await expect(page.getByText('暂无封禁项')).toBeVisible();
