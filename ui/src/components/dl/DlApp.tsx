@@ -131,6 +131,21 @@ export default function DlApp() {
   const [events, setEvents] = useState<SchedulerEventEnvelope[]>([]);
   const [connected, setConnected] = useState(false);
   const [detail, setDetail] = useState<string | null>(null);
+  /// R17 焦点归还（WAI-ARIA 对话框模式）：开抽屉前的触发元素（行），
+  /// 关闭后归还焦点（键盘用户不被扔回 body；虚拟滚动已回收行则放弃）。
+  const detailTriggerRef = useRef<HTMLElement | null>(null);
+  const openDetail = useCallback((id: string) => {
+    detailTriggerRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setDetail(id);
+  }, []);
+  useEffect(() => {
+    if (detail !== null) return;
+    const el = detailTriggerRef.current;
+    if (!el) return;
+    detailTriggerRef.current = null;
+    if (el.isConnected) el.focus();
+  }, [detail]);
   const [toasts, setToasts] = useState<{ id: number; kind: string; text: string }[]>([]);
   const [filter, setFilter] = useState<TaskFilterKey>("all");
   const [query, setQuery] = useState("");
@@ -672,7 +687,7 @@ export default function DlApp() {
                   onToggleAll={toggleAll}
                   onSelect={onSelectRow}
                   onSelectRange={onSelectRange}
-                  onOpen={setDetail}
+                  onOpen={openDetail}
                   onAction={onAction}
                   busy={busy}
                   query={query}
