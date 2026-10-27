@@ -39,6 +39,7 @@ export type { GlobalLimitReq } from "./generated/GlobalLimitReq";
 export type { RssFeedUpdateReq } from "./generated/RssFeedUpdateReq";
 export type { AddRssRuleReq } from "./generated/AddRssRuleReq";
 export type { TaskLogs } from "./generated/TaskLogs";
+export type { MagnetMetaOut } from "./generated/MagnetMetaOut";
 export type { TaskEvent } from "./generated/TaskEvent";
 export type { SettingsSnapshot as Settings } from "./generated/SettingsSnapshot";
 export type { SettingsReq } from "./generated/SettingsReq";

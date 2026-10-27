@@ -23,6 +23,8 @@ import type {
   GlobalLimits,
   LimitReq,
   ListTasksQuery,
+  MagnetMetaOut,
+  MagnetMetaReq,
   PeerResults,
   PiecePriorityReq,
   PriorityReq,
@@ -355,6 +357,12 @@ export class DaemonClient {
   /// 探测预览（E31，第二梯队新建表单）：不建任务，取大小/建议名/
   /// Range 支持（headers/proxy/auth 同 add 语义随探测下发——预览即验证
   /// 反防盗链配置是否有效）。非 2xx 抛错误（req 统一错误提取）。
+  /// 磁力元数据抓取（体检 #182 R7：/bt/metadata 接入——预览文件清单，
+  /// 不建任务）。需 daemon 编译时启用 bt feature（否则 400 明确报错）。
+  btMagnetMetadata(magnet: string, timeoutS?: number): Promise<MagnetMetaOut> {
+    const body: MagnetMetaReq = { magnet, trackers: [], peers: [], timeout_s: timeoutS };
+    return req("/bt/metadata", { method: "POST", body: JSON.stringify(body) });
+  }
   probe(body: Partial<ProbeReq>): Promise<ProbeOut> {
     return req("/probe", { method: "POST", body: JSON.stringify(body) });
   }

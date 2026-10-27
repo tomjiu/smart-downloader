@@ -1122,6 +1122,45 @@ pub struct MagnetMetaReq {
     pub save_to: Option<String>,
 }
 
+/// `POST /bt/metadata` 成功响应（原 serde_json::json! 动态构建，体检 #182
+/// R7 DTO 化——磁力预览 UI 接入前置；wire 与原 json! 逐键一致）。
+#[derive(serde::Serialize, TS)]
+#[ts(export, optional_fields)]
+pub struct MagnetMetaOut {
+    /// v1 infohash（40 hex 小写）。
+    pub infohash: String,
+    /// 种子名（多文件 = 目录名）。
+    pub name: String,
+    pub total_size: u64,
+    pub piece_len: i64,
+    pub num_pieces: i64,
+    /// 文件清单（单文件 = 1 项）。
+    pub files: Vec<MagnetFileOut>,
+    pub trackers: Vec<String>,
+    pub web_seeds: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub comment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub created_by: Option<String>,
+    /// 原始 .torrent 内容（base64；预取 sidecar 消费）。
+    pub torrent_b64: String,
+    /// save_to 落盘回执（未请求时省略）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub saved_to: Option<String>,
+}
+
+/// 磁力元数据文件条目。
+#[derive(serde::Serialize, TS)]
+#[ts(export)]
+pub struct MagnetFileOut {
+    /// 相对路径（多文件以 / 连接）。
+    pub path: String,
+    pub size: u64,
+}
+
 #[cfg(feature = "bt")]
 async fn bt_magnet_metadata(
     State(state): State<Arc<DaemonState>>,
@@ -1323,7 +1362,7 @@ async fn run_magnet_fetch(
     magnet: &str,
     opts: &smart_dl_btcore::magnet::FetchOpts,
     save_to: Option<&std::path::Path>,
-) -> Result<serde_json::Value, (StatusCode, String)> {
+) -> Result<MagnetMetaOut, (StatusCode, String)> {
     use smart_dl_btcore::magnet::{fetch_metadata, FetchError};
 
     // S2：先清扫历史遗留（进程死亡残骸），再建本进程 scratch
@@ -1384,23 +1423,27 @@ async fn run_magnet_fetch(
     }
 
     let s = &fetched.summary;
-    Ok(serde_json::json!({
-        "infohash": fetched.infohash,
-        "name": s.name,
-        "total_size": s.total_size,
-        "piece_len": s.piece_len,
-        "num_pieces": s.num_pieces,
-        "files": s.files.iter().map(|f| serde_json::json!({
-            "path": f.path,
-            "size": f.size,
-        })).collect::<Vec<_>>(),
-        "trackers": s.trackers,
-        "web_seeds": s.web_seeds,
-        "comment": s.comment,
-        "created_by": s.created_by,
-        "torrent_b64": base64::engine::general_purpose::STANDARD.encode(&fetched.torrent),
-        "saved_to": saved_to,
-    }))
+    Ok(MagnetMetaOut {
+        infohash: fetched.infohash,
+        name: s.name.clone(),
+        total_size: s.total_size,
+        piece_len: s.piece_len,
+        num_pieces: s.num_pieces,
+        files: s
+            .files
+            .iter()
+            .map(|f| MagnetFileOut {
+                path: f.path.clone(),
+                size: f.size,
+            })
+            .collect(),
+        trackers: s.trackers.clone(),
+        web_seeds: s.web_seeds.clone(),
+        comment: s.comment.clone(),
+        created_by: s.created_by.clone(),
+        torrent_b64: base64::engine::general_purpose::STANDARD.encode(&fetched.torrent),
+        saved_to,
+    })
 }
 
 #[cfg(not(feature = "bt"))]
@@ -3154,6 +3197,69 @@ async fn nas_token(State(_): State<Arc<DaemonState>>, Json(req): Json<NasTokenRe
             Json(serde_json::json!({ "ok": false, "error": e })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod magnet_dto_tests {
+    use super::*;
+
+    /// 体检 #182 R7：MagnetMetaOut DTO 化的 wire 契约锁定——序列化键集与
+    /// 原 serde_json::json! 动态构建逐键一致（含 saved_to/comment/created_by
+    /// 的 None 省略语义），磁力预览 UI（btMagnetMetadata）与既有 API 消费方
+    /// （rt-13 公网 swarm 脚本）不被字段改名静默破坏。
+    #[test]
+    fn magnet_meta_out_wire_keys_match_legacy_json() {
+        let out = MagnetMetaOut {
+            infohash: "a".repeat(40),
+            name: "n".into(),
+            total_size: 1,
+            piece_len: 2,
+            num_pieces: 3,
+            files: vec![MagnetFileOut {
+                path: "p".into(),
+                size: 4,
+            }],
+            trackers: vec![],
+            web_seeds: vec![],
+            comment: None,
+            created_by: None,
+            torrent_b64: "bg==".into(),
+            saved_to: None,
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        let mut expect = vec![
+            "infohash",
+            "name",
+            "total_size",
+            "piece_len",
+            "num_pieces",
+            "files",
+            "trackers",
+            "web_seeds",
+            "torrent_b64",
+        ];
+        expect.sort_unstable();
+        assert_eq!(
+            keys, expect,
+            "None 字段（comment/created_by/saved_to）必须省略，其余逐键对齐原 json! 版本"
+        );
+        // 文件条目键集
+        let f = &v["files"][0];
+        assert_eq!(f["path"], "p");
+        assert_eq!(f["size"], 4);
+
+        // Some 侧：save_to/comment 出现
+        let out2 = MagnetMetaOut {
+            comment: Some("c".into()),
+            saved_to: Some("x.torrent".into()),
+            ..out
+        };
+        let v2 = serde_json::to_value(&out2).unwrap();
+        assert_eq!(v2["comment"], "c");
+        assert_eq!(v2["saved_to"], "x.torrent");
     }
 }
 
