@@ -16,8 +16,9 @@ state: string, source: string,
  */
 dest_root: string, engine?: string, done: number, total: number, error?: string, 
 /**
- * 文件级进度（实时读引擎 status().files；单文件/无文件引擎为空数组）。
- * FTP 目录任务与 BT 多文件任务在此处行为一致（都从引擎状态链透出）。
+ * 文件级进度（实时读引擎 status().files）。BT 多文件 / FTP 目录 /
+ * HTTP 单文件（体检 #182 C-2 起 httpdl 透出 [rel_path=落盘名, done,
+ * size]）三口径一致；无文件概念的引擎为空数组。
  */
 files: Array<FileProgress>, 
 /**
