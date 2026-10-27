@@ -27,7 +27,12 @@ import type {
   TaskSnapshot,
 } from "@/lib/daemon/types";
 import { client } from "@/lib/daemon/store";
-import TasksTable, { displayName, type TaskAction, type TableSort } from "./TasksTable";
+import TasksTable, {
+  displayName,
+  type SortKey,
+  type TaskAction,
+  type TableSort,
+} from "./TasksTable";
 import StatsView from "./StatsView";
 import LogsView from "./LogsView";
 import RssView from "./RssView";
@@ -35,7 +40,7 @@ import SettingsView from "./SettingsView";
 import SecurityView from "./SecurityView";
 import TaskDetail from "./TaskDetail";
 import NewTaskForm from "./NewTaskForm";
-import Toolbar, { type TaskFilterKey, type ViewKey } from "./Toolbar";
+import Toolbar, { TASK_FILTERS, type TaskFilterKey, type ViewKey } from "./Toolbar";
 import Sidebar from "./Sidebar";
 import StatusBar from "./StatusBar";
 import { ConfirmDialog, TableSkeleton } from "./Common";
@@ -60,6 +65,43 @@ const SEGMENT_STATES: Record<Exclude<TaskFilterKey, "all">, string> = {
 /// SSE 速率新鲜度 TTL（与 TasksTable.RATE_TTL_MS 同口径；DlApp 侧的
 /// 过期清理 interval 消费）。
 const RATE_TTL_MS = 5000;
+
+/// R15 视图状态持久化（qB 式「记住我的列表」）：sort / filter / view
+/// 三态存 localStorage；搜索框不持久化（陈旧搜索会在重载后造成「列表
+/// 为何是空的」困惑——qB 同款决策）。恢复值全部校验（旧版本/损坏/
+/// 手改的键值 → 回落默认），typeof window 守卫防 SSG 预渲染崩溃；
+/// 恢复走挂载后 useEffect 而非 lazy initializer——避免服务端渲染
+/// 默认态与客户端恢复态的 hydration 不匹配（与 dl.side 同模式）。
+const VIEW_KEYS: ViewKey[] = ["tasks", "stats", "rss", "logs", "security", "settings"];
+const SORT_KEYS = ["name", "state", "progress", "speed", "size", "eta"] as const;
+
+function restoreView(): ViewKey {
+  const raw = localStorage.getItem("dl.view");
+  return VIEW_KEYS.includes(raw as ViewKey) ? (raw as ViewKey) : "tasks";
+}
+
+function restoreFilter(): TaskFilterKey {
+  const raw = localStorage.getItem("dl.filter");
+  const keys = TASK_FILTERS.map((f) => f.key) as readonly string[];
+  return keys.includes(raw ?? "") ? (raw as TaskFilterKey) : "all";
+}
+
+function restoreSort(): TableSort {
+  const raw = localStorage.getItem("dl.sort");
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as { key?: unknown; dir?: unknown };
+    if (
+      (SORT_KEYS as readonly string[]).includes(v.key as string) &&
+      (v.dir === "asc" || v.dir === "desc")
+    ) {
+      return { key: v.key as SortKey, dir: v.dir };
+    }
+  } catch {
+    /* 损坏 JSON → 默认 */
+  }
+  return null;
+}
 
 /// 活跃（非终态）任务状态集（P1-5-C：全终态时冻结快照轮询的判定口径；
 /// 与 Common.tsx StateBadge 的 live 集一致 + Queued/Evaluating/Paused
@@ -137,6 +179,27 @@ export default function DlApp() {
     if (saved === "1" || saved === "0") setSideCollapsed(saved === "1");
     else if (window.innerWidth <= 900) setSideCollapsed(true);
   }, []);
+
+  /// R15：视图状态恢复（挂载后一次；校验过的合法值才生效）。首拍列表
+  /// 请求以默认序发出，恢复的 sort 生效后 listParams 变化 → 即时重拉
+  /// 带排序的新序（两拍收敛，无需专门等待）。
+  useEffect(() => {
+    setView(restoreView());
+    setFilter(restoreFilter());
+    setSort(restoreSort());
+  }, []);
+
+  /// R15：变更即持久化（sort=null 清键——回默认序后重载不再恢复旧序）。
+  useEffect(() => {
+    localStorage.setItem("dl.view", view);
+  }, [view]);
+  useEffect(() => {
+    localStorage.setItem("dl.filter", filter);
+  }, [filter]);
+  useEffect(() => {
+    if (sort) localStorage.setItem("dl.sort", JSON.stringify(sort));
+    else localStorage.removeItem("dl.sort");
+  }, [sort]);
 
   /// 全局快捷键（Slack/GitHub 惯例）：Ctrl/Cmd+1..6 切视图、/ 聚焦搜索。
   /// 输入控件内不拦截（除 Ctrl 组合——数字组合在输入框内无编辑语义冲突）。
