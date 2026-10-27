@@ -97,6 +97,21 @@ npx playwright test -c e2e-restart/playwright.config.ts   # 重启韧性独立�
 | `keyboard-nav.spec.ts` | 键盘导航：↑/↓ 跨虚拟窗口接力 + Enter/Esc 焦点归还 + Space 选中 |
 | `e2e-restart/`（独立） | daemon kill -9 重启后 SSE live 流自愈（seq 归零探测） |
 
+### 契约对齐审计（npm run audit:routes）
+
+前后端路由 × 调用点双向核验（体检 A 层工具入库，#202 勘误后版本——
+`req()` / `fetch(url(...))` / `EventSource` 三通道全覆盖）：
+
+- **破窗**（UI 调用无对应路由）：任何一条即 FAIL——字段改名 / 路由删除
+  在此显形，不必等运行时 404；
+- **盲区**（路由无 UI 消费者）：对照 by-design 登记簿分类（config/health/
+  metrics/version/ws/nas×5/xunlei-import 等 daemon-only 运维端点），
+  未登记者列出待人工判定（新缺口 or 需登记）。
+
+```bash
+cd ui && npm run audit:routes
+```
+
 ### CLI 速查
 
 ```bash
