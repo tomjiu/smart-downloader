@@ -300,6 +300,13 @@ export class DaemonClient {
       method: "DELETE",
     });
   }
+  /// 手动云兜底（Q-B9，体检 #182 第 4 真缺口 R21 接入）：BT 任务暂停且
+  /// 进度 <50% → 云 Provider 直链 → HTTP 引擎拉全 → 任务置 Completed。
+  /// 不满足前提（未暂停/进度过半/无可用 Provider）→ 409 + 原因文案。
+  fallback(id: string): Promise<{ status: string; provider?: string; message?: string }> {
+    return req(`/tasks/${id}/fallback`, { method: "POST" });
+  }
+
   /// 手动注入 peer（`ip:port`，支持 IPv6 `[::1]:6881`）：部分成功语义，
   /// 逐条回执（ok / error）。注意：409（全失败且非 BT）也会带 results 体。
   addPeers(id: string, addrs: string[]): Promise<PeerResults> {
