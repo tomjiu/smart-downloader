@@ -8,11 +8,11 @@
  *
  * 覆盖：magnet 添加（UI）→ BT 面板渲染 → peer 注入（UI 输入 + 回执）→
  * 本地 swarm 下载完成（API）→ tracker 刷新 / magnet 复制（剪贴板断言）/
- * 重新校验（回执）。
+ * 导出 .torrent（下载事件 + 文件名 + bencode 校验）/ 重新校验（回执）。
  */
 import { test, expect } from '@playwright/test';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, openSync, readSync, closeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import net from 'node:net';
@@ -121,6 +121,32 @@ test.describe.serial('BT 面板 e2e（bt daemon + 本地 swarm）', () => {
     await page.getByTestId('magnet-copy').click();
     const clip = await page.evaluate(() => navigator.clipboard.readText());
     expect(clip).toMatch(/^magnet:\?xt=urn:btih:/);
+
+    // 6.5) 导出 .torrent（#202 勘误护栏：UI 入口实存——exportTorrent 走裸
+    //      fetch() 二进制通道，此前复检工具只认 req()/EventSource 而漏报为
+    //      "无 UI 入口"。此处端到端锁死整链：按钮 → fetch /tasks/:id/export →
+    //      Content-Disposition 文件名解析 → blob a[download] → 浏览器下载事件）
+    const dlPromise = page.waitForEvent('download');
+    await page.getByTestId('export-torrent').click();
+    const dl = await dlPromise;
+    // suggestedFilename 取自 a.download（= daemon Content-Disposition 解析产物）
+    expect(dl.suggestedFilename()).toMatch(/\.torrent$/);
+    // 内容为合法 bencode：字典 'd' 开头 + 必有 4:info 字段（magnet 添加的任务
+    // 可无 tracker，故不断言 announce）。download.path() 落盘临时文件，
+    // 只读首 256 字节防大文件（ torrents 体量小，保险而已）。
+    const dlPath = await dl.path();
+    expect(dlPath).toBeTruthy();
+    let head = '';
+    const fd = openSync(dlPath!, 'r');
+    try {
+      const buf = Buffer.alloc(256);
+      const n = readSync(fd, buf, 0, 256, 0);
+      head = buf.subarray(0, n).toString('latin1');
+    } finally {
+      closeSync(fd);
+    }
+    expect(head[0]).toBe('d');
+    expect(head).toContain('4:info');
 
     // 7) 重新校验（需确认：alertdialog「强制重新校验」→ 确认 → 回执）
     await page.getByTestId('recheck-btn').click();
