@@ -228,12 +228,12 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
     await robustSelectAll(page, 3);
     await batch.getByRole('button', { name: /暂停/ }).click();
     await waitStates(request, new Set(['Paused']), 10_000);
-    // 【体检发现 UX-1】批量操作后选择集被清空（onBatch setSelected(new Set())）
-    // ——「暂停→恢复」两连击需重新全选；测试按现状适配，发现已记录待改进
-    await robustSelectAll(page, 3);
+    // UX-1 已修复（fix/batch-keep-selection）：pause/resume 保留选择集——
+    // 断言计数徽标仍为 3（无需重新全选），直接连击恢复
+    await expect(batch.locator('.dl-tool-count').first()).toHaveText('3');
     await batch.getByRole('button', { name: /恢复/ }).click();
     await waitStates(request, new Set(['Downloading']), 10_000);
-    // 批量删除（确认）
+    // 批量删除（确认）——remove 仍清空选择（任务已删），重选
     await robustSelectAll(page, 3);
     await batch.getByRole('button', { name: /删除/ }).click();
     await page.getByTestId('confirm-ok').click();

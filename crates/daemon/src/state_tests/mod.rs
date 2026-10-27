@@ -418,6 +418,7 @@ mod persist_tests;
 mod post_download_tests;
 mod prio_convergence_tests;
 mod queue_gate_tests;
+mod queue_priority_expose_tests;
 mod rate_cache_tests;
 mod remove_hardening_tests;
 mod rss_persist_tests;

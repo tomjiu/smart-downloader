@@ -67,6 +67,8 @@ impl DaemonState {
             retries: rec.task.retry.retries as u64,
             max_retries: rec.task.retry.max_retries as u64,
             next_retry_at_unix: rec.task.metadata.next_retry_at_unix,
+            // 体检 #182 C-1：队列优先级持久透出（UI 重启后仍可回显）
+            queue_priority: rec.task.queue_priority,
         })
     }
 
@@ -152,6 +154,8 @@ impl DaemonState {
                 retries: rec.task.retry.retries as u64,
                 max_retries: rec.task.retry.max_retries as u64,
                 next_retry_at_unix: rec.task.metadata.next_retry_at_unix,
+                // 体检 #182 C-1：队列优先级持久透出（原仅 set 响应回显）
+                queue_priority: rec.task.queue_priority,
             })
             .collect();
         (page, total)

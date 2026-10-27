@@ -218,6 +218,12 @@ pub struct TaskSnapshot {
     #[serde(skip_serializing_if = "is_zero_u64")]
     #[ts(optional = nullable)]
     pub next_retry_at_unix: u64,
+    /// 队列优先级（体检 #182 C-1 持久透出）：数值越小越先出队（top = 队列
+    /// 最小值 - 1；0 = 默认，序列化省略）。原仅 set 响应回显——UI 重启后
+    /// 无法回显当前值，现入快照与列表两口径。
+    #[serde(skip_serializing_if = "is_zero_i32")]
+    #[ts(optional = nullable)]
+    pub queue_priority: i32,
 }
 
 /// 实时速率（E13 透出）：与快照 `done`/`total` 同一次引擎快照取样——
@@ -280,6 +286,10 @@ pub struct TaskSummary {
     #[serde(skip_serializing_if = "is_zero_u64")]
     #[ts(optional = nullable)]
     pub next_retry_at_unix: u64,
+    /// 队列优先级（体检 #182 C-1）：同 TaskSnapshot 口径（0 = 默认省略）。
+    #[serde(skip_serializing_if = "is_zero_i32")]
+    #[ts(optional = nullable)]
+    pub queue_priority: i32,
 }
 
 /// 列表过滤/分页查询（E7）。`states`/`engines` 空 = 不过滤；匹配均大小写不敏感。
@@ -553,6 +563,12 @@ fn now_unix_ms() -> u64 {
 
 /// serde skip_serializing_if 谓词：start_at_unix 为 0（未调度）时快照省略。
 fn is_zero_u64(v: &u64) -> bool {
+    *v == 0
+}
+
+/// serde skip_serializing_if 谓词：queue_priority 为 0（默认）时省略
+/// （体检 #182 C-1：与 start_at_unix 同口径的向后兼容策略）。
+fn is_zero_i32(v: &i32) -> bool {
     *v == 0
 }
 
