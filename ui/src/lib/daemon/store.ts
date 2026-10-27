@@ -557,7 +557,30 @@ export class DaemonClient {
           .filter(Boolean)
           .join("&");
         es = new EventSource(url(`/events/stream${q ? `?${q}` : ""}`));
-        es.onopen = () => onState(true);
+        // R18：连接（重）建立时校验 seq 边界——daemon 重启后 seq 从 0 重计，
+        // 陈旧 lastSeq（如 5000）> 新最大 seq 时 after=5000 会滤空一切且
+        // 连接表面健康（服务端正常接受、无错误可触发任何报警——live 流
+        // 静默死亡：速率列/完成 toast/日志全部失效直到手动刷新页面）。
+        // onopen 探测 latest_seq：回退 → lastSeq 归零 + 立即重建连接
+        // （全量重放；新 daemon 缓冲尚小，重放开销可忽略）。探测失败 →
+        // 不动作（连接本身已建立，事件照常；边界校验留给下次重连）。
+        es.onopen = () => {
+          onState(true);
+          void this.listEvents({ limit: 1 })
+            .then((page) => {
+              if (
+                !closed &&
+                es &&
+                typeof page.latest_seq === "number" &&
+                page.latest_seq < lastSeq
+              ) {
+                lastSeq = 0;
+                es.close();
+                connect();
+              }
+            })
+            .catch(() => {});
+        };
         for (const type of EVENT_TYPES) es.addEventListener(type, handle as EventListener);
         es.onerror = () => {
           onState(false);
