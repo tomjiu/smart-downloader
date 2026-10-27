@@ -684,7 +684,31 @@ impl DownloadEngine for BtEngine {
     async fn status(&self, id: &EngineTaskId) -> Result<EngineStatus, EngineError> {
         // 会话内未注册的 infohash → NotFound（任务已移除/从未添加）。
         match self.core.status(id) {
-            Ok(st) => Ok(map_status(&st)),
+            Ok(st) => {
+                let mut es = map_status(&st);
+                // R18（缺陷④修复）：文件级进度透出——BtCore::file_progress
+                // 引擎层早已存在但此前零生产调用方，map_status 只合成 1 条
+                // 空路径聚合条目（TaskSnapshot.files 契约「BT 多文件与 FTP
+                // 目录任务行为一致」未兑现，UI 文件列表无从渲染）。
+                // names 与 progress 长度一致且非空时逐文件透出；任一失败
+                // （metadata 未就绪/极瞬态）保持旧聚合条目兜底。
+                if let (Ok(paths), Ok(prog)) =
+                    (self.core.file_paths(id), self.core.file_progress(id))
+                {
+                    if !paths.is_empty() && paths.len() == prog.len() {
+                        es.files = paths
+                            .into_iter()
+                            .zip(prog)
+                            .map(|(p, (done, size))| FileProgress {
+                                rel_path: p,
+                                done: done.max(0) as u64,
+                                size: size.max(0) as u64,
+                            })
+                            .collect();
+                    }
+                }
+                Ok(es)
+            }
             Err(_) => Err(EngineError::NotFound),
         }
     }

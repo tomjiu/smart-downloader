@@ -754,6 +754,37 @@ lt_err lt_file_progress(lt_session* s, const char* ih, int64_t* done_arr, int64_
     }
 }
 
+/* R18：全部文件相对路径批量导出（'\n' 分隔，两段式）——文件级进度透出的
+   名字源。单文件 torrent = 1 项（文件名本身）。 */
+lt_err lt_file_paths(lt_session* s, const char* ih, char* buf, size_t cap, size_t* out_len) {
+    if (!s || !ih) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        const std::shared_ptr<const lt::torrent_info> tf = h.torrent_file();
+        if (!tf) { set_err(s, "metadata not available"); return LT_ERR_NOT_FOUND; }
+        std::string joined;
+#if LIBTORRENT_VERSION_NUM >= 20100
+        const auto& fs = tf->files_impl(); // ABI100：files() 仅 ABI<4
+#else
+        const auto& fs = tf->files();
+#endif
+        for (auto const i : fs.file_range()) {
+            joined += fs.file_path(i); // 相对 torrent 根的 '/' 连接路径
+            joined += '\n';
+        }
+        if (!buf || cap < joined.size()) {
+            if (out_len) *out_len = joined.size();
+            return LT_ERR_BUFFER_TOO_SMALL;
+        }
+        std::memcpy(buf, joined.data(), joined.size());
+        if (out_len) *out_len = joined.size();
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
 lt_err lt_set_file_priorities(lt_session* s, const char* ih, const int* idx_arr, const int* prio_arr, int n) {
     if (!s || !ih || !idx_arr || !prio_arr || n <= 0) return LT_ERR_ARG;
     try {
