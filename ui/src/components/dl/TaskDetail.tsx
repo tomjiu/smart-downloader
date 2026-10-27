@@ -82,6 +82,9 @@ export default function TaskDetail({
   /// 队列优先级（操作后回显；快照无该字段——set-only 契约）。
   const [queuePrio, setQueuePrio] = useState<number | null>(null);
   const [prioBusy, setPrioBusy] = useState(false);
+  /// 云兜底（Q-B9 接入，体检 #182 第 4 真缺口）：BT+Paused 才渲染按钮；
+  /// 前置校验在 daemon（未暂停/进度过半/无 Provider → 409 文案透出）。
+  const [fallbackBusy, setFallbackBusy] = useState(false);
 
   /// 文件优先级：本地乐观值（下标 → 档位；快照轮询 1.5s 会再对齐）。
   const [filePrioOverride, setFilePrioOverride] = useState<Record<number, number>>({});
@@ -148,6 +151,22 @@ export default function TaskDetail({
   };
 
   /// 队列优先级动作（top/up/down/bottom）。busy 独立禁用四钮。
+  const runFallback = () => {
+    if (!task) return;
+    setFallbackBusy(true);
+    client
+      .fallback(task.task_id)
+      .then((r) => {
+        setMsg({
+          ok: true,
+          text: r.provider ? `云兜底完成（${r.provider}）` : "云兜底完成",
+        });
+        onChanged();
+      })
+      .catch((e) => setMsg({ ok: false, text: `云兜底失败：${String(e)}` }))
+      .finally(() => setFallbackBusy(false));
+  };
+
   const movePrio = (action: "top" | "up" | "down" | "bottom") => {
     setPrioBusy(true);
     client
@@ -442,6 +461,27 @@ export default function TaskDetail({
                 {queuePrio != null ? ` 当前值 ${queuePrio}（数值大者优先）。` : ""}
               </div>
             </div>
+
+            {task.engine === "bt" && task.state === "Paused" && (
+              <div className="dl-card">
+                <b style={{ display: "block", marginBottom: 10 }}>云 Provider 兜底</b>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="dl-btn dl-btn--primary"
+                    data-testid="fallback-btn"
+                    disabled={fallbackBusy}
+                    title="改走云 Provider 直链拉全（暂停中且进度 <50% 的 BT 任务）"
+                    onClick={runFallback}
+                  >
+                    <Icon name="cloud-download" size={13} /> 立即兜底
+                  </button>
+                  <span className="dl-field-help">
+                    剩余部分改走 Provider 直链（HTTP 传输），完成后任务置 Completed。
+                  </span>
+                </div>
+              </div>
+            )}
 
             <div className="dl-card">
               <b style={{ display: "block", marginBottom: 10 }}>任务级控制</b>
