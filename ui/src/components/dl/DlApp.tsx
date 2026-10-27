@@ -486,7 +486,9 @@ export default function DlApp() {
       }
       act(async () => {
         await client.batchTasks(ids, op);
-        setSelected(new Set());
+        // UX-1 修复（体检 #182）：pause/resume 保留选择集——「批量暂停→
+        // 批量恢复」是连续操作，清空选择迫使用户重新全选（qBittorrent 等
+        // 惯例均保留）。remove 路径任务已删除，仍清空（上方 run 内）。
       });
     },
     [act, selected],
