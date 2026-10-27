@@ -29,6 +29,18 @@ const FILES = {
   '/delete.bin': { size: 8 * MiB, throttle: 512 * KiB },
 };
 
+// R16 批量负载路由：任意 /bulk/<name> 服务 64KiB 确定性内容——
+// 重负载 e2e 需要大量互异 URL（canonical 去重按 URL 判异），固定四文件
+// 不够用；catch-all 免去逐文件登记。
+const BULK_SIZE = 64 * KiB;
+
+function resolveFile(pathname) {
+  const f = FILES[pathname];
+  if (f) return f;
+  if (pathname.startsWith('/bulk/')) return { size: BULK_SIZE, throttle: 0 };
+  return null;
+}
+
 const byteAt = (i) => i % 251;
 
 /** RSS 订阅源（体检 e2e：RSS 全链路）。内容确定性，标题带序号便于规则断言。 */
@@ -66,7 +78,7 @@ const server = http.createServer((req, res) => {
     res.end(RSS_XML);
     return;
   }
-  const f = FILES[url.pathname];
+  const f = resolveFile(url.pathname);
   if (!f) {
     res.writeHead(404, { 'Content-Type': 'text/plain' });
     res.end('not found');

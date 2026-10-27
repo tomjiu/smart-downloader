@@ -2354,6 +2354,12 @@ async fn list_events(
         "has_more": has_more,
         "oldest_seq": hub.oldest_seq(),
         "truncated": truncated,
+        // R16：已发布最大 seq（追加字段，向后兼容）——客户端据此建立
+        // live 边界：SSE 以 after=latest_seq 订阅（仅增量），历史走本端点
+        // 分页拉取。修复「页面重载即全量重放 → 完成事件 toast 洪泛遮挡
+        // UI」（120 任务批量导入后重载页面被 toast 埋没——重放事件对
+        // 用户是历史而非现场，不应弹现场提示）。
+        "latest_seq": hub.last_seq(),
     }))
     .into_response()
 }

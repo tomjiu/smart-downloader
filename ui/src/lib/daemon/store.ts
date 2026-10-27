@@ -58,6 +58,18 @@ import type {
 const LS_KEY = "dl.daemon.base";
 const LS_TOKEN = "dl.daemon.token";
 
+/// R16：GET /events 响应形状（daemon http.rs list_events 的 json! 动态
+/// 结构——字段集本地锁定；daemon 侧新增字段时此处同步）。
+export interface EventsPage {
+  events: SchedulerEventEnvelope[];
+  next_after: number;
+  has_more: boolean;
+  oldest_seq: number | null;
+  truncated: boolean;
+  /** 已发布最大 seq（live 边界：SSE after=latest_seq 仅收增量）。 */
+  latest_seq: number;
+}
+
 export function getBase(): string {
   if (typeof window === "undefined") return "";
   return localStorage.getItem(LS_KEY) ?? "";
@@ -482,6 +494,24 @@ export class DaemonClient {
   }
 
   // 事件流（SSE，带断线重连）。审计修复（40-e P1-6/P1-13）：
+  /// R16：事件历史分页查询（GET /events）。响应形状（daemon json! 动态
+  /// 结构，本地类型锁定）：events 升序 + next_after / has_more / oldest_seq
+  /// / truncated / latest_seq（已发布最大 seq——live 边界）。
+  listEvents(q?: {
+    after?: number;
+    limit?: number;
+    taskId?: string;
+    type?: string;
+  }): Promise<EventsPage> {
+    const p = new URLSearchParams();
+    if (typeof q?.after === "number") p.set("after", String(q.after));
+    if (typeof q?.limit === "number") p.set("limit", String(q.limit));
+    if (q?.taskId) p.set("task_id", q.taskId);
+    if (q?.type) p.set("type", q.type);
+    const qs = p.toString();
+    return req(`/events${qs ? `?${qs}` : ""}`);
+  }
+
   // - token 以 ?token= 查询参数传递（EventSource 规范无法设置请求头，
   //   旧实现配置 token 后 401 死循环；daemon 侧对 /events/stream 回退）
   // - 重连带 after 游标（最后收到 seq）——旧实现重连从 0 全量重放，
@@ -495,11 +525,16 @@ export class DaemonClient {
   subscribeEvents(
     onEvent: (env: SchedulerEventEnvelope) => void,
     onState: (connected: boolean) => void,
+    /** R16 live 边界：初始游标（GET /events 的 latest_seq）。提供时 SSE
+     * 仅收增量（after=seq）——重载不再全量重放（历史 toast 洪泛根除；
+     * 历史日志改由 listEvents REST 引导）。缺省 0 = 旧行为（全量重放，
+     * REST 引导失败的降级路径）。 */
+    afterSeq = 0,
   ): () => void {
     let closed = false;
     let es: EventSource | null = null;
     let retry: ReturnType<typeof setTimeout> | null = null;
-    let lastSeq = 0;
+    let lastSeq = afterSeq;
     /// daemon events.rs known_event_type_labels() 全集（13 种；新增变体
     /// 时此处同步——未知类型不路由，属可接受的静默丢弃口径）。
     const EVENT_TYPES = [
