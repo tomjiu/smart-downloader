@@ -2206,6 +2206,9 @@ async fn events_api_pagination_filter_and_validation_e2e() {
     assert_eq!(body["has_more"], false);
     assert_eq!(body["truncated"], false, "缓冲未冲掉任何事件 → 无缺口");
     assert_eq!(body["oldest_seq"], 1);
+    // R16：latest_seq = 已发布最大 seq（live 边界——SSE after=latest_seq
+    // 订阅仅增量，重载不再全量重放）
+    assert_eq!(body["latest_seq"], 6, "latest_seq 与尾部事件 seq 一致");
     assert_eq!(body["events"][0]["seq"], 1);
     assert_eq!(body["events"][0]["event"]["type"], "task_created");
     assert_eq!(body["events"][3]["event"]["type"], "completed");

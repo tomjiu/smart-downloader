@@ -161,7 +161,9 @@ export default function DlApp() {
 
   const toast = useCallback((t: { kind: string; text: string }) => {
     const id = Date.now() + Math.random();
-    setToasts((cur) => [...cur, { id, ...t }]);
+    // R16：并发上限 3（最旧挤掉）——批量完成风暴不把 UI 埋进 toast 堆
+    // （120 任务导入后重载曾被 120 个「任务完成」toast 连环遮挡按钮）。
+    setToasts((cur) => [...cur, { id, ...t }].slice(-3));
     setTimeout(() => setToasts((cur) => cur.filter((x) => x.id !== id)), 4200);
   }, []);
 
@@ -365,51 +367,76 @@ export default function DlApp() {
   }, [refresh]);
 
   /// SSE 事件流（速率/完成/失败 toast）：与轮询分离——过滤/搜索切换
-  /// 只重置轮询节拍，事件流不重连。
+  /// 只重置轮播节拍，事件流不重连。
+  /// R16 live 边界：先 GET /events 取 latest_seq + 最近 200 条日志种子，
+  /// 再以 after=latest_seq 订阅增量——重载不再全量重放（历史完成事件
+  /// 对用户是历史而非现场，不该弹「任务完成」toast；曾致批量导入后
+  /// 重载被 toast 洪泛遮挡按钮）。REST 失败 → 保持 after=0 全量重放
+  /// （降级 = 旧行为，toast 照常）。
   useEffect(() => {
-    const unsub = client.subscribeEvents(
-      (env) => {
-        setEvents((cur) => {
-          const next = [...cur, env];
-          return next.length > 500 ? next.slice(next.length - 500) : next;
-        });
-        const type = env.event.type;
-        if (type === "speed") {
-          const tid = String(env.event.task_id ?? "");
-          if (tid) {
-            // ts-rs 精确联合（#147 §六）：speed 变体字段为必填 number；
-            // 取值须在 setRates 回调外完成——属性路径 narrowing 不进闭包。
-            const { down_rate, up_rate } = env.event;
-            setRates((cur) => ({
-              ...cur,
-              [tid]: {
-                down: Number(down_rate ?? 0),
-                up: Number(up_rate ?? 0),
-                ts: Date.now(),
-              },
-            }));
-          }
+    const onEnv = (env: SchedulerEventEnvelope) => {
+      setEvents((cur) => {
+        const next = [...cur, env];
+        return next.length > 500 ? next.slice(next.length - 500) : next;
+      });
+      const type = env.event.type;
+      if (type === "speed") {
+        const tid = String(env.event.task_id ?? "");
+        if (tid) {
+          // ts-rs 精确联合（#147 §六）：speed 变体字段为必填 number；
+          // 取值须在 setRates 回调外完成——属性路径 narrowing 不进闭包。
+          const { down_rate, up_rate } = env.event;
+          setRates((cur) => ({
+            ...cur,
+            [tid]: {
+              down: Number(down_rate ?? 0),
+              up: Number(up_rate ?? 0),
+              ts: Date.now(),
+            },
+          }));
         }
-        if (type === "completed") toast({ kind: "success", text: "任务完成" });
-        if (type === "failed") toast({ kind: "error", text: "任务失败" });
-        // 审计修复（40-e P2-22）：终态事件清理速率表条目
-        // （事件类型全集见 events.rs type_label——无 removed 变体，
-        // 删除场景由渲染侧 5s TTL 衰减兜底）
-        if (type === "completed" || type === "failed") {
-          const tid = String(env.event.task_id ?? "");
-          if (tid) {
-            setRates((cur) => {
-              if (!(tid in cur)) return cur;
-              const next = { ...cur };
-              delete next[tid];
-              return next;
-            });
-          }
+      }
+      if (type === "completed") toast({ kind: "success", text: "任务完成" });
+      if (type === "failed") toast({ kind: "error", text: "任务失败" });
+      // 审计修复（40-e P2-22）：终态事件清理速率表条目
+      // （事件类型全集见 events.rs type_label——无 removed 变体，
+      // 删除场景由渲染侧 5s TTL 衰减兜底）
+      if (type === "completed" || type === "failed") {
+        const tid = String(env.event.task_id ?? "");
+        if (tid) {
+          setRates((cur) => {
+            if (!(tid in cur)) return cur;
+            const next = { ...cur };
+            delete next[tid];
+            return next;
+          });
         }
-      },
-      setConnected,
-    );
-    return unsub;
+      }
+    };
+    // 先降级订阅（全量重放）；REST 引导成功后热切换为 live 增量流。
+    // disposed 守卫：卸载后迟到的 REST 解析不得再换流（EventSource 泄漏）。
+    let disposed = false;
+    let unsub = client.subscribeEvents(onEnv, setConnected);
+    client
+      .listEvents({ limit: 1 })
+      .then((page) => {
+        const latest = page.latest_seq ?? 0;
+        return client
+          .listEvents({ after: Math.max(0, latest - 200), limit: 200 })
+          .then((seed) => {
+            if (disposed) return;
+            setEvents(seed.events.slice(-500));
+            unsub();
+            unsub = client.subscribeEvents(onEnv, setConnected, latest);
+          });
+      })
+      .catch(() => {
+        /* REST 不可达：保持降级全量重放流（与旧行为一致） */
+      });
+    return () => {
+      disposed = true;
+      unsub();
+    };
   }, [toast]);
 
   /// 快照轮询独立节拍（2s）：挂载一次，读 ref 最新列表。
