@@ -716,6 +716,11 @@ pub struct DaemonState {
     /// 安全修复（V1/V13）：HTTP API Bearer token。None/空 = 未配置（serve 保证
     /// 非回环监听时拒绝启动，回环监听放行兼容本机 CLI）；Some = 全端点强制校验。
     http_token: Option<String>,
+    /// 一次性启动 nonce（#212 桌面壳身份验证）：`--instance-token` 注入；
+    /// `GET /instance-token/:nonce` 匹配回 200、否则 404。非 API 凭据（不
+    /// 授予任何权限），仅用于桌面壳确认「监听端口的进程是本次拉起的子进程」
+    /// （防残留 daemon 冒名顶替）。None/空 = 未设置（探针恒 404）。
+    pub(crate) instance_token: Option<String>,
     /// 安全修复（V10-2）：磁盘预检严格模式（true = 空间不可探测时拒绝入队）。
     /// 启动时由 `[download] disk_precheck_strict` 注入，不参与热重载。
     disk_precheck_strict: bool,

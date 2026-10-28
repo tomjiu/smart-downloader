@@ -1687,6 +1687,37 @@ async fn health_endpoint() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok" }))
 }
 
+/// #212 桌面壳身份验证探针：`GET /instance-token/:nonce`。
+/// daemon 启动时经 `--instance-token` 注入一次性随机 nonce，壳就绪探测改探
+/// 本路由——仅当「路径 nonce == 启动 nonce」时回 200。修复 #212：残留
+/// daemon / 外来 HTTP 服务占用端口时，壳的旧探测（只认 HTTP/1. 状态行）
+/// 会假阳性连到旧实例；本路由使「非本次拉起的进程」必然 404，fail-fast
+/// 可见。与 /health 同在 auth_mw 之下（tokenless 桌面场景放行回环 Host；
+/// token 模式下桌面壳本就无法加载 UI，探针 401 同样 fail-fast 正确）。
+/// 常数时间比较：避免本机旁观进程借响应时延逐字节探 nonce（非凭据，
+/// 仅为纵深防御）。非凭据语义：持有 nonce 不授予任何 API 权限。
+async fn instance_token_probe(
+    Path(nonce): Path<String>,
+    State(state): State<Arc<DaemonState>>,
+) -> Response {
+    let expected = state.instance_token.as_deref().unwrap_or("");
+    // ct_eq：等长才比较（长度本身非敏感——nonce 仅身份标识）；逐字节异或归零判定
+    let a = expected.as_bytes();
+    let b = nonce.as_bytes();
+    let matched = !expected.is_empty()
+        && a.len() == b.len()
+        && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0;
+    if matched {
+        (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "instance token mismatch" })),
+        )
+            .into_response()
+    }
+}
+
 /// 删除任务（引擎 remove + 目录记录移除；`?delete_data=true` 同步删除已下载
 /// 数据（E7：BT 删种子数据 / HTTP 删落盘文件），缺省 false 保留文件）。
 /// #161 契约守卫：wire 契约（?delete_data=）纳入 ts-rs。
@@ -2974,6 +3005,7 @@ macro_rules! router_base {
             .route("/metrics", get(metrics_endpoint))
             .route("/version", get(version_endpoint))
             .route("/health", get(health_endpoint))
+            .route("/instance-token/:nonce", get(instance_token_probe))
             .route("/providers", get(providers))
             .route("/events", get(list_events))
             .route("/events/stream", get(events_stream))
