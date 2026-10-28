@@ -12,6 +12,16 @@
 //! | `cleanup` / `post_download` / `webhook` / `scheduler` | 立即（同 refresh_config 热更语义） |
 //! | `queue` | 持久化预留（门控接线见 BACKLOG S1-b，当前仅存配置） |
 //!
+//! B1（#214 设置覆盖度，2026-10）：config 16 域中 8 域首次接入设置面：
+//!
+//! | 域 | 生效语义 |
+//!|---|---|
+//! | `rss.max_processed_items_per_feed` | 立即（刷新时经 live_config 现读，无中间缓存） |
+//! | `rss.auto_refresh` / `rss.refresh_interval_secs` | 重启生效（ticker 启动期固化周期/开关；PUT 仅持久化） |
+//! | `download.fsync_*` 三件套 | 重启生效（烘入 HTTP 引擎；PUT 仅持久化） |
+//! | `bittorrent.enabled` / `bittorrent.save_path` | 重启生效（引擎装配期读；PUT 仅持久化） |
+//! | `server` / `provider` / `provider_xunlei` / `provider_quark` / `xunlei` | **只读快照**（装配期生效，不提供 PUT——避免「设置了看似生效实则没有」的假阳性，#160 同族预防）；`server.http_token` 只出 set/unset 布尔，明文永不出设置面 |
+//!
 //! 持久化：`PUT /settings?persist=true`（默认）在权威配置（live_config）上打
 //! 补丁后原子回写 `--config` 文件（tmp+rename）。未指定 `--config` 时仅运行
 //! 时生效（report.persisted=false）。热重载循环按文本变更检测（文件为准），
@@ -33,6 +43,7 @@ pub struct SettingsReq {
     pub connection: Option<ConnectionReq>,
     pub bittorrent: Option<BtSessionReq>,
     pub download: Option<DownloadReq>,
+    pub rss: Option<RssReq>,
     pub cleanup: Option<CleanupReq>,
     pub post_download: Option<PostDownloadReq>,
     pub webhook: Option<WebhookReq>,
@@ -40,6 +51,21 @@ pub struct SettingsReq {
     pub queue: Option<QueueReq>,
     /// 持久化开关（默认 true）；与 query `?persist=` 等价（body 优先）。
     pub persist: Option<bool>,
+}
+
+/// RSS 域（B1，#214）：全局刷新策略。max_processed 运行时生效；
+/// auto_refresh / refresh_interval_secs 由 serve 启动期 ticker 固化，
+/// PUT 仅持久化（重启生效）。
+#[derive(Debug, Clone, Default, serde::Deserialize, TS)]
+#[serde(default)]
+#[ts(export, optional_fields)]
+pub struct RssReq {
+    /// 自动刷新总开关（重启生效：ticker 是否 spawn 在启动期决定）。
+    pub auto_refresh: Option<bool>,
+    /// 刷新间隔秒（重启生效；合法域 60..=604800，下限与 serve 同源）。
+    pub refresh_interval_secs: Option<u64>,
+    /// 单订阅已处理条目保留上限（立即生效：刷新路径经 live_config 现读）。
+    pub max_processed_items_per_feed: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize, TS)]
@@ -85,6 +111,12 @@ pub struct BtSessionReq {
     /// 存储模式（batch5 对标 qB「预分配磁盘空间」）：true = 新任务预分配。
     /// 会话级开关，仅重启时注入引擎（PUT 仅持久化）。
     pub storage_allocate: Option<bool>,
+    /// BT 引擎总开关（B1，#214）：装配期生效（引擎是否注入），PUT 仅
+    /// 持久化（重启生效；运行中引擎不摘除）。
+    pub enabled: Option<bool>,
+    /// BT 落盘目录（B1，#214）：空串 = 清除（回落跟随默认下载目录）；
+    /// 装配期生效，PUT 仅持久化（重启生效）。
+    pub save_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize, TS)]
@@ -95,6 +127,13 @@ pub struct DownloadReq {
     pub disk_precheck_strict: Option<bool>,
     /// HTTP 重定向最大跳数（batch5，1..=100）；仅重启时烘入 client。
     pub max_redirects: Option<u32>,
+    /// 段数据落盘策略主开关（B1，#214；PR #128）：true = 每段 fsync 后
+    /// 记账；false = 批量模式。烘入 HTTP 引擎，PUT 仅持久化（重启生效）。
+    pub fsync_per_segment: Option<bool>,
+    /// 批量模式阈值一：累计完成段数（1..=1024；重启生效）。
+    pub fsync_batch_segments: Option<u32>,
+    /// 批量模式阈值二：距上次落盘毫秒（100..=600000；重启生效）。
+    pub fsync_batch_interval_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize, TS)]
@@ -212,9 +251,15 @@ pub struct SettingsBittorrentDto {
     pub storage_allocate: bool,
     /// 当前构建是否装配 BT 引擎（feature bt）。
     pub bt_available: bool,
+    /// BT 引擎总开关（#214 B1，重启生效）：false 时下次启动不装配 BT 引擎。
+    pub enabled: bool,
+    /// BT 独立落盘目录（#214 B1，重启生效）；None = 跟随默认下载目录。
+    pub save_path: Option<String>,
+    /// 解析后实际落盘目录（save_path 或 dest_root；装配期采用值）。
+    pub resolved_save_path: String,
 }
 
-/// 下载域：默认落盘目录 + 预检严格度 + 重定向预算。
+/// 下载域：默认落盘目录 + 预检严格度 + 重定向预算 + fsync 落盘策略（B1）。
 #[derive(Debug, Clone, serde::Serialize, TS)]
 #[ts(export)]
 pub struct SettingsDownloadDto {
@@ -222,6 +267,13 @@ pub struct SettingsDownloadDto {
     pub disk_precheck_strict: bool,
     /// HTTP 重定向最大跳数（batch5，1..=100，重启生效）。
     pub max_redirects: u32,
+    /// 段数据落盘策略主开关（#214 B1）：true = 每段 fsync 后记账（P0-4
+    /// 最严粒度，SSD 推荐）；false = 批量模式（机械盘推荐）。
+    pub fsync_per_segment: bool,
+    /// 批量模式阈值一：自上次落盘累计完成段数。
+    pub fsync_batch_segments: u32,
+    /// 批量模式阈值二：距上次落盘时长（毫秒）。
+    pub fsync_batch_interval_ms: u64,
 }
 
 /// 清理域：Completed 自动清扫。
@@ -266,6 +318,89 @@ pub struct SettingsQueueDto {
     pub max_active_ftp: u32,
 }
 
+/// RSS 域（B1，#214）：全局刷新策略快照。max_processed 运行时可热改；
+/// auto_refresh / refresh_interval_secs 重启生效（ticker 固化）。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsRssDto {
+    /// 自动刷新开关（重启生效；false 时仅手动刷新）。
+    pub auto_refresh: bool,
+    /// 刷新间隔秒（重启生效；实际周期下限 60）。
+    pub refresh_interval_secs: u64,
+    /// 单订阅已处理条目保留上限（立即生效；防 rss.json 无限膨胀）。
+    pub max_processed_items_per_feed: u32,
+}
+
+/// 服务端域（B1，#214，只读）：监听地址 + 鉴权/跨源装配快照。
+/// `http_token` 明文永不出设置面（脱敏口径同 connection.proxy），
+/// 只暴露 set/unset 布尔供 UI 提示「已配置鉴权」。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsServerDto {
+    /// HTTP/WS 监听地址（如 127.0.0.1:8787）。
+    pub addr: String,
+    /// 是否已配置 Bearer 鉴权令牌（只读；明文不出）。
+    pub http_token_set: bool,
+    /// 额外允许的跨源请求 Host 白名单。
+    pub extra_allowed_hosts: Vec<String>,
+    /// 额外允许的跨源请求 Origin 白名单。
+    pub extra_allowed_origins: Vec<String>,
+}
+
+/// 云兜底 Provider 总开关（B1，#214，只读；装配期生效）。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsProviderDto {
+    /// 云兜底总开关（POST /tasks/:id/fallback 需 ≥1 可用 provider）。
+    pub enabled: bool,
+    /// MockProvider（开发/演示）。
+    pub mock: bool,
+    /// 运行中已装配的 provider 名单（assembly 结果，非配置声明）。
+    pub assembled: Vec<String>,
+}
+
+/// 迅雷云盘 Provider（B1，#214，只读；装配期生效）。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsProviderXunleiDto {
+    pub enabled: bool,
+    /// 登录态 JSON 路径（登录写入由 CLI/示例侧完成，daemon 只读）。
+    pub token_path: Option<String>,
+    /// 身份档位：web / nas（解析后生效值：env 覆盖 > config > web）。
+    pub tier: String,
+    /// 档位是否来自环境变量覆盖（部署提示用）。
+    pub tier_from_env: bool,
+    /// 登录态文件当前是否存在（排障提示用；不读内容）。
+    pub token_file_present: bool,
+}
+
+/// 夸克网盘 Provider（B1，#214，只读；装配期生效）。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsProviderQuarkDto {
+    pub enabled: bool,
+    /// Cookie 登录态 JSON 路径。
+    pub cookie_path: Option<String>,
+    /// 登录态文件当前是否存在（排障提示用；不读内容）。
+    pub cookie_file_present: bool,
+}
+
+/// 迅雷 SDK 引擎（B1，#214，只读；装配期生效，Windows-only feature）。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsXunleiDto {
+    /// 迅雷 SDK 引擎开关（需编译 --features xunlei）。
+    pub enabled: bool,
+    /// 当前构建是否装配迅雷引擎（feature xunlei）。
+    pub available: bool,
+    /// 迅雷 SDK 目录（含 DownloadSDKProxy.dll 等）。
+    pub sdk_dir: Option<String>,
+    /// 落盘目录；None = 跟随默认下载目录。
+    pub save_path: Option<String>,
+    /// 解析后实际落盘目录（save_path 或 dest_root）。
+    pub resolved_save_path: String,
+}
+
 #[derive(Debug, Clone, serde::Serialize, TS)]
 #[ts(export)]
 pub struct SettingsMetaDto {
@@ -281,11 +416,17 @@ pub struct SettingsSnapshot {
     pub connection: SettingsConnectionDto,
     pub bittorrent: SettingsBittorrentDto,
     pub download: SettingsDownloadDto,
+    pub rss: SettingsRssDto,
     pub cleanup: SettingsCleanupDto,
     pub post_download: SettingsPostDownloadDto,
     pub webhook: SettingsWebhookDto,
     pub scheduler: SettingsSchedulerDto,
     pub queue: SettingsQueueDto,
+    pub server: SettingsServerDto,
+    pub provider: SettingsProviderDto,
+    pub provider_xunlei: SettingsProviderXunleiDto,
+    pub provider_quark: SettingsProviderQuarkDto,
+    pub xunlei: SettingsXunleiDto,
     pub meta: SettingsMetaDto,
 }
 
@@ -300,6 +441,16 @@ impl DaemonState {
         let effective = *self.global_limits.lock();
         let queue = self.queue_cfg.lock().clone();
         let cleanup = self.cleanup.lock().clone();
+        // B1（#214）：解析目录先算后用——后续域字段会部分 move cfg（bt_resolved
+        // 同理提前拿出，避免借用/move 交错）。
+        let bt_resolved_save_path = cfg.bt_save_path().display().to_string();
+        let xunlei_resolved_save_path = cfg.xunlei_save_path().display().to_string();
+        // tier 解析走 &self 方法——须在结构体字面量部分 move cfg 之前调
+        //（域字段直取不受影响，但 &self 方法与 partial move 互斥）。
+        let xunlei_tier = cfg.resolve_xunlei_tier_name();
+        let xunlei_tier_from_env = std::env::var("SMART_DL_XUNLEI_TIER")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
         SettingsSnapshot {
             bandwidth: SettingsBandwidthDto {
                 max_download_kb_s: base.max_download_kb_s,
@@ -333,11 +484,22 @@ impl DaemonState {
                 max_seeding_time_min: cfg.bt.max_seeding_time_min,
                 storage_allocate: cfg.bt.storage_allocate,
                 bt_available: self.engines.contains_key(&EngineKind::Bt),
+                enabled: cfg.bt.enabled,
+                save_path: cfg.bt.save_path.as_ref().map(|p| p.display().to_string()),
+                resolved_save_path: bt_resolved_save_path,
             },
             download: SettingsDownloadDto {
                 dest_root: self.default_dest_root.lock().display().to_string(),
                 disk_precheck_strict: self.disk_precheck_strict,
                 max_redirects: cfg.download.max_redirects,
+                fsync_per_segment: cfg.download.fsync_per_segment,
+                fsync_batch_segments: cfg.download.fsync_batch_segments,
+                fsync_batch_interval_ms: cfg.download.fsync_batch_interval_ms,
+            },
+            rss: SettingsRssDto {
+                auto_refresh: cfg.rss.auto_refresh,
+                refresh_interval_secs: cfg.rss.refresh_interval_secs,
+                max_processed_items_per_feed: cfg.rss.max_processed_items_per_feed,
             },
             cleanup: SettingsCleanupDto {
                 auto_remove_completed_days: cleanup.auto_remove_completed_days,
@@ -365,6 +527,69 @@ impl DaemonState {
                 max_active_bt: queue.max_active_bt,
                 max_active_http: queue.max_active_http,
                 max_active_ftp: queue.max_active_ftp,
+            },
+            // —— B1 只读装配快照（#214）：装配期生效，PUT 不可写 ——
+            server: SettingsServerDto {
+                addr: cfg.server.addr.clone(),
+                // 明文 token 永不出设置面（脱敏口径同 proxy）：只出 set/unset。
+                http_token_set: self
+                    .http_token
+                    .as_deref()
+                    .map(|t| !t.trim().is_empty())
+                    .unwrap_or(false),
+                extra_allowed_hosts: cfg.server.extra_allowed_hosts.clone(),
+                extra_allowed_origins: cfg.server.extra_allowed_origins.clone(),
+            },
+            provider: SettingsProviderDto {
+                enabled: cfg.provider.enabled,
+                mock: cfg.provider.mock,
+                // 装配结果（非配置声明）：providers 为 serve 注入的运行时名单。
+                assembled: self
+                    .providers
+                    .iter()
+                    .map(|p| p.name().to_string())
+                    .collect(),
+            },
+            provider_xunlei: SettingsProviderXunleiDto {
+                enabled: cfg.provider_xunlei.enabled,
+                token_path: cfg
+                    .provider_xunlei
+                    .token_path
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                tier: xunlei_tier,
+                tier_from_env: xunlei_tier_from_env,
+                token_file_present: cfg
+                    .provider_xunlei
+                    .token_path
+                    .clone()
+                    .unwrap_or_else(|| std::path::PathBuf::from("xunlei_auth.json"))
+                    .exists(),
+            },
+            provider_quark: SettingsProviderQuarkDto {
+                enabled: cfg.provider_quark.enabled,
+                cookie_path: cfg
+                    .provider_quark
+                    .cookie_path
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                cookie_file_present: cfg
+                    .provider_quark
+                    .cookie_path
+                    .clone()
+                    .unwrap_or_else(|| std::path::PathBuf::from("quark_auth.json"))
+                    .exists(),
+            },
+            xunlei: SettingsXunleiDto {
+                enabled: cfg.xunlei.enabled,
+                available: cfg!(feature = "xunlei"),
+                sdk_dir: cfg.xunlei.sdk_dir.as_ref().map(|p| p.display().to_string()),
+                save_path: cfg
+                    .xunlei
+                    .save_path
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                resolved_save_path: xunlei_resolved_save_path,
             },
             meta: SettingsMetaDto {
                 // 持久化目标；None = 未指定 --config（PUT 仅运行时生效）
@@ -438,6 +663,20 @@ impl DaemonState {
                     )));
                 }
             }
+            // B1（#214）：save_path 只做可打印性/长度检查（目录创建在重启装配期，
+            // 与 serve 对 bt_save_path 的 create_dir_all 同源）；空串 = 清除回落。
+            if let Some(p) = bt.save_path.as_deref() {
+                if p.trim().len() > 4096 {
+                    return Err(DaemonError::InvalidSource(
+                        "bittorrent.save_path 超长（>4096）".into(),
+                    ));
+                }
+                if p.contains('\0') {
+                    return Err(DaemonError::InvalidSource(
+                        "bittorrent.save_path 含非法字符（NUL）".into(),
+                    ));
+                }
+            }
         }
         if let Some(c) = &req.connection {
             if let Some(p) = c.proxy.as_deref() {
@@ -474,6 +713,42 @@ impl DaemonState {
                 if !(1..=100).contains(&v) {
                     return Err(DaemonError::InvalidSource(format!(
                         "download.max_redirects = {v} 无效：须在 1..=100"
+                    )));
+                }
+            }
+            // B1（#214）：fsync 三件套——合法域与 config.rs 加载期钳制同源，
+            // 但 PUT 侧从严拒绝（先验证后写，零副作用）而非静默钳制。
+            if let Some(v) = d.fsync_batch_segments {
+                if !(1..=1024).contains(&v) {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "download.fsync_batch_segments = {v} 无效：须在 1..=1024"
+                    )));
+                }
+            }
+            if let Some(v) = d.fsync_batch_interval_ms {
+                if !(100..=600_000).contains(&v) {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "download.fsync_batch_interval_ms = {v} 无效：须在 100..=600000"
+                    )));
+                }
+            }
+        }
+        // B1（#214）：rss 域验证。refresh_interval_secs 下限 60 与 serve
+        // ticker 的 .max(60) 同源（防误配风暴）；上限 7 天防 rss.json 膨胀
+        // 前的空窗过长。max_processed_items_per_feed 下限 1：0 会截掉全部
+        // 已处理条目 → 去重标记丢失 → 源刷新时全量重复建任务（P1-10 同族）。
+        if let Some(r) = &req.rss {
+            if let Some(v) = r.refresh_interval_secs {
+                if !(60..=604_800).contains(&v) {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "rss.refresh_interval_secs = {v} 无效：须在 60..=604800（秒）"
+                    )));
+                }
+            }
+            if let Some(v) = r.max_processed_items_per_feed {
+                if !(1..=100_000).contains(&v) {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "rss.max_processed_items_per_feed = {v} 无效：须在 1..=100000"
                     )));
                 }
             }
@@ -638,6 +913,22 @@ impl DaemonState {
                 }
                 restart_required.push("bittorrent.storage_allocate".into());
             }
+            // B1（#214）：引擎总开关——装配期生效（运行中引擎不摘除：摘除会
+            // 令在传 BT 任务句柄悬空）；PUT 仅持久化。
+            if let Some(v) = bt.enabled {
+                if let Some(cfg) = self.live_config.lock().as_mut() {
+                    cfg.bt.enabled = v;
+                }
+                restart_required.push("bittorrent.enabled".into());
+            }
+            // B1（#214）：BT 独立落盘目录——空串 = 清除（回落 dest_root）；
+            // 引擎构造期读，PUT 仅持久化。
+            if let Some(v) = bt.save_path.as_deref() {
+                if let Some(cfg) = self.live_config.lock().as_mut() {
+                    cfg.bt.save_path = (!v.trim().is_empty()).then(|| PathBuf::from(v.trim()));
+                }
+                restart_required.push("bittorrent.save_path".into());
+            }
         }
         if let Some(d) = &req.download {
             if let Some(root) = d.dest_root.as_deref() {
@@ -673,6 +964,53 @@ impl DaemonState {
                     cfg.download.max_redirects = v;
                 }
                 restart_required.push("download.max_redirects".into());
+            }
+            // B1（#214）：fsync 三件套——烘入 HTTP 引擎构造（每任务段写策略），
+            // PUT 仅持久化（disk_precheck_strict 先例：中途热切会令同任务
+            // 段级 WAL 粒度不一致）。restart_required 只报实际提交的键
+            // （e2e HC-9 抓出的契约缺陷：整组硬推三键会虚报「重启生效 3 项」）。
+            if let Some(cfg) = self.live_config.lock().as_mut() {
+                if let Some(v) = d.fsync_per_segment {
+                    cfg.download.fsync_per_segment = v;
+                    restart_required.push("download.fsync_per_segment".into());
+                }
+                if let Some(v) = d.fsync_batch_segments {
+                    cfg.download.fsync_batch_segments = v;
+                    restart_required.push("download.fsync_batch_segments".into());
+                }
+                if let Some(v) = d.fsync_batch_interval_ms {
+                    cfg.download.fsync_batch_interval_ms = v;
+                    restart_required.push("download.fsync_batch_interval_ms".into());
+                }
+            }
+        }
+        // B1（#214）：rss 域。max_processed_items_per_feed 为唯一运行时生效
+        // 键（刷新路径 rss_max_processed_items 经 live_config 现读，无中间
+        // 缓存 → 打补丁即热切）；auto_refresh / refresh_interval_secs 由
+        // serve 启动期 ticker 固化，PUT 仅持久化。
+        if let Some(r) = &req.rss {
+            if r.auto_refresh.is_some()
+                || r.refresh_interval_secs.is_some()
+                || r.max_processed_items_per_feed.is_some()
+            {
+                if let Some(cfg) = self.live_config.lock().as_mut() {
+                    if let Some(v) = r.auto_refresh {
+                        cfg.rss.auto_refresh = v;
+                    }
+                    if let Some(v) = r.refresh_interval_secs {
+                        cfg.rss.refresh_interval_secs = v;
+                    }
+                    if let Some(v) = r.max_processed_items_per_feed {
+                        cfg.rss.max_processed_items_per_feed = v;
+                        applied.push("rss.max_processed_items_per_feed".into());
+                    }
+                }
+                if r.auto_refresh.is_some() {
+                    restart_required.push("rss.auto_refresh".into());
+                }
+                if r.refresh_interval_secs.is_some() {
+                    restart_required.push("rss.refresh_interval_secs".into());
+                }
             }
         }
         if let Some(c) = &req.cleanup {

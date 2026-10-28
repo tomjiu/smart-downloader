@@ -63,11 +63,17 @@ async fn get_settings_returns_all_domains() {
         "connection",
         "bittorrent",
         "download",
+        "rss",
         "cleanup",
         "post_download",
         "webhook",
         "scheduler",
         "queue",
+        "server",
+        "provider",
+        "provider_xunlei",
+        "provider_quark",
+        "xunlei",
         "meta",
     ] {
         assert!(s.get(domain).is_some(), "settings 快照缺域 {domain}");
@@ -84,6 +90,295 @@ async fn get_settings_returns_all_domains() {
         "S1-b 默认 0 = 不限（禁用排队）"
     );
     assert!(s["meta"]["persist_path"].is_string(), "持久化路径可见");
+    // B1（#214）：新接入域默认值断言（与 config.rs Default 单源对齐）。
+    assert_eq!(s["rss"]["auto_refresh"], true);
+    assert_eq!(s["rss"]["refresh_interval_secs"], 900);
+    assert_eq!(s["rss"]["max_processed_items_per_feed"], 200);
+    assert_eq!(s["download"]["fsync_per_segment"], true);
+    assert_eq!(s["download"]["fsync_batch_segments"], 8);
+    assert_eq!(s["download"]["fsync_batch_interval_ms"], 2000);
+    assert_eq!(s["bittorrent"]["enabled"], true);
+    assert!(
+        s["bittorrent"]["save_path"].is_null(),
+        "默认 None = 跟随 dest_root"
+    );
+    assert!(
+        s["bittorrent"]["resolved_save_path"].is_string(),
+        "解析后落盘目录恒可见"
+    );
+    assert_eq!(s["server"]["addr"], "127.0.0.1:8787");
+    assert_eq!(s["server"]["http_token_set"], false);
+    assert_eq!(s["provider"]["enabled"], false);
+    assert_eq!(s["provider_xunlei"]["tier"], "web");
+    assert_eq!(s["provider_quark"]["enabled"], false);
+    assert_eq!(s["xunlei"]["available"], false, "默认构建无 xunlei feature");
+}
+
+/// B1（#214）：只读装配域不出明文敏感项——http_token 即使已配置也只出
+/// set/unset 布尔（脱敏口径同 connection.proxy）。反例断言（全文搜不到
+/// 明文）防回归。
+#[tokio::test]
+async fn readonly_domains_never_leak_http_token() {
+    // 直接装配带鉴权的 state（spawn_daemon 不注入 http_token；serve 的
+    // 注入点 = with_http_token，此处同源补齐）。
+    let engine = HttpEngine::new(reqwest::Client::new());
+    let state = Arc::new(
+        DaemonState::new(Arc::new(engine), vec![])
+            .with_http_token(Some("secret-token-xyz-174".into()))
+            .with_live_config(base_cfg()),
+    );
+    let app = http::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let body = client
+        .get(format!("{base}/settings"))
+        .bearer_auth("secret-token-xyz-174")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(
+        !body.contains("secret-token-xyz-174"),
+        "设置面泄漏 http_token 明文"
+    );
+    let s: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(s["server"]["http_token_set"], true, "set 布尔可见");
+    assert!(
+        s["server"].get("http_token").is_none(),
+        "server 域不得出现 http_token 键"
+    );
+}
+
+/// B1（#214）：rss 域三层语义——max_processed 立即生效（applied），
+/// auto_refresh / refresh_interval_secs 重启生效（restart_required + 落盘）。
+#[tokio::test]
+async fn put_rss_domains_split_runtime_and_restart() {
+    let (_dir, base, cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+
+    let report: serde_json::Value = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({
+            "rss": {
+                "max_processed_items_per_feed": 500,
+                "auto_refresh": false,
+                "refresh_interval_secs": 1800
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let applied = report["applied"].as_array().unwrap();
+    assert!(
+        applied
+            .iter()
+            .any(|v| v == "rss.max_processed_items_per_feed"),
+        "max_processed 应在 applied：{applied:?}"
+    );
+    let restart = report["restart_required"].as_array().unwrap();
+    assert!(
+        restart.iter().any(|v| v == "rss.auto_refresh"),
+        "{restart:?}"
+    );
+    assert!(
+        restart.iter().any(|v| v == "rss.refresh_interval_secs"),
+        "{restart:?}"
+    );
+
+    // 快照回读：三键均已写入 live_config（运行时值/待重启值都从快照可见）。
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["rss"]["max_processed_items_per_feed"], 500);
+    assert_eq!(s["rss"]["auto_refresh"], false);
+    assert_eq!(s["rss"]["refresh_interval_secs"], 1800);
+
+    // 落盘断言（回读解析）：三键回写 toml。
+    let reloaded = smart_dl_daemon::config::Config::load(Some(&cfg_path)).unwrap();
+    assert_eq!(reloaded.rss.max_processed_items_per_feed, 500);
+    assert!(!reloaded.rss.auto_refresh);
+    assert_eq!(reloaded.rss.refresh_interval_secs, 1800);
+}
+
+/// B1（#214）：fsync 三件套 + BT 引擎开关/独立目录——全部重启生效
+/// （PUT 仅持久化；引擎运行中行为不变）。
+#[tokio::test]
+async fn put_fsync_and_bt_assembly_persist_only() {
+    let (_dir, base, cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+
+    let report: serde_json::Value = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({
+            "download": {
+                "fsync_per_segment": false,
+                "fsync_batch_segments": 16,
+                "fsync_batch_interval_ms": 500
+            },
+            "bittorrent": { "enabled": false, "save_path": "/tmp/bt-b1" }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let restart = report["restart_required"].as_array().unwrap();
+    for k in [
+        "download.fsync_per_segment",
+        "download.fsync_batch_segments",
+        "download.fsync_batch_interval_ms",
+        "bittorrent.enabled",
+        "bittorrent.save_path",
+    ] {
+        assert!(restart.iter().any(|v| v == k), "缺 {k}：{restart:?}");
+    }
+    assert!(
+        report["applied"].as_array().unwrap().is_empty(),
+        "重启域不得进 applied：{:?}",
+        report["applied"]
+    );
+
+    // 落盘断言：toml 回写（回读解析断言，避免多域同名字段误判）。
+    let reloaded = smart_dl_daemon::config::Config::load(Some(&cfg_path)).unwrap();
+    assert!(!reloaded.download.fsync_per_segment);
+    assert_eq!(reloaded.download.fsync_batch_segments, 16);
+    assert_eq!(reloaded.download.fsync_batch_interval_ms, 500);
+    assert!(!reloaded.bt.enabled);
+    assert_eq!(
+        reloaded.bt.save_path,
+        Some(std::path::PathBuf::from("/tmp/bt-b1"))
+    );
+    // 快照同步断言（resolved 跟随新目录）。
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["download"]["fsync_per_segment"], false);
+    assert_eq!(s["download"]["fsync_batch_segments"], 16);
+    assert_eq!(s["download"]["fsync_batch_interval_ms"], 500);
+    assert_eq!(s["bittorrent"]["enabled"], false);
+    assert_eq!(s["bittorrent"]["save_path"], "/tmp/bt-b1");
+    assert_eq!(s["bittorrent"]["resolved_save_path"], "/tmp/bt-b1");
+}
+
+/// B1（#214）：bt.save_path 空串 = 清除回落（None → 跟随默认目录）。
+#[tokio::test]
+async fn put_bt_save_path_empty_clears_to_dest_root() {
+    let (_dir, base, _cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+    // 先设一个独立目录，再空串清除。
+    client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({ "bittorrent": { "save_path": "/tmp/bt-orig" } }))
+        .send()
+        .await
+        .unwrap();
+    let s: serde_json::Value = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({ "bittorrent": { "save_path": "" } }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let _ = s; // report 形状已由上一测覆盖；此处验证快照
+    let snap: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        snap["bittorrent"]["save_path"].is_null(),
+        "空串应清除 save_path"
+    );
+    let resolved = snap["bittorrent"]["resolved_save_path"].as_str().unwrap();
+    assert!(
+        resolved.ends_with("downloads"),
+        "清除后应回落 dest_root（downloads）：{resolved}"
+    );
+    // 落盘断言（回读解析）：save_path 已清回 None。
+    let reloaded = smart_dl_daemon::config::Config::load(Some(&_cfg_path)).unwrap();
+    assert!(reloaded.bt.save_path.is_none(), "toml 应已清除 save_path");
+}
+
+/// B1（#214）：越界值 400 零副作用（fsync/rss 合法域从严拒绝）。
+#[tokio::test]
+async fn put_b1_out_of_range_rejected_zero_side_effect() {
+    let (_dir, base, cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+    for (body, key) in [
+        (
+            serde_json::json!({ "download": { "fsync_batch_segments": 0 } }),
+            "fsync_batch_segments 下限",
+        ),
+        (
+            serde_json::json!({ "download": { "fsync_batch_interval_ms": 50 } }),
+            "fsync_batch_interval_ms 下限",
+        ),
+        (
+            serde_json::json!({ "rss": { "refresh_interval_secs": 30 } }),
+            "refresh_interval_secs 下限",
+        ),
+        (
+            serde_json::json!({ "rss": { "max_processed_items_per_feed": 0 } }),
+            "max_processed 下限",
+        ),
+    ] {
+        let resp = client
+            .put(format!("{base}/settings"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{key} 应 400");
+    }
+    // 零副作用：快照与落盘均保持默认（回读解析断言，避免初始全字段
+    // 序列化的字符串误判）。
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["download"]["fsync_batch_segments"], 8);
+    assert_eq!(s["rss"]["refresh_interval_secs"], 900);
+    assert_eq!(s["rss"]["max_processed_items_per_feed"], 200);
+    let reloaded = smart_dl_daemon::config::Config::load(Some(&cfg_path)).unwrap();
+    assert_eq!(
+        reloaded.download.fsync_batch_segments, 8,
+        "越界 PUT 不得改值"
+    );
+    assert_eq!(reloaded.rss.refresh_interval_secs, 900, "越界 PUT 不得改值");
+    assert_eq!(
+        reloaded.rss.max_processed_items_per_feed, 200,
+        "越界 PUT 不得改值"
+    );
 }
 
 #[tokio::test]

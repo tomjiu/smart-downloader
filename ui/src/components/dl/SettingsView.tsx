@@ -155,6 +155,8 @@ const DEFAULTS: Record<string, PatchEntry[]> = {
     ["connection", "bt_max_connections", 0],
   ],
   bittorrent: [
+    ["bittorrent", "enabled", true],
+    ["bittorrent", "save_path", ""],
     ["bittorrent", "enable_dht", false],
     ["bittorrent", "enable_lsd", false],
     ["bittorrent", "enable_upnp", false],
@@ -168,8 +170,16 @@ const DEFAULTS: Record<string, PatchEntry[]> = {
   download: [
     ["download", "disk_precheck_strict", false],
     ["download", "max_redirects", 10],
+    ["download", "fsync_per_segment", true],
+    ["download", "fsync_batch_segments", 8],
+    ["download", "fsync_batch_interval_ms", 2000],
     ["scheduler", "start_jitter_seconds", 0],
     ["scheduler", "completion_action", "none"],
+  ],
+  rss: [
+    ["rss", "auto_refresh", true],
+    ["rss", "refresh_interval_secs", 900],
+    ["rss", "max_processed_items_per_feed", 200],
   ],
   queue: [
     ["queue", "max_active_bt", 0],
@@ -603,6 +613,18 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
         </button>
         </h3>
         <div className="dl-form-grid">
+          {/* B1（#214）：引擎总开关 + 独立落盘目录（重启生效） */}
+          <label className="dl-field-label">BT 引擎总开关<Effective kind="restart" /></label>
+          <Switch label="BT 引擎" on={s.bittorrent.enabled} onChange={(v) => patch("bittorrent", "enabled", v)} />
+          <div className="dl-field-help">关闭后重启不装配 BT 引擎（磁力/种子任务不可用）；运行中引擎不摘除，在传任务不受影响</div>
+          <label className="dl-field-label" htmlFor="set-a11y-26">BT 独立落盘目录<Effective kind="restart" /></label>
+          <input id="set-a11y-26"
+            className="dl-input"
+            placeholder={`留空 = 跟随默认下载目录（${s.download.dest_root}）`}
+            value={s.bittorrent.save_path ?? ""}
+            onChange={(e) => patch("bittorrent", "save_path", e.target.value)}
+          />
+          <div className="dl-field-help">当前解析生效：{s.bittorrent.resolved_save_path}（重启装配期采值）</div>
           <label className="dl-field-label">DHT（去中心化 peer 发现）<Effective kind="now" /></label>
           <Switch label="DHT" on={s.bittorrent.enable_dht} onChange={(v) => patch("bittorrent", "enable_dht", v)} />
           <label className="dl-field-label">LSD（本地网络发现）<Effective kind="now" /></label>
@@ -725,6 +747,31 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
             onChange={(e) => patch("download", "max_redirects", num(e.target.value) ?? 10)}
           />
           <div className="dl-field-help">1..=100；默认 10（reqwest 默认值），仅启动时烘入 client</div>
+
+          {/* B1（#214）：fsync 落盘策略三件套（重启生效） */}
+          <label className="dl-field-label">段数据逐段 fsync<Effective kind="restart" /></label>
+          <Switch label="逐段 fsync" on={s.download.fsync_per_segment} onChange={(v) => patch("download", "fsync_per_segment", v)} />
+          <div className="dl-field-help">开 = 每段 fsync 后记账（断电最严先金，SSD 推荐）；关 = 批量模式（机械盘推荐：段级 fsync 会把吞吐压到个位数 MB/s）</div>
+          <label className="dl-field-label" htmlFor="set-a11y-27">批量阈值：累计段数<Effective kind="restart" /></label>
+          <input id="set-a11y-27"
+            className="dl-input"
+            type="number"
+            min={1}
+            max={1024}
+            value={s.download.fsync_batch_segments}
+            onChange={(e) => patch("download", "fsync_batch_segments", num(e.target.value) ?? 8)}
+          />
+          <div className="dl-field-help">1..=1024；批量模式下累计 N 段才做一次「数据 fsync + 账本落盘」（默认 8 ≈ 128MB 摘销一次 fsync）</div>
+          <label className="dl-field-label" htmlFor="set-a11y-28">批量阈值：时间间隔（毫秒）<Effective kind="restart" /></label>
+          <input id="set-a11y-28"
+            className="dl-input"
+            type="number"
+            min={100}
+            max={600000}
+            value={s.download.fsync_batch_interval_ms}
+            onChange={(e) => patch("download", "fsync_batch_interval_ms", num(e.target.value) ?? 2000)}
+          />
+          <div className="dl-field-help">100..=600000；两阈值先到者触发（默认 2000ms）</div>
           <label className="dl-field-label" htmlFor="set-a11y-18">错峰随机延迟（秒）<Effective kind="now" /></label>
           <input id="set-a11y-18" className="dl-input" type="number" min={0} value={s.scheduler.start_jitter_seconds} onChange={(e) => patch("scheduler", "start_jitter_seconds", num(e.target.value) ?? 0)} />
           <div className="dl-field-help">新任务在 0..=N 秒内随机延迟启动；0 = 关闭</div>
@@ -748,6 +795,98 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           </select>
           <div className="dl-field-help">
             全部任务到达终态（含暂停/做种）后触发，每进程会话最多一次；空任务表不触发
+          </div>
+        </div>
+      </section>
+      )}
+
+      {/* —— RSS 订阅（B1，#214） —— */}
+      {hit("RSS 订阅 feed 刷新 refresh 条目 膨胀") && (
+      <section className="dl-card">
+        <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+          <Icon name="clock" size={14} className="dl-sec-ico" /> RSS 订阅
+
+        <span style={{ flex: 1 }} />
+        <button type="button" className="dl-btn dl-btn--ghost" style={{ fontSize: 11.5 }} disabled={busy}
+          aria-label="恢复RSS默认值" title="把本组字段填回出厂默认（待保存）"
+          onClick={() => patchMany(DEFAULTS.rss)}>
+          恢复默认
+        </button>
+        </h3>
+        <div className="dl-form-grid">
+          <label className="dl-field-label">自动刷新<Effective kind="restart" /></label>
+          <Switch label="自动刷新" on={s.rss.auto_refresh} onChange={(v) => patch("rss", "auto_refresh", v)} />
+          <div className="dl-field-help">关 = 仅手动刷新（订阅页「刷新」按钮）；重启后生效（刷新器随启动装配）</div>
+          <label className="dl-field-label" htmlFor="set-a11y-29">刷新间隔（秒）<Effective kind="restart" /></label>
+          <input id="set-a11y-29"
+            className="dl-input"
+            type="number"
+            min={60}
+            max={604800}
+            value={s.rss.refresh_interval_secs}
+            onChange={(e) => patch("rss", "refresh_interval_secs", num(e.target.value) ?? 900)}
+          />
+          <div className="dl-field-help">60..=604800；下限 60 防误配风暴；重启后生效。订阅级可单独覆盖（订阅页设置）</div>
+          <label className="dl-field-label" htmlFor="set-a11y-30">已处理条目保留上限<Effective kind="now" /></label>
+          <input id="set-a11y-30"
+            className="dl-input"
+            type="number"
+            min={1}
+            max={100000}
+            value={s.rss.max_processed_items_per_feed}
+            onChange={(e) => patch("rss", "max_processed_items_per_feed", num(e.target.value) ?? 200)}
+          />
+          <div className="dl-field-help">1..=100000；单订阅保留最近 N 条已处理条目（防 rss.json 无限膨胀）；保存即生效</div>
+        </div>
+      </section>
+      )}
+
+      {/* —— 装配与鉴权（B1，#214：只读快照——改 config.toml 后重启生效） —— */}
+      {hit("装配 鉴权 server provider 迅雷 夸克 插件 只读 assembly token cors") && (
+      <section className="dl-card">
+        <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+          <Icon name="shield" size={14} className="dl-sec-ico" /> 装配与鉴权
+          <span className="dl-badge">只读</span>
+          <span style={{ fontSize: 11.5, color: "var(--fg-3)" }}>以下为启动装配快照——修改 config.toml 并重启后生效</span>
+        </h3>
+        <div className="dl-form-grid">
+          <label className="dl-field-label">监听地址</label>
+          <div className="dl-field-help" style={{ margin: 0 }}>{s.server.addr}</div>
+          <label className="dl-field-label">API 鉴权令牌</label>
+          <div className="dl-field-help" style={{ margin: 0 }}>
+            {s.server.http_token_set ? "已配置（明文不显示；本页右上「后端连接」可改客户端侧令牌）" : "未配置（仅回环监听放行）"}
+          </div>
+          <label className="dl-field-label">跨源 Host 白名单</label>
+          <div className="dl-field-help" style={{ margin: 0 }}>
+            {s.server.extra_allowed_hosts.length ? s.server.extra_allowed_hosts.join("、") : "（无）"}
+          </div>
+          <label className="dl-field-label">跨源 Origin 白名单</label>
+          <div className="dl-field-help" style={{ margin: 0 }}>
+            {s.server.extra_allowed_origins.length ? s.server.extra_allowed_origins.join("、") : "（无）"}
+          </div>
+          <label className="dl-field-label">云兜底 Provider</label>
+          <div className="dl-field-help" style={{ margin: 0 }}>
+            {s.provider.enabled
+              ? `已启用（运行中装配：${s.provider.assembled.length ? s.provider.assembled.join("、") : "无"}${s.provider.mock ? "；含 Mock" : ""}）`
+              : "未启用（POST /tasks/:id/fallback 需要 ≥1 个可用 provider）"}
+          </div>
+          <label className="dl-field-label">迅雷云盘 Provider</label>
+          <div className="dl-field-help" style={{ margin: 0 }}>
+            {s.provider_xunlei.enabled
+              ? `已启用 · 档位 ${s.provider_xunlei.tier}${s.provider_xunlei.tier_from_env ? "（环境变量覆盖）" : ""} · 登录态 ${s.provider_xunlei.token_file_present ? "已配置" : "未配置"}`
+              : "未启用"}
+          </div>
+          <label className="dl-field-label">夸克网盘 Provider</label>
+          <div className="dl-field-help" style={{ margin: 0 }}>
+            {s.provider_quark.enabled
+              ? `已启用 · Cookie ${s.provider_quark.cookie_file_present ? "已配置" : "未配置"}`
+              : "未启用"}
+          </div>
+          <label className="dl-field-label">迅雷 SDK 引擎</label>
+          <div className="dl-field-help" style={{ margin: 0 }}>
+            {s.xunlei.enabled
+              ? `已启用（Windows 专属）· 落盘 ${s.xunlei.resolved_save_path}${s.xunlei.available ? "" : " · 当前构建未编译该特性，仅配置生效"}`
+              : "未启用"}
           </div>
         </div>
       </section>

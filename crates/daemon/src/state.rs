@@ -873,7 +873,7 @@ pub use create::{canonical_http_url, ensure_dest_root, precheck_space};
 #[cfg(test)]
 use lifecycle::ct_eq;
 pub use persistence::write_tasks_atomic;
-pub use settings::{SettingsApplyReport, SettingsReq};
+pub use settings::{SettingsApplyReport, SettingsReq, SettingsSnapshot};
 
 #[cfg(test)]
 #[path = "state_tests/mod.rs"]

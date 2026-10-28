@@ -4,4 +4,17 @@ export type DownloadReq = { dest_root?: string, disk_precheck_strict?: boolean,
 /**
  * HTTP 重定向最大跳数（batch5，1..=100）；仅重启时烘入 client。
  */
-max_redirects?: number, };
+max_redirects?: number, 
+/**
+ * 段数据落盘策略主开关（B1，#214；PR #128）：true = 每段 fsync 后
+ * 记账；false = 批量模式。烘入 HTTP 引擎，PUT 仅持久化（重启生效）。
+ */
+fsync_per_segment?: boolean, 
+/**
+ * 批量模式阈值一：累计完成段数（1..=1024；重启生效）。
+ */
+fsync_batch_segments?: number, 
+/**
+ * 批量模式阈值二：距上次落盘毫秒（100..=600000；重启生效）。
+ */
+fsync_batch_interval_ms?: number, };

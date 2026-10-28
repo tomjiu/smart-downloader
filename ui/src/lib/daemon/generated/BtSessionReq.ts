@@ -17,4 +17,14 @@ max_seeding_time_min?: number,
  * 存储模式（batch5 对标 qB「预分配磁盘空间」）：true = 新任务预分配。
  * 会话级开关，仅重启时注入引擎（PUT 仅持久化）。
  */
-storage_allocate?: boolean, };
+storage_allocate?: boolean, 
+/**
+ * BT 引擎总开关（B1，#214）：装配期生效（引擎是否注入），PUT 仅
+ * 持久化（重启生效；运行中引擎不摘除）。
+ */
+enabled?: boolean, 
+/**
+ * BT 落盘目录（B1，#214）：空串 = 清除（回落跟随默认下载目录）；
+ * 装配期生效，PUT 仅持久化（重启生效）。
+ */
+save_path?: string, };

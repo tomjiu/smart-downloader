@@ -15,4 +15,16 @@ storage_allocate: boolean,
 /**
  * 当前构建是否装配 BT 引擎（feature bt）。
  */
-bt_available: boolean, };
+bt_available: boolean, 
+/**
+ * BT 引擎总开关（#214 B1，重启生效）：false 时下次启动不装配 BT 引擎。
+ */
+enabled: boolean, 
+/**
+ * BT 独立落盘目录（#214 B1，重启生效）；None = 跟随默认下载目录。
+ */
+save_path: string | null, 
+/**
+ * 解析后实际落盘目录（save_path 或 dest_root；装配期采用值）。
+ */
+resolved_save_path: string, };

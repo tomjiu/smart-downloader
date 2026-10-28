@@ -6,13 +6,14 @@ import type { ConnectionReq } from "./ConnectionReq";
 import type { DownloadReq } from "./DownloadReq";
 import type { PostDownloadReq } from "./PostDownloadReq";
 import type { QueueReq } from "./QueueReq";
+import type { RssReq } from "./RssReq";
 import type { SchedulerReq } from "./SchedulerReq";
 import type { WebhookReq } from "./WebhookReq";
 
 /**
  * `PUT /settings` 请求体：各域可选，域内字段可选（None = 不调整）。
  */
-export type SettingsReq = { bandwidth?: BandwidthReq, connection?: ConnectionReq, bittorrent?: BtSessionReq, download?: DownloadReq, cleanup?: CleanupReq, post_download?: PostDownloadReq, webhook?: WebhookReq, scheduler?: SchedulerReq, queue?: QueueReq, 
+export type SettingsReq = { bandwidth?: BandwidthReq, connection?: ConnectionReq, bittorrent?: BtSessionReq, download?: DownloadReq, rss?: RssReq, cleanup?: CleanupReq, post_download?: PostDownloadReq, webhook?: WebhookReq, scheduler?: SchedulerReq, queue?: QueueReq, 
 /**
  * 持久化开关（默认 true）；与 query `?persist=` 等价（body 优先）。
  */
