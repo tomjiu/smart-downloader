@@ -164,6 +164,20 @@ test.describe('daemon 不可达 UX', () => {
     await expect(page.getByTestId('daemon-down')).toHaveCount(0);
   });
 
+  test('DD-7 断连时统计页等待卡（不误报全零/未注册 Provider）', async ({ page }) => {
+    // R29：StatsView 旧体验在断连时渲染全零统计 + providers catch 落 []
+    // → 误报「未注册 Provider」。修复后：等待卡 + 等待连接文案。
+    await gotoWithBase(page, DEAD_BASE);
+    await expect(page.getByTestId('daemon-down')).toBeVisible({ timeout: 10_000 });
+    await page.getByRole('button', { name: '统计' }).click();
+    const card = page.getByTestId('stats-waiting');
+    await expect(card).toBeVisible();
+    await expect(card).toContainText('daemon 未连接');
+    // 不误报：「未注册 Provider」与全零统计网格均不得出现（等待卡整体替换）
+    await expect(page.getByText('未注册 Provider')).toHaveCount(0);
+    await expect(page.getByText('加载中…')).toHaveCount(0);
+  });
+
   test('DD-5 令牌配错（401，daemon 活着）→ 认证失败面板变体（非「无法连接」）', async ({ page }) => {
     test.setTimeout(120_000);
     if (!existsSync(DAEMON_BIN)) throw new Error(`daemon 二进制不存在: ${DAEMON_BIN}`);

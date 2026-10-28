@@ -754,7 +754,7 @@ export default function DlApp() {
               )}
             </>
           )}
-          {view === "stats" && <StatsView stats={stats} history={history} />}
+          {view === "stats" && <StatsView stats={stats} history={history} connected={connected} />}
           {view === "rss" && <RssView onToast={toast} />}
           {view === "logs" && <LogsView events={events} />}
           {view === "settings" && <SettingsView onToast={toast} />}
