@@ -134,6 +134,21 @@ pub struct DownloadReq {
     pub fsync_batch_segments: Option<u32>,
     /// 批量模式阈值二：距上次落盘毫秒（100..=600000；重启生效）。
     pub fsync_batch_interval_ms: Option<u64>,
+    /// 自定义 User-Agent（B2，#214）：空串 = 产品默认；新任务生效。
+    pub user_agent: Option<String>,
+    /// 代理例外列表（B2，#214）：整表替换；新任务生效。
+    pub no_proxy: Option<Vec<String>>,
+    /// TCP 连接超时秒（B2，#214，1..=300）；新任务生效。
+    pub connect_timeout_secs: Option<u64>,
+    /// 空闲读超时秒（B2，#214，1..=3600）；新任务生效。
+    pub read_timeout_secs: Option<u64>,
+    /// 单任务最大并发连接（B2，#214，0..=64；0 = 自动公式）；新任务生效。
+    pub max_connections_per_task: Option<u32>,
+    /// 分段粒度 MB（B2，#214，1..=1024）；仅无账本新下载采用。
+    pub min_split_mb: Option<u64>,
+    /// 全局自动重试默认次数（B2，#214，0..=10）；任务未指定 auto_retry 时
+    /// 兜底；立即生效（add 时现读）。
+    pub retry_max_attempts: Option<u32>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize, TS)]
@@ -274,6 +289,20 @@ pub struct SettingsDownloadDto {
     pub fsync_batch_segments: u32,
     /// 批量模式阈值二：距上次落盘时长（毫秒）。
     pub fsync_batch_interval_ms: u64,
+    /// 自定义 User-Agent（B2，#214）：空 = 产品默认 smart-dl/&lt;version&gt;。
+    pub user_agent: String,
+    /// 代理例外列表（B2，#214）：host 后缀命中 → 绕过代理直连。
+    pub no_proxy: Vec<String>,
+    /// TCP 连接超时秒（B2，#214；默认 10）。
+    pub connect_timeout_secs: u64,
+    /// 空闲读超时秒（B2，#214；默认 30；无总超时——护长下载）。
+    pub read_timeout_secs: u64,
+    /// 单任务最大并发连接（B2，#214；0 = 自动公式 clamp(total/64MB,2,8)）。
+    pub max_connections_per_task: u32,
+    /// 分段粒度 MB（B2，#214；默认 16；账本恢复沿用原粒度）。
+    pub min_split_mb: u64,
+    /// 全局自动重试默认次数（B2，#214；0 = 任务不指定则不重试）。
+    pub retry_max_attempts: u32,
 }
 
 /// 清理域：Completed 自动清扫。
@@ -495,6 +524,13 @@ impl DaemonState {
                 fsync_per_segment: cfg.download.fsync_per_segment,
                 fsync_batch_segments: cfg.download.fsync_batch_segments,
                 fsync_batch_interval_ms: cfg.download.fsync_batch_interval_ms,
+                user_agent: cfg.download.user_agent.clone(),
+                no_proxy: cfg.download.no_proxy.clone(),
+                connect_timeout_secs: cfg.download.connect_timeout_secs,
+                read_timeout_secs: cfg.download.read_timeout_secs,
+                max_connections_per_task: cfg.download.max_connections_per_task,
+                min_split_mb: cfg.download.min_split_mb,
+                retry_max_attempts: cfg.download.retry_max_attempts,
             },
             rss: SettingsRssDto {
                 auto_refresh: cfg.rss.auto_refresh,
@@ -729,6 +765,77 @@ impl DaemonState {
                 if !(100..=600_000).contains(&v) {
                     return Err(DaemonError::InvalidSource(format!(
                         "download.fsync_batch_interval_ms = {v} 无效：须在 100..=600000"
+                    )));
+                }
+            }
+            // B2（#214）：HTTP 调谐域验证。加载期宽容钳制（config.rs
+            // http_tuning），PUT 侧从严拒绝——先验证后写零副作用。
+            if let Some(v) = d.user_agent.as_deref() {
+                let t = v.trim();
+                if t.len() > 512 {
+                    return Err(DaemonError::InvalidSource(
+                        "download.user_agent 超长（>512）".into(),
+                    ));
+                }
+                if t.contains(['\r', '\n']) {
+                    return Err(DaemonError::InvalidSource(
+                        "download.user_agent 含换行符（头注入防护）".into(),
+                    ));
+                }
+            }
+            if let Some(list) = &d.no_proxy {
+                if list.len() > 64 {
+                    return Err(DaemonError::InvalidSource(
+                        "download.no_proxy 最多 64 条".into(),
+                    ));
+                }
+                for e in list {
+                    let e = e.trim();
+                    if e.is_empty() {
+                        return Err(DaemonError::InvalidSource(
+                            "download.no_proxy 含空条目".into(),
+                        ));
+                    }
+                    if e.len() > 256 {
+                        return Err(DaemonError::InvalidSource(
+                            "download.no_proxy 单条超长（>256）".into(),
+                        ));
+                    }
+                }
+            }
+            if let Some(v) = d.connect_timeout_secs {
+                if !(1..=300).contains(&v) {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "download.connect_timeout_secs = {v} 无效：须在 1..=300"
+                    )));
+                }
+            }
+            if let Some(v) = d.read_timeout_secs {
+                if !(1..=3600).contains(&v) {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "download.read_timeout_secs = {v} 无效：须在 1..=3600"
+                    )));
+                }
+            }
+            if let Some(v) = d.max_connections_per_task {
+                if v > 64 {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "download.max_connections_per_task = {v} 无效：须在 0..=64（0 = 自动公式）"
+                    )));
+                }
+            }
+            if let Some(v) = d.min_split_mb {
+                if !(1..=1024).contains(&v) {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "download.min_split_mb = {v} 无效：须在 1..=1024"
+                    )));
+                }
+            }
+            if let Some(v) = d.retry_max_attempts {
+                // 与任务级 auto_retry 同门（E30：0..=10 防极端配置拖垮调度循环）
+                if v > 10 {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "download.retry_max_attempts = {v} 无效：须在 0..=10"
                     )));
                 }
             }
@@ -983,6 +1090,81 @@ impl DaemonState {
                     restart_required.push("download.fsync_batch_interval_ms".into());
                 }
             }
+            // B2（#214）：HTTP 调谐域——引擎级热改（新任务生效）+ 权威配置
+            // 补丁。整组快照式下发（引擎置换 tuning，非逐字段补丁）：任一
+            // 键提交即以合并后的全量 tuning 下发，applied 只报实际提交键。
+            let b2_touched = d.user_agent.is_some()
+                || d.no_proxy.is_some()
+                || d.connect_timeout_secs.is_some()
+                || d.read_timeout_secs.is_some()
+                || d.max_connections_per_task.is_some()
+                || d.min_split_mb.is_some();
+            if b2_touched {
+                {
+                    let mut cfg_guard = self.live_config.lock();
+                    if let Some(cfg) = cfg_guard.as_mut() {
+                        if let Some(v) = d.user_agent.as_deref() {
+                            cfg.download.user_agent = v.trim().to_string();
+                        }
+                        if let Some(v) = &d.no_proxy {
+                            cfg.download.no_proxy = v
+                                .iter()
+                                .map(|s| s.trim().to_string())
+                                .filter(|s| !s.is_empty())
+                                .collect();
+                        }
+                        if let Some(v) = d.connect_timeout_secs {
+                            cfg.download.connect_timeout_secs = v;
+                        }
+                        if let Some(v) = d.read_timeout_secs {
+                            cfg.download.read_timeout_secs = v;
+                        }
+                        if let Some(v) = d.max_connections_per_task {
+                            cfg.download.max_connections_per_task = v;
+                        }
+                        if let Some(v) = d.min_split_mb {
+                            cfg.download.min_split_mb = v;
+                        }
+                    }
+                }
+                // 引擎热改（失败仅告警不回滚：新任务沿用旧 tuning，快照与
+                // 引擎短暂不一致由下次 PUT / 重启收敛——与 dispatch_bt_patch
+                // 同口径）。
+                let tuning = self
+                    .live_config
+                    .lock()
+                    .as_ref()
+                    .map(|c| c.download.http_tuning())
+                    .unwrap_or_default();
+                self.dispatch_http_tuning(&tuning).await;
+                // 只报实际提交键（fsync 虚报缺陷同教训：整组硬推会虚报计数）
+                if d.user_agent.is_some() {
+                    applied.push("download.user_agent".into());
+                }
+                if d.no_proxy.is_some() {
+                    applied.push("download.no_proxy".into());
+                }
+                if d.connect_timeout_secs.is_some() {
+                    applied.push("download.connect_timeout_secs".into());
+                }
+                if d.read_timeout_secs.is_some() {
+                    applied.push("download.read_timeout_secs".into());
+                }
+                if d.max_connections_per_task.is_some() {
+                    applied.push("download.max_connections_per_task".into());
+                }
+                if d.min_split_mb.is_some() {
+                    applied.push("download.min_split_mb".into());
+                }
+            }
+            // B2（#214）：全局重试默认——add 时现读 live_config（立即生效），
+            // 此处仅补丁权威配置。
+            if let Some(v) = d.retry_max_attempts {
+                if let Some(cfg) = self.live_config.lock().as_mut() {
+                    cfg.download.retry_max_attempts = v;
+                }
+                applied.push("download.retry_max_attempts".into());
+            }
         }
         // B1（#214）：rss 域。max_processed_items_per_feed 为唯一运行时生效
         // 键（刷新路径 rss_max_processed_items 经 live_config 现读，无中间
@@ -1166,6 +1348,18 @@ impl DaemonState {
                 Ok(()) => {}
                 Err(EngineError::Unsupported) => {}
                 Err(e) => tracing::warn!("BT 会话设置下发失败（保留旧值）: {e}"),
+            }
+        }
+    }
+
+    /// HTTP 调谐下发（B2，#214）：能力询问（TD-2 http() 一步到位）——引擎
+    /// 缺失或无 HTTP 面均静默跳过；Unsupported 静默（非 HTTP 引擎默认实现）。
+    pub(super) async fn dispatch_http_tuning(&self, tuning: &smart_dl_core::types::HttpTuning) {
+        if let Some(http) = self.engines.get(&EngineKind::Http).and_then(|e| e.http()) {
+            match http.set_tuning(tuning.clone()).await {
+                Ok(()) => {}
+                Err(EngineError::Unsupported) => {}
+                Err(e) => tracing::warn!("HTTP 调谐下发失败（保留旧值）: {e}"),
             }
         }
     }

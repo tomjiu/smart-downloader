@@ -17,4 +17,33 @@ fsync_batch_segments?: number,
 /**
  * 批量模式阈值二：距上次落盘毫秒（100..=600000；重启生效）。
  */
-fsync_batch_interval_ms?: number, };
+fsync_batch_interval_ms?: number, 
+/**
+ * 自定义 User-Agent（B2，#214）：空串 = 产品默认；新任务生效。
+ */
+user_agent?: string, 
+/**
+ * 代理例外列表（B2，#214）：整表替换；新任务生效。
+ */
+no_proxy?: Array<string>, 
+/**
+ * TCP 连接超时秒（B2，#214，1..=300）；新任务生效。
+ */
+connect_timeout_secs?: number, 
+/**
+ * 空闲读超时秒（B2，#214，1..=3600）；新任务生效。
+ */
+read_timeout_secs?: number, 
+/**
+ * 单任务最大并发连接（B2，#214，0..=64；0 = 自动公式）；新任务生效。
+ */
+max_connections_per_task?: number, 
+/**
+ * 分段粒度 MB（B2，#214，1..=1024）；仅无账本新下载采用。
+ */
+min_split_mb?: number, 
+/**
+ * 全局自动重试默认次数（B2，#214，0..=10）；任务未指定 auto_retry 时
+ * 兜底；立即生效（add 时现读）。
+ */
+retry_max_attempts?: number, };

@@ -20,4 +20,32 @@ fsync_batch_segments: number,
 /**
  * 批量模式阈值二：距上次落盘时长（毫秒）。
  */
-fsync_batch_interval_ms: number, };
+fsync_batch_interval_ms: number, 
+/**
+ * 自定义 User-Agent（B2，#214）：空 = 产品默认 smart-dl/&lt;version&gt;。
+ */
+user_agent: string, 
+/**
+ * 代理例外列表（B2，#214）：host 后缀命中 → 绕过代理直连。
+ */
+no_proxy: Array<string>, 
+/**
+ * TCP 连接超时秒（B2，#214；默认 10）。
+ */
+connect_timeout_secs: number, 
+/**
+ * 空闲读超时秒（B2，#214；默认 30；无总超时——护长下载）。
+ */
+read_timeout_secs: number, 
+/**
+ * 单任务最大并发连接（B2，#214；0 = 自动公式 clamp(total/64MB,2,8)）。
+ */
+max_connections_per_task: number, 
+/**
+ * 分段粒度 MB（B2，#214；默认 16；账本恢复沿用原粒度）。
+ */
+min_split_mb: number, 
+/**
+ * 全局自动重试默认次数（B2，#214；0 = 任务不指定则不重试）。
+ */
+retry_max_attempts: number, };

@@ -173,6 +173,13 @@ const DEFAULTS: Record<string, PatchEntry[]> = {
     ["download", "fsync_per_segment", true],
     ["download", "fsync_batch_segments", 8],
     ["download", "fsync_batch_interval_ms", 2000],
+    ["download", "user_agent", ""],
+    ["download", "no_proxy", []],
+    ["download", "connect_timeout_secs", 10],
+    ["download", "read_timeout_secs", 30],
+    ["download", "max_connections_per_task", 0],
+    ["download", "min_split_mb", 16],
+    ["download", "retry_max_attempts", 0],
     ["scheduler", "start_jitter_seconds", 0],
     ["scheduler", "completion_action", "none"],
   ],
@@ -718,7 +725,7 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
       )}
 
       {/* —— 下载与磁盘 —— */}
-      {hit("下载 download 磁盘 disk 目录 dest 预检 重定向 redirect 错峰 jitter 定时 关机 completion") && (
+      {hit("下载 download 磁盘 disk 目录 dest 预检 重定向 redirect 错峰 jitter 定时 关机 completion 超时 timeout user-agent ua 代理例外 no_proxy 分段 split 连接 connection 重试 retry") && (
       <section className="dl-card">
         <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
           <Icon name="file-directory" size={14} className="dl-sec-ico" /> 下载
@@ -772,6 +779,81 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
             onChange={(e) => patch("download", "fsync_batch_interval_ms", num(e.target.value) ?? 2000)}
           />
           <div className="dl-field-help">100..=600000；两阈值先到者触发（默认 2000ms）</div>
+
+          {/* B2（#214）：HTTP 传输调谐——aria2 对标六项（新任务生效） */}
+          <label className="dl-field-label" htmlFor="set-a11y-31">自定义 User-Agent<Effective kind="new" /></label>
+          <input id="set-a11y-31"
+            className="dl-input"
+            placeholder={`留空 = 产品默认（${"smart-dl/"}<版本>）`}
+            value={s.download.user_agent}
+            onChange={(e) => patch("download", "user_agent", e.target.value)}
+          />
+          <div className="dl-field-help">对齐 aria2 --user-agent；新任务的探测与段请求同源生效（不得含换行）</div>
+          <label className="dl-field-label" htmlFor="set-a11y-32">代理例外（no_proxy）<Effective kind="new" /></label>
+          <textarea id="set-a11y-32"
+            className="dl-input"
+            rows={2}
+            placeholder={"lan\n.corp.example"}
+            value={(s.download.no_proxy ?? []).join("\n")}
+            onChange={(e) =>
+              patch(
+                "download",
+                "no_proxy",
+                e.target.value.split("\n").map((x) => x.trim()).filter((x) => x.length > 0),
+              )
+            }
+          />
+          <div className="dl-field-help">每行一条（host 后缀匹配，命中即绕过代理直连）；对齐 aria2 --no-proxy</div>
+          <label className="dl-field-label" htmlFor="set-a11y-33">连接超时（秒）<Effective kind="new" /></label>
+          <input id="set-a11y-33"
+            className="dl-input"
+            type="number"
+            min={1}
+            max={300}
+            value={s.download.connect_timeout_secs}
+            onChange={(e) => patch("download", "connect_timeout_secs", num(e.target.value) ?? 10)}
+          />
+          <div className="dl-field-help">1..=300（默认 10）；TCP 建连超时，防黑洞地址挂死</div>
+          <label className="dl-field-label" htmlFor="set-a11y-34">读超时（秒）<Effective kind="new" /></label>
+          <input id="set-a11y-34"
+            className="dl-input"
+            type="number"
+            min={1}
+            max={3600}
+            value={s.download.read_timeout_secs}
+            onChange={(e) => patch("download", "read_timeout_secs", num(e.target.value) ?? 30)}
+          />
+          <div className="dl-field-help">1..=3600（默认 30）；空闲读超时（非总超时——长下载不受限）</div>
+          <label className="dl-field-label" htmlFor="set-a11y-35">单任务最大连接数<Effective kind="new" /></label>
+          <input id="set-a11y-35"
+            className="dl-input"
+            type="number"
+            min={0}
+            max={64}
+            value={s.download.max_connections_per_task}
+            onChange={(e) => patch("download", "max_connections_per_task", num(e.target.value) ?? 0)}
+          />
+          <div className="dl-field-help">0..=64；0 = 自动公式 clamp(总量/64MB, 2, 8)；1 = 强制单连接；对齐 aria2 --max-connection-per-server</div>
+          <label className="dl-field-label" htmlFor="set-a11y-36">分段粒度（MB）<Effective kind="new" /></label>
+          <input id="set-a11y-36"
+            className="dl-input"
+            type="number"
+            min={1}
+            max={1024}
+            value={s.download.min_split_mb}
+            onChange={(e) => patch("download", "min_split_mb", num(e.target.value) ?? 16)}
+          />
+          <div className="dl-field-help">1..=1024（默认 16）；仅影响无账本的新下载（断点续传沿用原粒度）；对齐 aria2 --min-split-size</div>
+          <label className="dl-field-label" htmlFor="set-a11y-37">自动重试默认次数<Effective kind="now" /></label>
+          <input id="set-a11y-37"
+            className="dl-input"
+            type="number"
+            min={0}
+            max={10}
+            value={s.download.retry_max_attempts}
+            onChange={(e) => patch("download", "retry_max_attempts", num(e.target.value) ?? 0)}
+          />
+          <div className="dl-field-help">0..=10；任务未显式指定重试次数时的全局默认（指数退避 2/4/8…s，上限 60s）；0 = 不重试</div>
           <label className="dl-field-label" htmlFor="set-a11y-18">错峰随机延迟（秒）<Effective kind="now" /></label>
           <input id="set-a11y-18" className="dl-input" type="number" min={0} value={s.scheduler.start_jitter_seconds} onChange={(e) => patch("scheduler", "start_jitter_seconds", num(e.target.value) ?? 0)} />
           <div className="dl-field-help">新任务在 0..=N 秒内随机延迟启动；0 = 关闭</div>

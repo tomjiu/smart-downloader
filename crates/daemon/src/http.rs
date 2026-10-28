@@ -1840,7 +1840,10 @@ async fn add_task(
 ) -> impl IntoResponse {
     // E30：auto_retry 范围门（0..=10；防极端配置拖垮调度循环）。B1 起三选一
     // 各分支共享（metalink 展开的 HTTP 任务同样消费 auto_retry）。
-    let auto_retry = req.auto_retry.unwrap_or(0);
+    // B2（#214）：任务未显式指定时兜底全局默认（[download] retry_max_attempts，
+    // add 时现读 live_config → 设置热改立即生效）。
+    let global_retry_default = state.http_retry_default();
+    let auto_retry = req.auto_retry.unwrap_or(global_retry_default);
     if auto_retry > 10 {
         return (
             StatusCode::BAD_REQUEST,

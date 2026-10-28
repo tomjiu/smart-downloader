@@ -591,6 +591,54 @@ pub trait HttpEngineExt: DownloadEngine {
         _id: &EngineTaskId,
         _proxy: Option<String>,
     ) -> Result<(), EngineError>;
+
+    /// 引擎级调谐热改（B2，#214 设置覆盖度）：UA / 连接与读超时 /
+    /// 单任务并发上限 / 分段粒度 / 代理例外。**新任务生效**（逐任务 client
+    /// 构建与段计划生成时现读）；存量任务自下一次重下轮（pause→resume /
+    /// 重试重入，epoch+1 重建 client）起跟随。分段粒度仅影响无账本的新下载
+    /// （账本恢复沿用原粒度——WAL 对齐不变量）。非法值（超时 0 等）由
+    /// daemon 校验层拦截，引擎侧信任入参。
+    async fn set_tuning(&self, _tuning: HttpTuning) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+}
+
+/// HTTP 引擎调谐参数（B2，#214）：对标 aria2 `--user-agent` /
+/// `--max-connection-per-server` / `--min-split-size` / `--no-proxy` /
+/// `--connect-timeout` `--timeout`。全量字段快照式下发（非补丁）——
+/// daemon 设置面持有权威值，引擎侧整体置换。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HttpTuning {
+    /// 自定义 User-Agent；空串 = 产品默认 `smart-dl/<version>`（诚实标识，
+    /// 不伪装浏览器）。逐任务 client 与探针请求同源生效（新任务起）。
+    pub user_agent: String,
+    /// 代理例外列表（aria2 `--no-proxy` 对标）：任务 URL 的 host 命中任一
+    /// 条目（后缀匹配，大小写不敏感，条目可带前导 `.`）→ 该任务绕过代理
+    /// 直连；空表 = 全部走代理。
+    pub no_proxy: Vec<String>,
+    /// TCP 连接超时秒（1..=300；默认 10）。仅影响新建连接。
+    pub connect_timeout_secs: u64,
+    /// 空闲读超时秒（1..=3600；默认 30）。不设总超时（护长下载，H-9）。
+    pub read_timeout_secs: u64,
+    /// 单任务最大并发连接（worker 数上限，0..=64）；0 = 自动公式
+    /// clamp(total/64MB, 2, 8)（现状）。1 = 强制单连接。
+    pub max_connections_per_task: u32,
+    /// 分段粒度 MB（1..=1024；默认 16）。仅无账本新下载采用；账本恢复
+    /// 沿用原粒度（WAL 段对齐不变量优先）。
+    pub min_split_mb: u64,
+}
+
+impl Default for HttpTuning {
+    fn default() -> Self {
+        Self {
+            user_agent: String::new(),
+            no_proxy: Vec::new(),
+            connect_timeout_secs: 10,
+            read_timeout_secs: 30,
+            max_connections_per_task: 0,
+            min_split_mb: 16,
+        }
+    }
 }
 
 /// BT 会话级设置补丁（S1）：`apply_bt_session` 入参。字段独立可选——

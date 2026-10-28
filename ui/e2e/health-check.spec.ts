@@ -363,6 +363,13 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
     await expect(page.locator('.dl-field-label:has-text("段数据逐段 fsync")')).toBeVisible();
     await expect(page.locator('.dl-field-label:has-text("批量阈值：累计段数")')).toBeVisible();
     await expect(page.locator('.dl-field-label:has-text("批量阈值：时间间隔（毫秒）")')).toBeVisible();
+    // B2（#214）：HTTP 传输调谐组（aria2 对标）
+    await expect(page.locator('.dl-field-label:has-text("自定义 User-Agent")')).toBeVisible();
+    await expect(page.locator('.dl-field-label:has-text("代理例外（no_proxy）")')).toBeVisible();
+    await expect(page.locator('.dl-field-label:has-text("连接超时（秒）")')).toBeVisible();
+    await expect(page.locator('.dl-field-label:has-text("单任务最大连接数")')).toBeVisible();
+    await expect(page.locator('.dl-field-label:has-text("分段粒度（MB）")')).toBeVisible();
+    await expect(page.locator('.dl-field-label:has-text("自动重试默认次数")')).toBeVisible();
     // BT 节新增两字段
     await expect(page.locator('.dl-field-label:has-text("BT 引擎总开关")')).toBeVisible();
     await expect(page.locator('.dl-field-label:has-text("BT 独立落盘目录")')).toBeVisible();

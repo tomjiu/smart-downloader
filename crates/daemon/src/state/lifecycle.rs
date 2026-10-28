@@ -512,6 +512,17 @@ impl DaemonState {
         self.bootstrap_client.clone()
     }
 
+    /// `[download] retry_max_attempts`（B2，#214）：任务未显式指定 auto_retry
+    /// 时的全局默认。live_config 现读（add 时调用 → 设置热改立即生效）；
+    /// 无权威配置（测试装配）= 0（现状语义）。
+    pub(crate) fn http_retry_default(&self) -> u32 {
+        self.live_config
+            .lock()
+            .as_ref()
+            .map(|c| c.download.retry_max_attempts)
+            .unwrap_or(0)
+    }
+
     /// `[rss] max_processed_items_per_feed`（live_config 注入优先；None = 上层兑底）。
     pub(crate) fn rss_max_processed_items_opt(&self) -> Option<usize> {
         self.live_config
