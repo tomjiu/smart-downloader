@@ -98,6 +98,42 @@ body {
   }
 }
 
+/* ── 页面级容器（#213-2 布局统一）──
+   此前各视图根容器各自内联（gap 14/16 混用、maxWidth 有无不一、
+   SecurityView 直接拿 dl-card 当根），观感突兀。统一为两层结构：
+   .dl-page          所有视图共用：纵向堆叠 + 统一节奏（gap/--space-4）
+   .dl-page--narrow  表单类视图（设置/RSS/安全）：860 阅读宽度 + 居中
+   （任务/日志/统计为全宽数据视图，只用基类）*/
+.dl-page {
+  display: grid;
+  gap: var(--space-4);
+  align-content: start;
+  width: 100%;
+}
+.dl-page--narrow {
+  max-width: 860px;
+  margin-inline: auto;
+}
+
+/* ── 视图切换入场（#213-3）──
+   dl-main 直接子级 = 当前视图的根分块；条件渲染（view === "x" && …）
+   切视图即重挂载 → 入场动画自然触发，纯 CSS 零标记改动。时长走 --dur
+   token，动作语言与 dl-fade / dl-slide 同族（淡入 + 4px 上浮）。 */
+.dl-main > * {
+  animation: dl-view-in var(--dur) ease-out both;
+}
+@keyframes dl-view-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dl-main > * {
+    animation: none;
+  }
+}
+
 /* ── 通用控件（旧 UI 库移除后的基础件）── */
 .dl-btn {
   display: inline-flex;
