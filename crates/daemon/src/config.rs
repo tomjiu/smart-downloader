@@ -54,6 +54,13 @@ pub struct ServerCfg {
     /// 大小写不敏感，剥端口比对。
     #[serde(default)]
     pub extra_allowed_hosts: Vec<String>,
+    /// R24 跨源 CORS 放行 Origin 清单（完整 origin 含端口，如
+    /// `http://ui.lan:3000`）：静态托管 UI → 远程 daemon 场景浏览器读取
+    /// 响应所需。回环 Origin（localhost/127.*/::1）始终放行（与 tokenless
+    /// 守卫的回环信任同口径）；非回环远端建议配 `http_token`（tokenless
+    /// 守卫对非回环 Origin 仍 403，CORS 头不放松它）。不参与热重载。
+    #[serde(default)]
+    pub extra_allowed_origins: Vec<String>,
 }
 
 impl Default for ServerCfg {
@@ -62,6 +69,7 @@ impl Default for ServerCfg {
             addr: "127.0.0.1:8787".into(),
             http_token: None,
             extra_allowed_hosts: Vec::new(),
+            extra_allowed_origins: Vec::new(),
         }
     }
 }
@@ -367,14 +375,29 @@ pub struct WebhookCfg {
 }
 
 /// 已完成任务自动清理配置（E20）：按完成龄期清扫 Completed 任务。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct CleanupCfg {
     /// Completed 任务保留天数（从完成时刻起算）；0 = 禁用（默认）。
     /// 清扫间隔固定 10min；文件默认保留（keep_data）。
     pub auto_remove_completed_days: u32,
-    /// 自动清理时是否同时删除已下载数据；true = 保留文件（默认）。
+    /// 自动清理时是否保留已下载数据；true = 保留文件（默认）。
     pub auto_remove_keep_data: bool,
+}
+
+impl Default for CleanupCfg {
+    fn default() -> Self {
+        CleanupCfg {
+            auto_remove_completed_days: 0,
+            // 与文档口径单源（「文件默认保留」）：修复前此处随 derive 退化
+            // 为 false——用户只写 `[cleanup] auto_remove_completed_days = 7`
+            // 不显式设 keep_data 时，清扫会连已下载数据一起删，与两处
+            // 字段注释（config.rs / settings.rs「默认保留」）相反。
+            // 子表手写 Default 约定（P1-b 同模式：ServerCfg/RssCfg/BtCfg…）
+            // 本就要求与文档声明单源，CleanupCfg 漏挂。
+            auto_remove_keep_data: true,
+        }
+    }
 }
 
 /// 下载完成自动处理配置（E27，清单 #15）：完成后移动 + 外部钩子。
@@ -657,6 +680,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cleanup_defaults_keep_data_per_doc() {
+        // 文档两处口径（config.rs / settings.rs 字段注释）：「文件默认保留」。
+        // 修复前：CleanupCfg 随 derive 退化 keep_data=false——只开
+        // auto_remove_completed_days 不显式设 keep_data 的用户，清扫会
+        // 连已下载数据一起删（与文档相反的数据丢失面）。
+        let c = Config::default();
+        assert_eq!(c.cleanup.auto_remove_completed_days, 0, "默认禁用清扫");
+        assert!(
+            c.cleanup.auto_remove_keep_data,
+            "默认必须保留已下载数据（文档口径）"
+        );
+        // TOML 局部键路径：只写 days 不写 keep_data → 后者取文档默认 true
+        let toml = "[cleanup]\nauto_remove_completed_days = 7\n";
+        let c2: Config = toml::from_str(toml).unwrap();
+        assert_eq!(c2.cleanup.auto_remove_completed_days, 7);
+        assert!(
+            c2.cleanup.auto_remove_keep_data,
+            "局部 [cleanup] 只写 days 时 keep_data 须回退到文档默认 true"
+        );
+    }
+
+    #[test]
     fn fsync_defaults_are_per_segment_wal_strict() {
         // 默认必须保持 P0-4 语义：机械盘用户显式 opt-in 才进批量模式
         let c = Config::default();
@@ -840,6 +885,41 @@ mod tests {
             vec!["MyHost.local".to_string(), " dev.box ".to_string()]
         );
         assert!(!Config::is_loopback_addr(":::8787"));
+    }
+
+    #[test]
+    fn extra_allowed_origins_field_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "sd-cfg-cors-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(&p, "[server]\naddr = \"127.0.0.1:8787\"\n").unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert!(
+            c.server.extra_allowed_origins.is_empty(),
+            "serde default 必须空（不启用 CORS 时不放行任何非回环 Origin）"
+        );
+        std::fs::write(
+            &p,
+            "[server]\nextra_allowed_origins = [\"http://ui.lan:3000\", \" https://cdn.example.org \"]\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        // 原样透传（归一在 builder 注入点做——与 extra_allowed_hosts 同口径）
+        assert_eq!(
+            c.server.extra_allowed_origins,
+            vec![
+                "http://ui.lan:3000".to_string(),
+                " https://cdn.example.org ".to_string()
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

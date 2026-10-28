@@ -598,6 +598,27 @@ impl DownloadEngine for BtEngine {
             _ => return Err(EngineError::Other("source is not bt".to_string())),
         };
         let ih = ih.map_err(|e| EngineError::Other(core_err(&e)))?;
+        // R5 根治（优先级启动竞态，2026-10 多文件本地 swarm 实测）：内核
+        // 三个 add 入口均 paused 落库，本窗口应用任务级子文件优先级不存在
+        // 启动序列竞态——原实现 resume 后才由上层补设，本地极速下载在
+        // 补设前即可完成（skip 非确定性丢失：同脚本两跑 total_wanted
+        // 16MB/24MB 分叉）。恢复重放路径（persistence.rs）的 add 后补设
+        // 同款竞态一并根治。best-effort：失败仅告警不阻断建任务
+        //（magnet 无 metadata 时 FFI 报 NOT_FOUND 属预期，由上层 pending
+        // 重放循环在 metadata 就绪后收敛）。
+        if let Some(prios) = task.file_priorities.as_ref().filter(|p| !p.is_empty()) {
+            let pairs: Vec<(i32, i32)> = prios
+                .iter()
+                .enumerate()
+                .map(|(i, p)| (i as i32, *p as i32))
+                .collect();
+            if let Err(e) = self.core.set_file_priorities(&ih, &pairs) {
+                tracing::warn!(
+                    "add: 初始子文件优先级应用失败（暂停窗口内，可后补）: {}",
+                    core_err(&e)
+                );
+            }
+        }
         // 内核统一语义（Bug A 修复）：三个 add 入口（magnet / .torrent /
         // fastresume 回灌）均 paused + 非 auto_managed 落库。任务层「添加即
         // 下载」：首次 add 成功即 resume——否则 handle 永久暂停，magnet 元数
@@ -663,7 +684,31 @@ impl DownloadEngine for BtEngine {
     async fn status(&self, id: &EngineTaskId) -> Result<EngineStatus, EngineError> {
         // 会话内未注册的 infohash → NotFound（任务已移除/从未添加）。
         match self.core.status(id) {
-            Ok(st) => Ok(map_status(&st)),
+            Ok(st) => {
+                let mut es = map_status(&st);
+                // R18（缺陷④修复）：文件级进度透出——BtCore::file_progress
+                // 引擎层早已存在但此前零生产调用方，map_status 只合成 1 条
+                // 空路径聚合条目（TaskSnapshot.files 契约「BT 多文件与 FTP
+                // 目录任务行为一致」未兑现，UI 文件列表无从渲染）。
+                // names 与 progress 长度一致且非空时逐文件透出；任一失败
+                // （metadata 未就绪/极瞬态）保持旧聚合条目兜底。
+                if let (Ok(paths), Ok(prog)) =
+                    (self.core.file_paths(id), self.core.file_progress(id))
+                {
+                    if !paths.is_empty() && paths.len() == prog.len() {
+                        es.files = paths
+                            .into_iter()
+                            .zip(prog)
+                            .map(|(p, (done, size))| FileProgress {
+                                rel_path: p,
+                                done: done.max(0) as u64,
+                                size: size.max(0) as u64,
+                            })
+                            .collect();
+                    }
+                }
+                Ok(es)
+            }
             Err(_) => Err(EngineError::NotFound),
         }
     }

@@ -27,7 +27,7 @@
 ///   展开栈溢出的路径）；读后显示文件名 + 体积徽章，可移除重选
 
 import { useEffect, useRef, useState } from "react";
-import type { AddTaskReq, ProbeOut } from "@/lib/daemon/types";
+import type { MagnetMetaOut, AddTaskReq, ProbeOut } from "@/lib/daemon/types";
 import { client } from "@/lib/daemon/store";
 import { fmtBytes } from "@/lib/daemon/format";
 import { Icon } from "./Icon";
@@ -173,6 +173,28 @@ export default function NewTaskForm({
     setProbeErr(null);
   };
 
+  /// 磁力元数据预览（体检 #182 R7：magnet 链接的文件清单预览，不建任务）。
+  const [metaOut, setMetaOut] = useState<MagnetMetaOut | null>(null);
+  const [metaErr, setMetaErr] = useState("");
+  const [metaBusy, setMetaBusy] = useState(false);
+
+  /// 磁力元数据抓取（swarm 拉取 metadata，可能需数十秒——按钮态明示）。
+  const runMeta = async () => {
+    const u = url.trim();
+    if (!u) return;
+    setMetaBusy(true);
+    setMetaOut(null);
+    setMetaErr("");
+    try {
+      const out = await client.btMagnetMetadata(u, 30);
+      setMetaOut(out);
+    } catch (e) {
+      setMetaErr(String(e));
+    } finally {
+      setMetaBusy(false);
+    }
+  };
+
   /// 探测预览（仅 URL 模式 http(s)；headers/proxy/auth 随发）。
   const runProbe = async () => {
     const u = url.trim();
@@ -313,20 +335,33 @@ export default function NewTaskForm({
                 if (e.key === "Enter") submit();
               }}
             />
-            <button
-              type="button"
-              className="dl-btn"
-              disabled={probing || !url.trim() || !/^https?:\/\//.test(url.trim())}
-              title={
-                /^https?:\/\//.test(url.trim())
-                  ? "探测大小/落盘名/Range 支持（不建任务；headers/代理/认证随探测下发）"
-                  : "仅 http(s) 直链可预览"
-              }
-              data-testid="probe-btn"
-              onClick={runProbe}
-            >
-              {probing ? "探测中…" : "预览"}
-            </button>
+            {/^magnet:/i.test(url.trim()) ? (
+              <button
+                type="button"
+                className="dl-btn"
+                disabled={metaBusy || !url.trim()}
+                title="从 swarm 抓取元数据预览文件清单（不建任务；可能需数十秒）"
+                data-testid="meta-btn"
+                onClick={runMeta}
+              >
+                {metaBusy ? "抓取元数据中…" : "元数据预览"}
+              </button>
+            ) : (
+              <button
+                type="button"
+                className="dl-btn"
+                disabled={probing || !url.trim() || !/^https?:\/\//.test(url.trim())}
+                title={
+                  /^https?:\/\//.test(url.trim())
+                    ? "探测大小/落盘名/Range 支持（不建任务；headers/代理/认证随探测下发）"
+                    : "仅 http(s) 直链可预览；magnet 链接用元数据预览"
+                }
+                data-testid="probe-btn"
+                onClick={runProbe}
+              >
+                {probing ? "探测中…" : "预览"}
+              </button>
+            )}
           </div>
           {probeOut && (
             <div className="dl-field-help" role="status" data-testid="probe-result" style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
@@ -339,6 +374,32 @@ export default function NewTaskForm({
           {probeErr && (
             <div className="dl-field-help" role="alert" style={{ color: "var(--err)" }}>
               探测失败：{probeErr}
+            </div>
+          )}
+          {metaOut && (
+            <div className="dl-card" style={{ padding: "8px 12px" }} data-testid="meta-result" role="status">
+              <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 6 }}>
+                <span>名称 <b>{metaOut.name}</b></span>
+                <span>大小 <b>{fmtBytes(metaOut.total_size)}</b></span>
+                <span>文件 <b>{metaOut.files.length}</b></span>
+                <span>Piece <b>{metaOut.num_pieces} × {fmtBytes(metaOut.piece_len)}</b></span>
+              </div>
+              <div style={{ maxHeight: 160, overflowY: "auto" }}>
+                {metaOut.files.map((f, i) => (
+                  <div key={i} style={{ display: "flex", justifyContent: "space-between", gap: 10, fontSize: 12, padding: "1px 0" }}>
+                    <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={f.path}>
+                      {f.path}
+                    </span>
+                    <span style={{ color: "var(--fg-3)", flex: "none" }}>{fmtBytes(f.size)}</span>
+                  </div>
+                ))}
+              </div>
+              <div style={{ color: "var(--fg-3)", fontSize: 11, marginTop: 4 }}>infohash: {metaOut.infohash}</div>
+            </div>
+          )}
+          {metaErr && (
+            <div className="dl-field-help" role="alert" style={{ color: "var(--err)" }}>
+              元数据抓取失败：{metaErr}
             </div>
           )}
         </div>

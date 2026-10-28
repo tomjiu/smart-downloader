@@ -530,6 +530,49 @@ impl Session {
         call(code, || Ok(done.into_iter().zip(size).collect()))
     }
 
+    /// 全部文件相对路径（'\n' 分隔批量导出，两段式扩容重试）。
+    /// 单文件 torrent = 1 项（文件名本身）。需要 metadata。
+    /// R18：文件级进度透出的名字源（file_progress 有进度无名）。
+    pub fn file_paths(&self, ih: &str) -> Result<Vec<String>> {
+        let i = self.ih(ih)?;
+        // 两段式：先探测所需字节
+        let mut need: usize = 0;
+        let code = unsafe { lt_file_paths(self.raw, i.as_ptr(), ptr::null_mut(), 0, &mut need) };
+        if code == lt_err_LT_OK {
+            return Ok(Vec::new()); // 空表（无文件）
+        }
+        if code != lt_err_LT_ERR_BUFFER_TOO_SMALL {
+            return Err(Error::from(code));
+        }
+        let mut cap = need;
+        loop {
+            let mut buf = vec![0u8; cap];
+            let mut n: usize = 0;
+            let code2 = unsafe {
+                lt_file_paths(
+                    self.raw,
+                    i.as_ptr(),
+                    buf.as_mut_ptr() as *mut c_char,
+                    buf.len(),
+                    &mut n,
+                )
+            };
+            if code2 == lt_err_LT_OK {
+                buf.truncate(n);
+                let joined = String::from_utf8_lossy(&buf).into_owned();
+                return Ok(joined
+                    .split('\n')
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect());
+            }
+            if code2 != lt_err_LT_ERR_BUFFER_TOO_SMALL {
+                return Err(Error::from(code2));
+            }
+            cap = cap.saturating_mul(2); // 极端：探测与填充间隙文件集变化 → 扩容重试
+        }
+    }
+
     /// 子文件优先级批量设置（P1 任务级能力）。`prio` = (文件下标, 0..=7)，
     /// 内核两段式（全量校验→应用）。需要 metadata（否则 NOT_FOUND）。
     pub fn set_file_priorities(&self, ih: &str, prio: &[(i32, i32)]) -> Result<()> {

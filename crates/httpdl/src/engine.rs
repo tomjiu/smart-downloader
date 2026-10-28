@@ -20,7 +20,7 @@ use smart_dl_core::identity::ContentIdentity;
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
     Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
-    EngineTaskId, HttpEngineExt,
+    EngineTaskId, FileProgress, HttpEngineExt,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -141,6 +141,11 @@ pub fn proxy_auth_of(url: &str) -> Option<(String, String)> {
     Some((u.to_string(), p.to_string()))
 }
 
+/// HTTP 引擎默认 User-Agent（soak #168 实测发现：thinkbroadband 等公网源
+/// 对无 UA 请求返回 403；reqwest 默认不发 UA）。产品 UA（诚实标识，非浏览器
+/// 伪装）；任务级 headers 里的显式 UA 仍可覆盖（reqwest 请求级优先）。
+pub const USER_AGENT: &str = concat!("smart-dl/", env!("CARGO_PKG_VERSION"));
+
 /// 任务级代理 client 构建（E5）：配置与 serve.rs 全局 client 同口径——
 /// connect 10s + read 30s（H-9：不设总超时护长下载）；proxy URL 非法返回 Err
 /// （daemon add 时调用本函数校验，spawn 时重建失败则任务标 Error）。
@@ -153,6 +158,7 @@ pub fn build_proxied_client(proxy_url: &str) -> Result<reqwest::Client, String> 
         None => proxy,
     };
     reqwest::Client::builder()
+        .user_agent(USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(10))
         .read_timeout(std::time::Duration::from_secs(30))
         // A5（cookie jar）：任务级 client 各自独立 jar（与全局 client 隔离），
@@ -1496,7 +1502,22 @@ impl DownloadEngine for HttpEngine {
         Ok(EngineStatus {
             state: t.state,
             metadata_received: true,
-            files: vec![],
+            // 体检 #182 C-2：单文件级进度透出（原恒空数组——快照/详情文件区
+            // 对 HTTP 任务无内容，三方核验只能扫目录）。rel_path = 最终落盘
+            // 名（E9 决策链：显式名 → CD → URL 末段，sanitize_rel 终审），
+            // 与 dest_root 拼接即完整路径；与 BT/FTP 目录任务的 files 口径
+            // 对齐（daemon 快照零改动直接透出）。
+            files: t
+                .resolved_name
+                .clone()
+                .map(|n| {
+                    vec![FileProgress {
+                        rel_path: n,
+                        done: t.done,
+                        size: t.total,
+                    }]
+                })
+                .unwrap_or_default(),
             total_done: t.done,
             total: t.total,
             down_rate,

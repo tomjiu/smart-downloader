@@ -50,9 +50,12 @@ function StatCard({
 export default function StatsView({
   stats,
   history,
+  connected,
 }: {
   stats: Stats | null;
   history: SpeedPoint[];
+  /// R29：连接态（区分「等待连接」与「加载中」；断连重连后重拉 providers）
+  connected: boolean;
 }) {
   // ---- #161 P2：全局限速总阀门 + Provider 状态（视图内自取，SecurityView 模式）----
   const [limits, setLimits] = useState<GlobalLimits | null>(null);
@@ -71,13 +74,17 @@ export default function StatsView({
     }
   }, []);
 
+  // R29：连接态入依赖——断连期间的失败不清空 providers（旧 catch 落 []
+  // 会在断连时误报「未注册 Provider」），重连后自动重拉。
   useEffect(() => {
     loadLimits();
     client
       .providers()
       .then(setProviders)
-      .catch(() => setProviders([]));
-  }, [loadLimits]);
+      .catch(() => {
+        /* 断连保持 null（等待连接态）；重连触发本 effect 重拉 */
+      });
+  }, [loadLimits, connected]);
 
   /// 应用总阀门：空输入 = 不调整该方向；0 = 不限。响应即生效值。
   const applyLimits = async () => {
@@ -95,6 +102,19 @@ export default function StatsView({
       setLimitsBusy(false);
     }
   };
+
+  // R29：从未连上 + 断连 → 明确等待卡（旧体验渲染全零统计 + 「未注册
+  // Provider」，与真实状态不符——侧栏红点之外唯一线索是限速卡错误串）。
+  if (!stats && !connected) {
+    return (
+      <div className="dl-card" data-testid="stats-waiting" style={{ color: "var(--fg-3)", padding: 24 }}>
+        daemon 未连接——统计暂不可用，等待自动重连…
+        <div style={{ fontSize: 12, marginTop: 6 }}>
+          连接恢复后本页自动加载（每秒重试，无需刷新）
+        </div>
+      </div>
+    );
+  }
 
   const st = stats ?? {
     total: 0,
@@ -193,7 +213,9 @@ export default function StatsView({
             <b>云盘 Provider</b>
           </div>
           {providers == null ? (
-            <div style={{ color: "var(--fg-3)", fontSize: 12 }}>加载中…</div>
+            <div style={{ color: "var(--fg-3)", fontSize: 12 }}>
+              {connected ? "加载中…" : "等待 daemon 连接…"}
+            </div>
           ) : providers.length === 0 ? (
             <div style={{ color: "var(--fg-3)", fontSize: 12 }}>未注册 Provider</div>
           ) : (

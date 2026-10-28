@@ -14,4 +14,14 @@ search?: string,
 /**
  * E18：标签 any-of 过滤（逗号分隔多值；大小写不敏感；空白段丢弃）。
  */
-tag?: string, };
+tag?: string, 
+/**
+ * R13：排序键（created/name/state/progress/size/speed/eta；缺省/空白 =
+ * 创建序）。非法值 → 400（与 state/engine 校验同口径，含合法值全集）。
+ */
+sort?: string, 
+/**
+ * R13：排序方向（asc/desc；缺省 = asc）。允许仅给 order 不给 sort
+ * （语义 = 创建序倒序，最新优先）。
+ */
+order?: string, };

@@ -75,6 +75,45 @@ scripts/m0/02_build.ps1     # 构建 ffi 内核 + workspace
 | `xunlei-import` | 迅雷任务导入（隐含 bt） |
 | `nas` | NAS 版迅雷引擎托管（Linux-only） |
 
+### UI e2e（Playwright，真实 daemon + 真实下载 + 真实 UI 产物）
+
+不进 CI（浏览器依赖重，本地/实机跑——与 scripts/manual/ 手工脚本同一姿态）。
+串行执行：全部用例共享同一 daemon（真实状态累积），afterEach 清场。
+
+```bash
+cargo build -p smart-dl-daemon          # debug 即可
+cd ui && npm install && npm run build   # 产出 ui/out（e2e 走真实产物，不用 dev server）
+npx playwright install chromium         # 首次
+npm run test:e2e                        # 主套件
+npx playwright test -c e2e-restart/playwright.config.ts   # 重启韧性独立套件（自带 daemon 生命周期）
+```
+
+| 套件 | 覆盖 |
+|------|------|
+| `critical-paths.spec.ts` | 8 条关键路径：核心下载/限速行为证明/暂停恢复/删除确认/null 名兜底/详情矩阵/新建表单/封禁页 |
+| `sort-server.spec.ts` | 服务端排序回程：表头三态 + 网络层参数证据 + 过滤排序组合 + UI/API 三方一致 |
+| `view-persist.spec.ts` | 视图状态持久化：sort/filter 重载恢复 + 损坏值容错 |
+| `bulk-load.spec.ts` | 120 任务重负载全生命周期：风暴/虚拟滚动护栏/统计一致/toast 双护栏/批量/清场 |
+| `keyboard-nav.spec.ts` | 键盘导航：↑/↓ 跨虚拟窗口接力 + Enter/Esc 焦点归还 + Space 选中 |
+| `e2e-restart/`（独立） | daemon kill -9 重启后 SSE live 流自愈（seq 归零探测） |
+
+### 契约对齐审计（npm run audit:routes）
+
+前后端路由 × 调用点双向核验（体检 A 层工具入库，#202 勘误后版本——
+`req()` / `fetch(url(...))` / `EventSource` 三通道全覆盖）：
+
+- **破窗**（UI 调用无对应路由）：任何一条即 FAIL——字段改名 / 路由删除
+  在此显形，不必等运行时 404；
+- **盲区**（路由无 UI 消费者）：对照 by-design 登记簿分类（config/health/
+  metrics/version/ws/nas×5/xunlei-import 等 daemon-only 运维端点，及
+  `DELETE /security/bans` 旧解禁通道——UI 已迁 `POST /security/bans/unban`，
+  DELETE 保留兼容既有 CLI/脚本调用方），
+  未登记者列出待人工判定（新缺口 or 需登记）。
+
+```bash
+cd ui && npm run audit:routes
+```
+
 ### CLI 速查
 
 ```bash
@@ -92,7 +131,7 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `/tasks` | GET / POST | 任务列表（`?state=`/`?engine=` 过滤、`?search=` 关键字、`?tag=` 标签 any-of、`?limit`/`?offset` 分页 + `X-Total-Count`）/ 建任务（HTTP、FTP 目录、magnet、.torrent；能力字段：任务级代理/自定义 headers/Basic 凭据/顺序下载/trackers/限速/校验 sha256·sha1·md5/`backup_url`+`backup_md5`/显式 `name`/`conflict_policy`/`start_at_unix` 定时/`auto_retry` 自动重试预算） |
+| `/tasks` | GET / POST | 任务列表（`?state=`/`?engine=` 过滤、`?search=` 关键字、`?tag=` 标签 any-of、`?sort=`/`?order=` 服务端排序【created·name·state·progress·size·speed·eta × asc·desc，排序在分页前应用；仅 `?order=desc` = 最新优先】、`?limit`/`?offset` 分页 + `X-Total-Count`）/ 建任务（HTTP、FTP 目录、magnet、.torrent；能力字段：任务级代理/自定义 headers/Basic 凭据/顺序下载/trackers/限速/校验 sha256·sha1·md5/`backup_url`+`backup_md5`/显式 `name`/`conflict_policy`/`start_at_unix` 定时/`auto_retry` 自动重试预算） |
 | `/tasks/batch` | POST | 批量操作：显式 `ids`（≤100，pause/resume/remove）或条件 `select`（state/engine/tag/search 任一，仅 pause/resume 非破坏动作） |
 | `/tasks/:id` | GET / DELETE | 快照（files 明细 + 实时速率 + 累计流量/分享率 + 标签 + 顺序下载标志）/ 删除（`?delete_data=true` 引擎侧同删已下载数据） |
 | `/tasks/:id/pause` · `/resume` | POST | 生命周期（定时等待中任务：pause = 取消自动启动，resume = 立即激活；终态 Failed 任务 resume = 手动重试重新接入引擎） |
@@ -113,13 +152,23 @@ smart-dl import-xunlei <xlbt.cfg ...>       # 迅雷任务导入（可选）
 | `/metrics` | GET | Prometheus 指标（text/plain；任务按状态/引擎计数 + 聚合速率） |
 | `/providers` | GET | Provider 状态 |
 | `/probe` | POST | 探测预览：不建任务取 URL 元数据（大小/服务端文件名/Range/ETag/Last-Modified/Content-Type + `suggest_name`；headers/代理/Basic 凭据同 add 语义；v1 仅 HTTP 源） |
-| `/events` | GET | 事件历史查询（seq 游标分页 + task_id/type 过滤 + 缺口报警） |
-| `/events/stream` | GET | 事件流（SSE：历史重放 + 活流尾随，Last-Event-ID 断线续传） |
+| `/events` | GET | 事件历史查询（seq 游标分页 + task_id/type 过滤 + 缺口报警 + `latest_seq` 已发布最大 seq——live 边界：增量消费方先取此值再以 `after=` 订阅/轮询，只收增量） |
+| `/events/stream` | GET | 事件流（SSE：`after=` 游标历史重放 + 活流尾随，Last-Event-ID 断线续传；Web UI 以 `after=latest_seq` 仅订阅增量——历史事件对用户是历史而非现场，不弹现场提示） |
 | `/ws` | GET | 事件流（WebSocket，背压保护） |
+
+事件通道选型：**Web UI 用 SSE**（`/events/stream`，EventSource 原生断线续传）；
+**桌面壳/脚本等非浏览器消费者用 WS**（`/ws`，双向 + 背压保护 + 连接即推全量
+快照）；事后对账/补拉用 REST（`/events` 游标分页）。三通道共用同一 Envelope
+与 WsHub 环形缓冲（契约详见 `docs/IMPLEMENTED.md` E12/M7）。
+
+以下端点为 **daemon-only**（无 Web UI 入口，面向脚本/运维/CLI 消费）：
+`/nas/*`（NAS 版迅雷引擎托管，Linux-only）、`/tasks/xunlei-import`（CLI 子命令
+`xunlei-import` 使用）、`/config`（GET 只读快照，UI 设置页走 `/settings`）、
+`/metrics`（Prometheus 抓取）。
 
 ## 配置
 
-TOML 配置（默认 `./config.toml`，任务状态 `./tasks.json`）：`[download]`（dest_root/并发/限速/代理/disk_precheck_strict 磁盘预检严格模式/fsync_per_segment 段落盘策略——true 每段 fsync（默认，崩溃一致性最严）；false 批量模式，累计 fsync_batch_segments 段或 fsync_batch_interval_ms 毫秒先到者一次「数据 fsync+账本落盘」，机械盘吞吐推荐，WAL 语义不变；基准见 scripts/manual/fsync_bench.sh）、`[bt]`（save_path/DHT/LSD/UPnP/做种）、`[provider]`（fallback 链）、`[server]`（bind/token）、`[webhook]`（任务完成通知 URL，POST JSON，fire-and-forget）、`[cleanup]`（auto_remove_completed_days 已完成任务 N 天后自动清扫，0 = 禁用；auto_remove_keep_data 默认保留文件）、`[post_download]`（完成后自动处理：move_to 移动到目标目录 + hook 外部程序，环境变量 SD_TASK_ID/SD_TASK_NAME/SD_FILE_PATH/SD_ENGINE 传任务上下文；空 = 禁用）、`[scheduler]`（start_jitter_seconds 错峰随机延迟上限，秒；0 = 关）。支持热重载。
+TOML 配置（默认 `./config.toml`，任务状态 `./tasks.json`）：`[download]`（dest_root/并发/限速/代理/disk_precheck_strict 磁盘预检严格模式/fsync_per_segment 段落盘策略——true 每段 fsync（默认，崩溃一致性最严）；false 批量模式，累计 fsync_batch_segments 段或 fsync_batch_interval_ms 毫秒先到者一次「数据 fsync+账本落盘」，机械盘吞吐推荐，WAL 语义不变；基准见 scripts/manual/fsync_bench.sh）、`[bt]`（save_path/DHT/LSD/UPnP/做种）、`[provider]`（fallback 链）、`[server]`（bind/token/extra_allowed_origins 跨源 CORS 放行 Origin 清单——静态托管 UI → 远程 daemon 场景浏览器读取所需；回环 Origin 始终放行，非回环远端建议配 token）、`[webhook]`（任务完成通知 URL，POST JSON，fire-and-forget）、`[cleanup]`（auto_remove_completed_days 已完成任务 N 天后自动清扫，0 = 禁用；auto_remove_keep_data 默认保留文件）、`[post_download]`（完成后自动处理：move_to 移动到目标目录 + hook 外部程序，环境变量 SD_TASK_ID/SD_TASK_NAME/SD_FILE_PATH/SD_ENGINE 传任务上下文；空 = 禁用）、`[scheduler]`（start_jitter_seconds 错峰随机延迟上限，秒；0 = 关）。支持热重载。
 
 ## 文档地图
 

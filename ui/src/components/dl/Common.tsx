@@ -1,8 +1,10 @@
 "use client";
-/// 通用小件：状态徽章 / 进度条 / 速率胶囊 / 空态 / 确认对话框 / 表格骨架。
+/// 通用小件：状态徽章 / 进度条 / 速率胶囊 / 空态 / 确认对话框 / 表格骨架 / daemon 不可达面板。
 /// Issue #115 Phase 1：全部改用 dl-* token 体系（旧库 class 已清零）。
 /// 交互打磨批：ConfirmDialog（危险操作确认，alertdialog 语义 + Esc +
 /// 初始焦点取消按钮）；TableSkeleton（E8：首帧数据未到时不再误报「暂无任务」）。
+/// R24：DaemonDown——首帧未到且轮询全败时替换骨架（区分「加载中」与
+/// 「daemon 未启动」，首跑时序 UI 先于 daemon 是常见场景）。
 
 import { useEffect, useRef } from "react";
 import { fmtBytes, fmtPct, fmtSpeed, fmtUnixShort } from "@/lib/daemon/format";
@@ -170,6 +172,68 @@ export function TableSkeleton({ rows = 8 }: { rows?: number }) {
           <span style={{ width: "8%", height: 10 }} />
         </div>
       ))}
+    </div>
+  );
+}
+
+/// R24/R25：daemon 连接失败面板（双变体）。触发条件 = 首帧未到
+/// （loaded=false）且最近一轮双请求（/tasks + /stats）全败——与
+/// TableSkeleton（daemon 可达、数据在途）严格互斥。旧体验：骨架条无限
+/// 渲染，用户无法分辨「慢加载」与「daemon 未启动」；且令牌配错（HTTP
+/// 401/403，daemon 活着）与网络不可达（拒绝/超时）同脸——排障方向完全
+/// 错误。变体（R25，HttpError 分类驱动）：
+/// - unreachable：网络层失败——指引检查 daemon 启动/地址可达；
+/// - auth：HTTP 401/403——daemon 已应答但拒绝，指引检查令牌/白名单。
+/// 恢复路径零交互：轮询每秒自动重试，daemon 起来/凭据修正即自愈
+/// （connected 翻转驱动，e2e 有全链护栏）。
+export function DaemonDown({
+  base,
+  hasToken,
+  mode = "unreachable",
+}: {
+  base: string;
+  hasToken: boolean;
+  mode?: "unreachable" | "auth";
+}) {
+  const auth = mode === "auth";
+  return (
+    <div
+      className={`dl-daemon-down${auth ? " is-auth" : ""}`}
+      role="alert"
+      data-testid="daemon-down"
+      data-mode={mode}
+    >
+      <div className="dl-empty-orb">
+        <Icon name={auth ? "shield" : "server"} size={22} />
+      </div>
+      <div className="dl-dd-title">
+        {auth ? "认证失败（daemon 拒绝了请求）" : "无法连接 daemon"}
+      </div>
+      <div className="dl-dd-meta">
+        <span className="dl-dd-k">地址</span>
+        <code className="dl-dd-v" data-testid="daemon-down-base">
+          {base || "同源（当前页面地址）"}
+        </code>
+      </div>
+      <div className="dl-dd-meta">
+        <span className="dl-dd-k">令牌</span>
+        <span className="dl-dd-v">{hasToken ? "已设置（Bearer）" : "未设置"}</span>
+      </div>
+      <div className="dl-dd-hint">
+        {auth ? (
+          <>
+            daemon 已连接但返回 401/403——请检查 Bearer 令牌（设置 → 连接 →
+            Bearer Token）是否与服务端 <code>http_token</code> 一致；若走反向
+            代理/跨源，还需服务端 <code>extra_allowed_hosts</code> /
+            <code>extra_allowed_origins</code> 白名单放行。
+          </>
+        ) : (
+          <>
+            请确认 daemon 已启动（<code>smart-dl-daemon serve</code>）且地址可达。
+            页面每秒自动重试，无需刷新——连接恢复后自动进入任务列表。
+          </>
+        )}
+      </div>
     </div>
   );
 }

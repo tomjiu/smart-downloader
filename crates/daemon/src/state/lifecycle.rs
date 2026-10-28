@@ -24,6 +24,7 @@ impl DaemonState {
             slot_reservations: Mutex::new(HashSet::new()),
             ban_replay_failed: Mutex::new(Vec::new()),
             extra_allowed_hosts: Vec::new(),
+            extra_allowed_origins: Vec::new(),
             global_limits: Mutex::new(GlobalLimits {
                 max_download_kb_s: 0,
                 max_upload_kb_s: 0,
@@ -121,6 +122,16 @@ impl DaemonState {
     /// 场景（如 `myhost.local`）。仅 tokenless 模式消费；配置 token 后无效。
     pub fn with_extra_allowed_hosts(mut self, hosts: Vec<String>) -> Self {
         self.extra_allowed_hosts = hosts
+            .into_iter()
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect();
+        self
+    }
+
+    /// R24：CORS 额外放行 Origin 注入（config.server.extra_allowed_origins）。
+    pub fn with_extra_allowed_origins(mut self, origins: Vec<String>) -> Self {
+        self.extra_allowed_origins = origins
             .into_iter()
             .map(|h| h.trim().to_ascii_lowercase())
             .filter(|h| !h.is_empty())

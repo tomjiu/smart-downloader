@@ -146,8 +146,9 @@ pub struct TaskSnapshot {
     pub total: u64,
     #[ts(optional)]
     pub error: Option<String>,
-    /// 文件级进度（实时读引擎 status().files；单文件/无文件引擎为空数组）。
-    /// FTP 目录任务与 BT 多文件任务在此处行为一致（都从引擎状态链透出）。
+    /// 文件级进度（实时读引擎 status().files）。BT 多文件 / FTP 目录 /
+    /// HTTP 单文件（体检 #182 C-2 起 httpdl 透出 [rel_path=落盘名, done,
+    /// size]）三口径一致；无文件概念的引擎为空数组。
     pub files: Vec<FileProgress>,
     /// 实时速率（E13）：取自与 `done`/`total` 同一次引擎快照，非 `engine_status`
     /// 轮询缓存（缓存 2s 龄且仅活跃任务有写入，快照应即时）。记录级 Paused
@@ -218,6 +219,12 @@ pub struct TaskSnapshot {
     #[serde(skip_serializing_if = "is_zero_u64")]
     #[ts(optional = nullable)]
     pub next_retry_at_unix: u64,
+    /// 队列优先级（体检 #182 C-1 持久透出）：数值越小越先出队（top = 队列
+    /// 最小值 - 1；0 = 默认，序列化省略）。原仅 set 响应回显——UI 重启后
+    /// 无法回显当前值，现入快照与列表两口径。
+    #[serde(skip_serializing_if = "is_zero_i32")]
+    #[ts(optional = nullable)]
+    pub queue_priority: i32,
 }
 
 /// 实时速率（E13 透出）：与快照 `done`/`total` 同一次引擎快照取样——
@@ -280,12 +287,59 @@ pub struct TaskSummary {
     #[serde(skip_serializing_if = "is_zero_u64")]
     #[ts(optional = nullable)]
     pub next_retry_at_unix: u64,
+    /// 队列优先级（体检 #182 C-1）：同 TaskSnapshot 口径（0 = 默认省略）。
+    #[serde(skip_serializing_if = "is_zero_i32")]
+    #[ts(optional = nullable)]
+    pub queue_priority: i32,
+}
+
+/// 列表排序键（R13 `?sort=`）。`None` = 创建序（兼容不变，与既有行为
+/// 逐字节等同）；有值时在**过滤之后、分页之前**应用（分页语义成立的前提）。
+/// 排序值口径：
+/// - `Created`：task_id 数值后缀（即创建序本身，供 `?order=desc` 反转为最新优先）
+/// - `Name`：展示名 = 显式名 → 来源末段派生（与 UI `displayName` 同链），
+///   Unicode 简单小写比较（UI 侧 localeCompare("zh-Hans-CN") 存在口径差，
+///   服务端不依赖 locale —— 文档声明）
+/// - `State`：状态标签串（英文枚举名，字典序）
+/// - `Progress`/`Size`/`Speed`/`Eta`：引擎快照缓存（`engine_status`，轮询器
+///   写入；非活跃任务无缓存或字段为 0 → 按 0/无穷处理）
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListSort {
+    Created,
+    Name,
+    State,
+    Progress,
+    Size,
+    Speed,
+    Eta,
+}
+
+/// 合法排序键全集（HTTP 层 `?sort=` 校验依据；与 `ListSort` 变体同步——
+/// 新增变体时编译期漏项由测试锁定）。
+pub fn known_sort_keys() -> Vec<String> {
+    [
+        "created", "name", "state", "progress", "size", "speed", "eta",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// 排序方向（R13）：`Asc` 为默认（`?sort=created` 与无参数行为等同）。
+/// 允许仅给 `?order=desc` 不给 `sort` —— 语义 = 创建序倒序（最新优先，
+/// 真实用户高频需求）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ListOrder {
+    #[default]
+    Asc,
+    Desc,
 }
 
 /// 列表过滤/分页查询（E7）。`states`/`engines` 空 = 不过滤；匹配均大小写不敏感。
 /// `limit`/`offset` 由 HTTP 层校验（limit 1..=500，offset ≥ 0 由类型保证）后下推。
 /// `search`（E14）：关键字子串匹配任务名或来源 URL（均大小写不敏感；
 /// None/空串 = 不过滤），语料经 `DownloadSource::search_urls` 脱敏。
+/// `sort`/`order`（R13）：见 [`ListSort`]/[`ListOrder`]；None + Asc = 既有创建序。
 #[derive(Clone, Debug, Default)]
 pub struct ListQuery {
     pub states: Vec<String>,
@@ -296,6 +350,10 @@ pub struct ListQuery {
     /// 标签 any-of 过滤（E18）：空 = 不过滤；命中任一标签即保留（维度内
     /// OR、与 states/engines/search 维度间 AND）；大小写不敏感。
     pub tags: Vec<String>,
+    /// 排序键（R13）：None = 创建序（兼容不变）。
+    pub sort: Option<ListSort>,
+    /// 排序方向（R13）：默认 Asc；仅当 sort 为 None 时对创建序生效。
+    pub order: ListOrder,
 }
 
 /// 合法状态标签全集（E7 `?state=` 校验依据；与 `state_label` 输出同步——
@@ -556,6 +614,12 @@ fn is_zero_u64(v: &u64) -> bool {
     *v == 0
 }
 
+/// serde skip_serializing_if 谓词：queue_priority 为 0（默认）时省略
+/// （体检 #182 C-1：与 start_at_unix 同口径的向后兼容策略）。
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
+}
+
 fn is_hex_digest(s: &str, len: usize) -> bool {
     s.len() == len && s.chars().all(|c| c.is_ascii_hexdigit())
 }
@@ -671,6 +735,9 @@ pub struct DaemonState {
     /// tokenless 模式额外放行 Host 名（batch8）：Host/Origin 同源守卫白名单
     /// 扩展（反代域名等）。仅 http_token 未配置时消费；启动注入，不热更。
     pub(crate) extra_allowed_hosts: Vec<String>,
+    /// R24 CORS 额外放行 Origin（完整 origin 含端口）：跨源 UI 读取响应
+    /// 所需（回环 Origin 始终放行）。启动注入，不热更。
+    pub(crate) extra_allowed_origins: Vec<String>,
     /// ban 重放失败待重试集（batch7-P2）：replay_bans 单条失败（引擎瞬时
     /// 不可用/下发报错）不再仅 warn 后整会话丢失——挂入本集，由 serve
     /// 30s tick 经 retry_pending_bans 重发至成功。仅内存（重启自然重放）。

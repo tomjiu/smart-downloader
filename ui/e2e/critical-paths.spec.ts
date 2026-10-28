@@ -322,17 +322,38 @@ test.describe.serial('关键路径 e2e（真实 daemon + 真实下载）', () =>
     };
     expect(bans.banned).toEqual([]);
 
-    // 8c. 封禁尝试（无 BT 引擎构建 → 逐条回执 ok:false + 原因，UI 原样透出
-    //     ——这是「不隐藏引擎边界」的契约面；真实封禁链路由 CI bt job 覆盖）
+    // 8c. 封禁尝试（构建自适应）：
+    //     - 无 BT 引擎构建 → 1.2.3.4 与 not-an-ip 均回执 ok:false（「不隐藏
+    //       引擎边界」契约面），列表保持空态
+    //     - bt 构建 → 1.2.3.4 真实入表（CI bt job 同套件可跑），not-an-ip
+    //       仍 ✗ 逐条透出
     await page.getByTestId('bans-add-input').fill('1.2.3.4\nnot-an-ip');
     await page.getByTestId('bans-add-submit').click();
     const results = page.getByTestId('bans-results');
     await expect(results).toBeVisible({ timeout: 5_000 });
     await expect(results).toContainText('1.2.3.4');
     await expect(results).toContainText('not-an-ip');
-    await expect(results).toContainText('✗');
-    // 回执后列表仍为空（全部失败不入表）
-    await expect(page.getByText('暂无封禁项')).toBeVisible();
+    await expect(results).toContainText('✗'); // not-an-ip 恒失败（两种构建一致）
+    const bansAfter = (await request.get(`${BASE}/security/bans`).then((r) => r.json())) as {
+      banned: string[];
+    };
+    if (bansAfter.banned.includes('1.2.3.4')) {
+      // bt 构建：真实封禁成功 → UI 列表显示该条目（不再空态）
+      await expect(page.getByText('1.2.3.4').first()).toBeVisible({ timeout: 5_000 });
+      // 清场（超合并验证 F1）+ 解禁 UI 路径覆盖：走行级「解禁」按钮
+      // （#187 规范通道；串行共享 daemon 下封禁表是跨套件全局态，残留会
+      // 毒害后续 health-check HC-1 的空态断言）。解禁后 UI 自行刷新列表。
+      await page.getByTestId('ban-remove').first().click();
+      await expect(page.getByText('暂无封禁项')).toBeVisible({ timeout: 5_000 });
+      // API 双确认：封禁表确已清空（不只是 UI 视图）
+      const bansFinal = (await request.get(`${BASE}/security/bans`).then((r) => r.json())) as {
+        banned: string[];
+      };
+      expect(bansFinal.banned).toEqual([]);
+    } else {
+      // 无 bt 构建：全部失败不入表 → 空态保持
+      await expect(page.getByText('暂无封禁项')).toBeVisible();
+    }
     expect(pageErrors, '页面不得有未捕获异常').toEqual([]);
   });
 });

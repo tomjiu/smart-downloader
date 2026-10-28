@@ -187,10 +187,10 @@ async fn gate_rejects_on_backup_unreachable() {
         ..Default::default()
     })
     .await;
-    // 备用源地址：占一个端口后立即释放（connect refused）
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let dead = listener.local_addr().unwrap();
-    drop(listener);
+    // 备用源地址：确定性死源——特权端口 1（非 root 无法 bind → 永无监听者，
+    // 连接必 refused）。原「占端口后立即释放」在并行测试下有端口复用时序
+    // 竞态（与 source_probe_resilience 的 #165 CI 偶发同根因）。
+    let dead = std::net::SocketAddr::from(([127, 0, 0, 1], 1));
 
     let dir = tempfile::tempdir().unwrap();
     let engine = HttpEngine::new(reqwest::Client::new());

@@ -26,10 +26,10 @@ import type {
   TaskRate,
   TaskSnapshot,
 } from "@/lib/daemon/types";
-import { client } from "@/lib/daemon/store";
+import { client, getBase, getToken, HttpError } from "@/lib/daemon/store";
 import TasksTable, {
   displayName,
-  taskSortValue,
+  type SortKey,
   type TaskAction,
   type TableSort,
 } from "./TasksTable";
@@ -40,10 +40,10 @@ import SettingsView from "./SettingsView";
 import SecurityView from "./SecurityView";
 import TaskDetail from "./TaskDetail";
 import NewTaskForm from "./NewTaskForm";
-import Toolbar, { type TaskFilterKey, type ViewKey } from "./Toolbar";
+import Toolbar, { TASK_FILTERS, type TaskFilterKey, type ViewKey } from "./Toolbar";
 import Sidebar from "./Sidebar";
 import StatusBar from "./StatusBar";
-import { ConfirmDialog, TableSkeleton } from "./Common";
+import { ConfirmDialog, DaemonDown, TableSkeleton } from "./Common";
 import { Icon } from "./Icon";
 
 type SpeedPoint = { down: number; up: number };
@@ -65,6 +65,43 @@ const SEGMENT_STATES: Record<Exclude<TaskFilterKey, "all">, string> = {
 /// SSE 速率新鲜度 TTL（与 TasksTable.RATE_TTL_MS 同口径；DlApp 侧的
 /// 过期清理 interval 消费）。
 const RATE_TTL_MS = 5000;
+
+/// R15 视图状态持久化（qB 式「记住我的列表」）：sort / filter / view
+/// 三态存 localStorage；搜索框不持久化（陈旧搜索会在重载后造成「列表
+/// 为何是空的」困惑——qB 同款决策）。恢复值全部校验（旧版本/损坏/
+/// 手改的键值 → 回落默认），typeof window 守卫防 SSG 预渲染崩溃；
+/// 恢复走挂载后 useEffect 而非 lazy initializer——避免服务端渲染
+/// 默认态与客户端恢复态的 hydration 不匹配（与 dl.side 同模式）。
+const VIEW_KEYS: ViewKey[] = ["tasks", "stats", "rss", "logs", "security", "settings"];
+const SORT_KEYS = ["name", "state", "progress", "speed", "size", "eta"] as const;
+
+function restoreView(): ViewKey {
+  const raw = localStorage.getItem("dl.view");
+  return VIEW_KEYS.includes(raw as ViewKey) ? (raw as ViewKey) : "tasks";
+}
+
+function restoreFilter(): TaskFilterKey {
+  const raw = localStorage.getItem("dl.filter");
+  const keys = TASK_FILTERS.map((f) => f.key) as readonly string[];
+  return keys.includes(raw ?? "") ? (raw as TaskFilterKey) : "all";
+}
+
+function restoreSort(): TableSort {
+  const raw = localStorage.getItem("dl.sort");
+  if (!raw) return null;
+  try {
+    const v = JSON.parse(raw) as { key?: unknown; dir?: unknown };
+    if (
+      (SORT_KEYS as readonly string[]).includes(v.key as string) &&
+      (v.dir === "asc" || v.dir === "desc")
+    ) {
+      return { key: v.key as SortKey, dir: v.dir };
+    }
+  } catch {
+    /* 损坏 JSON → 默认 */
+  }
+  return null;
+}
 
 /// 活跃（非终态）任务状态集（P1-5-C：全终态时冻结快照轮询的判定口径；
 /// 与 Common.tsx StateBadge 的 live 集一致 + Queued/Evaluating/Paused
@@ -94,6 +131,21 @@ export default function DlApp() {
   const [events, setEvents] = useState<SchedulerEventEnvelope[]>([]);
   const [connected, setConnected] = useState(false);
   const [detail, setDetail] = useState<string | null>(null);
+  /// R17 焦点归还（WAI-ARIA 对话框模式）：开抽屉前的触发元素（行），
+  /// 关闭后归还焦点（键盘用户不被扔回 body；虚拟滚动已回收行则放弃）。
+  const detailTriggerRef = useRef<HTMLElement | null>(null);
+  const openDetail = useCallback((id: string) => {
+    detailTriggerRef.current =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    setDetail(id);
+  }, []);
+  useEffect(() => {
+    if (detail !== null) return;
+    const el = detailTriggerRef.current;
+    if (!el) return;
+    detailTriggerRef.current = null;
+    if (el.isConnected) el.focus();
+  }, [detail]);
   const [toasts, setToasts] = useState<{ id: number; kind: string; text: string }[]>([]);
   const [filter, setFilter] = useState<TaskFilterKey>("all");
   const [query, setQuery] = useState("");
@@ -106,9 +158,24 @@ export default function DlApp() {
   }, [query]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
+  /// R24：挂载后捕获连接目标（localStorage 仅客户端可读；面板晚于首拍
+  /// 渲染，彼时必就绪——首拍骨架与 SSR HTML 一致，无 hydration 风险）。
+  useEffect(() => {
+    setDd({ base: getBase(), hasToken: !!getToken() });
+  }, []);
   const [adding, setAdding] = useState(false);
   /// E8：首帧数据是否已到（区分「加载中」骨架与「暂无任务」空态）。
   const [loaded, setLoaded] = useState(false);
+  /// R24：首轮轮询是否已决（区分「首次请求在途」与「daemon 不可达」）。
+  /// 门控 DaemonDown 面板：正常加载首拍（请求在飞、connected 仍 false）
+  /// 必须显示骨架而非面板——否则每次健康加载都会闪「无法连接」。
+  const [polled, setPolled] = useState(false);
+  /// R25：全败且拒绝原因是 HTTP 401/403——daemon 可达但拒绝（令牌错/
+  /// 白名单未放行），面板切换认证失败变体（文案/指引与网络不可达分道）。
+  const [authFailed, setAuthFailed] = useState(false);
+  /// R24：面板要展示的连接目标（localStorage 仅客户端可读，挂载后捕获；
+  /// 面板只在轮询决出后渲染，彼时已就绪）。
+  const [dd, setDd] = useState<{ base: string; hasToken: boolean } | null>(null);
   /// 表头排序（null = 后端默认序）。
   const [sort, setSort] = useState<TableSort>(null);
   /// 危险操作确认（删除任务/批量删除）。
@@ -119,12 +186,18 @@ export default function DlApp() {
     danger: boolean;
     run: () => Promise<void>;
   } | null>(null);
-  const historyRef = useRef<SpeedPoint[]>([]);
-  const [historyTick, setHistoryTick] = useState(0);
+  /// 速率曲线历史（不可变更新：新数组引用驱动 SpeedChart useMemo 重算）。
+  /// 修复：旧实现 historyRef 原地 push + historyTick 驱动重渲染——但
+  /// StatsView 拿到的 history 引用永不变，SpeedChart 的 useMemo([data])
+  /// 引用相等短路，曲线在挂载后永久冻结（切走再切回才重算）。
+  /// 无变化返旧引用：速率未变时跳过重渲染（保留原优化意图）。
+  const [history, setHistory] = useState<SpeedPoint[]>([]);
 
   const toast = useCallback((t: { kind: string; text: string }) => {
     const id = Date.now() + Math.random();
-    setToasts((cur) => [...cur, { id, ...t }]);
+    // R16：并发上限 3（最旧挤掉）——批量完成风暴不把 UI 埋进 toast 堆
+    // （120 任务导入后重载曾被 120 个「任务完成」toast 连环遮挡按钮）。
+    setToasts((cur) => [...cur, { id, ...t }].slice(-3));
     setTimeout(() => setToasts((cur) => cur.filter((x) => x.id !== id)), 4200);
   }, []);
 
@@ -142,6 +215,27 @@ export default function DlApp() {
     if (saved === "1" || saved === "0") setSideCollapsed(saved === "1");
     else if (window.innerWidth <= 900) setSideCollapsed(true);
   }, []);
+
+  /// R15：视图状态恢复（挂载后一次；校验过的合法值才生效）。首拍列表
+  /// 请求以默认序发出，恢复的 sort 生效后 listParams 变化 → 即时重拉
+  /// 带排序的新序（两拍收敛，无需专门等待）。
+  useEffect(() => {
+    setView(restoreView());
+    setFilter(restoreFilter());
+    setSort(restoreSort());
+  }, []);
+
+  /// R15：变更即持久化（sort=null 清键——回默认序后重载不再恢复旧序）。
+  useEffect(() => {
+    localStorage.setItem("dl.view", view);
+  }, [view]);
+  useEffect(() => {
+    localStorage.setItem("dl.filter", filter);
+  }, [filter]);
+  useEffect(() => {
+    if (sort) localStorage.setItem("dl.sort", JSON.stringify(sort));
+    else localStorage.removeItem("dl.sort");
+  }, [sort]);
 
   /// 全局快捷键（Slack/GitHub 惯例）：Ctrl/Cmd+1..6 切视图、/ 聚焦搜索。
   /// 输入控件内不拦截（除 Ctrl 组合——数字组合在输入框内无编辑语义冲突）。
@@ -171,16 +265,28 @@ export default function DlApp() {
   const listParams = useMemo<ListTasksQuery | null>(() => {
     const state = filter !== "all" ? SEGMENT_STATES[filter] : undefined;
     const search = debouncedQuery || undefined;
-    return state === undefined && search === undefined ? null : { state, search };
-  }, [filter, debouncedQuery]);
+    // R14：排序下推服务端（SortKey 与服务端 sort 键一一对应；
+    // null = 默认创建序）。服务端为排序唯一权威——表头切换 →
+    // listParams 重建 → refresh 重建 → 轮询 effect 即时重拉新序。
+    const sortQ =
+      sort !== null ? { sort: sort.key, order: sort.dir } : undefined;
+    return state === undefined && search === undefined && sortQ === undefined
+      ? null
+      : { state, search, ...sortQ };
+  }, [filter, debouncedQuery, sort]);
   const filtered = listParams !== null;
 
   const refresh = useCallback(async () => {
     // 审计修复（40-e P1-4）：失败保留旧数据——双请求都失败才判断连。
-    const [t, s] = await Promise.all([
-      client.listTasks(listParams ?? undefined).catch(() => null),
-      client.stats().catch(() => null),
+    // R25：allSettled 捕获拒绝原因——全败时区分「认证失败」（HttpError
+    // 401/403：daemon 活着、令牌/白名单问题）与「网络不可达」（fetch
+    // TypeError：拒绝/超时），面板给出完全不同的文案与排障指引。
+    const [tRes, sRes] = await Promise.allSettled([
+      client.listTasks(listParams ?? undefined),
+      client.stats(),
     ]);
+    const t = tRes.status === "fulfilled" ? tRes.value : null;
+    const s = sRes.status === "fulfilled" ? sRes.value : null;
     if (t !== null) {
       setLoaded(true);
       // P1-5-A 修复（Issue #127）：内容签名去重 + 项级引用稳定。
@@ -214,15 +320,34 @@ export default function DlApp() {
     }
     if (s) {
       setStats(s);
-      const h = historyRef.current;
-      const last = h[h.length - 1];
-      if (!last || last.down !== s.down_bytes_s || last.up !== s.up_bytes_s) {
-        h.push({ down: s.down_bytes_s, up: s.up_bytes_s });
-        if (h.length > 180) h.splice(0, h.length - 180);
-        setHistoryTick((x) => x + 1);
-      }
+      // 不可变更新：新点 → 新数组引用（SpeedChart memo 重算）；
+      // 速率未变 → 返回旧引用（跳过重渲染）。上限 180 点滑动窗口。
+      setHistory((h) => {
+        const last = h[h.length - 1];
+        if (last && last.down === s.down_bytes_s && last.up === s.up_bytes_s) {
+          return h;
+        }
+        const next = [...h, { down: s.down_bytes_s, up: s.up_bytes_s }];
+        return next.length > 180 ? next.slice(next.length - 180) : next;
+      });
     }
     setConnected(t !== null || s !== null);
+    // R25：全败时分类——任一拒绝原因是 HttpError 401/403 → 认证/白名单
+    // 面板（daemon 可达）；否则网络不可达面板。恢复同拍自动（1s 轮询）。
+    if (t === null && s === null) {
+      const reasons = [tRes, sRes]
+        .filter((r): r is PromiseRejectedResult => r.status === "rejected")
+        .map((r) => r.reason);
+      setAuthFailed(
+        reasons.some(
+          (e) => e instanceof HttpError && (e.status === 401 || e.status === 403),
+        ),
+      );
+    } else {
+      setAuthFailed(false);
+    }
+    // R25：首轮决出标记（DaemonDown 门控——首拍在飞不算不可达）。
+    setPolled(true);
   }, [listParams]);
 
   /// 详情快照轮询：仅对当前列表中的任务并发拉取（表格进度/大小/ETA 数据源）。
@@ -300,51 +425,76 @@ export default function DlApp() {
   }, [refresh]);
 
   /// SSE 事件流（速率/完成/失败 toast）：与轮询分离——过滤/搜索切换
-  /// 只重置轮询节拍，事件流不重连。
+  /// 只重置轮播节拍，事件流不重连。
+  /// R16 live 边界：先 GET /events 取 latest_seq + 最近 200 条日志种子，
+  /// 再以 after=latest_seq 订阅增量——重载不再全量重放（历史完成事件
+  /// 对用户是历史而非现场，不该弹「任务完成」toast；曾致批量导入后
+  /// 重载被 toast 洪泛遮挡按钮）。REST 失败 → 保持 after=0 全量重放
+  /// （降级 = 旧行为，toast 照常）。
   useEffect(() => {
-    const unsub = client.subscribeEvents(
-      (env) => {
-        setEvents((cur) => {
-          const next = [...cur, env];
-          return next.length > 500 ? next.slice(next.length - 500) : next;
-        });
-        const type = env.event.type;
-        if (type === "speed") {
-          const tid = String(env.event.task_id ?? "");
-          if (tid) {
-            // ts-rs 精确联合（#147 §六）：speed 变体字段为必填 number；
-            // 取值须在 setRates 回调外完成——属性路径 narrowing 不进闭包。
-            const { down_rate, up_rate } = env.event;
-            setRates((cur) => ({
-              ...cur,
-              [tid]: {
-                down: Number(down_rate ?? 0),
-                up: Number(up_rate ?? 0),
-                ts: Date.now(),
-              },
-            }));
-          }
+    const onEnv = (env: SchedulerEventEnvelope) => {
+      setEvents((cur) => {
+        const next = [...cur, env];
+        return next.length > 500 ? next.slice(next.length - 500) : next;
+      });
+      const type = env.event.type;
+      if (type === "speed") {
+        const tid = String(env.event.task_id ?? "");
+        if (tid) {
+          // ts-rs 精确联合（#147 §六）：speed 变体字段为必填 number；
+          // 取值须在 setRates 回调外完成——属性路径 narrowing 不进闭包。
+          const { down_rate, up_rate } = env.event;
+          setRates((cur) => ({
+            ...cur,
+            [tid]: {
+              down: Number(down_rate ?? 0),
+              up: Number(up_rate ?? 0),
+              ts: Date.now(),
+            },
+          }));
         }
-        if (type === "completed") toast({ kind: "success", text: "任务完成" });
-        if (type === "failed") toast({ kind: "error", text: "任务失败" });
-        // 审计修复（40-e P2-22）：终态事件清理速率表条目
-        // （事件类型全集见 events.rs type_label——无 removed 变体，
-        // 删除场景由渲染侧 5s TTL 衰减兜底）
-        if (type === "completed" || type === "failed") {
-          const tid = String(env.event.task_id ?? "");
-          if (tid) {
-            setRates((cur) => {
-              if (!(tid in cur)) return cur;
-              const next = { ...cur };
-              delete next[tid];
-              return next;
-            });
-          }
+      }
+      if (type === "completed") toast({ kind: "success", text: "任务完成" });
+      if (type === "failed") toast({ kind: "error", text: "任务失败" });
+      // 审计修复（40-e P2-22）：终态事件清理速率表条目
+      // （事件类型全集见 events.rs type_label——无 removed 变体，
+      // 删除场景由渲染侧 5s TTL 衰减兜底）
+      if (type === "completed" || type === "failed") {
+        const tid = String(env.event.task_id ?? "");
+        if (tid) {
+          setRates((cur) => {
+            if (!(tid in cur)) return cur;
+            const next = { ...cur };
+            delete next[tid];
+            return next;
+          });
         }
-      },
-      setConnected,
-    );
-    return unsub;
+      }
+    };
+    // 先降级订阅（全量重放）；REST 引导成功后热切换为 live 增量流。
+    // disposed 守卫：卸载后迟到的 REST 解析不得再换流（EventSource 泄漏）。
+    let disposed = false;
+    let unsub = client.subscribeEvents(onEnv, setConnected);
+    client
+      .listEvents({ limit: 1 })
+      .then((page) => {
+        const latest = page.latest_seq ?? 0;
+        return client
+          .listEvents({ after: Math.max(0, latest - 200), limit: 200 })
+          .then((seed) => {
+            if (disposed) return;
+            setEvents(seed.events.slice(-500));
+            unsub();
+            unsub = client.subscribeEvents(onEnv, setConnected, latest);
+          });
+      })
+      .catch(() => {
+        /* REST 不可达：保持降级全量重放流（与旧行为一致） */
+      });
+    return () => {
+      disposed = true;
+      unsub();
+    };
   }, [toast]);
 
   /// 快照轮询独立节拍（2s）：挂载一次，读 ref 最新列表。
@@ -404,21 +554,11 @@ export default function DlApp() {
     } as Record<TaskFilterKey, number>;
   }, [stats]);
 
-  /// 显示集 = 服务端过滤后的列表（#161 P3：过滤/搜索已在 daemon 执行，
-  /// 客户端不再二次过滤——避免双重口径遮蔽服务端语义漂移）。
-  /// 排序在过滤/搜索之后应用（显示序 = 用户所见序；Shift 范围选择按此序）。
-  const sorted = useMemo(() => {
-    if (!sort) return tasks;
-    const dir = sort.dir === "asc" ? 1 : -1;
-    return [...tasks].sort((a, b) => {
-      const va = taskSortValue(a, snapshots[a.task_id], rates[a.task_id], sort.key);
-      const vb = taskSortValue(b, snapshots[b.task_id], rates[b.task_id], sort.key);
-      if (typeof va === "string" || typeof vb === "string") {
-        return String(va).localeCompare(String(vb), "zh-Hans-CN") * dir;
-      }
-      return (va - vb) * dir;
-    });
-  }, [tasks, sort, snapshots, rates]);
+  /// 显示集 = 服务端过滤 + 排序后的列表（#161 P3 过滤下推 + R14 排序下推：
+  /// 两者均由 daemon 执行，客户端不再二次过滤/二次排序——避免双重口径
+  /// 遮蔽服务端语义漂移；列表轮询 1s 携带 sort/order 重拉，序随引擎快照
+  /// 缓存更新，新鲜度与旧客户端实时重排等同）。显示序 = 用户所见序，
+  /// Shift 范围选择按此序。
 
   const act = useCallback(
     async (fn: () => Promise<unknown>) => {
@@ -486,7 +626,9 @@ export default function DlApp() {
       }
       act(async () => {
         await client.batchTasks(ids, op);
-        setSelected(new Set());
+        // UX-1 修复（体检 #182）：pause/resume 保留选择集——「批量暂停→
+        // 批量恢复」是连续操作，清空选择迫使用户重新全选（qBittorrent 等
+        // 惯例均保留）。remove 路径任务已删除，仍清空（上方 run 内）。
       });
     },
     [act, selected],
@@ -513,9 +655,9 @@ export default function DlApp() {
 
   const toggleAll = useCallback(
     (on: boolean) => {
-      setSelected(on ? new Set(sorted.map((t) => t.task_id)) : new Set());
+      setSelected(on ? new Set(tasks.map((t) => t.task_id)) : new Set());
     },
-    [sorted],
+    [tasks],
   );
 
   const onSelectRow = useCallback(
@@ -578,11 +720,23 @@ export default function DlApp() {
                   + 探测预览 + 高级项）。常驻挂载 hidden 切换——收起不丢已填
                   内容；Esc 不收表单（防误触丢稿），收起走「取消」/工具栏。 */}
               <NewTaskForm open={adding} onOpen={setAdding} onAdded={onTaskAdded} />
+              {/* R24/R25：首帧未到时三分支——首轮未决（请求在飞）或连接正常 =
+                  骨架（与 SSR HTML 一致，无闪变）；首轮已决且连接失败 =
+                  daemon 不可达面板（网络层）或认证失败变体（HTTP 401/403，
+                  daemon 活着但拒绝）。connected 翻转零交互自愈（1s 轮询）。 */}
               {!loaded ? (
-                <TableSkeleton />
+                polled && !connected ? (
+                  <DaemonDown
+                    base={dd?.base ?? ""}
+                    hasToken={dd?.hasToken ?? false}
+                    mode={authFailed ? "auth" : "unreachable"}
+                  />
+                ) : (
+                  <TableSkeleton />
+                )
               ) : (
                 <TasksTable
-                  tasks={sorted}
+                  tasks={tasks}
                   snapshots={snapshots}
                   rates={rates}
                   selected={selected}
@@ -590,7 +744,7 @@ export default function DlApp() {
                   onToggleAll={toggleAll}
                   onSelect={onSelectRow}
                   onSelectRange={onSelectRange}
-                  onOpen={setDetail}
+                  onOpen={openDetail}
                   onAction={onAction}
                   busy={busy}
                   query={query}
@@ -600,15 +754,11 @@ export default function DlApp() {
               )}
             </>
           )}
-          {view === "stats" && (
-            <StatsView stats={stats} history={historyRef.current} />
-          )}
+          {view === "stats" && <StatsView stats={stats} history={history} connected={connected} />}
           {view === "rss" && <RssView onToast={toast} />}
           {view === "logs" && <LogsView events={events} />}
           {view === "settings" && <SettingsView onToast={toast} />}
           {view === "security" && <SecurityView onToast={toast} />}
-          {/* historyTick 驱动曲线重绘 */}
-          <span hidden>{historyTick}</span>
           </main>
         </div>
 

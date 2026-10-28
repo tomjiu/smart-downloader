@@ -1678,3 +1678,54 @@ html,
   outline: 2px solid var(--accent);
   outline-offset: 1px;
 }
+
+/* ── R24：daemon 不可达面板（与空态/骨架同语言：orb + 居中列） ── */
+.dl-daemon-down {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 48px var(--space-5);
+  color: var(--fg-3);
+  text-align: center;
+}
+.dl-daemon-down .dl-empty-orb {
+  border-color: var(--err);
+  color: var(--err);
+}
+.dl-dd-title {
+  font-size: var(--fs-lg);
+  font-weight: 600;
+  color: var(--fg);
+}
+.dl-dd-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-sm);
+}
+.dl-dd-k {
+  color: var(--fg-3);
+}
+.dl-dd-v {
+  color: var(--fg-2);
+}
+.dl-daemon-down code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  padding: 1px 6px;
+  border-radius: 6px;
+  background: var(--bg-2);
+}
+.dl-dd-hint {
+  max-width: 460px;
+  font-size: var(--fs-sm);
+  line-height: 1.6;
+  color: var(--fg-3);
+}
+
+/* ── R25：认证失败变体（daemon 可达但 401/403——警示黄而非错误红） ── */
+.dl-daemon-down.is-auth .dl-empty-orb {
+  border-color: var(--warn, #ebcb8b);
+  color: var(--warn, #ebcb8b);
+}

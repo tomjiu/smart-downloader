@@ -16,8 +16,9 @@ state: string, source: string,
  */
 dest_root: string, engine?: string, done: number, total: number, error?: string, 
 /**
- * 文件级进度（实时读引擎 status().files；单文件/无文件引擎为空数组）。
- * FTP 目录任务与 BT 多文件任务在此处行为一致（都从引擎状态链透出）。
+ * 文件级进度（实时读引擎 status().files）。BT 多文件 / FTP 目录 /
+ * HTTP 单文件（体检 #182 C-2 起 httpdl 透出 [rel_path=落盘名, done,
+ * size]）三口径一致；无文件概念的引擎为空数组。
  */
 files: Array<FileProgress>, 
 /**
@@ -85,4 +86,10 @@ max_retries?: number,
  * 自动重试到期时刻（E30，unix 秒；0 = 无重试安排，序列化省略）。
  * 非 0 且状态 Queued = 重试等待中，列表据此可展示「重试中」。
  */
-next_retry_at_unix?: number, };
+next_retry_at_unix?: number, 
+/**
+ * 队列优先级（体检 #182 C-1 持久透出）：数值越小越先出队（top = 队列
+ * 最小值 - 1；0 = 默认，序列化省略）。原仅 set 响应回显——UI 重启后
+ * 无法回显当前值，现入快照与列表两口径。
+ */
+queue_priority?: number, };

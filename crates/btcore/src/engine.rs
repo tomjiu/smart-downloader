@@ -266,6 +266,11 @@ impl BtCore {
         self.sess.file_progress(ih)
     }
 
+    /// 全部文件相对路径（R18：文件级进度透出的名字源）。
+    pub fn file_paths(&self, ih: &str) -> ffi::Result<Vec<String>> {
+        self.sess.file_paths(ih)
+    }
+
     // —— 富 peer ——
 
     pub fn peers(&self, ih: &str) -> ffi::Result<Vec<PeerInfo>> {

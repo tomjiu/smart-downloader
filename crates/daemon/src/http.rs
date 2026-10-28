@@ -26,7 +26,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use ts_rs::TS;
 
-use crate::state::{known_engine_labels, known_state_labels, BatchAction, ListQuery};
+use crate::state::{
+    known_engine_labels, known_sort_keys, known_state_labels, BatchAction, ListOrder, ListQuery,
+    ListSort,
+};
 
 #[derive(Deserialize, TS)]
 #[ts(export, optional_fields)]
@@ -55,6 +58,14 @@ pub struct AddTaskReq {
     /// flag；缺省 = 默认并行策略。
     #[serde(default)]
     pub sequential: bool,
+    /// 初始子文件优先级（R5，仅 torrent_b64 入口）：建任务时在引擎 add 的
+    /// 暂停窗口内应用（resume 前），根治「创建后补设」与启动序列的竞态
+    //（实测：本地极速下载在补设前完成，skip 非确定性丢失）。
+    /// 下标越界（对 torrent 文件数）或 priority>7 → 400；未提及下标取默认 4。
+    /// magnet 入口携带 → 400（metadata 未就绪，请建任务后经
+    /// `POST /tasks/:id/files/priority` 设置）。
+    #[serde(default)]
+    pub file_priorities: Vec<FilePriorityEntry>,
     /// 任务级代理 URL（E5，仅 HTTP 任务生效）：`http(s)://` / `socks5://` /
     /// `socks4://`，可带 `user:pass@`；缺省 = 走全局 `[download] proxy`（若有）。
     /// 非法代理 URL → 400；BT/FTP 任务携带此字段被忽略。
@@ -160,7 +171,7 @@ pub struct ProbeOut {
 /// download.bin，逐候选 sanitize_rel 终审）。探测失败（网络/非 2xx/416
 /// 之外状态）→ 502；入参非法 → 400。url 不回显（请求方自持；凭据不二次暴露）。
 async fn probe_endpoint(
-    State(_state): State<Arc<DaemonState>>,
+    State(state): State<Arc<DaemonState>>,
     Json(req): Json<ProbeReq>,
 ) -> Response {
     let url = req.url.trim();
@@ -183,7 +194,17 @@ async fn probe_endpoint(
                     .into_response()
             }
         },
-        _ => reqwest::Client::new(),
+        // soak #168 补遗（#169 评审项）：非代理探测改用引擎同源 client（bootstrap
+        // = serve 注入的全局 client 克隆，UA/cookie/重定向与任务下载完全一致——
+        // 探测即真实预览；原裸 Client::new() 无 UA，thinkbroadband 类源会
+        // 「探测 403 而下载成功」行为割裂）。None 兜底（测试/非 serve 上下文）
+        // 同样带产品 UA，与 RSS/metalink 的 bootstrap 口径一致。
+        _ => state.bootstrap_client_opt().unwrap_or_else(|| {
+            reqwest::Client::builder()
+                .user_agent(smart_dl_httpdl::engine::USER_AGENT)
+                .build()
+                .unwrap_or_default()
+        }),
     };
     let mut headers: Vec<(String, String)> = req
         .headers
@@ -1104,6 +1125,45 @@ pub struct MagnetMetaReq {
     pub save_to: Option<String>,
 }
 
+/// `POST /bt/metadata` 成功响应（原 serde_json::json! 动态构建，体检 #182
+/// R7 DTO 化——磁力预览 UI 接入前置；wire 与原 json! 逐键一致）。
+#[derive(serde::Serialize, TS)]
+#[ts(export, optional_fields)]
+pub struct MagnetMetaOut {
+    /// v1 infohash（40 hex 小写）。
+    pub infohash: String,
+    /// 种子名（多文件 = 目录名）。
+    pub name: String,
+    pub total_size: u64,
+    pub piece_len: i64,
+    pub num_pieces: i64,
+    /// 文件清单（单文件 = 1 项）。
+    pub files: Vec<MagnetFileOut>,
+    pub trackers: Vec<String>,
+    pub web_seeds: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub comment: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub created_by: Option<String>,
+    /// 原始 .torrent 内容（base64；预取 sidecar 消费）。
+    pub torrent_b64: String,
+    /// save_to 落盘回执（未请求时省略）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub saved_to: Option<String>,
+}
+
+/// 磁力元数据文件条目。
+#[derive(serde::Serialize, TS)]
+#[ts(export)]
+pub struct MagnetFileOut {
+    /// 相对路径（多文件以 / 连接）。
+    pub path: String,
+    pub size: u64,
+}
+
 #[cfg(feature = "bt")]
 async fn bt_magnet_metadata(
     State(state): State<Arc<DaemonState>>,
@@ -1305,7 +1365,7 @@ async fn run_magnet_fetch(
     magnet: &str,
     opts: &smart_dl_btcore::magnet::FetchOpts,
     save_to: Option<&std::path::Path>,
-) -> Result<serde_json::Value, (StatusCode, String)> {
+) -> Result<MagnetMetaOut, (StatusCode, String)> {
     use smart_dl_btcore::magnet::{fetch_metadata, FetchError};
 
     // S2：先清扫历史遗留（进程死亡残骸），再建本进程 scratch
@@ -1341,7 +1401,11 @@ async fn run_magnet_fetch(
                 FetchError::Magnet(_) | FetchError::Summary(_) => {
                     (StatusCode::BAD_REQUEST, e.to_string())
                 }
-                FetchError::Timeout { .. } => (StatusCode::REQUEST_TIMEOUT, e.to_string()),
+                // 504（非 408）：Chromium 网络栈对「复用连接 + 长等待后收到 408」
+                // 有特殊处理——响应被吞咽并透明重试，fetch 永不决出（UI 按钮
+                // 永久转圈；超合并验证 F2 实证：字节级响应合规但浏览器不认）。
+                // 504 不在重试集，语义亦更准（上游 swarm 未按时交付）。
+                FetchError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, e.to_string()),
                 FetchError::Ffi(_) | FetchError::Other(_) => {
                     (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
                 }
@@ -1366,23 +1430,27 @@ async fn run_magnet_fetch(
     }
 
     let s = &fetched.summary;
-    Ok(serde_json::json!({
-        "infohash": fetched.infohash,
-        "name": s.name,
-        "total_size": s.total_size,
-        "piece_len": s.piece_len,
-        "num_pieces": s.num_pieces,
-        "files": s.files.iter().map(|f| serde_json::json!({
-            "path": f.path,
-            "size": f.size,
-        })).collect::<Vec<_>>(),
-        "trackers": s.trackers,
-        "web_seeds": s.web_seeds,
-        "comment": s.comment,
-        "created_by": s.created_by,
-        "torrent_b64": base64::engine::general_purpose::STANDARD.encode(&fetched.torrent),
-        "saved_to": saved_to,
-    }))
+    Ok(MagnetMetaOut {
+        infohash: fetched.infohash,
+        name: s.name.clone(),
+        total_size: s.total_size,
+        piece_len: s.piece_len,
+        num_pieces: s.num_pieces,
+        files: s
+            .files
+            .iter()
+            .map(|f| MagnetFileOut {
+                path: f.path.clone(),
+                size: f.size,
+            })
+            .collect(),
+        trackers: s.trackers.clone(),
+        web_seeds: s.web_seeds.clone(),
+        comment: s.comment.clone(),
+        created_by: s.created_by.clone(),
+        torrent_b64: base64::engine::general_purpose::STANDARD.encode(&fetched.torrent),
+        saved_to,
+    })
 }
 
 #[cfg(not(feature = "bt"))]
@@ -1780,6 +1848,16 @@ async fn add_task(
                 format!("auto_retry 取值 0..=10，收到 {auto_retry}") })),
         );
     }
+    // R5：初始子文件优先级仅 torrent_b64 入口支持（引擎 add 暂停窗口内应用，
+    // 根治创建后补设的启动序列竞态）。magnet 的 metadata 未就绪、
+    // url/metalink 非 BT ——携带但无 torrent_b64 → 400。
+    if !req.file_priorities.is_empty() && req.torrent_b64.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error":
+                "file_priorities 仅支持 torrent_b64 入口（magnet 请建任务后经 POST /tasks/:id/files/priority 设置）" })),
+        );
+    }
 
     // 源三选一（优先级 torrent > metalink > url）；统一产出任务 id 列表
     // （单源任务 = 单元素；metalink = 逐 <file> 展开，B1）。
@@ -1789,6 +1867,11 @@ async fn add_task(
             Ok(bytes) => {
                 #[cfg(feature = "bt")]
                 {
+                    let file_prios: Vec<(usize, u32)> = req
+                        .file_priorities
+                        .iter()
+                        .map(|e| (e.index, e.priority))
+                        .collect();
                     state
                         .add_torrent_task_opts(
                             bytes,
@@ -1796,6 +1879,7 @@ async fn add_task(
                             req.sequential,
                             req.start_at_unix,
                             req.auto_retry.unwrap_or(0),
+                            file_prios,
                         )
                         .await
                         .map(|id| vec![id])
@@ -1999,6 +2083,14 @@ struct ListTasksQuery {
     /// E18：标签 any-of 过滤（逗号分隔多值；大小写不敏感；空白段丢弃）。
     #[serde(default)]
     tag: Option<String>,
+    /// R13：排序键（created/name/state/progress/size/speed/eta；缺省/空白 =
+    /// 创建序）。非法值 → 400（与 state/engine 校验同口径，含合法值全集）。
+    #[serde(default)]
+    sort: Option<String>,
+    /// R13：排序方向（asc/desc；缺省 = asc）。允许仅给 order 不给 sort
+    /// （语义 = 创建序倒序，最新优先）。
+    #[serde(default)]
+    order: Option<String>,
 }
 
 /// `limit` 上限（防一次性拉全表打爆内存；UI 每页 50 量级，500 留足余量）。
@@ -2031,7 +2123,45 @@ fn parse_label_list(
     Ok(labels)
 }
 
-/// 校验查询参数 → ListQuery（400 语义：state/engine 值非法或 limit 越界）。
+/// 排序键解析（R13）：trim 后空白 = 未提供；非法值 → Err（含合法值全集）。
+fn parse_sort_key(raw: &Option<String>) -> Result<Option<ListSort>, String> {
+    let Some(raw) = raw else { return Ok(None) };
+    let t = raw.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    let key = match t.to_ascii_lowercase().as_str() {
+        "created" => ListSort::Created,
+        "name" => ListSort::Name,
+        "state" => ListSort::State,
+        "progress" => ListSort::Progress,
+        "size" => ListSort::Size,
+        "speed" => ListSort::Speed,
+        "eta" => ListSort::Eta,
+        other => {
+            return Err(format!(
+                "未知 sort 值 {other:?}（合法值: {}）",
+                known_sort_keys().join(", ")
+            ))
+        }
+    };
+    Ok(Some(key))
+}
+
+/// 排序方向解析（R13）：缺省 = Asc；非法值 → Err。
+fn parse_sort_order(raw: &Option<String>) -> Result<ListOrder, String> {
+    match raw {
+        None => Ok(ListOrder::Asc),
+        Some(s) => match s.trim().to_ascii_lowercase().as_str() {
+            "" => Ok(ListOrder::Asc),
+            "asc" => Ok(ListOrder::Asc),
+            "desc" => Ok(ListOrder::Desc),
+            other => Err(format!("未知 order 值 {other:?}（合法值: asc, desc）")),
+        },
+    }
+}
+
+/// 校验查询参数 → ListQuery（400 语义：state/engine/sort/order 值非法或 limit 越界）。
 fn validate_list_query(q: &ListTasksQuery) -> Result<ListQuery, String> {
     let states = parse_label_list(&q.state, &known_state_labels(), "state")?;
     let engines = parse_label_list(&q.engine, &known_engine_labels(), "engine")?;
@@ -2065,12 +2195,16 @@ fn validate_list_query(q: &ListTasksQuery) -> Result<ListQuery, String> {
                     .collect()
             })
             .unwrap_or_default(),
+        // R13：排序下推（sort/order 解析失败 → 400，与 state/engine 同口径）
+        sort: parse_sort_key(&q.sort)?,
+        order: parse_sort_order(&q.order)?,
     })
 }
 
-/// 任务列表（E7 过滤/分页；E14 增 `?search=` 关键字过滤）：无参数 → 全量数组
-/// （兼容不变）；有分页参数 → 附 `X-Total-Count`（过滤后总数，含 search 过滤）。
-/// 排序恒为创建序（task_id 数值后缀）。
+/// 任务列表（E7 过滤/分页；E14 增 `?search=`；R13 增 `?sort=&order=`）：无参数
+/// → 全量数组（兼容不变）；有分页参数 → 附 `X-Total-Count`（过滤后总数，含
+/// search 过滤）。默认排序 = 创建序（task_id 数值后缀）；R13 起可选服务端排序
+/// （排序在过滤后、分页前应用——分页语义成立的前提，详见 ListSort 文档）。
 async fn list_tasks(
     Query(q): Query<ListTasksQuery>,
     State(state): State<Arc<DaemonState>>,
@@ -2139,6 +2273,9 @@ fn parse_batch_select(s: &BatchSelect) -> Result<ListQuery, String> {
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .map(str::to_string),
+        // 批量条件选择不走排序（恒全量执行，无分页语义）
+        sort: None,
+        order: Default::default(),
         tags: s
             .tag
             .as_deref()
@@ -2221,6 +2358,12 @@ async fn list_events(
         "has_more": has_more,
         "oldest_seq": hub.oldest_seq(),
         "truncated": truncated,
+        // R16：已发布最大 seq（追加字段，向后兼容）——客户端据此建立
+        // live 边界：SSE 以 after=latest_seq 订阅（仅增量），历史走本端点
+        // 分页拉取。修复「页面重载即全量重放 → 完成事件 toast 洪泛遮挡
+        // UI」（120 任务批量导入后重载页面被 toast 埋没——重放事件对
+        // 用户是历史而非现场，不应弹现场提示）。
+        "latest_seq": hub.last_seq(),
     }))
     .into_response()
 }
@@ -3014,8 +3157,127 @@ fn finish_router(
         }
         None => app,
     };
+    // R24：CORS 层最后叠加 = 最外层——预检 OPTIONS 必须短路在 auth_mw
+    // 之前（浏览器预检不携带 Authorization，先进 auth 会拿 401 被判
+    // CORS 失败）；非预检响应（含 auth 的 401/403）出栈时补 ACAO 头，
+    // 跨源 UI 才能读取真实错误信息而非笼统网络错误。
     app.layer(middleware::from_fn_with_state(state.clone(), auth_mw))
+        .layer(middleware::from_fn_with_state(state.clone(), cors_mw))
         .with_state(state)
+}
+
+/// R24 跨源 CORS 中间件：静态托管 UI → 远程 daemon 模式的浏览器读取
+/// 许可。此前 UI 的 `dl.daemon.base` 地址覆盖（Settings「daemon 地址」）
+/// 在浏览器跨源下永不可用——daemon 不发 CORS 头，fetch 一律被浏览器
+/// 拦截（UI 表现为「无法连接」）。
+///
+/// 放行口径与 tokenless 守卫（request_from_local_origin）同构：
+/// - 回环 Origin（localhost / 127.* / ::1，任意端口）始终放行——服务端
+///   本就信任回环 Origin，此处只补浏览器侧读取头，不扩大攻击面；
+/// - `extra_allowed_origins`（完整 origin 含端口）显式追加——面向
+///   配了 `http_token` 的远程/反代场景；
+/// - 其余（evil.com 等）：无 ACAO 头 → 浏览器拦截；tokenless 守卫
+///   照旧 403，双保险不变。
+///
+/// 不用 `Access-Control-Allow-Credentials`：鉴权走 Authorization 头
+/// （非 cookie），标准 fetch 默认模式即可携带。
+async fn cors_mw(
+    State(state): State<Arc<DaemonState>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    use axum::http::{header, Method, StatusCode};
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let allowed = origin
+        .as_deref()
+        .map(|o| origin_allowed(o, &state.extra_allowed_origins));
+    // 预检（OPTIONS + Origin + ACRM）：放行 → 204 + 许可头；拒绝 → 204
+    // 不带头（浏览器判 CORS 失败，服务端无副作用——preflight 本就无业务语义）。
+    if req.method() == Method::OPTIONS {
+        if allowed == Some(true) {
+            let o = origin.unwrap_or_default();
+            return (
+                StatusCode::NO_CONTENT,
+                [
+                    (
+                        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                        axum::http::HeaderValue::from_str(&o)
+                            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("*")),
+                    ),
+                    (
+                        header::ACCESS_CONTROL_ALLOW_METHODS,
+                        axum::http::HeaderValue::from_static(
+                            "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+                        ),
+                    ),
+                    (
+                        header::ACCESS_CONTROL_ALLOW_HEADERS,
+                        axum::http::HeaderValue::from_static("Content-Type, Authorization"),
+                    ),
+                    (
+                        header::ACCESS_CONTROL_MAX_AGE,
+                        axum::http::HeaderValue::from_static("600"),
+                    ),
+                ],
+            )
+                .into_response();
+        }
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let mut resp = next.run(req).await;
+    if allowed == Some(true) {
+        let o = origin.unwrap_or_default();
+        let headers = resp.headers_mut();
+        if let Ok(v) = axum::http::HeaderValue::from_str(&o) {
+            headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+        }
+        // 缓存正确性：响应随 Origin 变化 → Vary 补列（追加而非覆盖，
+        // 不冲掉路由层已有的 Vary 声明）。
+        let vary = headers
+            .get(header::VARY)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let new_vary = match vary {
+            Some(v)
+                if v.split(',')
+                    .any(|t| t.trim().eq_ignore_ascii_case("origin")) =>
+            {
+                None
+            }
+            Some(v) => Some(format!("{v}, Origin")),
+            None => Some("Origin".to_owned()),
+        };
+        if let Some(nv) = new_vary {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&nv) {
+                headers.insert(header::VARY, v);
+            }
+        }
+    }
+    resp
+}
+
+/// Origin 放行判定（R24）：回环 host（剥 scheme/端口）或完整命中
+/// `extra_allowed_origins`（大小写不敏感、trim——与 extra_allowed_hosts
+/// 同卫生口径）。`null`（沙箱 iframe）/非 http(s) scheme → false。
+fn origin_allowed(origin: &str, extra: &[String]) -> bool {
+    let bare = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .unwrap_or(origin);
+    if bare.is_empty() {
+        return false;
+    }
+    let host = bare.rsplit_once(':').map(|(x, _)| x).unwrap_or(bare);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host == "localhost" || host.starts_with("127.") || host == "::1" {
+        return true;
+    }
+    let o = origin.trim().to_ascii_lowercase();
+    extra.iter().any(|e| e.trim().to_ascii_lowercase() == o)
 }
 
 /// ===== NAS 引擎管理端点（feature nas）=====
@@ -3120,6 +3382,69 @@ async fn nas_token(State(_): State<Arc<DaemonState>>, Json(req): Json<NasTokenRe
             Json(serde_json::json!({ "ok": false, "error": e })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod magnet_dto_tests {
+    use super::*;
+
+    /// 体检 #182 R7：MagnetMetaOut DTO 化的 wire 契约锁定——序列化键集与
+    /// 原 serde_json::json! 动态构建逐键一致（含 saved_to/comment/created_by
+    /// 的 None 省略语义），磁力预览 UI（btMagnetMetadata）与既有 API 消费方
+    /// （rt-13 公网 swarm 脚本）不被字段改名静默破坏。
+    #[test]
+    fn magnet_meta_out_wire_keys_match_legacy_json() {
+        let out = MagnetMetaOut {
+            infohash: "a".repeat(40),
+            name: "n".into(),
+            total_size: 1,
+            piece_len: 2,
+            num_pieces: 3,
+            files: vec![MagnetFileOut {
+                path: "p".into(),
+                size: 4,
+            }],
+            trackers: vec![],
+            web_seeds: vec![],
+            comment: None,
+            created_by: None,
+            torrent_b64: "bg==".into(),
+            saved_to: None,
+        };
+        let v = serde_json::to_value(&out).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        keys.sort_unstable();
+        let mut expect = vec![
+            "infohash",
+            "name",
+            "total_size",
+            "piece_len",
+            "num_pieces",
+            "files",
+            "trackers",
+            "web_seeds",
+            "torrent_b64",
+        ];
+        expect.sort_unstable();
+        assert_eq!(
+            keys, expect,
+            "None 字段（comment/created_by/saved_to）必须省略，其余逐键对齐原 json! 版本"
+        );
+        // 文件条目键集
+        let f = &v["files"][0];
+        assert_eq!(f["path"], "p");
+        assert_eq!(f["size"], 4);
+
+        // Some 侧：save_to/comment 出现
+        let out2 = MagnetMetaOut {
+            comment: Some("c".into()),
+            saved_to: Some("x.torrent".into()),
+            ..out
+        };
+        let v2 = serde_json::to_value(&out2).unwrap();
+        assert_eq!(v2["comment"], "c");
+        assert_eq!(v2["saved_to"], "x.torrent");
     }
 }
 

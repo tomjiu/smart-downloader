@@ -20,7 +20,7 @@
 ///   magnet/导出）
 
 import { useEffect, useRef, useState } from "react";
-import type { TaskSnapshot } from "@/lib/daemon/types";
+import type { TaskLogs, TaskSnapshot } from "@/lib/daemon/types";
 import { client } from "@/lib/daemon/store";
 import { fmtBytes, fmtPct, fmtUnixShort } from "@/lib/daemon/format";
 import { StateBadge, TaskProgress } from "./Common";
@@ -81,7 +81,13 @@ export default function TaskDetail({
 
   /// 队列优先级（操作后回显；快照无该字段——set-only 契约）。
   const [queuePrio, setQueuePrio] = useState<number | null>(null);
+  /// 操作日志（体检 #182 P2：/tasks/:id/logs 端点接入——原仅全局事件流，
+  /// 任务自身审计轨迹无 UI 入口）。与快照同拍轮询（低频变化，成本低）。
+  const [logs, setLogs] = useState<TaskLogs | null>(null);
   const [prioBusy, setPrioBusy] = useState(false);
+  /// 云兜底（Q-B9 接入，体检 #182 第 4 真缺口）：BT+Paused 才渲染按钮；
+  /// 前置校验在 daemon（未暂停/进度过半/无 Provider → 409 文案透出）。
+  const [fallbackBusy, setFallbackBusy] = useState(false);
 
   /// 文件优先级：本地乐观值（下标 → 档位；快照轮询 1.5s 会再对齐）。
   const [filePrioOverride, setFilePrioOverride] = useState<Record<number, number>>({});
@@ -97,8 +103,14 @@ export default function TaskDetail({
         // 审查修复（P2）：顺序下载开关回读快照字段——原实现恒初始化 false，
         // 已开启的任务显示"已关闭"且首点误发 true。
         setSeq(Boolean(t.sequential));
+        // 体检 #182 C-1：队列优先级从快照回读（原仅 set 响应回显——抽屉
+        // 重开/页面刷新后丢显）。快照 0 = 默认（序列化省略 → undefined）。
+        setQueuePrio(t.queue_priority ?? 0);
         // 重置乐观覆盖（快照是权威值；任务切换时也须清）。
         setFilePrioOverride({});
+        // 操作日志（体检 #182 P2）：与快照同拍轮询（低频变化，成本低）。
+        const lg = await client.getTaskLogs(id).catch(() => null);
+        if (alive && lg) setLogs(lg);
       } catch {
         /* 抽屉期间任务可能被移除 */
       }
@@ -148,6 +160,22 @@ export default function TaskDetail({
   };
 
   /// 队列优先级动作（top/up/down/bottom）。busy 独立禁用四钮。
+  const runFallback = () => {
+    if (!task) return;
+    setFallbackBusy(true);
+    client
+      .fallback(task.task_id)
+      .then((r) => {
+        setMsg({
+          ok: true,
+          text: r.provider ? `云兜底完成（${r.provider}）` : "云兜底完成",
+        });
+        onChanged();
+      })
+      .catch((e) => setMsg({ ok: false, text: `云兜底失败：${String(e)}` }))
+      .finally(() => setFallbackBusy(false));
+  };
+
   const movePrio = (action: "top" | "up" | "down" | "bottom") => {
     setPrioBusy(true);
     client
@@ -443,6 +471,27 @@ export default function TaskDetail({
               </div>
             </div>
 
+            {task.engine === "bt" && task.state === "Paused" && (
+              <div className="dl-card">
+                <b style={{ display: "block", marginBottom: 10 }}>云 Provider 兜底</b>
+                <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                  <button
+                    type="button"
+                    className="dl-btn dl-btn--primary"
+                    data-testid="fallback-btn"
+                    disabled={fallbackBusy}
+                    title="改走云 Provider 直链拉全（暂停中且进度 <50% 的 BT 任务）"
+                    onClick={runFallback}
+                  >
+                    <Icon name="cloud-download" size={13} /> 立即兜底
+                  </button>
+                  <span className="dl-field-help">
+                    剩余部分改走 Provider 直链（HTTP 传输），完成后任务置 Completed。
+                  </span>
+                </div>
+              </div>
+            )}
+
             <div className="dl-card">
               <b style={{ display: "block", marginBottom: 10 }}>任务级控制</b>
               <div className="dl-form-grid">
@@ -626,6 +675,59 @@ export default function TaskDetail({
                     共 {task.files.length} 个子文件，仅显示前 {FILES_SHOWN} 项（优先级设置同理仅前 {FILES_SHOWN} 项）
                   </div>
                 )}
+              </div>
+            )}
+
+            {/* 操作日志（体检 #182 P2）：任务自身审计轨迹（add/pause/resume/
+                remove/restored + detail），区别于日志视图的全局事件流 */}
+            {logs && logs.events.length > 0 && (
+              <div>
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    margin: "4px 0 8px",
+                    color: "var(--fg-2)",
+                    fontSize: 13,
+                    fontWeight: 600,
+                  }}
+                >
+                  <Icon name="output" size={13} /> 操作日志
+                  <span className="dl-badge">{logs.events.length}</span>
+                </div>
+                <div
+                  className="dl-card"
+                  style={{ padding: "6px 10px", maxHeight: 180, overflowY: "auto" }}
+                  aria-label="任务操作日志"
+                >
+                  {logs.events.map((e, i) => (
+                    <div
+                      key={i}
+                      style={{
+                        display: "flex",
+                        gap: 8,
+                        padding: "2px 0",
+                        fontSize: 12,
+                        color: "var(--fg-2)",
+                      }}
+                    >
+                      <span style={{ color: "var(--fg-3)", flex: "none" }}>
+                        {new Date(e.at_ms).toLocaleTimeString()}
+                      </span>
+                      <span
+                        className="dl-badge"
+                        style={{ flex: "none" }}
+                        data-testid="task-log-op"
+                      >
+                        {e.op}
+                      </span>
+                      <span style={{ wordBreak: "break-all", color: "var(--fg-3)" }}>
+                        {e.detail ?? ""}
+                      </span>
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
 

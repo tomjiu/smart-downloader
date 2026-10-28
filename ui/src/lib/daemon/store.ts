@@ -23,6 +23,8 @@ import type {
   GlobalLimits,
   LimitReq,
   ListTasksQuery,
+  MagnetMetaOut,
+  MagnetMetaReq,
   PeerResults,
   PiecePriorityReq,
   PriorityReq,
@@ -46,6 +48,7 @@ import type {
   SuperSeedingReq,
   TagsReq,
   TaskListItem,
+  TaskLogs,
   TaskSnapshot,
   TrackerEntry,
   TrackersReq,
@@ -54,6 +57,18 @@ import type {
 
 const LS_KEY = "dl.daemon.base";
 const LS_TOKEN = "dl.daemon.token";
+
+/// R16：GET /events 响应形状（daemon http.rs list_events 的 json! 动态
+/// 结构——字段集本地锁定；daemon 侧新增字段时此处同步）。
+export interface EventsPage {
+  events: SchedulerEventEnvelope[];
+  next_after: number;
+  has_more: boolean;
+  oldest_seq: number | null;
+  truncated: boolean;
+  /** 已发布最大 seq（live 边界：SSE after=latest_seq 仅收增量）。 */
+  latest_seq: number;
+}
 
 export function getBase(): string {
   if (typeof window === "undefined") return "";
@@ -84,6 +99,21 @@ function headers(): HeadersInit {
   return t ? { Authorization: `Bearer ${t}` } : {};
 }
 
+/// R25：HTTP 层错误（daemon 已应答但非 2xx）——与网络层失败（fetch
+/// TypeError）区分：UI 据此分辨「认证失败」（401/403，daemon 活着、
+/// 令牌/白名单问题）与「无法连接」（拒绝/超时，daemon 没应答）。
+/// 此前两者同抛裸 Error → 首屏统一显示「无法连接 daemon」，令牌配错
+/// 的用户被引向完全错误的排障方向。
+export class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "HttpError";
+  }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const hasBody = init?.body != null;
   const res = await fetch(url(path), {
@@ -102,7 +132,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       /* 忽略非 JSON 错误体 */
     }
-    throw new Error(msg);
+    throw new HttpError(res.status, msg);
   }
   return res.json() as Promise<T>;
 }
@@ -115,8 +145,11 @@ export class DaemonClient {
   /// 但误导后续消费——若读 done/total 将拿到 undefined）。
   /// #161 P3：q 支持服务端过滤/搜索（?state=&engine=&search=&tag=，
   /// 参数形状由生成的 ListTasksQuery 锁定；未提供/全空 = 全量，
-  /// 行为与形状同旧）。分页（limit/offset + X-Total-Count）留待
-  /// 服务端排序支持后再接（客户端排序与分页组合语义不成立）。
+  /// 行为与形状同旧）。
+  /// R14：q.sort/q.order 下推服务端排序（?sort=&order=；服务端为排序
+  /// 唯一权威——与 #173 过滤下推同模式，避免双重口径）。分页
+  /// （limit/offset + X-Total-Count）语义自 R13 起成立，UI 接入待虚拟
+  /// 滚动场景评估后再定（当前全量拉取 + 虚拟滚动的内存/DOM 表现已达标）。
   listTasks(q?: ListTasksQuery): Promise<TaskListItem[]> {
     if (q) {
       const p = new URLSearchParams();
@@ -124,6 +157,8 @@ export class DaemonClient {
       if (q.engine) p.set("engine", q.engine);
       if (q.search) p.set("search", q.search);
       if (q.tag) p.set("tag", q.tag);
+      if (q.sort) p.set("sort", q.sort);
+      if (q.order) p.set("order", q.order);
       if (typeof q.limit === "number") p.set("limit", String(q.limit));
       if (typeof q.offset === "number") p.set("offset", String(q.offset));
       const s = p.toString();
@@ -133,6 +168,10 @@ export class DaemonClient {
   }
   getTask(id: string): Promise<TaskSnapshot> {
     return req(`/tasks/${id}`);
+  }
+  /// 任务操作日志（体检 #182 P2 补全：端点已备而 UI 未接——抽屉内直查）。
+  getTaskLogs(id: string): Promise<TaskLogs> {
+    return req(`/tasks/${id}/logs`);
   }
   /// ts-rs 生成（#147 §六）：请求体类型来自 Rust 结构体——字段名漂移在
   /// 编译期报错（旧 addTask 的 Record<string, unknown> 无任何防护）。
@@ -276,6 +315,13 @@ export class DaemonClient {
       method: "DELETE",
     });
   }
+  /// 手动云兜底（Q-B9，体检 #182 第 4 真缺口 R21 接入）：BT 任务暂停且
+  /// 进度 <50% → 云 Provider 直链 → HTTP 引擎拉全 → 任务置 Completed。
+  /// 不满足前提（未暂停/进度过半/无可用 Provider）→ 409 + 原因文案。
+  fallback(id: string): Promise<{ status: string; provider?: string; message?: string }> {
+    return req(`/tasks/${id}/fallback`, { method: "POST" });
+  }
+
   /// 手动注入 peer（`ip:port`，支持 IPv6 `[::1]:6881`）：部分成功语义，
   /// 逐条回执（ok / error）。注意：409（全失败且非 BT）也会带 results 体。
   addPeers(id: string, addrs: string[]): Promise<PeerResults> {
@@ -350,6 +396,12 @@ export class DaemonClient {
   /// 探测预览（E31，第二梯队新建表单）：不建任务，取大小/建议名/
   /// Range 支持（headers/proxy/auth 同 add 语义随探测下发——预览即验证
   /// 反防盗链配置是否有效）。非 2xx 抛错误（req 统一错误提取）。
+  /// 磁力元数据抓取（体检 #182 R7：/bt/metadata 接入——预览文件清单，
+  /// 不建任务）。需 daemon 编译时启用 bt feature（否则 400 明确报错）。
+  btMagnetMetadata(magnet: string, timeoutS?: number): Promise<MagnetMetaOut> {
+    const body: MagnetMetaReq = { magnet, trackers: [], peers: [], timeout_s: timeoutS };
+    return req("/bt/metadata", { method: "POST", body: JSON.stringify(body) });
+  }
   probe(body: Partial<ProbeReq>): Promise<ProbeOut> {
     return req("/probe", { method: "POST", body: JSON.stringify(body) });
   }
@@ -364,10 +416,12 @@ export class DaemonClient {
     const body: BansReq = { ips };
     return req("/security/bans", { method: "POST", body: JSON.stringify(body) });
   }
-  /// 批量解禁（幂等）。
+  /// 批量解禁（幂等）。体检 #182 卫生项：改走 POST /security/bans/unban
+  /// 规范通道（原 DELETE + body 违反 HTTP 语义——规范无定义，AI/多数
+  /// 客户端不发 DELETE body；daemon 保留 DELETE 路由仅为兼容既有调用方）。
   unbanIps(ips: string[]): Promise<BansOut> {
     const body: BansReq = { ips };
-    return req("/security/bans", { method: "DELETE", body: JSON.stringify(body) });
+    return req("/security/bans/unban", { method: "POST", body: JSON.stringify(body) });
   }
   /// IP 段批量导入（DAT PeerGuardian / P2P 格式文本；部分成功语义）。
   /// 注意：全失败时 400（错误体含 imported/errors）——req 统一抛错，
@@ -462,6 +516,24 @@ export class DaemonClient {
   }
 
   // 事件流（SSE，带断线重连）。审计修复（40-e P1-6/P1-13）：
+  /// R16：事件历史分页查询（GET /events）。响应形状（daemon json! 动态
+  /// 结构，本地类型锁定）：events 升序 + next_after / has_more / oldest_seq
+  /// / truncated / latest_seq（已发布最大 seq——live 边界）。
+  listEvents(q?: {
+    after?: number;
+    limit?: number;
+    taskId?: string;
+    type?: string;
+  }): Promise<EventsPage> {
+    const p = new URLSearchParams();
+    if (typeof q?.after === "number") p.set("after", String(q.after));
+    if (typeof q?.limit === "number") p.set("limit", String(q.limit));
+    if (q?.taskId) p.set("task_id", q.taskId);
+    if (q?.type) p.set("type", q.type);
+    const qs = p.toString();
+    return req(`/events${qs ? `?${qs}` : ""}`);
+  }
+
   // - token 以 ?token= 查询参数传递（EventSource 规范无法设置请求头，
   //   旧实现配置 token 后 401 死循环；daemon 侧对 /events/stream 回退）
   // - 重连带 after 游标（最后收到 seq）——旧实现重连从 0 全量重放，
@@ -475,11 +547,16 @@ export class DaemonClient {
   subscribeEvents(
     onEvent: (env: SchedulerEventEnvelope) => void,
     onState: (connected: boolean) => void,
+    /** R16 live 边界：初始游标（GET /events 的 latest_seq）。提供时 SSE
+     * 仅收增量（after=seq）——重载不再全量重放（历史 toast 洪泛根除；
+     * 历史日志改由 listEvents REST 引导）。缺省 0 = 旧行为（全量重放，
+     * REST 引导失败的降级路径）。 */
+    afterSeq = 0,
   ): () => void {
     let closed = false;
     let es: EventSource | null = null;
     let retry: ReturnType<typeof setTimeout> | null = null;
-    let lastSeq = 0;
+    let lastSeq = afterSeq;
     /// daemon events.rs known_event_type_labels() 全集（13 种；新增变体
     /// 时此处同步——未知类型不路由，属可接受的静默丢弃口径）。
     const EVENT_TYPES = [
@@ -517,7 +594,30 @@ export class DaemonClient {
           .filter(Boolean)
           .join("&");
         es = new EventSource(url(`/events/stream${q ? `?${q}` : ""}`));
-        es.onopen = () => onState(true);
+        // R18：连接（重）建立时校验 seq 边界——daemon 重启后 seq 从 0 重计，
+        // 陈旧 lastSeq（如 5000）> 新最大 seq 时 after=5000 会滤空一切且
+        // 连接表面健康（服务端正常接受、无错误可触发任何报警——live 流
+        // 静默死亡：速率列/完成 toast/日志全部失效直到手动刷新页面）。
+        // onopen 探测 latest_seq：回退 → lastSeq 归零 + 立即重建连接
+        // （全量重放；新 daemon 缓冲尚小，重放开销可忽略）。探测失败 →
+        // 不动作（连接本身已建立，事件照常；边界校验留给下次重连）。
+        es.onopen = () => {
+          onState(true);
+          void this.listEvents({ limit: 1 })
+            .then((page) => {
+              if (
+                !closed &&
+                es &&
+                typeof page.latest_seq === "number" &&
+                page.latest_seq < lastSeq
+              ) {
+                lastSeq = 0;
+                es.close();
+                connect();
+              }
+            })
+            .catch(() => {});
+        };
         for (const type of EVENT_TYPES) es.addEventListener(type, handle as EventListener);
         es.onerror = () => {
           onState(false);

@@ -633,6 +633,193 @@ async fn file_priority_index_out_of_range_400() {
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
 }
 
+// ============ 创建时初始优先级（R5 根治：暂停窗口内应用）============
+
+/// 双文件 .torrent（a.bin 1024B + b.bin 2048B，单 piece 覆盖 3072B 零内容）。
+/// piece hash = SHA1(3072 × 0x00)。
+fn multi_file_torrent_b64() -> String {
+    let mut t =
+        b"d4:infod5:filesld6:lengthi1024e4:pathl5:a.bineed6:lengthi2048e4:pathl5:b.binee".to_vec();
+    // ↑ info dict 内：两个文件 dict 各自闭合；下面补 files 列表闭合 e 再接字段
+    t.extend_from_slice(b"e4:name4:test12:piece lengthi16384e6:pieces20:");
+    // 02ec1f60b2e76741dd9848ac432057ff9d58d750 = SHA1(0x00 * 3072)
+    t.extend_from_slice(&[
+        0x02, 0xec, 0x1f, 0x60, 0xb2, 0xe7, 0x67, 0x41, 0xdd, 0x98, 0x48, 0xac, 0x43, 0x20, 0x57,
+        0xff, 0x9d, 0x58, 0xd7, 0x50,
+    ]);
+    t.extend_from_slice(b"ee");
+    base64::engine::general_purpose::STANDARD.encode(&t)
+}
+
+/// R5 缺陷回归：创建时携带 file_priorities → 引擎 add 暂停窗口内应用
+/// （resume 前）→ 首次 readback 即 [4,0]、任务 total 确定性排除 skip 文件。
+/// 旧实现创建后补设与启动序列竞态：本地极速下载在补设前完成，
+/// 同脚本两跑 total_wanted 16MB/24MB 分叉（skip 非确定性丢失）。
+#[tokio::test]
+async fn torrent_task_created_with_file_priorities_applies_pre_resume() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "torrent_b64": multi_file_torrent_b64(),
+            "file_priorities": [ { "index": 1, "priority": 0 } ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CREATED,
+        "创建时优先级建任务必须 201: {:?}",
+        resp.text().await.unwrap()
+    );
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 首次 readback（空 priorities = 纯读）即 [4,0]——无需轮询收敛
+    let resp = client
+        .post(format!("{base}/tasks/{tid}/files/priority"))
+        .json(&serde_json::json!({ "priorities": [] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body["priorities"],
+        serde_json::json!([4, 0]),
+        "创建时优先级应在 resume 前生效（R5：暂停窗口应用）"
+    );
+
+    // 注：total（=total_wanted）不在本测试断言——libtorrent 2.0 对无传输活动
+    // 的种子惰性重算 wanted（实测 idle 态恒 3072，set 端点重设亦不触发），
+    // 有 peers 的真实传输下方重算（e2e 脚本 scripts/manual/realtest 侧
+    // 3/3 实证 total=16MB 且 skip 文件零字节落盘）。此处断言优先级表即足够：
+    // readback [4,0] 证明暂停窗口应用已进 handle 优先级表（门控下载的依据）。
+}
+
+/// 创建时优先级：下标对 torrent 文件数越界 → 400。
+#[tokio::test]
+async fn create_file_priorities_index_out_of_range_400() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "torrent_b64": multi_file_torrent_b64(),
+            "file_priorities": [ { "index": 5, "priority": 0 } ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // priority 8 越界 → 400
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "torrent_b64": multi_file_torrent_b64(),
+            "file_priorities": [ { "index": 0, "priority": 8 } ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+/// 创建时优先级：magnet 入口携带 → 400（metadata 未就绪，须建任务后经
+/// /tasks/:id/files/priority 设置）。
+#[tokio::test]
+async fn create_file_priorities_rejected_for_magnet_400() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "url": "magnet:?xt=urn:btih:0000000000000000000000000000000000000000",
+            "file_priorities": [ { "index": 0, "priority": 0 } ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+}
+
+/// R18（缺陷④）回归：文件级进度透出——多文件 BT 任务 files 数组必须给出
+/// 逐文件 rel_path + size（旧实现只合成 1 条空路径聚合条目，
+/// 「BT 多文件与 FTP 目录任务行为一致」契约未兑现，UI 文件列表无从渲染）。
+#[tokio::test]
+async fn torrent_task_files_exposes_per_file_progress() {
+    let _lt = crate::common::lt_gate::LT_SESSION_GATE.lock().await;
+    let (addr, _state, _save) = serve_bt().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({
+            "torrent_b64": multi_file_torrent_b64(),
+            "file_priorities": [ { "index": 1, "priority": 0 } ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CREATED);
+    let tid = resp.json::<serde_json::Value>().await.unwrap()["task_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // files 数组：逐文件真名（torrent name 前缀 + 相对路径）+ 尺寸
+    let mut files = None;
+    for _ in 0..20 {
+        let resp = client
+            .get(format!("{base}/tasks/{tid}"))
+            .send()
+            .await
+            .unwrap();
+        let snap: serde_json::Value = resp.json().await.unwrap();
+        let fs = snap["files"].as_array().cloned();
+        if let Some(fs) = &fs {
+            if fs.len() == 2 {
+                files = Some(fs.clone());
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let files = files.expect("2s 内 files 必须透出 2 条逐文件条目");
+    assert_eq!(
+        serde_json::json!(&files[0]["rel_path"]),
+        serde_json::json!("test/a.bin"),
+        "rel_path = torrent 名 + 相对路径（与 FTP 目录任务口径一致）"
+    );
+    assert_eq!(
+        serde_json::json!(&files[1]["rel_path"]),
+        serde_json::json!("test/b.bin")
+    );
+    assert_eq!(
+        serde_json::json!(&files[0]["size"]),
+        serde_json::json!(1024)
+    );
+    assert_eq!(
+        serde_json::json!(&files[1]["size"]),
+        serde_json::json!(2048)
+    );
+}
+
 // ============ 持久化 + 恢复重放（P1-3：file_priorities 生命周期）============
 
 /// serve_bt 的外置目录变体：save = dir（调用方持有 tempdir 保活），可选注入
