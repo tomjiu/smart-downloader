@@ -210,7 +210,11 @@ fn main() {
                         tauri_plugin_shell::process::CommandEvent::Stderr(line) => {
                             let s = String::from_utf8_lossy(&line).to_string();
                             eprintln!("[daemon] {s}");
-                            let mut logs = ev_handle.state::<DaemonLogs>().0.lock().unwrap();
+                            // State 是借用句柄：先绑定再取锁（临时值在语句末
+                            // 释放，guard 跨语句存活会 E0716——fork 桌面构建
+                            // 实测抓到的编译错误）
+                            let logs_state = ev_handle.state::<DaemonLogs>();
+                            let mut logs = logs_state.0.lock().unwrap();
                             logs.push_back(s);
                             while logs.len() > STDERR_TAIL_MAX {
                                 logs.pop_front();
