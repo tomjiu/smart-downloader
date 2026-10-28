@@ -26,7 +26,8 @@
  *
  * by-design 登记簿（daemon-only / 运维端点，#190 已文档声明）：
  *   config/health/metrics/version/ws（基础设施）/ nas×5（NAS 托管运维）/
- *   xunlei-import（CLI 通道）。增删须同步 #190 的 README 声明。
+ *   xunlei-import（CLI 通道）/ DELETE security/bans（旧解禁通道，UI 已迁
+ *   POST unban，DELETE 保留兼容既有调用方）。增删须同步 #190 的 README 声明。
  *
  * 维护提醒：
  *   - 新增 wire 端点走裸 fetch() 时无需改本脚本（通道已覆盖）；走其他
@@ -69,6 +70,10 @@ const BY_DESIGN = new Set([
   'POST /nas/stop',
   'POST /nas/token',
   'POST /tasks/xunlei-import',
+  // 旧解禁通道（P2-1 审计修复）：DELETE 带 body 违反 HTTP 语义，UI 已迁
+  // POST /security/bans/unban（#187 规范通道）；DELETE 路由保留兼容既有
+  // CLI/脚本调用方（同 handler，见 http.rs 路由注释）——daemon-only 兼容面。
+  'DELETE /security/bans',
 ]);
 
 // ---- 1. daemon 路由（.route( 切段：段首路径 + 段身 handler 链）----

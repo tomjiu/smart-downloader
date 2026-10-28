@@ -105,7 +105,9 @@ npx playwright test -c e2e-restart/playwright.config.ts   # 重启韧性独立�
 - **破窗**（UI 调用无对应路由）：任何一条即 FAIL——字段改名 / 路由删除
   在此显形，不必等运行时 404；
 - **盲区**（路由无 UI 消费者）：对照 by-design 登记簿分类（config/health/
-  metrics/version/ws/nas×5/xunlei-import 等 daemon-only 运维端点），
+  metrics/version/ws/nas×5/xunlei-import 等 daemon-only 运维端点，及
+  `DELETE /security/bans` 旧解禁通道——UI 已迁 `POST /security/bans/unban`，
+  DELETE 保留兼容既有 CLI/脚本调用方），
   未登记者列出待人工判定（新缺口 or 需登记）。
 
 ```bash
