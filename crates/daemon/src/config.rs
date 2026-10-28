@@ -54,6 +54,13 @@ pub struct ServerCfg {
     /// 大小写不敏感，剥端口比对。
     #[serde(default)]
     pub extra_allowed_hosts: Vec<String>,
+    /// R24 跨源 CORS 放行 Origin 清单（完整 origin 含端口，如
+    /// `http://ui.lan:3000`）：静态托管 UI → 远程 daemon 场景浏览器读取
+    /// 响应所需。回环 Origin（localhost/127.*/::1）始终放行（与 tokenless
+    /// 守卫的回环信任同口径）；非回环远端建议配 `http_token`（tokenless
+    /// 守卫对非回环 Origin 仍 403，CORS 头不放松它）。不参与热重载。
+    #[serde(default)]
+    pub extra_allowed_origins: Vec<String>,
 }
 
 impl Default for ServerCfg {
@@ -62,6 +69,7 @@ impl Default for ServerCfg {
             addr: "127.0.0.1:8787".into(),
             http_token: None,
             extra_allowed_hosts: Vec::new(),
+            extra_allowed_origins: Vec::new(),
         }
     }
 }
@@ -877,6 +885,41 @@ mod tests {
             vec!["MyHost.local".to_string(), " dev.box ".to_string()]
         );
         assert!(!Config::is_loopback_addr(":::8787"));
+    }
+
+    #[test]
+    fn extra_allowed_origins_field_roundtrip() {
+        let dir = std::env::temp_dir().join(format!(
+            "sd-cfg-cors-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("config.toml");
+        std::fs::write(&p, "[server]\naddr = \"127.0.0.1:8787\"\n").unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        assert!(
+            c.server.extra_allowed_origins.is_empty(),
+            "serde default 必须空（不启用 CORS 时不放行任何非回环 Origin）"
+        );
+        std::fs::write(
+            &p,
+            "[server]\nextra_allowed_origins = [\"http://ui.lan:3000\", \" https://cdn.example.org \"]\n",
+        )
+        .unwrap();
+        let c = Config::load(Some(&p)).unwrap();
+        // 原样透传（归一在 builder 注入点做——与 extra_allowed_hosts 同口径）
+        assert_eq!(
+            c.server.extra_allowed_origins,
+            vec![
+                "http://ui.lan:3000".to_string(),
+                " https://cdn.example.org ".to_string()
+            ]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

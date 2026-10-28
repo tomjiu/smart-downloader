@@ -26,7 +26,7 @@ import type {
   TaskRate,
   TaskSnapshot,
 } from "@/lib/daemon/types";
-import { client } from "@/lib/daemon/store";
+import { client, getBase, getToken } from "@/lib/daemon/store";
 import TasksTable, {
   displayName,
   type SortKey,
@@ -43,7 +43,7 @@ import NewTaskForm from "./NewTaskForm";
 import Toolbar, { TASK_FILTERS, type TaskFilterKey, type ViewKey } from "./Toolbar";
 import Sidebar from "./Sidebar";
 import StatusBar from "./StatusBar";
-import { ConfirmDialog, TableSkeleton } from "./Common";
+import { ConfirmDialog, DaemonDown, TableSkeleton } from "./Common";
 import { Icon } from "./Icon";
 
 type SpeedPoint = { down: number; up: number };
@@ -158,9 +158,21 @@ export default function DlApp() {
   }, [query]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
+  /// R24：挂载后捕获连接目标（localStorage 仅客户端可读；面板晚于首拍
+  /// 渲染，彼时必就绪——首拍骨架与 SSR HTML 一致，无 hydration 风险）。
+  useEffect(() => {
+    setDd({ base: getBase(), hasToken: !!getToken() });
+  }, []);
   const [adding, setAdding] = useState(false);
   /// E8：首帧数据是否已到（区分「加载中」骨架与「暂无任务」空态）。
   const [loaded, setLoaded] = useState(false);
+  /// R24：首轮轮询是否已决（区分「首次请求在途」与「daemon 不可达」）。
+  /// 门控 DaemonDown 面板：正常加载首拍（请求在飞、connected 仍 false）
+  /// 必须显示骨架而非面板——否则每次健康加载都会闪「无法连接」。
+  const [polled, setPolled] = useState(false);
+  /// R24：面板要展示的连接目标（localStorage 仅客户端可读，挂载后捕获；
+  /// 面板只在轮询决出后渲染，彼时已就绪）。
+  const [dd, setDd] = useState<{ base: string; hasToken: boolean } | null>(null);
   /// 表头排序（null = 后端默认序）。
   const [sort, setSort] = useState<TableSort>(null);
   /// 危险操作确认（删除任务/批量删除）。
@@ -312,6 +324,8 @@ export default function DlApp() {
       });
     }
     setConnected(t !== null || s !== null);
+    // R24：首轮决出标记（DaemonDown 门控——首拍在飞不算不可达）。
+    setPolled(true);
   }, [listParams]);
 
   /// 详情快照轮询：仅对当前列表中的任务并发拉取（表格进度/大小/ETA 数据源）。
@@ -684,8 +698,19 @@ export default function DlApp() {
                   + 探测预览 + 高级项）。常驻挂载 hidden 切换——收起不丢已填
                   内容；Esc 不收表单（防误触丢稿），收起走「取消」/工具栏。 */}
               <NewTaskForm open={adding} onOpen={setAdding} onAdded={onTaskAdded} />
+              {/* R24：首帧未到时三分支——首轮未决（请求在飞）或连接正常 =
+                  骨架（与 SSR HTML 一致，无闪变）；首轮已决且连接失败 =
+                  daemon 不可达面板（地址/令牌/自愈提示）。connected 翻转
+                  零交互自愈（1s 轮询驱动）。 */}
               {!loaded ? (
-                <TableSkeleton />
+                polled && !connected ? (
+                  <DaemonDown
+                    base={dd?.base ?? ""}
+                    hasToken={dd?.hasToken ?? false}
+                  />
+                ) : (
+                  <TableSkeleton />
+                )
               ) : (
                 <TasksTable
                   tasks={tasks}

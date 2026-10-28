@@ -3157,8 +3157,127 @@ fn finish_router(
         }
         None => app,
     };
+    // R24：CORS 层最后叠加 = 最外层——预检 OPTIONS 必须短路在 auth_mw
+    // 之前（浏览器预检不携带 Authorization，先进 auth 会拿 401 被判
+    // CORS 失败）；非预检响应（含 auth 的 401/403）出栈时补 ACAO 头，
+    // 跨源 UI 才能读取真实错误信息而非笼统网络错误。
     app.layer(middleware::from_fn_with_state(state.clone(), auth_mw))
+        .layer(middleware::from_fn_with_state(state.clone(), cors_mw))
         .with_state(state)
+}
+
+/// R24 跨源 CORS 中间件：静态托管 UI → 远程 daemon 模式的浏览器读取
+/// 许可。此前 UI 的 `dl.daemon.base` 地址覆盖（Settings「daemon 地址」）
+/// 在浏览器跨源下永不可用——daemon 不发 CORS 头，fetch 一律被浏览器
+/// 拦截（UI 表现为「无法连接」）。
+///
+/// 放行口径与 tokenless 守卫（request_from_local_origin）同构：
+/// - 回环 Origin（localhost / 127.* / ::1，任意端口）始终放行——服务端
+///   本就信任回环 Origin，此处只补浏览器侧读取头，不扩大攻击面；
+/// - `extra_allowed_origins`（完整 origin 含端口）显式追加——面向
+///   配了 `http_token` 的远程/反代场景；
+/// - 其余（evil.com 等）：无 ACAO 头 → 浏览器拦截；tokenless 守卫
+///   照旧 403，双保险不变。
+///
+/// 不用 `Access-Control-Allow-Credentials`：鉴权走 Authorization 头
+/// （非 cookie），标准 fetch 默认模式即可携带。
+async fn cors_mw(
+    State(state): State<Arc<DaemonState>>,
+    req: axum::extract::Request,
+    next: Next,
+) -> axum::response::Response {
+    use axum::http::{header, Method, StatusCode};
+    let origin = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let allowed = origin
+        .as_deref()
+        .map(|o| origin_allowed(o, &state.extra_allowed_origins));
+    // 预检（OPTIONS + Origin + ACRM）：放行 → 204 + 许可头；拒绝 → 204
+    // 不带头（浏览器判 CORS 失败，服务端无副作用——preflight 本就无业务语义）。
+    if req.method() == Method::OPTIONS {
+        if allowed == Some(true) {
+            let o = origin.unwrap_or_default();
+            return (
+                StatusCode::NO_CONTENT,
+                [
+                    (
+                        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+                        axum::http::HeaderValue::from_str(&o)
+                            .unwrap_or_else(|_| axum::http::HeaderValue::from_static("*")),
+                    ),
+                    (
+                        header::ACCESS_CONTROL_ALLOW_METHODS,
+                        axum::http::HeaderValue::from_static(
+                            "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+                        ),
+                    ),
+                    (
+                        header::ACCESS_CONTROL_ALLOW_HEADERS,
+                        axum::http::HeaderValue::from_static("Content-Type, Authorization"),
+                    ),
+                    (
+                        header::ACCESS_CONTROL_MAX_AGE,
+                        axum::http::HeaderValue::from_static("600"),
+                    ),
+                ],
+            )
+                .into_response();
+        }
+        return StatusCode::NO_CONTENT.into_response();
+    }
+    let mut resp = next.run(req).await;
+    if allowed == Some(true) {
+        let o = origin.unwrap_or_default();
+        let headers = resp.headers_mut();
+        if let Ok(v) = axum::http::HeaderValue::from_str(&o) {
+            headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, v);
+        }
+        // 缓存正确性：响应随 Origin 变化 → Vary 补列（追加而非覆盖，
+        // 不冲掉路由层已有的 Vary 声明）。
+        let vary = headers
+            .get(header::VARY)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let new_vary = match vary {
+            Some(v)
+                if v.split(',')
+                    .any(|t| t.trim().eq_ignore_ascii_case("origin")) =>
+            {
+                None
+            }
+            Some(v) => Some(format!("{v}, Origin")),
+            None => Some("Origin".to_owned()),
+        };
+        if let Some(nv) = new_vary {
+            if let Ok(v) = axum::http::HeaderValue::from_str(&nv) {
+                headers.insert(header::VARY, v);
+            }
+        }
+    }
+    resp
+}
+
+/// Origin 放行判定（R24）：回环 host（剥 scheme/端口）或完整命中
+/// `extra_allowed_origins`（大小写不敏感、trim——与 extra_allowed_hosts
+/// 同卫生口径）。`null`（沙箱 iframe）/非 http(s) scheme → false。
+fn origin_allowed(origin: &str, extra: &[String]) -> bool {
+    let bare = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .unwrap_or(origin);
+    if bare.is_empty() {
+        return false;
+    }
+    let host = bare.rsplit_once(':').map(|(x, _)| x).unwrap_or(bare);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host == "localhost" || host.starts_with("127.") || host == "::1" {
+        return true;
+    }
+    let o = origin.trim().to_ascii_lowercase();
+    extra.iter().any(|e| e.trim().to_ascii_lowercase() == o)
 }
 
 /// ===== NAS 引擎管理端点（feature nas）=====

@@ -1,8 +1,10 @@
 "use client";
-/// 通用小件：状态徽章 / 进度条 / 速率胶囊 / 空态 / 确认对话框 / 表格骨架。
+/// 通用小件：状态徽章 / 进度条 / 速率胶囊 / 空态 / 确认对话框 / 表格骨架 / daemon 不可达面板。
 /// Issue #115 Phase 1：全部改用 dl-* token 体系（旧库 class 已清零）。
 /// 交互打磨批：ConfirmDialog（危险操作确认，alertdialog 语义 + Esc +
 /// 初始焦点取消按钮）；TableSkeleton（E8：首帧数据未到时不再误报「暂无任务」）。
+/// R24：DaemonDown——首帧未到且轮询全败时替换骨架（区分「加载中」与
+/// 「daemon 未启动」，首跑时序 UI 先于 daemon 是常见场景）。
 
 import { useEffect, useRef } from "react";
 import { fmtBytes, fmtPct, fmtSpeed, fmtUnixShort } from "@/lib/daemon/format";
@@ -170,6 +172,37 @@ export function TableSkeleton({ rows = 8 }: { rows?: number }) {
           <span style={{ width: "8%", height: 10 }} />
         </div>
       ))}
+    </div>
+  );
+}
+
+/// R24：daemon 不可达面板。触发条件 = 首帧未到（loaded=false）且最近一轮
+/// 双请求（/tasks + /stats）全败——与 TableSkeleton（daemon 可达、数据在途）
+/// 严格互斥。旧体验：骨架条无限渲染，用户无法分辨「慢加载」与「daemon
+/// 未启动」；真实首跑时序（UI 先于 daemon 启动）下只见灰条不见原因。
+/// 恢复路径零交互：轮询每秒自动重试，daemon 起来即自愈进入列表/空态
+/// （connected 翻转驱动，e2e 有全链护栏）。
+export function DaemonDown({ base, hasToken }: { base: string; hasToken: boolean }) {
+  return (
+    <div className="dl-daemon-down" role="alert" data-testid="daemon-down">
+      <div className="dl-empty-orb">
+        <Icon name="server" size={22} />
+      </div>
+      <div className="dl-dd-title">无法连接 daemon</div>
+      <div className="dl-dd-meta">
+        <span className="dl-dd-k">地址</span>
+        <code className="dl-dd-v" data-testid="daemon-down-base">
+          {base || "同源（当前页面地址）"}
+        </code>
+      </div>
+      <div className="dl-dd-meta">
+        <span className="dl-dd-k">令牌</span>
+        <span className="dl-dd-v">{hasToken ? "已设置（Bearer）" : "未设置"}</span>
+      </div>
+      <div className="dl-dd-hint">
+        请确认 daemon 已启动（<code>smart-dl-daemon serve</code>）且地址可达。
+        页面每秒自动重试，无需刷新——连接恢复后自动进入任务列表。
+      </div>
     </div>
   );
 }

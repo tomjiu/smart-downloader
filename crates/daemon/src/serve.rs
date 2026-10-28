@@ -124,6 +124,7 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
         .with_limits_cfg(cfg.limits.clone())
         .with_queue_cfg(cfg.queue.clone())
         .with_extra_allowed_hosts(cfg.server.extra_allowed_hosts.clone())
+        .with_extra_allowed_origins(cfg.server.extra_allowed_origins.clone())
         .with_config_path(args.config.clone())
         .with_live_config(cfg.clone());
     #[cfg(not(feature = "bt"))]
@@ -144,6 +145,7 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
         .with_limits_cfg(cfg.limits.clone())
         .with_queue_cfg(cfg.queue.clone())
         .with_extra_allowed_hosts(cfg.server.extra_allowed_hosts.clone())
+        .with_extra_allowed_origins(cfg.server.extra_allowed_origins.clone())
         .with_config_path(args.config.clone())
         .with_live_config(cfg.clone());
 
