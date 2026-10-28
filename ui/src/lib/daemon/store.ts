@@ -30,6 +30,7 @@ import type {
   PriorityReq,
   ProbeOut,
   ProbeReq,
+  ConfigSnapshot,
   ProviderStatusDto,
   QueuePriorityOut,
   RemovedUrl,
@@ -496,6 +497,11 @@ export class DaemonClient {
   /// Provider 运行态快照（健康/配额/冷却）。
   providers(): Promise<ProviderStatusDto[]> {
     return req("/providers");
+  }
+  /// `GET /config` 精简快照（#213-4 插件页：插件启停态/档位）。子集类型
+  /// 见 types.ts ConfigSnapshot 注释。
+  configSnapshot(): Promise<ConfigSnapshot> {
+    return req("/config");
   }
 
   stats(): Promise<Stats> {

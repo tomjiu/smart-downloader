@@ -59,7 +59,8 @@ const storeSrc = fs.readFileSync(
 
 /// by-design 盲区登记簿：daemon-only / 运维端点（无 UI 消费者是刻意的）。
 const BY_DESIGN = new Set([
-  'GET /config',
+  // #213-4 插件页起 UI 消费 /config（启停态/档位快照）——从 by-design 移出，
+  // 转为对齐通道（store.configSnapshot）。
   'GET /health',
   'GET /metrics',
   'GET /version',
