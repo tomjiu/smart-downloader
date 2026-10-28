@@ -153,6 +153,19 @@ r = json.load(sys.stdin)
 print(r.get('id') or r.get('task_id') or '')"
 }
 
+# 首跑发现（2026-10-28）：URL 池只有 4 个源而默认 JOBS=8——同波每 URL 提交
+# 两次，daemon canonical 查重（同 URL 未终态 → 409 DuplicateRejected）吃掉
+# 一半，实际并发 = JOBS/2（采样 total_tasks=4 实锤），soak 一直在半负载跑
+# 而脚本只 ⚠️ 不计数。修法：每次提交追加 salt 参数（服务器忽略未知参数、
+# 内容仍按 size 确定性生成；canonical 剥 token 参数但保留 salt → 身份唯一，
+# 查重放行）——真实并发回到 JOBS，且 SHA 参考值不变。
+uniq_url() { # $1=url $2=salt → 唯一化 URL（无 query 用 ?，有则 &）
+  case "$1" in
+    *\?*) echo "$1&salt=$2" ;;
+    *)    echo "$1?salt=$2" ;;
+  esac
+}
+
 task_snapshot() { curl -s "$API/tasks/$1"; }
 
 wait_terminal() { # $1=task_id $2=超时秒 → echo 终态
@@ -198,7 +211,8 @@ else:
 # ── 主循环：波次提交 + 周期采样 ────────────────────────────────────────────
 echo "timestamp,elapsed_min,rss_kb,fds,threads,busy_tasks,total_tasks" > "$SAMPLES_CSV"
 START=$(date +%s)
-WAVE=0; FAIL=0; TOTAL_COMPLETED=0; TOTAL_FAILED=0; TOTAL_REMOVED=0; FD_BASELINE=""
+WAVE=0; FAIL=0; TOTAL_COMPLETED=0
+TOTAL_CREATE_FAILED=0; TOTAL_FAILED=0; TOTAL_REMOVED=0; FD_BASELINE=""
 WAVE_TIMEOUT=${SOAK_WAVE_TIMEOUT_SEC:-900}
 NEXT_SAMPLE=$(( SECONDS + SAMPLE_INTERVAL ))
 WAVE_GAP=${SOAK_WAVE_GAP_SEC:-15}   # 波间隔：对免费公网源保持礼貌请求率
@@ -213,12 +227,22 @@ while :; do
   WAVE=$((WAVE+1))
   echo "== [$(date +%H:%M:%S)] wave $WAVE（t=${ELAPSED_MIN}m）提交 $JOBS 任务 =="
   TIDS=(); TIDX=()   # 并行数组：任务 id ↔ URL 下标（创建失败不占位，校验不错位）
+  WAVE_CREATED=0
   for j in $(seq 1 "$JOBS"); do
     idx=$(( (WAVE * JOBS + j) % NU ))
-    TID=$(add_task "${URLS[$idx]}" "$WORK/dl/w${WAVE}j${j}" "${REF_SHA[$idx]}")
-    [ -n "$TID" ] || { echo "  ⚠️ 任务创建失败（url=${URLS[$idx]}）"; continue; }
-    TIDS+=("$TID"); TIDX+=("$idx")
+    U=$(uniq_url "${URLS[$idx]}" "w${WAVE}j${j}")
+    TID=$(add_task "$U" "$WORK/dl/w${WAVE}j${j}" "${REF_SHA[$idx]}")
+    if [ -n "$TID" ]; then
+      TIDS+=("$TID"); TIDX+=("$idx"); WAVE_CREATED=$((WAVE_CREATED+1))
+    else
+      TOTAL_CREATE_FAILED=$((TOTAL_CREATE_FAILED+1))
+      echo "  ⚠️ 任务创建失败（url=$U）"
+    fi
   done
+  # 首跑教训：并发缩水必须当场可见（此前半负载跑完仍 PASS）
+  if [ "$WAVE_CREATED" -lt "$JOBS" ]; then
+    echo "  ⚠️ wave $WAVE 实际并发 $WAVE_CREATED/$JOBS（累计创建失败 $TOTAL_CREATE_FAILED）"
+  fi
   # 整波零创建 = 硬失败（防死循环；典型原因：查重未释放/引擎不可用）
   if [ "${#TIDS[@]}" -eq 0 ]; then
     echo "❌ wave $WAVE 全部任务创建失败"; tail -5 "$DAEMON_LOG"
@@ -295,11 +319,22 @@ else
 fi
 
 # 2. 失败任务
-echo "完成 $TOTAL_COMPLETED / 失败 $TOTAL_FAILED / 波次 $WAVE"
+echo "完成 $TOTAL_COMPLETED / 失败 $TOTAL_FAILED / 波次 $WAVE / 创建失败 $TOTAL_CREATE_FAILED"
 if [ "$TOTAL_FAILED" -gt "$MAX_FAILED" ]; then
   echo "❌ 失败任务 $TOTAL_FAILED > 允许值 $MAX_FAILED（明细: $FAILED_LIST）"; FAIL=1
 else
   echo "✅ 失败任务数在允许范围内（≤$MAX_FAILED）"
+fi
+# 创建失败门（首跑教训：并发缩水曾静默通过）。本地模式全确定性 → 任何
+# 创建失败都是缺陷（salt 查重放行后不应再有 409）；真实公网模式容忍瞬时
+# 网络抖动，但超过提交量 10% 即视为负载未达标。
+ATTEMPTED=$(( WAVE * JOBS ))
+CREATE_TOLERANCE=$(( ATTEMPTED / 10 ))
+if [ "$MODE" = "--local" ]; then CREATE_TOLERANCE=0; fi
+if [ "$TOTAL_CREATE_FAILED" -gt "$CREATE_TOLERANCE" ]; then
+  echo "❌ 任务创建失败 $TOTAL_CREATE_FAILED > 允许值 $CREATE_TOLERANCE（负载缩水，soak 未达标）"; FAIL=1
+else
+  echo "✅ 创建失败数在允许范围内（≤$CREATE_TOLERANCE）"
 fi
 
 # 3. RSS 趋势回归（内存泄漏判据：投影增长 <20%）
