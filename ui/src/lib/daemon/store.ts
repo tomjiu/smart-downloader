@@ -99,6 +99,21 @@ function headers(): HeadersInit {
   return t ? { Authorization: `Bearer ${t}` } : {};
 }
 
+/// R25：HTTP 层错误（daemon 已应答但非 2xx）——与网络层失败（fetch
+/// TypeError）区分：UI 据此分辨「认证失败」（401/403，daemon 活着、
+/// 令牌/白名单问题）与「无法连接」（拒绝/超时，daemon 没应答）。
+/// 此前两者同抛裸 Error → 首屏统一显示「无法连接 daemon」，令牌配错
+/// 的用户被引向完全错误的排障方向。
+export class HttpError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "HttpError";
+  }
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const hasBody = init?.body != null;
   const res = await fetch(url(path), {
@@ -117,7 +132,7 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       /* 忽略非 JSON 错误体 */
     }
-    throw new Error(msg);
+    throw new HttpError(res.status, msg);
   }
   return res.json() as Promise<T>;
 }

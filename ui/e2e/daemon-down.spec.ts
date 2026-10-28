@@ -13,9 +13,14 @@
  *      （P1-4 失败保旧数据语义）+ 侧栏翻回未连接——区分「从未连上」
  *      与「连上后断连」两态。
  *
+ *   5. DD-5 令牌配错（HTTP 401，daemon 活着）→ 认证失败面板变体
+ *      （R25：HttpError 分类——与「无法连接」分道，指引检查令牌/白名单）；
+ *   6. DD-6 设置页修正令牌 → 零重载自愈（headers() 每请求读 localStorage）。
+ *
  * 死端口配方：127.0.0.1:1 特权端口确定性 refused（#174 同配方，无
- * 端口复用竞态）；恢复端口 8795 独占（主套件 8788 / restart 套件 8791 之外），
- * 自带 daemon 生命周期（e2e-restart 同模式），与共享 daemon 零状态交集。
+ * 端口复用竞态）；恢复端口 8795/8797 独占（主套件 8788 / restart 套件
+ * 8791 之外），自带 daemon 生命周期（e2e-restart 同模式），与共享 daemon
+ * 零状态交集。
  */
 import { test, expect, type Page } from '@playwright/test';
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -26,6 +31,8 @@ import { join, resolve } from 'node:path';
 const DEAD_BASE = 'http://127.0.0.1:1';
 const PORT = 8795;
 const BASE = `http://127.0.0.1:${PORT}`;
+const AUTH_PORT = 8797;
+const AUTH_BASE = `http://127.0.0.1:${AUTH_PORT}`;
 const UI_DIR = resolve(__dirname, '..');
 const REPO = resolve(UI_DIR, '..');
 const DAEMON_BIN = process.env.SD_DAEMON_BIN || join(REPO, 'target/debug/smart-dl-daemon');
@@ -155,5 +162,76 @@ test.describe('daemon 不可达 UX', () => {
     // 空态仍在（数据未被清成面板/骨架）
     await expect(page.getByText('暂无任务')).toBeVisible();
     await expect(page.getByTestId('daemon-down')).toHaveCount(0);
+  });
+
+  test('DD-5 令牌配错（401，daemon 活着）→ 认证失败面板变体（非「无法连接」）', async ({ page }) => {
+    test.setTimeout(120_000);
+    if (!existsSync(DAEMON_BIN)) throw new Error(`daemon 二进制不存在: ${DAEMON_BIN}`);
+
+    // token 模式 daemon（先启动——本测验证的是「可达但拒绝」）
+    const wd = mkdtempSync(join(tmpdir(), 'sd-ddauth-'));
+    const cfg = join(wd, 'config.toml');
+    writeFileSync(
+      cfg,
+      [
+        '[server]',
+        `addr = "127.0.0.1:${AUTH_PORT}"`,
+        'http_token = "real-tok"',
+        '',
+        '[download]',
+        `dest_root = "${join(wd, 'downloads').replace(/\\/g, '/')}"`,
+        '',
+      ].join('\n'),
+    );
+    const authDaemon = spawn(
+      DAEMON_BIN,
+      ['serve', '--config', cfg, '--ui-dir', join(UI_DIR, 'out')],
+      { stdio: ['ignore', 'pipe', 'pipe'], cwd: wd },
+    );
+    authDaemon.stdout!.on('data', () => {});
+    authDaemon.stderr!.on('data', (d: Buffer) => console.error('[dd-auth]', d.toString().trim()));
+    try {
+      // token 模式下 /health 同样要求 Bearer（auth_mw 覆盖全端点）
+      const deadline = Date.now() + 15_000;
+      for (;;) {
+        try {
+          const r = await fetch(`${AUTH_BASE}/health`, {
+            headers: { Authorization: 'Bearer real-tok' },
+          });
+          if (r.ok) break;
+        } catch {
+          /* 未就绪 */
+        }
+        if (Date.now() > deadline) throw new Error('auth daemon 15s 未就绪');
+        await new Promise((r) => setTimeout(r, 200));
+      }
+
+      // 页面带错误令牌 → 401 → 认证失败变体（不是「无法连接 daemon」）
+      await gotoWithBase(page, AUTH_BASE, 'wrong-tok');
+      const panel = page.getByTestId('daemon-down');
+      await expect(panel).toBeVisible({ timeout: 10_000 });
+      await expect(panel).toHaveAttribute('data-mode', 'auth');
+      await expect(panel.getByText('认证失败（daemon 拒绝了请求）')).toBeVisible();
+      await expect(panel.getByText('无法连接 daemon')).toHaveCount(0);
+      // 地址/令牌行如实呈现（排障第一手）
+      await expect(page.getByTestId('daemon-down-base')).toHaveText(AUTH_BASE);
+      await expect(panel.getByText('已设置（Bearer）')).toBeVisible();
+      // 指引面向令牌/白名单（非「请确认 daemon 已启动」）
+      await expect(panel.getByText(/http_token/)).toBeVisible();
+
+      // ---- DD-6：设置页修正令牌 → 零重载自愈（真实用户路径：headers()
+      //      每请求读 localStorage，下一拍轮询即用新令牌；面板消失） ----
+      await page.getByRole('button', { name: '设置' }).click();
+      const tokInput = page.locator('#set-a11y-25');
+      await expect(tokInput).toBeVisible();
+      await tokInput.fill('real-tok');
+      // 回任务视图（轮询期间已在自愈）
+      await page.getByRole('button', { name: '全部' }).click();
+      await expect(page.getByText('暂无任务')).toBeVisible({ timeout: 15_000 });
+      await expect(page.locator('.dl-conn.is-ok')).toContainText('已连接');
+      await expect(page.getByTestId('daemon-down')).toHaveCount(0);
+    } finally {
+      authDaemon.kill('SIGKILL');
+    }
   });
 });

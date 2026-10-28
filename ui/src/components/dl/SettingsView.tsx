@@ -308,11 +308,51 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
     return () => window.removeEventListener("beforeunload", h);
   }, [dirtyCount]);
 
+  /// 后端连接卡片（R25 提升为独立块）：纯本地 localStorage 读写，不依赖
+  /// GET /settings——令牌配错（401）时 /settings 永远拉不到，若此卡片
+  /// 跟随 s 渲染，用户将无法在 UI 内修正令牌（排障死锁：唯一修复入口
+  /// 恰在需要它的时刻不可达）。s 未就绪也渲染。
+  const connCard = (
+    <section className="dl-card">
+      <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+        <Icon name="server" size={14} className="dl-sec-ico" /> 后端连接
+
+      </h3>
+      <div className="dl-form-grid">
+        <label className="dl-field-label" htmlFor="set-a11y-24">daemon 地址</label>
+        <input id="set-a11y-24"
+          className="dl-input"
+          placeholder="留空 = 同源（内嵌 UI / 桌面端）；如 http://127.0.0.1:8787"
+          value={base}
+          onChange={(e) => {
+            setBaseState(e.target.value);
+            setBase(e.target.value.trim());
+          }}
+        />
+        <label className="dl-field-label" htmlFor="set-a11y-25">Bearer Token</label>
+        <input id="set-a11y-25"
+          className="dl-input"
+          type="password"
+          placeholder="未配置 http_token 时留空"
+          value={token}
+          onChange={(e) => {
+            setTokenState(e.target.value);
+            setToken(e.target.value.trim());
+          }}
+        />
+        <div className="dl-field-help">保存在本机浏览器存储；修改后自动生效（下次请求即走新地址/新令牌）</div>
+      </div>
+    </section>
+  );
+
   if (!s) {
     return (
-      <div className="dl-card" style={{ color: "var(--fg-3)" }}>
-        加载设置中…（若持续失败请检查「后端连接」）
-      </div>
+      <>
+        <div className="dl-card" style={{ color: "var(--fg-3)" }}>
+          加载设置中…（若持续失败请检查下方「后端连接」——令牌/地址）
+        </div>
+        {connCard}
+      </>
     );
   }
 
@@ -760,39 +800,8 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
       </section>
       )}
 
-      {/* —— 后端连接 —— */}
-      {hit("后端 连接 server 地址 token base") && (
-      <section className="dl-card">
-        <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
-          <Icon name="server" size={14} className="dl-sec-ico" /> 后端连接
-        
-        </h3>
-        <div className="dl-form-grid">
-          <label className="dl-field-label" htmlFor="set-a11y-24">daemon 地址</label>
-          <input id="set-a11y-24"
-            className="dl-input"
-            placeholder="留空 = 同源（内嵌 UI / 桌面端）；如 http://127.0.0.1:8787"
-            value={base}
-            onChange={(e) => {
-              setBaseState(e.target.value);
-              setBase(e.target.value.trim());
-            }}
-          />
-          <label className="dl-field-label" htmlFor="set-a11y-25">Bearer Token</label>
-          <input id="set-a11y-25"
-            className="dl-input"
-            type="password"
-            placeholder="未配置 http_token 时留空"
-            value={token}
-            onChange={(e) => {
-              setTokenState(e.target.value);
-              setToken(e.target.value.trim());
-            }}
-          />
-          <div className="dl-field-help">保存在本机浏览器存储；修改后自动生效（下次请求即走新地址）</div>
-        </div>
-      </section>
-      )}
+      {/* —— 后端连接（connCard：s 未就绪也渲染，见定义处注释） —— */}
+      {hit("后端 连接 server 地址 token base") && connCard}
 
       {/* —— 保存条（页尾 + sticky：长页滚动始终可达） —— */}
       <div className="dl-actions dl-actions--sticky">

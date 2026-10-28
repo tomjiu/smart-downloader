@@ -1723,3 +1723,9 @@ html,
   line-height: 1.6;
   color: var(--fg-3);
 }
+
+/* ── R25：认证失败变体（daemon 可达但 401/403——警示黄而非错误红） ── */
+.dl-daemon-down.is-auth .dl-empty-orb {
+  border-color: var(--warn, #ebcb8b);
+  color: var(--warn, #ebcb8b);
+}

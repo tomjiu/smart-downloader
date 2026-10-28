@@ -26,7 +26,7 @@ import type {
   TaskRate,
   TaskSnapshot,
 } from "@/lib/daemon/types";
-import { client, getBase, getToken } from "@/lib/daemon/store";
+import { client, getBase, getToken, HttpError } from "@/lib/daemon/store";
 import TasksTable, {
   displayName,
   type SortKey,
@@ -170,6 +170,9 @@ export default function DlApp() {
   /// 门控 DaemonDown 面板：正常加载首拍（请求在飞、connected 仍 false）
   /// 必须显示骨架而非面板——否则每次健康加载都会闪「无法连接」。
   const [polled, setPolled] = useState(false);
+  /// R25：全败且拒绝原因是 HTTP 401/403——daemon 可达但拒绝（令牌错/
+  /// 白名单未放行），面板切换认证失败变体（文案/指引与网络不可达分道）。
+  const [authFailed, setAuthFailed] = useState(false);
   /// R24：面板要展示的连接目标（localStorage 仅客户端可读，挂载后捕获；
   /// 面板只在轮询决出后渲染，彼时已就绪）。
   const [dd, setDd] = useState<{ base: string; hasToken: boolean } | null>(null);
@@ -275,10 +278,15 @@ export default function DlApp() {
 
   const refresh = useCallback(async () => {
     // 审计修复（40-e P1-4）：失败保留旧数据——双请求都失败才判断连。
-    const [t, s] = await Promise.all([
-      client.listTasks(listParams ?? undefined).catch(() => null),
-      client.stats().catch(() => null),
+    // R25：allSettled 捕获拒绝原因——全败时区分「认证失败」（HttpError
+    // 401/403：daemon 活着、令牌/白名单问题）与「网络不可达」（fetch
+    // TypeError：拒绝/超时），面板给出完全不同的文案与排障指引。
+    const [tRes, sRes] = await Promise.allSettled([
+      client.listTasks(listParams ?? undefined),
+      client.stats(),
     ]);
+    const t = tRes.status === "fulfilled" ? tRes.value : null;
+    const s = sRes.status === "fulfilled" ? sRes.value : null;
     if (t !== null) {
       setLoaded(true);
       // P1-5-A 修复（Issue #127）：内容签名去重 + 项级引用稳定。
@@ -324,7 +332,21 @@ export default function DlApp() {
       });
     }
     setConnected(t !== null || s !== null);
-    // R24：首轮决出标记（DaemonDown 门控——首拍在飞不算不可达）。
+    // R25：全败时分类——任一拒绝原因是 HttpError 401/403 → 认证/白名单
+    // 面板（daemon 可达）；否则网络不可达面板。恢复同拍自动（1s 轮询）。
+    if (t === null && s === null) {
+      const reasons = [tRes, sRes]
+        .filter((r): r is PromiseRejectedResult => r.status === "rejected")
+        .map((r) => r.reason);
+      setAuthFailed(
+        reasons.some(
+          (e) => e instanceof HttpError && (e.status === 401 || e.status === 403),
+        ),
+      );
+    } else {
+      setAuthFailed(false);
+    }
+    // R25：首轮决出标记（DaemonDown 门控——首拍在飞不算不可达）。
     setPolled(true);
   }, [listParams]);
 
@@ -698,15 +720,16 @@ export default function DlApp() {
                   + 探测预览 + 高级项）。常驻挂载 hidden 切换——收起不丢已填
                   内容；Esc 不收表单（防误触丢稿），收起走「取消」/工具栏。 */}
               <NewTaskForm open={adding} onOpen={setAdding} onAdded={onTaskAdded} />
-              {/* R24：首帧未到时三分支——首轮未决（请求在飞）或连接正常 =
+              {/* R24/R25：首帧未到时三分支——首轮未决（请求在飞）或连接正常 =
                   骨架（与 SSR HTML 一致，无闪变）；首轮已决且连接失败 =
-                  daemon 不可达面板（地址/令牌/自愈提示）。connected 翻转
-                  零交互自愈（1s 轮询驱动）。 */}
+                  daemon 不可达面板（网络层）或认证失败变体（HTTP 401/403，
+                  daemon 活着但拒绝）。connected 翻转零交互自愈（1s 轮询）。 */}
               {!loaded ? (
                 polled && !connected ? (
                   <DaemonDown
                     base={dd?.base ?? ""}
                     hasToken={dd?.hasToken ?? false}
+                    mode={authFailed ? "auth" : "unreachable"}
                   />
                 ) : (
                   <TableSkeleton />
