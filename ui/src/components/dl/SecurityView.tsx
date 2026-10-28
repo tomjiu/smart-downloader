@@ -128,6 +128,7 @@ export default function SecurityView({
   };
 
   return (
+    <div className="dl-page dl-page--narrow">
     <div className="dl-card" style={{ display: "grid", gap: 14 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <Icon name="shield" size={15} className="dl-drawer-ico" />
@@ -291,6 +292,7 @@ export default function SecurityView({
           }}
         />
       )}
+    </div>
     </div>
   );
 }
