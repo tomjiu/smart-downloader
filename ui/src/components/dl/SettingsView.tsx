@@ -357,7 +357,8 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
   }
 
   return (
-    <div style={{ display: "grid", gap: 16, maxWidth: 860 }}
+    <div
+      className="dl-page dl-page--narrow"
       onKeyDown={(e) => {
         // Enter 保存（仅单行 input；textarea 的 Enter 保留换行）
         if (e.key === "Enter" && e.target instanceof HTMLInputElement && !busy && dirtyCount) {

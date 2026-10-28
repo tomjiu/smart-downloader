@@ -128,7 +128,7 @@ export default function RssView({ onToast }: { onToast: (t: { kind: string; text
   };
 
   return (
-    <div style={{ display: "grid", gap: 16, maxWidth: 860 }}>
+    <div className="dl-page dl-page--narrow">
       {/* —— 订阅源 —— */}
       <Section title="订阅源" count={feeds.length}>
         <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
