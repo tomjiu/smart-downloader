@@ -18,6 +18,7 @@ impl DaemonState {
             default_dest_root: Mutex::new(PathBuf::from(".")),
             allowed_roots: Mutex::new(Vec::new()),
             http_token: None,
+            instance_token: None,
             disk_precheck_strict: false,
             config_snapshot: Mutex::new(None),
             pending_file_prio: Mutex::new(HashSet::new()),
@@ -116,6 +117,13 @@ impl DaemonState {
     /// 且反代域名 Host 合法性不应被收紧。
     pub(crate) fn tokenless(&self) -> bool {
         self.http_token.is_none()
+    }
+
+    /// 注入一次性启动 nonce（#212）：桌面壳生成随机值经 CLI
+    /// `--instance-token` 传入；空串过滤为 None（未设置 = 探针恒 404）。
+    pub fn with_instance_token(mut self, token: Option<String>) -> Self {
+        self.instance_token = token.filter(|t| !t.is_empty());
+        self
     }
 
     /// 注入 tokenless 模式额外放行的 Host 名（batch8）：反向代理/本机域名
