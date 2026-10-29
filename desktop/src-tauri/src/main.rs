@@ -245,7 +245,7 @@ fn main() {
                         let url: tauri::Url = format!("http://127.0.0.1:{port}/")
                             .parse()
                             .expect("daemon url");
-                        if let Ok(win) = tauri::WebviewWindowBuilder::new(
+                        let builder = tauri::WebviewWindowBuilder::new(
                             &app_handle,
                             "main",
                             tauri::WebviewUrl::External(url),
@@ -253,9 +253,17 @@ fn main() {
                         .title("Smart Downloader")
                         .inner_size(1280.0, 840.0)
                         .min_inner_size(960.0, 600.0)
-                        .visible(false)
-                        .build()
-                        {
+                        .visible(false);
+                        // #213-1 窗口装饰：Windows/Linux 去系统装饰，改由 UI 侧
+                        // TitleBar 组件自绘（拖拽区 + 最小化/最大化/关闭，见
+                        // ui/src/components/dl/TitleBar.tsx；IPC 权限见
+                        // capabilities/shell-ui.json）。macOS 刻意保留原生装饰——
+                        // 红绿灯按钮/圆角/阴影是平台惯例，去装饰会全部失去；
+                        // UI 侧同款探测（layout.tsx data-shell 旗标）不渲染
+                        // TitleBar。`title` 仍保留：任务栏/Alt-Tab 标识来源。
+                        #[cfg(not(target_os = "macos"))]
+                        let builder = builder.decorations(false);
+                        if let Ok(win) = builder.build() {
                             let _ = win.show();
                             let _ = win.set_focus();
                         }
