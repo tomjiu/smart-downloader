@@ -1,0 +1,13 @@
+[package]
+name = "smart-dl-shell-probe"
+version = "0.2.3"
+edition = "2021"
+rust-version = "1.77"
+description = "桌面壳纯逻辑（#212）：daemon 一次性身份验证探针 + 启动失败文案"
+
+[dependencies]
+# 探针：TCP 连接 + 读写 + 超时轮询（刻意不依赖 tauri——见 lib.rs 头注）
+tokio = { version = "1", features = ["time", "net", "io-util"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros"] }

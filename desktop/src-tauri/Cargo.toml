@@ -1,6 +1,9 @@
 # 独立 workspace：本 crate 在仓库根 workspace 目录树内但不属于其 members，
 # 若无此空声明，tauri/cargo 独立构建会因「believes it's in a workspace」报错。
+# members：桌面壳纯逻辑子 crate（#212 抽出——无 tauri/native 链接依赖，
+# 常规 rust 环境即可 cargo test，见 crates/shell-probe/src/lib.rs 头注）。
 [workspace]
+members = ["crates/shell-probe"]
 
 [package]
 name = "smart-dl-desktop"
@@ -16,10 +19,16 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-shell = "2"
+# #212：启动失败可见化——原生错误弹窗（Windows MessageBoxW / macOS
+# NSAlert / Linux GTK）；仅 Rust 侧调用（不走前端 IPC，无需 capabilities）
+tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# #212：daemon 身份验证探针 + 启动失败文案（纯逻辑子 crate）
+smart-dl-shell-probe = { path = "crates/shell-probe" }
 # wait_daemon 端口轮询（timeout/sleep + TcpStream::connect）；tauri 自带
 # runtime，此处仅取 API 所需 feature
+#（io-util 经依赖图 feature 统一由 tauri 侧带出，探针读写用）
 tokio = { version = "1", features = ["time", "net"] }
 
 [profile.release]
