@@ -644,6 +644,24 @@ impl DaemonState {
         // 「热重载跟随」；原实现仅启动时 with_completion_action 注入一次，
         // 直接编辑 TOML 改完成动作被静默忽略）。
         self.set_completion_action(&cfg.scheduler.completion_action);
+        // B4（#214 §三-13）：日志级别热重载跟随（qB「行为→日志」对标）。
+        // 手改 config.toml 的 [logging].level 在 5s watcher 周期内生效；
+        // PUT /settings 回写触发的热重载读回同值（logging::try_set_level
+        // 已应用 → current_level 相等 → 静默 no-op，无事件噪声）。
+        // 订阅者未装配（库嵌入/测试）→ 记账不切换（导入/PUT 侧已按
+        // restart_required 诚实报告；此处重复降级无副作用）。
+        {
+            let new_level = cfg.logging.normalized_level();
+            if new_level != crate::logging::current_level()
+                && crate::logging::try_set_level(&new_level)
+            {
+                tracing::info!(
+                    "配置热重载: log_level {:?} → {:?}",
+                    cfg.logging.level,
+                    new_level
+                );
+            }
+        }
     }
 }
 

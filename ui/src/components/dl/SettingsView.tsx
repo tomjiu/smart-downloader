@@ -11,7 +11,8 @@
 ///   beforeunload 提醒
 
 import { Icon } from "./Icon";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { ConfirmDialog } from "./Common";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { Settings, SettingsReq, ThemeKey } from "@/lib/daemon/types";
 import { DEFAULT_THEME, THEME_KEYS, THEME_META } from "@/lib/daemon/types";
 import { client, getBase, getToken, setBase, setToken } from "@/lib/daemon/store";
@@ -196,6 +197,9 @@ const DEFAULTS: Record<string, PatchEntry[]> = {
     ["queue", "max_active_http", 0],
     ["queue", "max_active_ftp", 0],
   ],
+  logging: [
+    ["logging", "level", "info"],
+  ],
   cleanup: [
     ["cleanup", "auto_remove_completed_days", 0],
     ["cleanup", "auto_remove_keep_data", false],
@@ -224,6 +228,10 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
   // 后端连接（本地生效，不入 /settings）
   const [base, setBaseState] = useState("");
   const [token, setTokenState] = useState("");
+  // B5（#214 §五-4）：导入待确认文件（ConfirmDialog 二次确认——整文件替换
+  // 影响面大，与 SecurityView 清空封禁同交互范式）。
+  const [pendingImport, setPendingImport] = useState<File | null>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   const load = useCallback(async () => {
     try {
@@ -961,6 +969,46 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
       </section>
       )}
 
+      {/* —— 日志（B4，#214 §三-13：qB「行为→日志」对标） —— */}
+      {hit("日志 log 级别 level 调试 verbose debug trace 输出") && (
+      <section className="dl-card">
+        <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+          <Icon name="output" size={14} className="dl-sec-ico" /> 日志
+          <span style={{ flex: 1 }} />
+          <button type="button" className="dl-btn dl-btn--ghost" style={{ fontSize: 11.5 }} disabled={busy}
+            aria-label="恢复日志默认值" title="把本组字段填回出厂默认（待保存）"
+            onClick={() => patchMany(DEFAULTS.logging)}>
+            恢复默认
+          </button>
+        </h3>
+        <div className="dl-form-grid">
+          <label className="dl-field-label" htmlFor="set-a11y-41">
+            日志级别 <Effective kind="now" />
+          </label>
+          <select
+            id="set-a11y-41"
+            className="dl-input"
+            data-testid="log-level-select"
+            value={s.logging.level}
+            onChange={(e) => patch("logging", "level", e.target.value)}
+          >
+            <option value="off">off（关闭）</option>
+            <option value="error">error（仅错误）</option>
+            <option value="warn">warn（警告）</option>
+            <option value="info">info（常规 · 默认）</option>
+            <option value="debug">debug（调试）</option>
+            <option value="trace">trace（全量跟踪）</option>
+          </select>
+          <div className="dl-field-help">
+            立即生效（运行日志 / `logs` 命令输出的详细程度）
+            {s.logging.effective_level !== s.logging.level
+              ? `；当前进程实际为 ${s.logging.effective_level}（RUST_LOG 环境变量覆盖中，保存后以新值为准）`
+              : ""}
+          </div>
+        </div>
+      </section>
+      )}
+
       {/* —— 装配与鉴权（B1，#214：只读快照——改 config.toml 后重启生效） —— */}
       {hit("装配 鉴权 server provider 迅雷 夸克 插件 只读 assembly token cors") && (
       <section className="dl-card">
@@ -1059,6 +1107,69 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
       </section>
       )}
 
+      {/* —— 配置备份（B5，#214 §五-4：导出/导入，qB 对标） —— */}
+      {hit("备份 导出 导入 export import 恢复 config toml 迁移") && (
+      <section className="dl-card" data-testid="settings-backup-card">
+        <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
+          <Icon name="file" size={14} className="dl-sec-ico" /> 配置备份
+        </h3>
+        <div className="dl-field-help" style={{ marginBottom: 10 }}>
+          导出当前全部设置为 TOML 文件（<b>含 API 令牌与代理凭据</b>，与 config.toml 同密级，请妥善保管）；
+          导入 = 整文件替换并落盘：可热改的设置立即生效，装配类设置（监听地址/引擎开关等）重启后生效。
+        </div>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+          <button
+            type="button"
+            className="dl-btn dl-btn--ghost"
+            disabled={busy}
+            aria-label="导出配置文件"
+            onClick={async () => {
+              setBusy(true);
+              try {
+                const text = await client.exportSettings();
+                const blobUrl = URL.createObjectURL(new Blob([text], { type: "application/toml" }));
+                const a = document.createElement("a");
+                a.href = blobUrl;
+                a.download = "smart-dl-config.toml";
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(blobUrl), 30_000);
+                onToast({ kind: "success", text: "配置已导出（smart-dl-config.toml）——含令牌，妥善保管" });
+              } catch (e) {
+                onToast({ kind: "error", text: `导出失败：${e}` });
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            <Icon name="cloud-download" size={13} /> 导出配置
+          </button>
+          <button
+            type="button"
+            className="dl-btn dl-btn--ghost"
+            disabled={busy}
+            aria-label="导入配置文件"
+            onClick={() => fileRef.current?.click()}
+          >
+            <Icon name="arrow-up" size={13} /> 导入配置…
+          </button>
+          <input
+            ref={fileRef}
+            id="set-a11y-42"
+            type="file"
+            accept=".toml,application/toml,text/plain"
+            hidden
+            onChange={(e) => {
+              const f = e.target.files?.[0] ?? null;
+              e.target.value = ""; // 同一文件可重复选择
+              if (f) setPendingImport(f);
+            }}
+          />
+        </div>
+      </section>
+      )}
+
       {/* —— 后端连接（connCard：s 未就绪也渲染，见定义处注释） —— */}
       {hit("后端 连接 server 地址 token base") && connCard}
 
@@ -1086,6 +1197,38 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           {dirtyCount ? `保存 ${dirtyCount} 项修改` : "保存"}
         </button>
       </div>
+
+      {/* B5：导入二次确认（ConfirmDialog：整文件替换 + 落盘，影响面大） */}
+      {pendingImport && (
+        <ConfirmDialog
+          title={`导入配置「${pendingImport.name}」`}
+          body={`将用该文件整体替换当前全部设置并落盘（${(pendingImport.size / 1024).toFixed(1)} KiB）：可热改的设置立即生效，装配类设置重启后生效。确定继续吗？`}
+          confirmText="导入并替换"
+          danger
+          onCancel={() => setPendingImport(null)}
+          onConfirm={async () => {
+            const f = pendingImport;
+            setPendingImport(null);
+            setBusy(true);
+            try {
+              const text = await f.text();
+              const report = await client.importSettings(text);
+              const parts: string[] = [];
+              if (report.applied.length) parts.push(`已应用 ${report.applied.length} 项`);
+              if (report.restart_required.length) parts.push(`重启生效 ${report.restart_required.length} 项`);
+              onToast({
+                kind: "success",
+                text: `导入完成：${parts.join("，") || "配置无变化"}，已落盘`,
+              });
+              await load();
+            } catch (e) {
+              onToast({ kind: "error", text: `导入失败：${e}` });
+            } finally {
+              setBusy(false);
+            }
+          }}
+        />
+      )}
     </div>
   );
 }

@@ -75,6 +75,7 @@ async fn get_settings_returns_all_domains() {
         "provider_quark",
         "xunlei",
         "meta",
+        "logging",
     ] {
         assert!(s.get(domain).is_some(), "settings 快照缺域 {domain}");
     }
@@ -112,6 +113,9 @@ async fn get_settings_returns_all_domains() {
     assert_eq!(s["provider_xunlei"]["tier"], "web");
     assert_eq!(s["provider_quark"]["enabled"], false);
     assert_eq!(s["xunlei"]["available"], false, "默认构建无 xunlei feature");
+    // B4（#214 §三-13）：日志域默认值 + 生效级别回显。
+    assert_eq!(s["logging"]["level"], "info");
+    assert_eq!(s["logging"]["effective_level"], "info");
 }
 
 /// B1（#214）：只读装配域不出明文敏感项——http_token 即使已配置也只出
@@ -1153,4 +1157,254 @@ async fn put_bittorrent_b3_unlimited_slots_and_clear_nodes() {
         serde_json::json!([])
     );
     assert_eq!(s["bittorrent"]["max_upload_slots"], -1);
+}
+
+// ---------------------------------------------------------------------------
+// B4（#214 §三-13）：日志级别域
+// ---------------------------------------------------------------------------
+
+/// PUT logging.level：嵌入进程（测试）无订阅者 → restart_required 诚实报告
+/// + live_config 补丁（快照可回读新值）+ 落盘。真实二进制（main 装配了
+/// reload 句柄）下同一路径报 applied——本测试锁定的是嵌入语义与零假阳性。
+#[tokio::test]
+async fn put_logging_level_persists_and_reports_embed_semantics() {
+    let (_dir, base, cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({ "logging": { "level": "DEBUG" } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let report: serde_json::Value = resp.json().await.unwrap();
+    // 嵌入语义：无订阅者 → restart_required（不虚报 applied）
+    assert!(
+        report["restart_required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("logging.level")),
+        "嵌入进程应报重启生效: {report}"
+    );
+
+    // 快照回读：归一化小写 + 生效级别记账未变（无订阅者）
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["logging"]["level"], "debug", "大小写归一");
+    assert_eq!(
+        s["logging"]["effective_level"], "info",
+        "无订阅者：进程生效级别不动（诚实回显）"
+    );
+
+    // 落盘：config.toml 含归一化后的值
+    let text = std::fs::read_to_string(&cfg_path).unwrap();
+    let on_disk: smart_dl_daemon::config::Config = toml::from_str(&text).unwrap();
+    assert_eq!(on_disk.logging.level, "debug");
+}
+
+/// PUT logging.level 非法值 → 400 零副作用（白名单六值）。
+#[tokio::test]
+async fn put_logging_level_invalid_rejected_zero_side_effect() {
+    let (_dir, base, cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+    let before = std::fs::read_to_string(&cfg_path).unwrap();
+
+    // 注："Info "（带空白大小写混合）合法——trim + 大小写不敏感是设计语义。
+    for bad in ["verbose", "7", "", "info,debug"] {
+        let resp = client
+            .put(format!("{base}/settings"))
+            .json(&serde_json::json!({ "logging": { "level": bad } }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "非法级别应 400: {bad:?}");
+    }
+    let after = std::fs::read_to_string(&cfg_path).unwrap();
+    assert_eq!(before, after, "验证失败不落盘");
+}
+
+// ---------------------------------------------------------------------------
+// B5（#214 §五-4）：配置导出 / 导入
+// ---------------------------------------------------------------------------
+
+/// GET /settings/export：TOML 文本 + 附件头 + 可解析回 Config + 含全部域。
+#[tokio::test]
+async fn settings_export_returns_full_toml() {
+    let (_dir, base, _p) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{base}/settings/export"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "application/toml; charset=utf-8"
+    );
+    assert!(resp
+        .headers()
+        .get("content-disposition")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .contains("smart-dl-config.toml"));
+    let text = resp.text().await.unwrap();
+    // 可解析回 Config（round-trip 完整性）
+    let cfg: smart_dl_daemon::config::Config = toml::from_str(&text).unwrap();
+    assert_eq!(cfg.logging.level, "info");
+    assert_eq!(cfg.server.addr, "127.0.0.1:8787");
+    // 全域在场（抽查每个表头）
+    for table in [
+        "[server]",
+        "[download]",
+        "[bt]",
+        "[limits]",
+        "[queue]",
+        "[rss]",
+        "[webhook]",
+        "[cleanup]",
+        "[post_download]",
+        "[scheduler]",
+        "[logging]",
+    ] {
+        assert!(text.contains(table), "导出缺表 {table}");
+    }
+}
+
+/// POST /settings/import 往返：导出 → 改两处（热键 logging.level + 冷键
+/// bt.enabled）→ 导入 → 报告分类正确 + 快照/磁盘生效。
+#[tokio::test]
+async fn settings_import_roundtrip_classifies_hot_and_restart() {
+    let (_dir, base, cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+
+    let exported = client
+        .get(format!("{base}/settings/export"))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let mut imported: smart_dl_daemon::config::Config = toml::from_str(&exported).unwrap();
+    imported.logging.level = "warn".into();
+    imported.bt.enabled = false;
+    imported.queue.max_active_http = 3;
+    let text = imported.to_toml_string().unwrap();
+
+    let resp = client
+        .post(format!("{base}/settings/import"))
+        .header("Content-Type", "application/toml")
+        .body(text)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let report: serde_json::Value = resp.json().await.unwrap();
+    let applied = report["applied"].as_array().unwrap();
+    let restart = report["restart_required"].as_array().unwrap();
+    assert!(
+        applied.contains(&serde_json::json!("logging.level")),
+        "日志级别为热键: {report}"
+    );
+    assert!(
+        applied.contains(&serde_json::json!("queue.max_active_http")),
+        "队列配额为热键: {report}"
+    );
+    assert!(
+        restart.contains(&serde_json::json!("bt.enabled")),
+        "引擎开关为冷键: {report}"
+    );
+    assert_eq!(report["persisted"], true);
+
+    // 快照回读 + 磁盘生效
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["logging"]["level"], "warn");
+    assert!(!s["bittorrent"]["enabled"].as_bool().unwrap());
+    assert_eq!(s["queue"]["max_active_http"], 3);
+    let on_disk: smart_dl_daemon::config::Config =
+        toml::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
+    assert_eq!(on_disk.logging.level, "warn");
+    assert!(!on_disk.bt.enabled);
+}
+
+/// POST /settings/import 非法 TOML / 语义校验失败 → 400 零副作用。
+#[tokio::test]
+async fn settings_import_invalid_rejected_zero_side_effect() {
+    let (_dir, base, cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+    let before = std::fs::read_to_string(&cfg_path).unwrap();
+
+    for bad in [
+        "not a toml {{{".to_string(),
+        "[bt]\nmax_share_ratio = -1.0\n".to_string(),
+    ] {
+        let resp = client
+            .post(format!("{base}/settings/import"))
+            .header("Content-Type", "application/toml")
+            .body(bad.clone())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "非法导入应 400: {bad:?}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(body["error"].as_str().is_some(), "错误信息可读");
+    }
+    let after = std::fs::read_to_string(&cfg_path).unwrap();
+    assert_eq!(before, after, "导入失败不落盘");
+}
+
+/// POST /settings/import 无 --config → 400（整文件导入必须落盘）。
+#[tokio::test]
+async fn settings_import_requires_config_path() {
+    // 与 spawn_daemon 同构但不注入 with_config_path（无持久化目标形态）。
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = base_cfg();
+    let engine = HttpEngine::new(reqwest::Client::new());
+    let dest = dir.path().join("downloads");
+    std::fs::create_dir_all(&dest).unwrap();
+    let state = DaemonState::new(Arc::new(engine), vec![])
+        .with_dest_root(dest.clone())
+        .with_config(smart_dl_daemon::config::Config::snapshot_json(
+            &cfg,
+            &PathBuf::from("./tasks.json"),
+        ))
+        .with_live_config(cfg);
+    let state = Arc::new(state);
+    let app = http::router(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{addr}");
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{base}/settings/import"))
+        .body("[logging]\nlevel = \"warn\"\n")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 400);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("持久化目标"),
+        "错误应指明缺 --config: {body}"
+    );
 }

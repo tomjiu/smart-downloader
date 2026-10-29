@@ -16,6 +16,9 @@ pub mod health;
 pub mod http;
 pub mod http_events;
 pub mod lockfile;
+/// 运行时日志级别（B4，#214 §三-13）：reload 句柄进程级单例 + 设置面/
+/// 热重载双入口。main 装配；库嵌入（测试）无订阅者时幂等降级。
+pub mod logging;
 /// Metalink4（RFC 5854）解析与 add 链路展开（B1）。
 pub mod metalink;
 /// NAS 版迅雷引擎托管（xllite/pan-cli，Linux-only）。附录 E-2026-08-30。

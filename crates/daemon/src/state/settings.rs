@@ -30,6 +30,14 @@
 //! | `bittorrent.max_upload_slots` | 立即（内核 unchoke_slots_limit；-1 = 不限 / 0 = 复位默认 / >0 = 槽位） |
 //! | `bittorrent.seeding_idle_limit_min` | 立即（daemon 侧执法：距上次上行负载达阈值自动暂停；口径 = upload_idle_secs 与做种起始取小） |
 //!
+//! B4+B5（#214 §三-13 日志级别 + §五-4 导入/导出）：
+//!
+//! | 面 | 生效语义 |
+//!|---|---|
+//! | `logging.level` | 立即（tracing reload；订阅者未装配的库嵌入降级为重启生效——诚实报告不虚报） |
+//! | `GET /settings/export` | 权威配置全量 TOML 文本（含 http_token——与磁盘文件同密级，鉴权面内传出；UI 提示妥善保管） |
+//! | `POST /settings/import` | 解析+校验 → 全域应用（热域立即 / 冷域重启）→ 原子落盘；语义 = 文件热重载与 PUT 各域的并集（见 import_settings） |
+//!
 //! 持久化：`PUT /settings?persist=true`（默认）在权威配置（live_config）上打
 //! 补丁后原子回写 `--config` 文件（tmp+rename）。未指定 `--config` 时仅运行
 //! 时生效（report.persisted=false）。热重载循环按文本变更检测（文件为准），
@@ -57,6 +65,8 @@ pub struct SettingsReq {
     pub webhook: Option<WebhookReq>,
     pub scheduler: Option<SchedulerReq>,
     pub queue: Option<QueueReq>,
+    /// 日志级别域（B4，#214 §三-13）。
+    pub logging: Option<LoggingReq>,
     /// 持久化开关（默认 true）；与 query `?persist=` 等价（body 优先）。
     pub persist: Option<bool>,
 }
@@ -209,6 +219,17 @@ pub struct QueueReq {
     pub max_active_bt: Option<u32>,
     pub max_active_http: Option<u32>,
     pub max_active_ftp: Option<u32>,
+}
+
+/// 日志级别域（B4，#214 §三-13，qB「行为→日志」对标）：tracing 级别名
+/// off/error/warn/info/debug/trace（大小写不敏感；trim 后比对）。立即生效
+///（tracing reload）；RUST_LOG 环境变量在启动期优先，运行时热改覆盖之。
+#[derive(Debug, Clone, Default, serde::Deserialize, TS)]
+#[serde(default)]
+#[ts(export, optional_fields)]
+pub struct LoggingReq {
+    /// 目标级别；未知值 400 整体拒绝（零副作用）。
+    pub level: Option<String>,
 }
 
 /// `PUT /settings` 响应：应用结果分类 + 当前生效限速。
@@ -464,6 +485,18 @@ pub struct SettingsMetaDto {
     pub persist_path: Option<String>,
 }
 
+/// 日志域（B4，#214 §三-13）：tracing 级别（canonical 小写）。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsLoggingDto {
+    /// 当前配置级别（归一口径：off/error/warn/info/debug/trace）。启动期
+    /// 实际过滤可能被 RUST_LOG 覆盖（开发者排障杠杆，热改后以本值为准）。
+    pub level: String,
+    /// 当前进程实际生效级别（logging::current_level 记账；与 level 不一致
+    /// = RUST_LOG 覆盖中——UI 可提示「环境变量覆盖」）。
+    pub effective_level: String,
+}
+
 /// `GET /settings` 全量快照。
 #[derive(Debug, Clone, serde::Serialize, TS)]
 #[ts(export)]
@@ -484,6 +517,8 @@ pub struct SettingsSnapshot {
     pub provider_quark: SettingsProviderQuarkDto,
     pub xunlei: SettingsXunleiDto,
     pub meta: SettingsMetaDto,
+    /// 日志域（B4，#214）。
+    pub logging: SettingsLoggingDto,
 }
 
 impl DaemonState {
@@ -662,6 +697,10 @@ impl DaemonState {
                 persist_path: (*self.config_path.lock())
                     .as_ref()
                     .map(|p| p.display().to_string()),
+            },
+            logging: SettingsLoggingDto {
+                level: cfg.logging.normalized_level(),
+                effective_level: crate::logging::current_level().to_string(),
             },
         }
     }
@@ -952,6 +991,17 @@ impl DaemonState {
                 if !(1..=100_000).contains(&v) {
                     return Err(DaemonError::InvalidSource(format!(
                         "rss.max_processed_items_per_feed = {v} 无效：须在 1..=100000"
+                    )));
+                }
+            }
+        }
+        // B4（#214 §三-13）：日志级别——白名单从严（六值，大小写不敏感）；
+        // 加载期宽容回落 info 的口径仅限 config.rs 启动路径，设置面不笼络。
+        if let Some(l) = &req.logging {
+            if let Some(v) = l.level.as_deref() {
+                if crate::logging::normalize_level(v).is_none() {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "logging.level = {v:?} 无效：仅支持 off / error / warn / info / debug / trace"
                     )));
                 }
             }
@@ -1392,6 +1442,23 @@ impl DaemonState {
                 applied.push(format!("queue.{k}"));
             }
         }
+        // B4（#214 §三-13）：日志级别——热改（tracing reload）+ 权威配置补丁。
+        // 订阅者未装配（库嵌入/测试进程）→ restart_required（诚实语义，
+        // #160 同族预防：「设置了看似生效实则没有」的假阳性禁止）。
+        if let Some(l) = &req.logging {
+            if let Some(v) = l.level.as_deref() {
+                // 验证阶段已过白名单；此处 unwrap 不可达（防御式二次归一）。
+                let norm = crate::logging::normalize_level(v).unwrap_or("info");
+                if let Some(cfg) = self.live_config.lock().as_mut() {
+                    cfg.logging.level = norm.to_string();
+                }
+                if crate::logging::try_set_level(norm) {
+                    applied.push("logging.level".into());
+                } else {
+                    restart_required.push("logging.level".into());
+                }
+            }
+        }
 
         // 备用窗口重评估（备用字段变更或基准变更经 apply_global_limits 已处理；
         // 这里兜底 alt 字段单独更新时立即切换引擎实际值）
@@ -1430,6 +1497,117 @@ impl DaemonState {
             applied,
             restart_required,
             persisted,
+            limits: *self.global_limits.lock(),
+        })
+    }
+
+    /// 导出权威配置全量 TOML（B5，#214 §五-4，`GET /settings/export`）。
+    /// live_config 缺席（无 --config 且从未 PUT）→ 默认值导出（幂等兜底，
+    /// 与快照/live_config 消费点的 unwrap_or_default 同口径）。
+    pub fn export_config_toml(&self) -> Result<String, DaemonError> {
+        let cfg = self.live_config.lock().clone().unwrap_or_default();
+        cfg.to_toml_string().map_err(DaemonError::Engine)
+    }
+
+    /// 导入配置（B5，#214 §五-4，`POST /settings/import`）：
+    ///
+    /// 语义 = **文件热重载与 `PUT /settings` 各域的并集**——
+    /// 1. 解析 + `validate()`（与启动/热重载同口径，batch10-F）→ 失败
+    ///    400 零副作用；
+    /// 2. `refresh_config` 全量换权威配置（dest_root/alt/queue/webhook/
+    ///    cleanup/jitter/completion/日志级别热跟随）；
+    /// 3. 限速两键经 `apply_global_limits`（E16 文件为准路径）+ 备用窗口
+    ///    即时重评估；
+    /// 4. BT 会话 / HTTP 调谐 / 全局代理逐引擎下发（能力门控 + warn 降级，
+    ///    与 PUT 同语义）；
+    /// 5. 原子落盘（tmp+rename+fsync+0600）。
+    ///
+    /// 报告：字段级 diff（新旧两份 Config 的 TOML 树递归比对）→ 热键入
+    /// `applied`、冷键入 `restart_required`（见 [`is_restart_scoped`]）。
+    /// `settings_changed` 事件携带 diff 全集。
+    pub async fn import_settings(&self, text: &str) -> Result<SettingsApplyReport, DaemonError> {
+        // ---- 第一阶段：解析 + 校验（零副作用）----
+        let mut new_cfg: crate::config::Config = toml::from_str(text)
+            .map_err(|e| DaemonError::InvalidSource(format!("导入配置解析失败: {e}")))?;
+        new_cfg
+            .validate()
+            .map_err(|e| DaemonError::InvalidSource(format!("导入配置校验失败: {e}")))?;
+        // 日志级别归一（六值小写；非法值与加载期同口径回落 info——备份
+        // 文件可能来自旧版本，导入路径不可比 PUT 更严）。
+        new_cfg.logging.level = new_cfg.logging.normalized_level();
+        // 导入必须落盘——无 --config 的运行时态没有恢复目标，明确拒绝
+        //（PUT 语义「仅运行时生效」对整文件导入无意义：丢了源文件即丢配置）。
+        let cfg_path = self.config_path.lock().clone().ok_or_else(|| {
+            DaemonError::InvalidSource("导入需要持久化目标（未指定 --config）".into())
+        })?;
+        let old_cfg = self.live_config.lock().clone().unwrap_or_default();
+        let diff = diff_config_keys(&old_cfg, &new_cfg);
+
+        // ---- 第二阶段：应用（文件热重载链路 + PUT 引擎下发并集）----
+        let tasks_path = self
+            .persist_path
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("./tasks.json"));
+        self.refresh_config(&new_cfg, &tasks_path);
+        // 限速（E16）：apply_global_limits 设基准 + tick 重评估备用窗口
+        //（与 PUT bandwidth 域同序）。
+        self.apply_global_limits(
+            Some(new_cfg.download.max_download_kb_s),
+            Some(new_cfg.bt.max_upload_kb_s),
+        )
+        .await?;
+        self.tick_alt_limits().await?;
+        // BT 会话全量补丁（能力门控：引擎缺失/Unsupported 静默；warn 降级）。
+        let patch = BtSessionPatch {
+            enable_dht: Some(new_cfg.bt.enable_dht),
+            enable_lsd: Some(new_cfg.bt.enable_lsd),
+            enable_upnp: Some(new_cfg.bt.enable_upnp),
+            enable_pex: Some(new_cfg.bt.enable_pex),
+            enable_utp: Some(new_cfg.bt.enable_utp),
+            encrypt: Some(new_cfg.bt.encrypt.clone()),
+            listen_port: Some(new_cfg.bt.listen_port),
+            max_connections: Some(new_cfg.bt.max_connections),
+            extra_trackers: Some(new_cfg.bt.extra_trackers.clone()),
+            max_share_ratio: Some(new_cfg.bt.max_share_ratio),
+            max_seeding_time_min: Some(new_cfg.bt.max_seeding_time_min),
+            dht_bootstrap_nodes: Some(new_cfg.bt.dht_bootstrap_nodes.clone()),
+            max_upload_slots: Some(new_cfg.bt.max_upload_slots),
+            seeding_idle_limit_min: Some(new_cfg.bt.seeding_idle_limit_min),
+        };
+        self.dispatch_bt_patch(&patch).await;
+        // HTTP 调谐 + 全局代理（新任务生效语义，与 PUT download/connection 同）。
+        let tuning = new_cfg.download.http_tuning();
+        self.dispatch_http_tuning(&tuning).await;
+        let proxy = (!new_cfg.download.proxy.trim().is_empty())
+            .then(|| new_cfg.download.proxy.trim().to_string());
+        self.dispatch_global_proxy(proxy.as_deref()).await?;
+
+        // ---- 第三阶段：落盘 + 报告 + 事件 ----
+        new_cfg.save_to(&cfg_path).map_err(DaemonError::Engine)?;
+        let applied: Vec<String> = diff
+            .iter()
+            .filter(|k| !is_restart_scoped(k))
+            .cloned()
+            .collect();
+        let restart_required: Vec<String> = diff
+            .iter()
+            .filter(|k| is_restart_scoped(k))
+            .cloned()
+            .collect();
+        if !diff.is_empty() {
+            self.hub
+                .publish(SchedulerEvent::SettingsChanged { keys: diff });
+        }
+        tracing::info!(
+            "配置导入: 应用 {} 项 / 重启生效 {} 项 / 落盘 {}",
+            applied.len(),
+            restart_required.len(),
+            cfg_path.display()
+        );
+        Ok(SettingsApplyReport {
+            applied,
+            restart_required,
+            persisted: true,
             limits: *self.global_limits.lock(),
         })
     }
@@ -1604,6 +1782,81 @@ fn validate_proxy_url(url: &str) -> Result<(), DaemonError> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// B5（#214 §五-4）：导入 diff 工具（纯函数，单测直打）
+// ---------------------------------------------------------------------------
+
+/// 新旧配置字段级 diff：两份 Config 序列化为 TOML 树后递归比对，输出
+/// 变更叶节点点分路径（如 `bt.max_upload_slots`；单侧新增/删除同样计变更）。
+/// 序列化失败（含非 TOML 可表达字段）→ 空表（导入报告降级为不分类，
+/// 应用语义不受影响——引擎下发与落盘不依赖本表）。
+fn diff_config_keys(old: &crate::config::Config, new: &crate::config::Config) -> Vec<String> {
+    let (Ok(a), Ok(b)) = (toml::Value::try_from(old), toml::Value::try_from(new)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut path = String::new();
+    walk_toml_diff(&a, &b, &mut path, &mut out);
+    out.sort();
+    out
+}
+
+/// TOML 树递归 diff（叶子值不等或单侧缺失 → 记路径）。
+fn walk_toml_diff(a: &toml::Value, b: &toml::Value, path: &mut String, out: &mut Vec<String>) {
+    if let (toml::Value::Table(ta), toml::Value::Table(tb)) = (a, b) {
+        let mut keys: Vec<&String> = ta.keys().chain(tb.keys()).collect();
+        keys.sort();
+        keys.dedup();
+        for k in keys {
+            let len = path.len();
+            if !path.is_empty() {
+                path.push('.');
+            }
+            path.push_str(k);
+            match (ta.get(k), tb.get(k)) {
+                (Some(va), Some(vb)) => walk_toml_diff(va, vb, path, out),
+                _ => out.push(path.clone()),
+            }
+            path.truncate(len);
+        }
+    } else if a != b {
+        out.push(path.clone());
+    }
+}
+
+/// 导入 diff 键的冷/热分类：整域冷（装配期/启动期固化）+ 点名冷键，
+/// 其余视为导入链路可热达（refresh_config + 引擎下发 + add 时现读）。
+fn is_restart_scoped(key: &str) -> bool {
+    /// 整域重启生效：服务端装配（addr/token/CORS）、云盘 Provider/SDK
+    /// 装配、daemon 自身路径（单实例锁 / 任务持久化文件）。
+    const FULL_DOMAINS: &[&str] = &[
+        "server",
+        "xunlei",
+        "provider",
+        "provider_xunlei",
+        "provider_quark",
+        "lock",
+        "storage",
+    ];
+    /// 点名冷键：引擎开关/目录（装配期）、fsync 烘入（PR #128 语义）、
+    /// 重定向烘入全局 client（reqwest Client 不可变）、预检一致性、
+    /// RSS ticker 启动期固化、BT 预分配会话级开关。
+    const KEYED: &[&str] = &[
+        "bt.enabled",
+        "bt.save_path",
+        "bt.storage_allocate",
+        "download.disk_precheck_strict",
+        "download.max_redirects",
+        "download.fsync_per_segment",
+        "download.fsync_batch_segments",
+        "download.fsync_batch_interval_ms",
+        "rss.auto_refresh",
+        "rss.refresh_interval_secs",
+    ];
+    let head = key.split('.').next().unwrap_or("");
+    FULL_DOMAINS.contains(&head) || KEYED.contains(&key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1688,5 +1941,66 @@ mod tests {
         // from == to → 空窗口
         let degenerate = cfg_from("08:00", "08:00", &[]);
         assert!(!alt_window_active(&degenerate, &t));
+    }
+
+    /// B5（#214 §五-4）：TOML 树 diff——单字段变更 / 多域变更 / 相等空表。
+    #[test]
+    fn diff_config_keys_reports_only_changed_leaves() {
+        let a = crate::config::Config::default();
+        let mut b = a.clone();
+        b.logging.level = "debug".into();
+        b.bt.max_upload_slots = 16;
+        assert_eq!(
+            diff_config_keys(&a, &b),
+            vec![
+                "bt.max_upload_slots".to_string(),
+                "logging.level".to_string()
+            ]
+        );
+        // 相等 → 空表
+        assert!(diff_config_keys(&a, &a.clone()).is_empty());
+        // 深层嵌套（Vec 字段）变更
+        let mut c = a.clone();
+        c.bt.extra_trackers = vec!["http://t.example/announce".into()];
+        assert_eq!(
+            diff_config_keys(&a, &c),
+            vec!["bt.extra_trackers".to_string()]
+        );
+    }
+
+    /// B5：冷/热分类——整域冷 + 点名冷键 + 热键白名单外默认热。
+    #[test]
+    fn is_restart_scoped_classifies_domains_and_keys() {
+        for k in [
+            "server.addr",
+            "server.http_token",
+            "xunlei.enabled",
+            "provider.mock",
+            "lock.path",
+            "storage.tasks_path",
+            "bt.enabled",
+            "bt.save_path",
+            "bt.storage_allocate",
+            "download.fsync_per_segment",
+            "download.max_redirects",
+            "rss.auto_refresh",
+            "rss.refresh_interval_secs",
+        ] {
+            assert!(is_restart_scoped(k), "{k} 应为冷键");
+        }
+        for k in [
+            "logging.level",
+            "bt.max_upload_slots",
+            "bt.enable_dht",
+            "download.user_agent",
+            "download.min_split_mb",
+            "queue.max_active_http",
+            "limits.alt_from",
+            "webhook.url",
+            "cleanup.auto_remove_completed_days",
+            "scheduler.completion_action",
+        ] {
+            assert!(!is_restart_scoped(k), "{k} 应为热键");
+        }
     }
 }

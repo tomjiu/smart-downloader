@@ -524,6 +524,33 @@ export class DaemonClient {
       body: JSON.stringify(patch),
     });
   }
+  /// 导出配置全量 TOML 文本（B5，#214 §五-4；非 JSON 响应——独立于
+  /// req<T>，鉴权头同源透传）。含 http_token/proxy 凭据（与磁盘文件同
+  /// 密级），调用方负责提示妥善保管。
+  async exportSettings(): Promise<string> {
+    const res = await fetch(url("/settings/export"), { headers: headers() });
+    if (!res.ok) {
+      let msg = `${res.status}`;
+      try {
+        const body = await res.json();
+        if (body?.error) msg = body.error;
+      } catch {
+        /* 非 JSON 错误体 */
+      }
+      throw new Error(msg);
+    }
+    return res.text();
+  }
+  /// 导入配置（B5，#214 §五-4）：body = TOML 文本（Content-Type
+  /// application/toml；daemon 侧 String 提取器不限类型）。返回与 PUT
+  /// /settings 同形的应用报告；解析/校验失败 req 抛错（400 文案）。
+  importSettings(text: string): Promise<SettingsApplyReport> {
+    return req("/settings/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/toml" },
+      body: text,
+    });
+  }
 
   // 事件流（SSE，带断线重连）。审计修复（40-e P1-6/P1-13）：
   /// R16：事件历史分页查询（GET /events）。响应形状（daemon json! 动态

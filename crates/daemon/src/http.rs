@@ -1584,6 +1584,52 @@ async fn settings_put(
     }
 }
 
+/// `GET /settings/export`（B5，#214 §五-4）：权威配置全量 TOML 下载
+///（qB「导出设置」对标）。Content-Disposition 附件名 smart-dl-config.toml。
+/// 注意：文本含 `server.http_token` / proxy 凭据（与磁盘 config.toml 同
+/// 密级，鉴权面内传出）；UI 侧提示用户妥善保管。
+async fn settings_export(State(state): State<Arc<DaemonState>>) -> Response {
+    match state.export_config_toml() {
+        Ok(text) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "application/toml; charset=utf-8",
+            )],
+            [(
+                axum::http::header::CONTENT_DISPOSITION,
+                "attachment; filename=\"smart-dl-config.toml\"",
+            )],
+            text,
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /settings/import`（B5，#214 §五-4）：body = TOML 文本
+///（Content-Type 不限——String 提取器）。语义见 `import_settings`：
+/// 解析+校验失败 → 400 零副作用；成功 = 热域立即 + 冷域重启 + 原子落盘，
+/// 返回应用报告（与 PUT /settings 同形）。
+async fn settings_import(State(state): State<Arc<DaemonState>>, body: String) -> Response {
+    match state.import_settings(&body).await {
+        Ok(report) => Json(report).into_response(),
+        Err(DaemonError::InvalidSource(m)) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": m })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 /// 全局统计（任务按状态/引擎聚合 + 聚合速率，速率口径 1s 快照）。
 async fn stats_endpoint(State(state): State<Arc<DaemonState>>) -> impl IntoResponse {
     Json(state.stats())
@@ -3001,6 +3047,8 @@ macro_rules! router_base {
             .route("/config", get(config_endpoint))
             .route("/config/limit", post(config_set_limit))
             .route("/settings", get(settings_endpoint).put(settings_put))
+            .route("/settings/export", get(settings_export))
+            .route("/settings/import", post(settings_import))
             .route("/rss/feeds", get(rss_feeds_list).post(rss_feed_add))
             .route(
                 "/rss/feeds/:id",
