@@ -1,5 +1,6 @@
 //! smart-dl-daemon 二进制入口：
-//! - `smart-dl-daemon serve [--config <path>] [--ui-dir <dir>] [--addr <addr>]`：daemon 服务
+//! - `smart-dl-daemon serve [--config <path>] [--ui-dir <dir>] [--addr <addr>] [--instance-token <hex>]`：daemon 服务
+//!   （--instance-token：#212 桌面壳身份验证的一次性 nonce，见 serve::ServeArgs）
 //! - 其他命令（add/list/status/...）：客户端模式，连接 serve 的 HTTP API
 //!   （`--server <url>`，默认 http://127.0.0.1:8787）
 
@@ -17,7 +18,7 @@ fn main() {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("参数错误: {e}");
-                eprintln!("用法: smart-dl-daemon serve [--config <path>] [--ui-dir <dir>] [--addr <addr>]");
+                eprintln!("用法: smart-dl-daemon serve [--config <path>] [--ui-dir <dir>] [--addr <addr>] [--instance-token <hex>]");
                 std::process::exit(2);
             }
         };
