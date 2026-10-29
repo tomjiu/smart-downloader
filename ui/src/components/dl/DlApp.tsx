@@ -35,6 +35,7 @@ import TasksTable, {
 } from "./TasksTable";
 import StatsView from "./StatsView";
 import LogsView from "./LogsView";
+import TitleBar from "./TitleBar";
 import ProvidersView from "./ProvidersView";
 import RssView from "./RssView";
 import SettingsView from "./SettingsView";
@@ -688,6 +689,10 @@ export default function DlApp() {
 
   return (
     <div className="dl-root">
+      {/* #213-1 桌面壳自绘标题栏：仅 data-shell="frameless"（Windows/Linux
+          壳）渲染；浏览器/macOS 恒返回 null 零影响。fixed 悬浮，dl-root
+          由 CSS 按同旗标 padding-top 让位（见 globals.css）。 */}
+      <TitleBar />
       <Sidebar
         view={view}
         onView={setView}
