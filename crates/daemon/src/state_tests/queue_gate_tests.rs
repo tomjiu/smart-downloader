@@ -10,6 +10,17 @@ fn queue_cfg(bt: u32, http: u32, ftp: u32) -> crate::config::QueueCfg {
         max_active_bt: bt,
         max_active_http: http,
         max_active_ftp: ftp,
+        max_active_total: 0,
+    }
+}
+
+/// B6（#214 §三-10）总量闸简写：分引擎全不限 + 全局总量 = total。
+/// 仅跨引擎用例使用（ftp 特性门控）。
+#[cfg(feature = "ftp")]
+fn queue_cfg_total(total: u32) -> crate::config::QueueCfg {
+    crate::config::QueueCfg {
+        max_active_total: total,
+        ..queue_cfg(0, 0, 0)
     }
 }
 
@@ -414,4 +425,105 @@ async fn concurrent_gate_attach_rollback_no_deadlock() {
         (24..=36).contains(&len),
         "任务记录数异常（应为 24 正常 + 落队 bad）: {len}"
     );
+}
+
+// ==================== B6（#214 §三-10）：跨引擎全局总量闸 ====================
+
+/// 总量闸比分引擎配额更紧时由总量决定排队：分引擎配额 5（宽松），总量 1
+/// → 第 2/3 个任务排队，queue_wait 事件必须点名「全局并发总量」（而非
+/// 引擎配额——排队原因可观测性）；释放唯一总量槽后 FIFO 递补一个。
+#[tokio::test]
+async fn total_gate_tighter_than_engine_quota_reports_global_wait() {
+    let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+    let state = DaemonState::new(fake.clone(), vec![]).with_queue_cfg(crate::config::QueueCfg {
+        max_active_http: 5,
+        max_active_total: 1,
+        ..queue_cfg(0, 0, 0)
+    });
+
+    let t1 = state
+        .add_http_task("https://srv/g1.bin".into(), None)
+        .await
+        .unwrap();
+    let t2 = state
+        .add_http_task("https://srv/g2.bin".into(), None)
+        .await
+        .unwrap();
+    let t3 = state
+        .add_http_task("https://srv/g3.bin".into(), None)
+        .await
+        .unwrap();
+
+    // t1 入引擎；t2/t3 被总量闸排队（引擎配额 5 未触——消息须区分）
+    {
+        let tasks = state.tasks.lock();
+        assert!(tasks.get(&t1).unwrap().engine_tid.is_some());
+        for (id, label) in [(&t2, "t2"), (&t3, "t3")] {
+            let r = tasks.get(id).unwrap();
+            assert!(r.engine_tid.is_none(), "{label} 应被总量闸排队");
+            assert!(
+                r.events
+                    .iter()
+                    .any(|e| e.op == "add"
+                        && e.detail.as_deref().unwrap_or("").contains("全局并发总量")),
+                "{label} queue_wait 事件须点名全局总量（排队原因可观测）: {:?}",
+                r.events
+            );
+        }
+    }
+
+    // 释放唯一总量槽（暂停 t1）→ FIFO 递补 t2；t3 仍排队（总量复满）
+    state.pause(&t1).await.unwrap();
+    let act = state.activate_due_tasks().await;
+    assert_eq!(act, vec![t2.clone()], "总量 1：递补后复满，仅 t2 激活");
+    assert!(state.tasks.lock().get(&t3).unwrap().engine_tid.is_none());
+}
+
+/// 跨引擎总量口径（feature ftp）：分引擎配额全不限，总量 2——HTTP 1 +
+/// FTP 1 在传即满，第 3 个（任意引擎）排队；释放 FTP 槽后 HTTP 排队任务
+/// 递补（总量槽跨引擎共享，不按引擎归属——qB「全局上限」语义）。
+#[cfg(feature = "ftp")]
+#[tokio::test]
+async fn total_gate_cross_engine_shared_slots() {
+    let http_fake = Arc::new(FakeEngine::new(EngineKind::Http));
+    let ftp_fake = Arc::new(FakeEngine::new(EngineKind::Ftp));
+    let state = DaemonState::new(http_fake.clone(), vec![])
+        .with_ftp(ftp_fake.clone())
+        .with_queue_cfg(queue_cfg_total(2));
+
+    let h1 = state
+        .add_http_task("https://srv/h1.bin".into(), None)
+        .await
+        .unwrap();
+    let f1 = state
+        .add_ftp_task("ftp://srv/f1.bin".into(), None)
+        .await
+        .unwrap();
+    assert!(state.tasks.lock().get(&h1).unwrap().engine_tid.is_some());
+    assert!(state.tasks.lock().get(&f1).unwrap().engine_tid.is_some());
+
+    // 总量 2 已满（h1+f1）→ 第 3 个 HTTP 任务排队（引擎配额不限，纯总量闸）
+    let h2 = state
+        .add_http_task("https://srv/h2.bin".into(), None)
+        .await
+        .unwrap();
+    let r2 = state.tasks.lock().get(&h2).unwrap().clone();
+    assert!(r2.engine_tid.is_none(), "总量满：跨引擎之和 2 = 上限");
+    assert!(
+        r2.events
+            .iter()
+            .any(|e| e.op == "add" && e.detail.as_deref().unwrap_or("").contains("全局并发总量")),
+        "queue_wait 事件须点名全局总量: {:?}",
+        r2.events
+    );
+
+    // 释放 FTP 槽 → 排队的 HTTP 任务递补（总量槽不分引擎归属）
+    state.pause(&f1).await.unwrap();
+    let act = state.activate_due_tasks().await;
+    assert_eq!(
+        act,
+        vec![h2.clone()],
+        "跨引擎递补：释放的是 FTP 槽，递补的是 HTTP 任务"
+    );
+    assert!(state.tasks.lock().get(&h2).unwrap().engine_tid.is_some());
 }

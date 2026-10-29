@@ -196,6 +196,7 @@ const DEFAULTS: Record<string, PatchEntry[]> = {
     ["queue", "max_active_bt", 0],
     ["queue", "max_active_http", 0],
     ["queue", "max_active_ftp", 0],
+    ["queue", "max_active_total", 0],
   ],
   logging: [
     ["logging", "level", "info"],
@@ -746,7 +747,7 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
       )}
 
       {/* —— 队列 —— */}
-      {hit("队列 queue 并发 active 并行") && (
+      {hit("队列 queue 并发 active 并行 全局 总量") && (
       <section className="dl-card">
         <h3 style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 14 }}>
           <Icon name="layers" size={14} className="dl-sec-ico" /> 并发队列
@@ -765,7 +766,17 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
           <input id="set-a11y-14" className="dl-input" type="number" min={0} value={s.queue.max_active_http} onChange={(e) => patch("queue", "max_active_http", num(e.target.value) ?? 0)} />
           <label className="dl-field-label" htmlFor="set-a11y-15">FTP 同时传输上限</label>
           <input id="set-a11y-15" className="dl-input" type="number" min={0} value={s.queue.max_active_ftp} onChange={(e) => patch("queue", "max_active_ftp", num(e.target.value) ?? 0)} />
-          <div className="dl-field-help">0 = 不限（禁用排队）；超配额自动排队，槽位空闲按提交顺序递补；手动恢复 = 强制开始</div>
+          <label className="dl-field-label" htmlFor="set-a11y-43">全局同时传输总量上限 <Effective kind="now" /></label>
+          <input id="set-a11y-43"
+            className="dl-input"
+            type="number"
+            min={0}
+            max={100000}
+            value={s.queue.max_active_total}
+            onChange={(e) => patch("queue", "max_active_total", num(e.target.value) ?? 0)}
+          />
+          <div className="dl-field-help">0 = 不限；大于 0 时在分引擎上限之上叠加跨引擎总量闸（BT+HTTP+FTP 在传之和），取小生效；修改立即生效，已在传任务不回退。0..=100000</div>
+          <div className="dl-field-help">分引擎：0 = 不限（禁用排队）；超配额自动排队，槽位空闲按提交顺序递补；手动恢复 = 强制开始</div>
         </div>
       </section>
       )}

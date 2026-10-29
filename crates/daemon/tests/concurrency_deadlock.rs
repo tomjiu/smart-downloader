@@ -43,6 +43,7 @@ fn config_quota(max_active_http: u32) -> QueueCfg {
         max_active_bt: 0,
         max_active_http,
         max_active_ftp: 0,
+        max_active_total: 0,
     }
 }
 

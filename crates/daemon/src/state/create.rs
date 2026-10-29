@@ -102,6 +102,15 @@ impl DaemonState {
         (v > 0).then_some(v)
     }
 
+    /// 跨引擎全局并发总量（#214 §三-10）：None = 不限（0）。读 live
+    /// queue_cfg——与 [`Self::queue_limit_of`] 同口径，PUT 热改下一枪生效。
+    /// 闸门叠加语义：分引擎配额先判（更具体的排队原因优先上报），
+    /// 总量后判——两者任一满即落队。
+    pub(super) fn total_limit_of(&self) -> Option<u32> {
+        let q = self.queue_cfg.lock().clone();
+        (q.max_active_total > 0).then_some(q.max_active_total)
+    }
+
     /// 当前占用引擎槽位的任务数（S1-b）：有句柄且不在释放态（Paused = 用户
     /// 挂起 / Seeding = 做种不占下载槽 / 终态）。add 后记录态短暂停留 Queued
     /// （首轮引擎状态同步前）——有句柄即占位。batch7-P1：slot_reservations
@@ -161,17 +170,34 @@ impl DaemonState {
         // 修复：持 tasks 锁完成「计数 + 插入 + 登记」三步原子化；
         // autosave/publish 保持在锁外（Bug B：autosave 重入 tasks 锁自死锁）。
         let task_id = task.id.clone();
+        // 两道闸门的配额均在进入 tasks 临界区前读取（锁序不变：queue_cfg
+        // 先取后放，与 tasks/slot_reservations 无嵌套——PR #114 统一锁序
+        // 不受影响）。
         let limit = self.queue_limit_of(kind);
+        let total_limit = self.total_limit_of();
         let reserved = {
             let mut tasks = self.tasks.lock();
-            let full = limit
-                .map(|l| {
-                    Self::active_slot_counts_locked(&tasks, &self.slot_reservations.lock())
-                        [Self::slot_index(kind)]
-                        >= l
-                })
+            let counts = Self::active_slot_counts_locked(&tasks, &self.slot_reservations.lock());
+            // 分引擎配额闸（更具体的原因优先上报）
+            let engine_full = limit
+                .map(|l| counts[Self::slot_index(kind)] >= l)
                 .unwrap_or(false);
-            if full {
+            // 全局总量闸（#214 §三-10）：三桶之和（含 add 在途预留占位）
+            let total_full = total_limit
+                .map(|t| counts.iter().sum::<u32>() >= t)
+                .unwrap_or(false);
+            if engine_full || total_full {
+                let why = if engine_full {
+                    format!(
+                        "queue_wait: {kind:?} 并发配额已满（{}），槽位空闲后自动递补",
+                        limit.unwrap_or(0)
+                    )
+                } else {
+                    format!(
+                        "queue_wait: 全局并发总量已满（{}），任一引擎槽位空闲后自动递补",
+                        total_limit.unwrap_or(0)
+                    )
+                };
                 let mut rec = TaskRecord {
                     seeding_since: None,
                     task: task.clone(),
@@ -180,13 +206,7 @@ impl DaemonState {
                     engine_status: None,
                     events: vec![],
                 };
-                rec.push_event(
-                    "add",
-                    Some(format!(
-                        "queue_wait: {kind:?} 并发配额已满（{}），槽位空闲后自动递补",
-                        limit.unwrap_or(0)
-                    )),
-                );
+                rec.push_event("add", Some(why));
                 tasks.insert(task_id.clone(), rec);
                 false
             } else {
@@ -448,6 +468,10 @@ impl DaemonState {
                 .collect()
         };
         let mut counts = self.active_slot_counts();
+        // #214 §三-10：全局总量口径 = 三桶之和（与 gate 同源计数，本 tick
+        // 内单调递增——激活只加不减，故总量满即可 break 而非逐条 continue）
+        let total_limit = self.total_limit_of();
+        let mut total: u32 = counts.iter().sum();
         let mut activated = Vec::new();
         for (id, task, kind) in due {
             // S1-b 配额闸门：槽位不足本轮跳过（下一 tick 再试）
@@ -456,8 +480,14 @@ impl DaemonState {
                     continue;
                 }
             }
+            // 全局总量闸门（#214 §三-10）：任一引擎的激活都会消耗总量——
+            // 总量满后后续所有引擎候选均无法过闸，直接收束本轮。
+            if total_limit.is_some_and(|t| total >= t) {
+                break;
+            }
             if self.activate_one(&id, task, kind).await {
                 counts[Self::slot_index(kind)] += 1;
+                total += 1;
                 activated.push(id);
             }
         }

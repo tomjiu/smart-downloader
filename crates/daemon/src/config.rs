@@ -384,6 +384,12 @@ pub struct QueueCfg {
     pub max_active_http: u32,
     /// FTP 引擎同时在传任务上限（S1-b；0 = 不限）。
     pub max_active_ftp: u32,
+    /// 跨引擎全局同时在传任务上限（#214 §三-10，qB「队列·全局上限」
+    /// 对标）；**0 = 不限（默认，升级前行为零变化）**。>0 时在分引擎
+    /// 配额之上叠加总量闸门：三桶（bt / http / ftp+sftp，桶口径与
+    /// 分引擎配额一致）在传数之和达上限 → 新任务排队。取小语义：
+    /// 任务实际受限 = min(本引擎配额, 全局总量 - 其他引擎占用)。
+    pub max_active_total: u32,
 }
 
 fn default_bt_encrypt() -> String {
@@ -787,6 +793,7 @@ impl Config {
             "queue_max_active_bt": self.queue.max_active_bt,
             "queue_max_active_http": self.queue.max_active_http,
             "queue_max_active_ftp": self.queue.max_active_ftp,
+            "queue_max_active_total": self.queue.max_active_total,
             // 仅暴露「登录态文件是否存在」布尔，不泄露路径字符串本身。
             "provider_xunlei_token_exists": self
                 .provider_xunlei

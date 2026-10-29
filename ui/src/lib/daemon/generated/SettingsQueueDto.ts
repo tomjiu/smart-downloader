@@ -2,5 +2,7 @@
 
 /**
  * 队列域（S1）：各引擎同时在传任务上限；0 = 不限。
+ * `max_active_total`（#214 §三-10）= 跨引擎全局总量闸，叠加在分引擎
+ * 配额之上（取小生效）；同为热键（live queue_cfg 现读）。
  */
-export type SettingsQueueDto = { max_active_bt: number, max_active_http: number, max_active_ftp: number, };
+export type SettingsQueueDto = { max_active_bt: number, max_active_http: number, max_active_ftp: number, max_active_total: number, };

@@ -1408,3 +1408,174 @@ async fn settings_import_requires_config_path() {
         "错误应指明缺 --config: {body}"
     );
 }
+
+/// B6（#214 §三-10）：PUT queue.max_active_total——热键语义（applied 而非
+/// restart_required）+ 快照回读 + 落盘（persist 默认 true）。
+#[tokio::test]
+async fn put_max_active_total_applies_hot_and_persists() {
+    let (_dir, base, cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({ "queue": { "max_active_total": 7 } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let report: serde_json::Value = resp.json().await.unwrap();
+    // 热键：applied 报告（门控读 live queue_cfg，无重启语义）
+    assert!(
+        report["applied"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("queue.max_active_total")),
+        "总量闸应报立即生效: {report}"
+    );
+    assert!(
+        !report["restart_required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("queue.max_active_total")),
+        "热键不得虚报重启生效: {report}"
+    );
+
+    // 快照回读
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["queue"]["max_active_total"], 7);
+
+    // 落盘：config.toml 持久化
+    let text = std::fs::read_to_string(&cfg_path).unwrap();
+    let on_disk: smart_dl_daemon::config::Config = toml::from_str(&text).unwrap();
+    assert_eq!(on_disk.queue.max_active_total, 7);
+}
+
+/// B6：PUT queue.max_active_total 越界（>100000）→ 400 零副作用。
+#[tokio::test]
+async fn put_max_active_total_out_of_range_rejected_zero_side_effect() {
+    let (_dir, base, cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+    let before = std::fs::read_to_string(&cfg_path).unwrap();
+
+    for bad in [100_001u32, u32::MAX] {
+        let resp = client
+            .put(format!("{base}/settings"))
+            .json(&serde_json::json!({ "queue": { "max_active_total": bad } }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "越界值 {bad} 必须拒绝");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("max_active_total"),
+            "错误信息须点名字段: {body}"
+        );
+    }
+
+    // 零副作用：文件不变 + 快照仍是默认 0
+    assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), before);
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["queue"]["max_active_total"], 0, "非法 PUT 不得改值");
+}
+
+/// B6：热改端到端——PUT 收紧总量闸后，后续 add 立即受闸（live queue_cfg
+/// 现读，无需重启）。占位语义：spawn_daemon 无轮询/调度循环，t1 句柄
+/// 落位后持续占槽（有句柄即占位），不依赖下载进度。
+#[tokio::test]
+async fn put_max_active_total_takes_effect_on_next_add() {
+    // 静态源：任意请求 200 + 64KB（探测/段请求均满足；两条路径避免
+    // 同源去重 409——add 层对相同源 URL 有活动任务去重）
+    let app = axum::Router::new()
+        .route(
+            "/big.bin",
+            axum::routing::get(|| async move {
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(axum::http::header::CONTENT_LENGTH, "65536")
+                    .body(axum::body::Body::from(vec![7u8; 64 * 1024]))
+                    .unwrap()
+            }),
+        )
+        .route(
+            "/big2.bin",
+            axum::routing::get(|| async move {
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(axum::http::header::CONTENT_LENGTH, "65536")
+                    .body(axum::body::Body::from(vec![7u8; 64 * 1024]))
+                    .unwrap()
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let srv_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let (_dir, base, _cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+
+    // 默认总量 0（不限）：第 1 个任务直接入引擎（201 + 句柄落位即占槽）
+    let t1 = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "url": format!("http://{srv_addr}/big.bin") }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(t1.status(), 201);
+
+    // 收紧总量为 1 → 第 2 个任务排队（引擎配额不限，纯总量闸）
+    let resp = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({ "queue": { "max_active_total": 1 } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let t2 = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "url": format!("http://{srv_addr}/big2.bin") }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(t2.status(), 201, "排队也是创建成功（与分引擎配额同语义）");
+    let t2_body: serde_json::Value = t2.json().await.unwrap();
+    let t2_id = t2_body["task_id"].as_str().unwrap().to_string();
+
+    let list: serde_json::Value = client
+        .get(format!("{base}/tasks"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rec = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["task_id"].as_str() == Some(t2_id.as_str()))
+        .expect("任务须在列表中");
+    assert_eq!(
+        rec["state"], "Queued",
+        "PUT 收紧后新任务应立即受闸排队（热改语义）: {rec}"
+    );
+}
