@@ -165,6 +165,9 @@ const DEFAULTS: Record<string, PatchEntry[]> = {
     ["bittorrent", "encrypt", "allow"],
     ["bittorrent", "max_share_ratio", 0],
     ["bittorrent", "max_seeding_time_min", 0],
+    ["bittorrent", "dht_bootstrap_nodes", []],
+    ["bittorrent", "max_upload_slots", 0],
+    ["bittorrent", "seeding_idle_limit_min", 0],
     ["bittorrent", "storage_allocate", false],
   ],
   download: [
@@ -672,6 +675,41 @@ export default function SettingsView({ onToast }: { onToast: (t: { kind: string;
             value={s.bittorrent.max_seeding_time_min}
             onChange={(e) => patch("bittorrent", "max_seeding_time_min", num(e.target.value) ?? 0)}
           />
+          <label className="dl-field-label" htmlFor="set-a11y-38">做种空闲上限（分钟）<Effective kind="now" /></label>
+          <input id="set-a11y-38"
+            className="dl-input"
+            type="number"
+            min={0}
+            placeholder="0 = 不启用"
+            value={s.bittorrent.seeding_idle_limit_min}
+            onChange={(e) => patch("bittorrent", "seeding_idle_limit_min", num(e.target.value) ?? 0)}
+          />
+          <div className="dl-field-help">qBittorrent「当做种空闲时间达到」：距上次上行负载达到指定分钟即自动暂停（从未上行自进入做种起算）；与分享率/时长任一达标即暂停</div>
+          <label className="dl-field-label" htmlFor="set-a11y-39">全局上传槽位<Effective kind="now" /></label>
+          <input id="set-a11y-39"
+            className="dl-input"
+            type="number"
+            min={-1}
+            placeholder="0 = 内核默认（8）"
+            value={s.bittorrent.max_upload_slots}
+            onChange={(e) => patch("bittorrent", "max_upload_slots", Math.trunc(num(e.target.value) ?? 0))}
+          />
+          <div className="dl-field-help">同时 unchoke 的 peer 总数（内核 unchoke_slots_limit）：-1 = 不限；0 = 内核默认（8）；&gt;0 = 槽位数；保存后即时生效</div>
+          <label className="dl-field-label" htmlFor="set-a11y-40">DHT 引导节点<Effective kind="restart" /></label>
+          <textarea id="set-a11y-40"
+            className="dl-input"
+            rows={3}
+            placeholder={"router.bittorrent.com:6881\ndht.transmissionbt.com:6881"}
+            value={(s.bittorrent.dht_bootstrap_nodes ?? []).join("\n")}
+            onChange={(e) =>
+              patch(
+                "bittorrent",
+                "dht_bootstrap_nodes",
+                e.target.value.split("\n").map((x) => x.trim()).filter((x) => x.length > 0),
+              )
+            }
+          />
+          <div className="dl-field-help">每行一条 host[:port]（端口可省，内核补 6881）；空 = 内核内置默认表；保存后需 DHT 重启（重启应用或切换 DHT 开关）才保证生效</div>
           <div className="dl-field-help">qBittorrent 同名能力：做种达到分享率或时长任一上限即自动暂停（可手动恢复）</div>
           <label className="dl-field-label">存储模式（预分配）<Effective kind="restart" /></label>
           <Switch

@@ -352,6 +352,44 @@ lt_err lt_apply_conn(lt_session* s, int port, int max_connections) {
     }
 }
 
+/* B3（#214 §三-6）：DHT 引导节点。NULL/空串 = 清除自定义回落内核默认
+   （settings_pack::clear 使该项回到 default 值链）；非空 = 整表替换。
+   注意：DHT 已启动时内核不保证热改生效（见 lt.h 契约注释）。 */
+lt_err lt_apply_dht_nodes(lt_session* s, const char* nodes_csv) {
+    if (!s) return LT_ERR_ARG;
+    try {
+        lt::settings_pack sp;
+        if (nodes_csv == nullptr || nodes_csv[0] == '\0') {
+            sp.clear(lt::settings_pack::dht_bootstrap_nodes);
+        } else {
+            sp.set_str(lt::settings_pack::dht_bootstrap_nodes, nodes_csv);
+        }
+        s->ses.apply_settings(sp);
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* B3（#214 §三-11）：会话全局上传槽位（unchoke_slots_limit）。
+   -1 = 不限；0 = 复位内核默认（settings_pack::clear，2.x 默认 8）；
+   >0 = 槽位数。 */
+lt_err lt_apply_upload_slots(lt_session* s, int slots) {
+    if (!s) return LT_ERR_ARG;
+    try {
+        lt::settings_pack sp;
+        if (slots == 0) {
+            sp.clear(lt::settings_pack::unchoke_slots_limit);
+        } else {
+            sp.set_int(lt::settings_pack::unchoke_slots_limit, slots);
+        }
+        s->ses.apply_settings(sp);
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
 // PEX 会话策略落地（内核 2.0.x 无 settings_pack 会话开关）：pex_disabled=true
 // 时对新增任务注入 per-torrent disable_pex；默认（false）不动 flags = 内核行为。
 void apply_pex_policy(lt_session* s, lt::add_torrent_params& p) {
@@ -485,6 +523,16 @@ lt_err lt_status(lt_session* s, const char* ih, lt_torrent_status* out) {
            libtorrent 1.x 起恒有该字段，无需版本守卫。 */
         out->all_time_download = st.all_time_download;
         out->all_time_upload = st.all_time_upload;
+        /* B3（#214 §三-12）：距上次上行负载的秒数（qB「做种空闲」数据源）。
+           从未上行（epoch/min time_point）→ -1，由调用方以进入做种态时刻
+           兜底；口径 = 内核 steady 时钟，会话内单调。 */
+        if (st.last_upload.time_since_epoch().count() <= 0) {
+            out->upload_idle_secs = -1;
+        } else {
+            const auto gap = std::chrono::duration_cast<std::chrono::seconds>(
+                                 lt::clock_type::now() - st.last_upload).count();
+            out->upload_idle_secs = gap < 0 ? 0 : static_cast<std::int64_t>(gap);
+        }
         return LT_OK;
     } catch (...) {
         return LT_ERR_ENGINE;
@@ -1270,6 +1318,20 @@ lt_err lt_torrent_set_max_connections(lt_session* s, const char* ih, int max_con
             h.set_max_connections(
                 s->ses.get_settings().get_int(lt::settings_pack::connections_limit));
         }
+        return LT_OK;
+    } catch (...) {
+        return LT_ERR_ENGINE;
+    }
+}
+
+/* B3（#214 §三-11）：任务级上传槽位。>0 = set_max_uploads；0 = 复位 -1
+   （内核文档：per-torrent 默认无限，受会话 unchoke_slots_limit 约束）。 */
+lt_err lt_torrent_set_max_uploads(lt_session* s, const char* ih, int max_uploads) {
+    if (!s || !ih) return LT_ERR_ARG;
+    try {
+        const lt::torrent_handle h = find_handle(s, ih);
+        if (!h.is_valid()) { set_err(s, "torrent not found"); return LT_ERR_NOT_FOUND; }
+        h.set_max_uploads(max_uploads > 0 ? max_uploads : -1);
         return LT_OK;
     } catch (...) {
         return LT_ERR_ENGINE;

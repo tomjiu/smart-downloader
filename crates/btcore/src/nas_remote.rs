@@ -455,6 +455,8 @@ impl DownloadEngine for NasRemoteEngine {
                 .map(|s| s.to_string()),
             // E9：NAS 引擎不参与名字回填（daemon add 时已派生远端名）
             name: None,
+            // B3：单向引擎无上行口径（序列化省略）
+            upload_idle_secs: None,
         })
     }
 

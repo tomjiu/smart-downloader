@@ -61,6 +61,7 @@ impl DaemonState {
             file_priorities: rec.task.file_priorities.clone(),
             sequential: rec.task.sequential,
             max_connections: rec.task.max_connections,
+            max_uploads: rec.task.max_uploads,
             name: rec.task.metadata.name.clone(),
             tags: rec.task.metadata.tags.clone(),
             start_at_unix: rec.task.metadata.start_at_unix,

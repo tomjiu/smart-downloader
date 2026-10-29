@@ -373,6 +373,10 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
     // BT 节新增两字段
     await expect(page.locator('.dl-field-label:has-text("BT 引擎总开关")')).toBeVisible();
     await expect(page.locator('.dl-field-label:has-text("BT 独立落盘目录")')).toBeVisible();
+    // B3（#214 §三 6/11/12）：BT 调谐三件套
+    await expect(page.locator('.dl-field-label:has-text("做种空闲上限（分钟）")')).toBeVisible();
+    await expect(page.locator('.dl-field-label:has-text("全局上传槽位")')).toBeVisible();
+    await expect(page.locator('.dl-field-label:has-text("DHT 引导节点")')).toBeVisible();
     // 只读装配区
     await expect(page.locator('.dl-field-label:has-text("监听地址")').first()).toBeVisible();
     await expect(page.locator('.dl-field-label:has-text("API 鉴权令牌")')).toBeVisible();
@@ -398,6 +402,24 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
     };
     expect(after2.download.fsync_batch_segments).toBe(16);
 
+    // —— B3（#214 §三 6/11/12）：BT 调谐三件套保存回环（立即生效键
+    //    max_upload_slots + 快照键 dht_bootstrap_nodes）——
+    const slots = page.locator('#set-a11y-39');
+    await expect(slots).toBeVisible();
+    await slots.fill('16');
+    const nodes = page.locator('#set-a11y-40');
+    await nodes.fill('router.bittorrent.com:6881\ndht.transmissionbt.com:6881');
+    await page.getByLabel('保存设置').click();
+    await expect(page.getByText(/已应用/).first()).toBeVisible({ timeout: 10_000 });
+    const afterB3 = (await (await request.get(`${BASE}/settings`)).json()) as {
+      bittorrent: { max_upload_slots: number; dht_bootstrap_nodes: string[] };
+    };
+    expect(afterB3.bittorrent.max_upload_slots).toBe(16);
+    expect(afterB3.bittorrent.dht_bootstrap_nodes).toEqual([
+      'router.bittorrent.com:6881',
+      'dht.transmissionbt.com:6881',
+    ]);
+
     // —— 复原（保住套件干净起点：两项均回出厂默认）——
     await input.fill('200');
     await seg.fill('8');
@@ -409,5 +431,15 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
     };
     expect(restored.rss.max_processed_items_per_feed).toBe(200);
     expect(restored.download.fsync_batch_segments).toBe(8);
+    // B3 复原：槽位回 0（内核默认）+ 节点清空（回落内置表）
+    await slots.fill('0');
+    await nodes.fill('');
+    await page.getByLabel('保存设置').click();
+    await expect(page.getByText(/已应用/).first()).toBeVisible({ timeout: 10_000 });
+    const restoredB3 = (await (await request.get(`${BASE}/settings`)).json()) as {
+      bittorrent: { max_upload_slots: number; dht_bootstrap_nodes: string[] };
+    };
+    expect(restoredB3.bittorrent.max_upload_slots).toBe(0);
+    expect(restoredB3.bittorrent.dht_bootstrap_nodes).toEqual([]);
   });
 });

@@ -258,6 +258,26 @@ impl Session {
         call(code, || Ok(()))
     }
 
+    /// DHT 引导节点（B3，qB「DHT 节点」对标）：`nodes` = "host:port" 列表
+    /// （内核 dht_bootstrap_nodes 逗号拼接口径）。空表 = 清除自定义回落
+    /// 内核默认列表。注意：DHT 已启动时内核不保证热改生效（重启/
+    /// 切换 enable_dht 后生效——见 lt.h 契约注释）。
+    pub fn apply_dht_nodes(&self, nodes: &[String]) -> Result<()> {
+        let csv = nodes.join(",");
+        let c = cstr(&csv)?;
+        call(unsafe { lt_apply_dht_nodes(self.raw, c.as_ptr()) }, || {
+            Ok(())
+        })
+    }
+
+    /// 会话全局上传槽位（B3，qB「全局上传槽位」）：`slots` 透传内核
+    /// unchoke_slots_limit——-1 = 不限；0 = 复位内核默认（sp.clear，
+    /// 2.x 默认 8）；>0 = 槽位数。运行中即时生效。
+    pub fn apply_upload_slots(&self, slots: i32) -> Result<()> {
+        let code = unsafe { lt_apply_upload_slots(self.raw, slots as c_int) };
+        call(code, || Ok(()))
+    }
+
     /// 最近一次错误（内核侧维护的人类可读文本）
     pub fn err_str(&self) -> Result<String> {
         let mut buf = vec![0u8; 1024];
@@ -468,6 +488,7 @@ impl Session {
             name: [0; 256],
             all_time_download: 0,
             all_time_upload: 0,
+            upload_idle_secs: 0,
         };
         let code = unsafe { lt_status(self.raw, i.as_ptr(), &mut st) };
         call(code, || Ok(st))
@@ -756,6 +777,17 @@ impl Session {
             unsafe {
                 lt_torrent_set_max_connections(self.raw, i.as_ptr(), max_connections as c_int)
             },
+            || Ok(()),
+        )
+    }
+
+    /// 任务级上传槽位（B3，qB「每任务上传槽位」）：`n > 0` = 槽位；
+    /// `n == 0` = 复位 -1（per-torrent 默认无限，受会话 unchoke_slots_limit
+    /// 约束——与 qB 复位到全局口径同构）。句柄级参数，metadata 未就绪也可设。
+    pub fn set_max_uploads(&self, ih: &str, max_uploads: u32) -> Result<()> {
+        let i = self.ih(ih)?;
+        call(
+            unsafe { lt_torrent_set_max_uploads(self.raw, i.as_ptr(), max_uploads as c_int) },
             || Ok(()),
         )
     }

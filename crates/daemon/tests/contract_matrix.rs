@@ -1097,3 +1097,28 @@ async fn contract_20_trackers_http_task_boundary() {
         "DELETE 边界 409"
     );
 }
+
+/// #21 `POST /tasks/:id/upload_slots {max_uploads}`（B3，#214 §三-11）：
+/// HTTP 任务 → 409（BT-only 语义边界，与 #12 connections 同口径——UI 对
+/// HTTP 任务调用必须收到 409 而非静默 200）。
+#[tokio::test]
+async fn contract_21_upload_slots_on_http_task_is_409() {
+    let (addr, _state) = serve().await;
+    let base = format!("http://{addr}");
+    let client = reqwest::Client::new();
+    let srv = TestServer::start(patterned(1024 * 1024)).await;
+    let (st, _b, id) = add_task(&client, &base, serde_json::json!({ "url": srv.url() })).await;
+    assert_eq!(st, reqwest::StatusCode::CREATED);
+
+    let resp = client
+        .post(format!("{base}/tasks/{id}/upload_slots"))
+        .json(&serde_json::json!({ "max_uploads": 4 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::CONFLICT,
+        "HTTP 任务的 upload_slots 必须 409（BT-only 边界）"
+    );
+}

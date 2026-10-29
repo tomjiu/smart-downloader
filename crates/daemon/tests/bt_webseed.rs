@@ -167,6 +167,7 @@ fn torrent_task(id: &str, torrent: Vec<u8>) -> DownloadTask {
         },
         limits: None,
         max_connections: None,
+        max_uploads: None,
         queue_priority: 0,
     }
 }

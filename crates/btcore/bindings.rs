@@ -236,6 +236,18 @@ unsafe extern "C" {
     ) -> lt_err;
 }
 unsafe extern "C" {
+    pub fn lt_apply_dht_nodes(
+        s: *mut lt_session,
+        nodes_csv: *const ::std::os::raw::c_char,
+    ) -> lt_err;
+}
+unsafe extern "C" {
+    pub fn lt_apply_upload_slots(
+        s: *mut lt_session,
+        slots: ::std::os::raw::c_int,
+    ) -> lt_err;
+}
+unsafe extern "C" {
     pub fn lt_add_magnet(
         s: *mut lt_session,
         magnet: *const ::std::os::raw::c_char,
@@ -290,10 +302,11 @@ pub struct lt_torrent_status {
     pub name: [::std::os::raw::c_char; 256usize],
     pub all_time_download: i64,
     pub all_time_upload: i64,
+    pub upload_idle_secs: i64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of lt_torrent_status"][::std::mem::size_of::<lt_torrent_status>() - 328usize];
+    ["Size of lt_torrent_status"][::std::mem::size_of::<lt_torrent_status>() - 336usize];
     ["Alignment of lt_torrent_status"][::std::mem::align_of::<lt_torrent_status>() - 8usize];
     ["Offset of field: lt_torrent_status::state"]
         [::std::mem::offset_of!(lt_torrent_status, state) - 0usize];
@@ -321,12 +334,21 @@ const _: () = {
         [::std::mem::offset_of!(lt_torrent_status, all_time_download) - 312usize];
     ["Offset of field: lt_torrent_status::all_time_upload"]
         [::std::mem::offset_of!(lt_torrent_status, all_time_upload) - 320usize];
+    ["Offset of field: lt_torrent_status::upload_idle_secs"]
+        [::std::mem::offset_of!(lt_torrent_status, upload_idle_secs) - 328usize];
 };
 unsafe extern "C" {
     pub fn lt_status(
         s: *mut lt_session,
         ih: *const ::std::os::raw::c_char,
         out: *mut lt_torrent_status,
+    ) -> lt_err;
+}
+unsafe extern "C" {
+    pub fn lt_torrent_set_max_uploads(
+        s: *mut lt_session,
+        ih: *const ::std::os::raw::c_char,
+        max_uploads: ::std::os::raw::c_int,
     ) -> lt_err;
 }
 unsafe extern "C" {

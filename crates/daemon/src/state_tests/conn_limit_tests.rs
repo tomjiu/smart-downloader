@@ -102,6 +102,7 @@ async fn conn_limit_replays_on_restore() {
             file_priorities: None,
             sequential: false,
             max_connections: Some(80),
+            max_uploads: None,
             queue_priority: 0,
             metadata: TaskMetadata {
                 name: None,
@@ -125,4 +126,128 @@ async fn conn_limit_replays_on_restore() {
     let calls = fake.max_conn_calls();
     assert_eq!(calls.len(), 1, "恢复后必须原样重放连接数上限");
     assert_eq!(calls[0].1, 80);
+}
+
+// —— B3（#214 §三-11）：任务级上传槽位（set_task_max_uploads 同口径） ——
+
+/// 非 BT 任务预拒（daemon 侧定性，不触碰引擎）。
+#[tokio::test]
+async fn upload_slots_rejects_non_bt_task() {
+    let fake = Arc::new(FakeEngine::new(EngineKind::Http));
+    let state = DaemonState::new(fake.clone(), vec![]);
+    let tid = state
+        .add_http_task("https://srv/a.bin".into(), None)
+        .await
+        .unwrap();
+    let err = state.set_task_max_uploads(&tid, 4).await.unwrap_err();
+    assert!(
+        matches!(err, DaemonError::UnsupportedOp(_)),
+        "HTTP 任务必须 409 预拒: {err:?}"
+    );
+    assert!(fake.max_uploads_calls.lock().is_empty(), "预拒不得触达引擎");
+}
+
+/// BT 任务：设置 → 引擎下发 + 记录字段 + 落盘；0 = 复位（仍记录 Some(0)，
+/// 恢复重放按 0 语义复位 -1 无限）。
+#[cfg(feature = "bt")]
+#[tokio::test]
+async fn upload_slots_bt_sets_resets_and_persists() {
+    let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("tasks.json");
+    let state = DaemonState::new(fake.clone(), vec![]).with_storage(store.clone());
+
+    let tid = state
+        .add_bt_task_opts(
+            "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567".into(),
+            None,
+            false,
+            None,
+            0,
+        )
+        .await
+        .unwrap();
+
+    state.set_task_max_uploads(&tid, 4).await.unwrap();
+    assert_eq!(fake.max_uploads_calls.lock().len(), 1);
+    assert_eq!(fake.max_uploads_calls.lock()[0].1, 4);
+    assert_eq!(
+        state.tasks.lock().get(&tid).unwrap().task.max_uploads,
+        Some(4)
+    );
+
+    // 复位（0 = 默认无限）
+    state.set_task_max_uploads(&tid, 0).await.unwrap();
+    let calls = fake.max_uploads_calls.lock().clone();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[1].1, 0);
+    assert_eq!(
+        state.tasks.lock().get(&tid).unwrap().task.max_uploads,
+        Some(0)
+    );
+
+    let text = std::fs::read_to_string(&store).unwrap();
+    assert!(text.contains("max_uploads"), "tasks.json 必须含新字段");
+}
+
+/// 恢复重放：持久化的 max_uploads 在 restore 后原样下发引擎。
+#[cfg(feature = "bt")]
+#[tokio::test]
+async fn upload_slots_replays_on_restore() {
+    let fake = Arc::new(FakeEngine::new(EngineKind::Bt));
+    let dir = tempfile::tempdir().unwrap();
+    let store = dir.path().join("tasks.json");
+    let magnet = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567";
+    let pts = vec![PersistedTask {
+        task: DownloadTask {
+            id: "t1".into(),
+            canonical_id: CanonicalId {
+                kind: CanonicalKind::Bt,
+                identity: magnet.into(),
+                validator: None,
+                token_sensitive: false,
+            },
+            source: DownloadSource::Magnet(magnet.into()),
+            identity: ContentIdentity::SingleFile {
+                size: 0,
+                etag: None,
+                sha256: None,
+                sha1: None,
+                md5: None,
+                backup_md5: None,
+            },
+            dest_root: std::path::PathBuf::from("./downloads"),
+            files: vec![],
+            acquisitions: vec![],
+            aggregate: Default::default(),
+            state: TaskState::Queued,
+            retry: Default::default(),
+            created_at: std::time::Instant::now(),
+            file_priorities: None,
+            sequential: false,
+            max_connections: None,
+            max_uploads: Some(6),
+            queue_priority: 0,
+            metadata: TaskMetadata {
+                name: None,
+                added_at_unix: 0,
+                added_at_ms: 0,
+                tags: Vec::new(),
+                finished_at_unix: 0,
+                start_at_unix: 0,
+                next_retry_at_unix: 0,
+            },
+            limits: None,
+        },
+        engine_kind: EngineKind::Bt,
+        paused: false,
+    }];
+    std::fs::write(&store, serde_json::to_vec(&pts).unwrap()).unwrap();
+
+    let state = DaemonState::new(fake.clone(), vec![]);
+    let n = state.restore_from(&store).await.unwrap();
+    assert_eq!(n, 1);
+    let calls = fake.max_uploads_calls.lock().clone();
+    assert_eq!(calls.len(), 1, "恢复后必须原样重放上传槽位");
+    assert_eq!(calls[0].1, 6);
 }

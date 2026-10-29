@@ -64,6 +64,7 @@ pub fn make_http_task_to(
         },
         limits: None,
         max_connections: None,
+        max_uploads: None,
         queue_priority: 0,
     }
 }
@@ -201,6 +202,7 @@ pub fn make_ftp_task(id: &str, url: &str, dest_root: PathBuf, name: &str) -> Dow
         },
         limits: None,
         max_connections: None,
+        max_uploads: None,
         queue_priority: 0,
     }
 }

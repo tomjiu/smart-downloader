@@ -53,6 +53,13 @@ pub struct DownloadTask {
     /// （metadata 未就绪也可设，handle 级参数）。旧 tasks.json 无此字段自动补 None。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_connections: Option<u32>,
+    /// 任务级上传槽位（B3，qB「每任务上传槽位」；仅 BT 引擎消费）。
+    /// None = 未设置（内核默认无限，受会话 unchoke_slots_limit 约束）；
+    /// Some(0) = 复位 -1；Some(n>0) = 同时 unchoke 的 peer 数上限 n。
+    /// 持久化 + 恢复重放（同 max_connections 口径）。旧 tasks.json 无此
+    /// 字段自动补 None。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_uploads: Option<u32>,
     /// 队列优先级（Task 46，qbit 队列位置对标）：值越小越优先（i32 允许负数
     /// 表达 top 上移链）；相同值按创建序 FIFO。仅影响 S1-b 排队递补顺序
     /// （activate_due_tasks 排序键 (queue_priority, created_at)），对已接入

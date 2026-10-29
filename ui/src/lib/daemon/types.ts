@@ -29,6 +29,7 @@ export type { ListTasksQuery } from "./generated/ListTasksQuery";
 export type { LimitReq } from "./generated/LimitReq";
 export type { SequentialReq } from "./generated/SequentialReq";
 export type { ConnectionsReq } from "./generated/ConnectionsReq";
+export type { UploadSlotsReq } from "./generated/UploadSlotsReq";
 export type { SetProxyReq } from "./generated/SetProxyReq";
 export type { RenameTaskReq } from "./generated/RenameTaskReq";
 export type { TagsReq } from "./generated/TagsReq";

@@ -51,6 +51,7 @@ fn bt_partial_task(dest_root: std::path::PathBuf) -> smart_dl_core::task::Downlo
         },
         limits: None,
         max_connections: None,
+        max_uploads: None,
         queue_priority: 0,
     }
 }

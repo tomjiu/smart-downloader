@@ -698,6 +698,7 @@ impl DaemonState {
             },
             limits: None,
             max_connections: None,
+            max_uploads: None,
             queue_priority: 0,
         };
 
@@ -863,6 +864,7 @@ impl DaemonState {
             },
             limits: None,
             max_connections: None,
+            max_uploads: None,
             queue_priority: 0,
         };
 
@@ -1113,6 +1115,7 @@ impl DaemonState {
             },
             limits: None,
             max_connections: None,
+            max_uploads: None,
             queue_priority: 0,
         };
         let mut rec = TaskRecord {
@@ -1299,6 +1302,7 @@ impl DaemonState {
             },
             limits: None,
             max_connections: None,
+            max_uploads: None,
             queue_priority: 0,
         };
 
@@ -1474,6 +1478,7 @@ impl DaemonState {
             },
             limits: None,
             max_connections: None,
+            max_uploads: None,
             queue_priority: 0,
         };
 
@@ -1641,6 +1646,7 @@ impl DaemonState {
             },
             limits: None,
             max_connections: None,
+            max_uploads: None,
             queue_priority: 0,
         };
 

@@ -31,6 +31,9 @@ pub struct TorrentStatus {
     pub all_time_download: i64,
     /// 全生命周期累计上行（E33；做种贡献，暂停不清零）。
     pub all_time_upload: i64,
+    /// 距上次上行负载的秒数（B3，qB「做种空闲」数据源；内核 steady 时钟）。
+    /// -1 = 本次会话从未上行（调用方以进入做种态时刻兜底）。
+    pub upload_idle_secs: i64,
 }
 
 impl From<lt_torrent_status> for TorrentStatus {
@@ -63,6 +66,7 @@ impl From<lt_torrent_status> for TorrentStatus {
             name,
             all_time_download: st.all_time_download.max(0),
             all_time_upload: st.all_time_upload.max(0),
+            upload_idle_secs: st.upload_idle_secs,
         }
     }
 }
@@ -199,6 +203,18 @@ impl BtCore {
     /// 端口变更自动 re-listen，运行中调用安全。
     pub fn apply_conn(&self, port: u16, max_connections: u32) -> ffi::Result<()> {
         self.sess.apply_conn(port, max_connections)
+    }
+
+    /// DHT 引导节点（B3，qB「DHT 节点」）："host:port" 列表整表替换；
+    /// 空表 = 清除自定义回落内核默认。生效时机 = DHT（重）启动读引导表。
+    pub fn apply_dht_nodes(&self, nodes: &[String]) -> ffi::Result<()> {
+        self.sess.apply_dht_nodes(nodes)
+    }
+
+    /// 会话全局上传槽位（B3，qB「全局上传槽位」）：-1 = 不限；0 = 复位
+    /// 内核默认（sp.clear，2.x 默认 8）；>0 = 槽位数。运行中即时生效。
+    pub fn apply_upload_slots(&self, slots: i32) -> ffi::Result<()> {
+        self.sess.apply_upload_slots(slots)
     }
 
     // —— 添加 / 移除 ——
@@ -350,6 +366,12 @@ impl BtCore {
         self.sess.set_max_connections(ih, max_connections)
     }
 
+    /// 任务级上传槽位（B3）：>0 = 上限；0 = 复位 -1（per-torrent 默认
+    /// 无限，受会话 unchoke_slots_limit 约束）。
+    pub fn set_max_uploads(&self, ih: &str, max_uploads: u32) -> ffi::Result<()> {
+        self.sess.set_max_uploads(ih, max_uploads)
+    }
+
     pub fn set_limits(&self, ih: &str, down: i64, up: i64) -> ffi::Result<()> {
         self.sess.set_limits(ih, down, up)
     }
@@ -482,5 +504,68 @@ mod tests {
         assert_eq!(parse_encrypt_policy(""), None);
         assert_eq!(parse_encrypt_policy("forced"), None);
         assert_eq!(parse_encrypt_policy("ALLOWED"), None);
+    }
+
+    /// B3（#214 §三-6）：DHT 引导节点 FFI 冒烟——设置/清除两态均 Ok
+    ///（参数封送 + 内核 apply_settings 不抛异常；真实 DHT 冷启动引表
+    /// 属手动验证项——settings 无读回接口）。
+    #[test]
+    fn apply_dht_nodes_smoke_roundtrip() {
+        let dir = std::env::temp_dir();
+        let core = BtCore::new(&dir, "test-dht-nodes").expect("session init");
+        core.apply_dht_nodes(&[
+            "router.bittorrent.com:6881".to_string(),
+            "dht.transmissionbt.com:6881".to_string(),
+        ])
+        .expect("设置引导节点应 Ok");
+        core.apply_dht_nodes(&[]).expect("清除回落内核默认应 Ok");
+        core.apply_dht_nodes(&["router.example".to_string()])
+            .expect("裸 host（无端口）应 Ok（内核补 6881）");
+    }
+
+    /// B3（#214 §三-11）：上传槽位 FFI 冒烟——>0 / -1（不限）/ 0（复位
+    /// 内核默认）三态均 Ok。
+    #[test]
+    fn apply_upload_slots_smoke_roundtrip() {
+        let dir = std::env::temp_dir();
+        let core = BtCore::new(&dir, "test-upload-slots").expect("session init");
+        core.apply_upload_slots(16).expect("槽位数应 Ok");
+        core.apply_upload_slots(-1).expect("不限应 Ok");
+        core.apply_upload_slots(0).expect("复位内核默认应 Ok");
+    }
+
+    /// B3：任务级上传槽位句柄参数冒烟——torrent 未添加时 NOT_FOUND
+    ///（find_handle 契约），加 magnet 后设置/复位均 Ok（metadata 未就绪
+    /// 也可设——handle 级参数）。
+    #[test]
+    fn set_max_uploads_handle_level_smoke() {
+        let dir = std::env::temp_dir();
+        let core = BtCore::new(&dir, "test-max-uploads").expect("session init");
+        let err = core.set_max_uploads("0d2c9c9d5c2d3e8f9a1b2c3d4e5f6a7b8c9d0e1f", 4);
+        assert!(err.is_err(), "未添加 torrent 必须 NOT_FOUND");
+        let ih = core
+            .add_magnet(
+                "magnet:?xt=urn:btih:0d2c9c9d5c2d3e8f9a1b2c3d4e5f6a7b8c9d0e1f",
+                &[],
+            )
+            .expect("add magnet");
+        core.set_max_uploads(&ih, 4).expect("设置槽位应 Ok");
+        core.set_max_uploads(&ih, 0).expect("复位 -1 应 Ok");
+    }
+
+    /// B3：status 透出 upload_idle_secs——新建未上传任务 = -1（从未上行，
+    /// steady 时钟口径），经 TorrentStatus 转换后语义保持。
+    #[test]
+    fn status_upload_idle_secs_never_uploaded() {
+        let dir = std::env::temp_dir();
+        let core = BtCore::new(&dir, "test-idle-secs").expect("session init");
+        let ih = core
+            .add_magnet(
+                "magnet:?xt=urn:btih:0d2c9c9d5c2d3e8f9a1b2c3d4e5f6a7b8c9d0e1f",
+                &[],
+            )
+            .expect("add magnet");
+        let st = core.status(&ih).expect("status");
+        assert_eq!(st.upload_idle_secs, -1, "本次会话从未上行必须 -1");
     }
 }

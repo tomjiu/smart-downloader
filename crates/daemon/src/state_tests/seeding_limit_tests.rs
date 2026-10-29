@@ -50,6 +50,7 @@ fn seeding_rec(id: &str, ih: &str, seeding_since: Option<std::time::Instant>) ->
             },
             limits: None,
             max_connections: None,
+            max_uploads: None,
             queue_priority: 0,
         },
         engine_tid: Some(ih.to_string()),
@@ -194,4 +195,86 @@ async fn downloading_state_not_enforced() {
     state.tasks.lock().insert(id, rec);
     let _ = state.poll_engine_states().await;
     assert!(fake.paused.lock().is_empty(), "非 Seeding 态不执法");
+}
+
+// —— B3（#214 §三-12）：seeding_idle_limit_min 做种空闲执法 ——
+
+/// idle 达标：引擎报距上次上行 3600s + 做种已持续 10 分钟 → 取小后
+/// idle=10min ≥ limit 5min → 暂停 + 事件。
+#[tokio::test]
+async fn idle_limit_reached_pauses_seeding_task() {
+    let since = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(600))
+        .unwrap();
+    let (state, fake, id) = setup((4_000_000, 4_000_000), None, None, Some(since)).await;
+    *fake.seeding_idle_limit.lock() = Some(5);
+    *fake.status_upload_idle.lock() = Some(3600);
+    let _ = state.poll_engine_states().await;
+    assert!(!fake.paused.lock().is_empty(), "空闲达标必须触发引擎暂停");
+    let tasks = state.tasks.lock();
+    let rec = tasks.get(&id).unwrap();
+    assert_eq!(rec.task.state, TaskState::Paused, "记录同步 Paused");
+    let ev = rec
+        .events
+        .iter()
+        .find(|e| e.op == "seeding_limit_reached")
+        .expect("必须有 seeding_limit_reached 事件");
+    assert!(
+        ev.detail.as_deref().unwrap_or("").contains("idle"),
+        "理由必须含 idle 口径: {:?}",
+        ev.detail
+    );
+}
+
+/// 从未上行（upload_idle=None）→ 自进入做种起算：seeding_since 10 分钟前
+/// + limit 5 → 达标暂停（qB「无活动」同构）。
+#[tokio::test]
+async fn idle_never_uploaded_counts_from_seeding_start() {
+    let since = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(600))
+        .unwrap();
+    let (state, fake, _id) = setup((0, 1_000), None, None, Some(since)).await;
+    *fake.seeding_idle_limit.lock() = Some(5);
+    *fake.status_upload_idle.lock() = None; // 从未上行
+    let _ = state.poll_engine_states().await;
+    assert!(
+        !fake.paused.lock().is_empty(),
+        "从未上行自做种起算（10min >= 5min）必须暂停"
+    );
+}
+
+/// 未达标：距上次上行 60s < limit 5min → 不暂停。
+#[tokio::test]
+async fn idle_not_reached_no_pause() {
+    let (state, fake, _id) = setup(
+        (4_000_000, 4_000_000),
+        None,
+        None,
+        Some(std::time::Instant::now()),
+    )
+    .await;
+    *fake.seeding_idle_limit.lock() = Some(5);
+    *fake.status_upload_idle.lock() = Some(60);
+    let _ = state.poll_engine_states().await;
+    assert!(fake.paused.lock().is_empty(), "60s < 5min 不暂停");
+}
+
+/// 取小口径：raw gap=3600s 但做种刚开始（elapsed≈0）→ idle 取小 ≈ 0 →
+/// 不暂停（leech 期最后一次上行不超报空闲，保守侧语义）。
+#[tokio::test]
+async fn idle_gap_clamped_by_seeding_elapsed() {
+    let (state, fake, _id) = setup(
+        (4_000_000, 4_000_000),
+        None,
+        None,
+        Some(std::time::Instant::now()),
+    )
+    .await;
+    *fake.seeding_idle_limit.lock() = Some(5);
+    *fake.status_upload_idle.lock() = Some(3600); // raw gap 超 limit
+    let _ = state.poll_engine_states().await;
+    assert!(
+        fake.paused.lock().is_empty(),
+        "做种刚开始：min(gap, elapsed) ≈ 0 < 5min 不暂停（取小保守）"
+    );
 }

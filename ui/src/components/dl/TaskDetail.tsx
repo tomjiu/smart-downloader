@@ -66,6 +66,7 @@ export default function TaskDetail({
   const [proxy, setProxy] = useState("");
   const [seq, setSeq] = useState(false);
   const [conn, setConn] = useState("");
+  const [uploads, setUploads] = useState("");
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
 
@@ -595,6 +596,26 @@ export default function TaskDetail({
                       }}
                     >
                       应用连接数
+                    </button>
+                    <label className="dl-field-label">上传槽位</label>
+                    <input
+                      className="dl-input"
+                      aria-label="任务上传槽位"
+                      placeholder={task.max_uploads != null ? `当前 ${task.max_uploads}` : "0 = 默认（受全局槽位约束）"}
+                      value={uploads}
+                      onChange={(e) => setUploads(e.target.value.replace(/[^0-9]/g, ""))}
+                    />
+                    <div />
+                    <button
+                      className="dl-btn"
+                      disabled={!uploads}
+                      onClick={() => {
+                        if (!uploads) return;
+                        run(() => client.taskUploadSlots(task.task_id, Number(uploads) || 0), uploads === "0" ? "已复位默认（无限）" : "上传槽位已应用");
+                        setUploads("");
+                      }}
+                    >
+                      应用槽位
                     </button>
                   </>
                 )}

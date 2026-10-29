@@ -776,12 +776,16 @@ impl DaemonState {
             return;
         }
         // 能力询问（TD-2 Step 3）：做种限制只在 BT 扩展面上；非 BT 引擎
-        // 双 None → 提前返回（与旧主 trait 默认 None 同构）。
-        let (ratio_limit, time_limit_min) = match engine.bt() {
-            Some(bt) => (bt.seeding_ratio_limit(), bt.seeding_time_limit()),
-            None => (None, None),
+        // 全 None → 提前返回（与旧主 trait 默认 None 同构）。
+        let (ratio_limit, time_limit_min, idle_limit_min) = match engine.bt() {
+            Some(bt) => (
+                bt.seeding_ratio_limit(),
+                bt.seeding_time_limit(),
+                bt.seeding_idle_limit(),
+            ),
+            None => (None, None, None),
         };
-        if ratio_limit.is_none() && time_limit_min.is_none() {
+        if ratio_limit.is_none() && time_limit_min.is_none() && idle_limit_min.is_none() {
             return;
         }
         let ratio = crate::state::share_ratio(st.total_uploaded, st.total_downloaded);
@@ -798,26 +802,43 @@ impl DaemonState {
             _ => false,
         };
         let time_hit = matches!((time_limit_min, elapsed_min), (Some(l), m) if m >= l as u64);
-        if !ratio_hit && !time_hit {
+        // B3（#214 §三-12，qB「当做种空闲时间达到」）：距上次上行负载
+        // 达阈值即暂停。口径 = 引擎 upload_idle_secs（内核 steady 时钟，
+        // last_upload）与做种态起始时刻取小——从未上行（None）自进入
+        // 做种起算（elapsed 兜底）；取小保守侧：leech 期最后一次上行
+        // 早于进入做种时不超报空闲。
+        let seeding_elapsed_secs = seeding_since.map(|t| t.elapsed().as_secs());
+        let idle_secs = st
+            .upload_idle_secs
+            .map(|gap| gap.min(seeding_elapsed_secs.unwrap_or(u64::MAX)))
+            .or(seeding_elapsed_secs)
+            .unwrap_or(0);
+        let idle_hit = matches!(idle_limit_min, Some(l) if idle_secs / 60 >= l as u64);
+        if !ratio_hit && !time_hit && !idle_hit {
             return;
         }
-        let reason = match (ratio_hit, time_hit) {
-            (true, true) => format!(
+        let reason = match (ratio_hit, time_hit, idle_hit) {
+            (false, false, true) => format!(
+                "seeding idle={}min >= limit={:?}min（距上次上行负载）",
+                idle_secs / 60,
+                idle_limit_min
+            ),
+            (true, true, _) => format!(
                 "ratio={:.2}>=?{:?} time={elapsed_min}min>=?{:?}min（双达）",
                 ratio.unwrap_or(f64::INFINITY),
                 ratio_limit,
                 time_limit_min
             ),
-            (true, false) => format!(
+            (true, _, _) => format!(
                 "ratio={:.2} >= limit={:?}",
                 ratio.unwrap_or(f64::INFINITY),
                 ratio_limit
             ),
-            (false, true) => format!(
+            (_, true, _) => format!(
                 "seeding time={elapsed_min}min >= limit={:?}min",
                 time_limit_min
             ),
-            (false, false) => unreachable!("已由 hit 判定"),
+            (false, false, false) => unreachable!("已由 hit 判定"),
         };
         // 完整 pause 语义（记录同步/事件/持久化/广播都在里面）
         if self.pause(id).await.is_ok() {
@@ -905,6 +926,7 @@ impl HttpSink for FallbackSink {
             },
             limits: None,
             max_connections: None,
+            max_uploads: None,
             queue_priority: 0,
         };
         let tid = self

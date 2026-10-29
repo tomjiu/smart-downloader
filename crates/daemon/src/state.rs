@@ -201,6 +201,11 @@ pub struct TaskSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub max_connections: Option<u32>,
+    /// 任务级上传槽位（B3，仅 BT 消费；None = 未设置走内核默认无限，
+    /// 序列化省略）。set 语义见 `DaemonState::set_task_max_uploads`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub max_uploads: Option<u32>,
     /// 定时启动时刻（E23，unix 秒；0 = 未调度，序列化省略）。与列表
     /// `TaskSummary::start_at_unix` 同口径。
     #[serde(skip_serializing_if = "is_zero_u64")]

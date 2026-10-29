@@ -359,6 +359,16 @@ pub struct ConnectionsReq {
     pub max_connections: u32,
 }
 
+/// 任务级上传槽位（`POST /tasks/:id/upload_slots`，B3，qB「每任务上传
+/// 槽位」）：`n > 0` = 同时 unchoke 的 peer 数上限；`n == 0` = 复位 -1
+/// （per-torrent 默认无限，受会话 unchoke_slots_limit 约束）。仅 BT
+/// 任务（其余 409）；即时生效（句柄级参数）；持久化 + 恢复重放。
+#[derive(Deserialize, TS)]
+#[ts(export)]
+pub struct UploadSlotsReq {
+    pub max_uploads: u32,
+}
+
 /// 手动添加 peer（`POST /tasks/:id/peers`，qbit「添加 peer」对标）：
 /// `addrs` 逐条注入（`ip:port`，支持 IPv6 `[::1]:6881`）；部分成功语义——
 /// 逐条回执 `[{addr, ok, error?}]`；任务非 BT → 全部回执 err（409）。
@@ -774,6 +784,32 @@ async fn task_connections(
         .set_task_max_connections(&id, req.max_connections)
         .await
     {
+        Ok(()) => match state.task_snapshot(&id).await {
+            Some(snap) => Json(snap).into_response(),
+            None => (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": "not found" })),
+            )
+                .into_response(),
+        },
+        Err(e) => {
+            let body = Json(serde_json::json!({ "error": e.to_string() }));
+            let status = match e {
+                DaemonError::NotFound(_) => StatusCode::NOT_FOUND,
+                DaemonError::UnsupportedOp(_) => StatusCode::CONFLICT,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, body).into_response()
+        }
+    }
+}
+
+async fn task_upload_slots(
+    State(state): State<Arc<DaemonState>>,
+    Path(id): Path<String>,
+    Json(req): Json<UploadSlotsReq>,
+) -> impl IntoResponse {
+    match state.set_task_max_uploads(&id, req.max_uploads).await {
         Ok(()) => match state.task_snapshot(&id).await {
             Some(snap) => Json(snap).into_response(),
             None => (
@@ -2932,6 +2968,7 @@ macro_rules! router_base {
             .route("/tasks/:id/limit", post(task_limit))
             .route("/tasks/:id/sequential", post(task_sequential))
             .route("/tasks/:id/connections", post(task_connections))
+            .route("/tasks/:id/upload_slots", post(task_upload_slots))
             .route("/tasks/:id/proxy", post(task_set_proxy))
             .route("/tasks/:id/name", post(task_rename))
             .route("/tasks/:id/tags", post(task_set_tags))
