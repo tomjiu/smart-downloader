@@ -36,6 +36,38 @@ pub struct Config {
     /// `RUST_LOG` 环境变量（开发者排障杠杆）> 本配置 > `info` 兜底；
     /// 运行中可经 `PUT /settings` 热改（tracing reload，立即生效）。
     pub logging: LoggingCfg,
+    /// IP 过滤订阅（B7，#214 §三-7，qB「IP 过滤·URL 订阅」对标）：
+    /// 周期拉取 DAT/P2P 格式黑名单并增量下发 BT 引擎（ip_filter）。
+    /// 手动封禁与订阅条目分账：刷新只增删订阅条目，手动封禁不受影响。
+    pub ip_filter: IpFilterCfg,
+}
+
+/// IP 过滤订阅配置（B7，#214 §三-7）。
+/// `url` 空 = 禁用（默认）；`http(s)://` 订阅源，DAT/P2P 两格式
+///（与手动导入同解析器）。`refresh_interval_secs` 0 = 仅启动拉一次；
+/// 默认 86400（qB 社区惯例每日一更）。热键：订阅循环 15s 粒度现读
+/// live_config，PUT 后下一粒度内生效；url 改空 = 禁用并清除已生效
+/// 订阅条目（手动封禁保留）。
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct IpFilterCfg {
+    /// 订阅源 URL（空 = 禁用）。
+    pub url: String,
+    /// 刷新间隔（秒）；0 = 仅启动时拉取一次。
+    pub refresh_interval_secs: u64,
+}
+
+/// 手写 Default（与 Config::default() 单源，ServerCfg 同范式）：url 空
+///（禁用）+ 每日刷新。`#[serde(default)]` 下用户只写 `[ip_filter] url`
+/// 时 refresh_interval_secs 取本默认而非 0（0 = 仅启动一次——非预期
+/// 默认）。
+impl Default for IpFilterCfg {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            refresh_interval_secs: 86_400,
+        }
+    }
 }
 
 /// 安全修复（第三轮审查 P1-b）：子表手写 Default（与 Config::default() 单源）。
@@ -639,6 +671,23 @@ impl Config {
                 self.bt.max_seeding_time_min
             ));
         }
+        // B7（#214 §三-7）：IP 过滤订阅——url 非空时须 http(s) + 长度上限；
+        // 刷新间隔上限 30 天（防手滑写成毫秒级把订阅源拉成 DDoS）。
+        if !self.ip_filter.url.is_empty() {
+            let u = self.ip_filter.url.trim();
+            if !(u.starts_with("http://") || u.starts_with("https://")) || u.len() > 2048 {
+                let short: String = u.chars().take(64).collect();
+                return Err(format!(
+                    "配置 ip_filter.url = {short} 无效：须 http(s):// 且 ≤2048 字符"
+                ));
+            }
+        }
+        if self.ip_filter.refresh_interval_secs > 2_592_000 {
+            return Err(format!(
+                "配置 ip_filter.refresh_interval_secs = {} 无效：须在 0..=2592000（0 = 仅启动拉一次）",
+                self.ip_filter.refresh_interval_secs
+            ));
+        }
         Ok(())
     }
 
@@ -794,6 +843,10 @@ impl Config {
             "queue_max_active_http": self.queue.max_active_http,
             "queue_max_active_ftp": self.queue.max_active_ftp,
             "queue_max_active_total": self.queue.max_active_total,
+            // B7（#214 §三-7）：订阅源仅出「是否已配置」布尔——完整 URL
+            // 含路径/token 级信息，与 http_token 同脱敏口径。
+            "ip_filter_configured": !self.ip_filter.url.is_empty(),
+            "ip_filter_refresh_interval_secs": self.ip_filter.refresh_interval_secs,
             // 仅暴露「登录态文件是否存在」布尔，不泄露路径字符串本身。
             "provider_xunlei_token_exists": self
                 .provider_xunlei
@@ -1445,4 +1498,43 @@ path = "/tmp/sd.lock"
         assert_eq!(snap2["post_move_to"], "/data/inbox");
         assert_eq!(snap2["post_hook"], "/usr/local/bin/on-done.sh");
     }
+}
+
+/// B7（#214 §三-7）：ip_filter 校验 + serde 默认 + 快照脱敏。
+#[test]
+fn ip_filter_validate_and_defaults() {
+    // serde 默认：只写 url 时 interval 取手写 Default（每日），非 0
+    let c: Config = toml::from_str("[ip_filter]\nurl = \"https://x.example/l.p2p\"\n").unwrap();
+    assert_eq!(c.ip_filter.url, "https://x.example/l.p2p");
+    assert_eq!(
+        c.ip_filter.refresh_interval_secs, 86_400,
+        "缺省 interval 取 Default（每日）而非 0"
+    );
+    assert!(c.validate().is_ok());
+
+    // 校验：非 http(s) / 超长 / interval 越界 → 启动拒绝
+    let mut c = Config::default();
+    c.ip_filter.url = "ftp://x.example/l".into();
+    assert!(c.validate().unwrap_err().contains("ip_filter.url"));
+    c.ip_filter.url = format!("https://x/{}", "a".repeat(2100));
+    assert!(c.validate().unwrap_err().contains("ip_filter.url"));
+    c.ip_filter.url = String::new();
+    c.ip_filter.refresh_interval_secs = 2_592_001;
+    assert!(c.validate().unwrap_err().contains("refresh_interval_secs"));
+    // 边界值合法：0（仅启动一次）与 30 天
+    c.ip_filter.refresh_interval_secs = 0;
+    assert!(c.validate().is_ok());
+    c.ip_filter.refresh_interval_secs = 2_592_000;
+    assert!(c.validate().is_ok());
+
+    // 快照脱敏：只出 configured 布尔，不出完整 URL
+    let mut c = Config::default();
+    c.ip_filter.url = "https://secret.example/list?key=abc".into();
+    let snap = c.snapshot_json(&PathBuf::from("/tmp/tasks.json"));
+    assert_eq!(snap["ip_filter_configured"], true);
+    assert_eq!(snap["ip_filter_refresh_interval_secs"], 86_400);
+    assert!(
+        snap.to_string().is_empty() || !snap.to_string().contains("secret.example"),
+        "完整 URL 不得进 /config 快照"
+    );
 }

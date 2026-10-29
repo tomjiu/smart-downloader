@@ -4,6 +4,7 @@ import type { SettingsBittorrentDto } from "./SettingsBittorrentDto";
 import type { SettingsCleanupDto } from "./SettingsCleanupDto";
 import type { SettingsConnectionDto } from "./SettingsConnectionDto";
 import type { SettingsDownloadDto } from "./SettingsDownloadDto";
+import type { SettingsIpFilterDto } from "./SettingsIpFilterDto";
 import type { SettingsLoggingDto } from "./SettingsLoggingDto";
 import type { SettingsMetaDto } from "./SettingsMetaDto";
 import type { SettingsPostDownloadDto } from "./SettingsPostDownloadDto";
@@ -24,4 +25,9 @@ export type SettingsSnapshot = { bandwidth: SettingsBandwidthDto, connection: Se
 /**
  * 日志域（B4，#214）。
  */
-logging: SettingsLoggingDto, };
+logging: SettingsLoggingDto, 
+/**
+ * IP 过滤订阅域（B7，#214 §三-7）：url/interval 为配置面，
+ * entry_count/last_* 为运行态（订阅循环 15s 粒度维护）。
+ */
+ip_filter: SettingsIpFilterDto, };

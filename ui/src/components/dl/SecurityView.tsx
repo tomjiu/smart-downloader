@@ -16,6 +16,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import type { BanOutcome } from "@/lib/daemon/types";
+import type { SettingsIpFilterDto } from "@/lib/daemon/generated/SettingsIpFilterDto";
 import { client } from "@/lib/daemon/store";
 import { Icon } from "./Icon";
 import { ConfirmDialog, EmptyState } from "./Common";
@@ -48,6 +49,13 @@ export default function SecurityView({
   const [importOut, setImportOut] = useState<{ imported: number; errors: string[] } | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
 
+  // B7（#214 §三-7）：IP 过滤订阅卡——配置面（url/interval）+ 运行态。
+  // url_loaded 三态：null = 未加载（输入框 disabled），string = 已编辑值。
+  const [ipfUrl, setIpfUrl] = useState<string | null>(null);
+  const [ipfInterval, setIpfInterval] = useState(86400);
+  const [ipfStatus, setIpfStatus] = useState<SettingsIpFilterDto | null>(null);
+  const [ipfBusy, setIpfBusy] = useState(false);
+
   const load = useCallback(async () => {
     try {
       setLoadErr(null);
@@ -58,9 +66,43 @@ export default function SecurityView({
     }
   }, []);
 
+  // B7：订阅配置 + 运行态一次性拉取（settings 快照内嵌）。
+  const loadIpFilter = useCallback(async () => {
+    try {
+      const s = await client.settings();
+      setIpfUrl(s.ip_filter.url);
+      setIpfInterval(s.ip_filter.refresh_interval_secs);
+      setIpfStatus(s.ip_filter);
+    } catch {
+      // 设置面拉取失败不阻断封禁表主功能；卡片保持未加载态
+    }
+  }, []);
+
   useEffect(() => {
     load();
-  }, [load]);
+    loadIpFilter();
+  }, [load, loadIpFilter]);
+
+  // B7：保存订阅配置（PUT 热键——15s 内拉取循环跟随；换源立即重拉）。
+  const saveIpFilter = async () => {
+    if (ipfUrl == null) return;
+    setIpfBusy(true);
+    try {
+      const rep = await client.putSettings({
+        ip_filter: { url: ipfUrl.trim(), refresh_interval_secs: ipfInterval },
+      });
+      const n = rep.applied.filter((k) => k.startsWith("ip_filter.")).length;
+      onToast({
+        kind: "success",
+        text: n > 0 ? `已保存（${n} 项，约 15 秒内开始拉取）` : "已保存（重启后生效）",
+      });
+      loadIpFilter();
+    } catch (e) {
+      onToast({ kind: "error", text: `订阅配置保存失败：${String(e)}` });
+    } finally {
+      setIpfBusy(false);
+    }
+  };
 
   const banLines = parseLines(banInput);
   const importLines = importInput
@@ -128,6 +170,7 @@ export default function SecurityView({
   };
 
   return (
+    <>
     <div className="dl-card" style={{ display: "grid", gap: 14 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <Icon name="shield" size={15} className="dl-drawer-ico" />
@@ -292,5 +335,74 @@ export default function SecurityView({
         />
       )}
     </div>
+
+    {/* —— B7（#214 §三-7）：IP 过滤订阅（qB「IP 过滤·URL 订阅」对标） —— */}
+    <div className="dl-card" style={{ display: "grid", gap: 12 }} data-testid="ip-filter-card">
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <Icon name="globe" size={15} className="dl-drawer-ico" />
+        <b>IP 过滤订阅</b>
+        {ipfStatus && ipfStatus.url && <span className="dl-badge">已启用</span>}
+        <div style={{ flex: 1 }} />
+        <button
+          type="button"
+          className="dl-btn dl-btn--ghost"
+          aria-label="刷新订阅状态"
+          title="刷新订阅状态"
+          disabled={ipfBusy}
+          onClick={loadIpFilter}
+        >
+          <Icon name="sync" size={13} />
+        </button>
+      </div>
+      <div className="dl-form-grid">
+        <label className="dl-field-label" htmlFor="set-a11y-44">订阅源 URL</label>
+        <input
+          id="set-a11y-44"
+          className="dl-input"
+          placeholder="https://example.com/level1.p2p（空 = 禁用）"
+          value={ipfUrl ?? ""}
+          disabled={ipfUrl == null}
+          onChange={(e) => setIpfUrl(e.target.value)}
+        />
+        <div className="dl-field-help">http(s)://，DAT（PeerGuardian）/ P2P 格式，≤2048 字符；清空 = 禁用并清除已生效订阅条目（手动封禁保留）</div>
+        <label className="dl-field-label" htmlFor="set-a11y-45">刷新间隔（秒）</label>
+        <input
+          id="set-a11y-45"
+          className="dl-input"
+          type="number"
+          min={0}
+          max={2592000}
+          value={ipfInterval}
+          disabled={ipfUrl == null}
+          onChange={(e) => setIpfInterval(Number(e.target.value) || 0)}
+        />
+        <div className="dl-field-help">0 = 仅启动拉一次；默认 86400（每日）；修改后约 15 秒内生效，拉取失败 5 分钟退避重试</div>
+      </div>
+      {ipfStatus && (
+        <div className="dl-field-help" data-testid="ip-filter-status">
+          生效条目 {ipfStatus.entry_count} 条
+          {ipfStatus.last_ok_unix > 0 &&
+            ` · 上次成功 ${new Date(ipfStatus.last_ok_unix * 1000).toLocaleString()}`}
+          {ipfStatus.last_error && (
+            <span style={{ color: "var(--err)" }}> · {ipfStatus.last_error}</span>
+          )}
+        </div>
+      )}
+      <div>
+        <button
+          type="button"
+          className="dl-btn dl-btn--primary"
+          disabled={ipfBusy || ipfUrl == null}
+          data-testid="ip-filter-save"
+          onClick={saveIpFilter}
+        >
+          <Icon name="check" size={13} /> 保存订阅配置
+        </button>
+      </div>
+      <div className="dl-field-help">
+        需 BT 引擎在线（拉取/解禁均下发 ip_filter）；订阅条目与手动封禁分账——刷新只增删订阅条目；拉取失败保持上次生效集不动
+      </div>
+    </div>
+    </>
   );
 }

@@ -245,6 +245,32 @@ pub struct TaskRates {
     pub up_bytes_s: u64,
 }
 
+/// IP 过滤订阅运行态（B7，#214 §三-7）。
+///
+/// `entries` 是订阅条目的**归属基准**（diff 用）：刷新时与上游新集合作
+/// 差集——新增者下发引擎并登记，消失者解禁并摘除；手动封禁不在集内，
+/// 永不受订阅刷新影响（分账语义）。`source_url` 记上次成功拉取的源：
+/// 与当前配置 url 不一致 → 下一轮强制重拉（换源即全量对齐）。
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct IpFilterState {
+    /// 当前订阅生效条目（单 IP 或 "a-b" 区间，归一化后字符串）。
+    #[serde(default)]
+    pub entries: std::collections::BTreeSet<String>,
+    /// 上次成功拉取的源 URL（空 = 尚未成功过）。
+    #[serde(default)]
+    pub source_url: String,
+    /// 上次成功刷新时刻（unix 秒；0 = 尚未成功）。
+    #[serde(default)]
+    pub last_ok_unix: u64,
+    /// 上次尝试时刻（unix 秒；成功/失败均记）——失败退避基准：距上次
+    /// 尝试 < 300s 不再发起（防订阅源故障时 15s 粒度高频打点）。
+    #[serde(default)]
+    pub last_attempt_unix: u64,
+    /// 上次失败原因（None = 最近一次拉取成功；成功时清除）。
+    #[serde(default)]
+    pub last_error: Option<String>,
+}
+
 /// 分享率计算（E33）：`uploaded / downloaded`；`down == 0`（无数据或尚未
 /// 产生下行）时 None——除零与「纯上传侧比率」都不给值，序列化时省略。
 /// 保留 3 位小数（qBittorrent 同级精度），负值/NaN 在源头（u64 字段）不可能。
@@ -597,8 +623,33 @@ fn normalize_digest(s: &str) -> String {
     s.trim().to_ascii_lowercase()
 }
 
+/// IP 过滤订阅轻量状态快照（B7）：不含条目集本体（避免 15s tick 克隆
+/// 大集合）；供订阅循环到期判定与 settings 快照消费。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct IpFilterStatus {
+    pub entry_count: usize,
+    pub source_url: String,
+    pub last_ok_unix: u64,
+    pub last_attempt_unix: u64,
+    pub last_error: Option<String>,
+}
+
+impl DaemonState {
+    /// 订阅状态轻量快照（B7）。
+    pub(crate) fn ip_filter_status(&self) -> IpFilterStatus {
+        let st = self.ip_filter.lock();
+        IpFilterStatus {
+            entry_count: st.entries.len(),
+            source_url: st.source_url.clone(),
+            last_ok_unix: st.last_ok_unix,
+            last_attempt_unix: st.last_attempt_unix,
+            last_error: st.last_error.clone(),
+        }
+    }
+}
+
 /// 当前 unix 秒（E23 调度判定用；时钟回拨/系统异常兑底 0 = 立即语义）。
-fn now_unix() -> u64 {
+pub(crate) fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -811,6 +862,13 @@ pub struct DaemonState {
     pub(crate) bt_bans: Mutex<Vec<String>>,
     /// bans.json 路径（with_storage 派生：tasks.json 同目录；None = 不落盘）。
     pub(crate) bans_persist_path: Option<PathBuf>,
+    /// IP 过滤订阅运行态（B7，#214 §三-7）：当前订阅生效条目集（diff
+    /// 基准，与手动封禁分账）+ 拉取记账。ip_filter.json 持久化
+    ///（tasks.json 同目录，with_storage 派生）——重启后保有归属基准，
+    /// 刷新时增量增删（上游删行本地同步解除）。
+    pub(crate) ip_filter: Mutex<IpFilterState>,
+    /// ip_filter.json 路径（with_storage 派生；None = 不落盘）。
+    pub(crate) ip_filter_persist_path: Option<PathBuf>,
     /// ban/unban 操作串行化锁（batch5-P2）：contains→await→push 三段非原子，
     /// 并发 ban(A)/unban(A) 交錯可使列表与内核脱节。tokio Mutex（guard Send，
     /// 可跨 await）；叶子锁：ban/unban/replay/import 全部经此，无嵌套。

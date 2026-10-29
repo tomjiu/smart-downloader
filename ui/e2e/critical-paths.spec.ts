@@ -354,6 +354,34 @@ test.describe.serial('关键路径 e2e（真实 daemon + 真实下载）', () =>
       // 无 bt 构建：全部失败不入表 → 空态保持
       await expect(page.getByText('暂无封禁项')).toBeVisible();
     }
+
+    // 8d. B7（#214 §三-7）：IP 过滤订阅卡——渲染 + UI 保存回环 + 复原
+    await expect(page.getByText('IP 过滤订阅', { exact: true })).toBeVisible();
+    await expect(page.getByTestId('ip-filter-status')).toBeVisible();
+    await expect(page.getByTestId('ip-filter-status')).toContainText('生效条目 0 条');
+    await page.getByTestId('ip-filter-save').waitFor({ state: 'visible' });
+    await page.locator('#set-a11y-44').fill('https://filter.example/level1.p2p');
+    await page.locator('#set-a11y-45').fill('7200');
+    await page.getByTestId('ip-filter-save').click();
+    await expect(page.getByText(/已保存/).first()).toBeVisible({ timeout: 10_000 });
+    const ipf = (await request.get(`${BASE}/settings`).then((r) => r.json())) as {
+      ip_filter: { url: string; refresh_interval_secs: number };
+    };
+    expect(ipf.ip_filter.url).toBe('https://filter.example/level1.p2p');
+    expect(ipf.ip_filter.refresh_interval_secs).toBe(7200);
+
+    // 复原（保住套件干净起点）：url 清空 + interval 回默认。
+    // 不等 toast（首个保存的 toast 可能仍在场造成假命中）——直接轮询 API 终态。
+    await page.locator('#set-a11y-44').fill('');
+    await page.locator('#set-a11y-45').fill('86400');
+    await page.getByTestId('ip-filter-save').click();
+    await expect(async () => {
+      const s = (await request.get(`${BASE}/settings`).then((r) => r.json())) as {
+        ip_filter: { url: string; refresh_interval_secs: number };
+      };
+      expect(s.ip_filter.url).toBe('');
+      expect(s.ip_filter.refresh_interval_secs).toBe(86400);
+    }).toPass({ timeout: 10_000 });
     expect(pageErrors, '页面不得有未捕获异常').toEqual([]);
   });
 });

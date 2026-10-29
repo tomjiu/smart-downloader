@@ -33,6 +33,8 @@ impl DaemonState {
             completion_action: Mutex::new("none".to_string()),
             completion_fired: std::sync::atomic::AtomicBool::new(false),
             ban_ops: tokio::sync::Mutex::new(()),
+            ip_filter: Mutex::new(super::IpFilterState::default()),
+            ip_filter_persist_path: None,
             rss_refresh_gate: tokio::sync::Mutex::new(()),
             session_traffic: Mutex::new((0, 0)),
             webhook_client: reqwest::Client::builder()
@@ -412,6 +414,29 @@ impl DaemonState {
             }
         }
         self.bans_persist_path = bans_path;
+        // B7（#214 §三-7）：ip_filter.json 回读（订阅条目归属基准——重启后
+        // 刷新 diff 才能正确增删；bans.json 已含全部生效条目，重放由
+        // serve 的 replay_bans 统一处理，此处只恢复归属记账）。
+        let ipf_path = path.parent().map(|d| d.join("ip_filter.json"));
+        if let Some(ipf) = &ipf_path {
+            match super::persistence::read_ip_filter_state(ipf) {
+                Ok(Some(st)) => {
+                    tracing::info!(
+                        "IP 过滤订阅状态回读: {} 条（源 {}）",
+                        st.entries.len(),
+                        if st.source_url.is_empty() {
+                            "<无>"
+                        } else {
+                            "已配置"
+                        }
+                    );
+                    self.ip_filter = Mutex::new(st);
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!("ip_filter.json 回读失败 {ipf:?}: {e}"),
+            }
+        }
+        self.ip_filter_persist_path = ipf_path;
         self.persist_path = Some(path);
         self
     }

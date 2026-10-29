@@ -387,3 +387,64 @@ impl DaemonState {
         Ok(restored)
     }
 }
+
+/// IP 过滤订阅状态原子落盘（B7，#214 §三-7）：write_bans_atomic 同配方
+///（唯一 tmp + 0600 + rename + fsync）。内容含订阅源 URL（可能带路径/
+/// 查询参数），按敏感口径 0600 持久化。
+pub fn write_ip_filter_state_atomic(
+    path: &Path,
+    st: &crate::state::IpFilterState,
+) -> std::io::Result<()> {
+    let json = serde_json::to_vec_pretty(st).map_err(std::io::Error::other)?;
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_name = format!(
+        "{}-{unique}.tmp",
+        path.file_name().map_or_else(
+            || "ip_filter".to_string(),
+            |f| f.to_string_lossy().to_string()
+        )
+    );
+    let tmp = path.with_file_name(tmp_name);
+    let write_guard = TmpWriteGuard { path: tmp.clone() };
+    let res = (|| {
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::File::create(&tmp)?;
+        std::io::Write::write_all(&mut f, &json)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    let renamed = res.is_ok();
+    drop(write_guard);
+    if !renamed {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// IP 过滤订阅状态回读（B7）：文件不存在 = None（首次启动，保默认态）；
+/// 解析失败 Err（调用方 warn 后继续——订阅基准丢失仅影响下次刷新的
+/// 增量精度，full-refresh 换源场景自动收敛）。
+pub fn read_ip_filter_state(path: &Path) -> std::io::Result<Option<crate::state::IpFilterState>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(std::io::Error::other)
+}

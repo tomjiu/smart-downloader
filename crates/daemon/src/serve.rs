@@ -421,6 +421,40 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
         });
     }
 
+    // B7（#214 §三-7）：IP 过滤订阅循环——15s 粒度检查（url/interval 均热改
+    // 跟随：每轮现读 live_config）。到期判定：换源（source_url != url）或
+    // 距上次成功 ≥ interval（interval = 0 → 仅首次/换源）。失败退避 5min
+    //（距上次尝试 < 300s 不发起——防订阅源故障时高频打点；成功后
+    // last_attempt = last_ok，interval ≥ 300 的周期刷新不受退避影响）。
+    // url 改空 = 禁用并清除订阅条目（手动封禁保留，幂等）。
+    {
+        let st = state_arc.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                let (url, interval) = st.ip_filter_cfg_now();
+                if url.is_empty() {
+                    st.clear_ip_filter_subscription().await;
+                    continue;
+                }
+                let now = crate::state::now_unix();
+                let due = {
+                    let meta = st.ip_filter_status();
+                    let backoff_ok = now.saturating_sub(meta.last_attempt_unix) >= 300;
+                    let fresh_needed = meta.source_url != url
+                        || meta.last_ok_unix == 0
+                        || (interval > 0 && now.saturating_sub(meta.last_ok_unix) >= interval);
+                    fresh_needed && backoff_ok
+                };
+                if due {
+                    if let Err(e) = st.refresh_ip_filter(&url).await {
+                        tracing::warn!("IP 过滤订阅刷新失败: {e}");
+                    }
+                }
+            }
+        });
+    }
+
     // 4d--. 定时任务调度循环（E23）：1s 周期把到期任务接入引擎
     //（start_at 未来不入引擎，Queued 等待；jitter 错峰同样由本循环到点激活）。
     // 无定时任务时空转（filter 后空集，无引擎调用）。
