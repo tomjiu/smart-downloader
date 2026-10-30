@@ -76,6 +76,7 @@ async fn get_settings_returns_all_domains() {
         "xunlei",
         "meta",
         "logging",
+        "ip_filter",
     ] {
         assert!(s.get(domain).is_some(), "settings 快照缺域 {domain}");
     }
@@ -1578,4 +1579,125 @@ async fn put_max_active_total_takes_effect_on_next_add() {
         rec["state"], "Queued",
         "PUT 收紧后新任务应立即受闸排队（热改语义）: {rec}"
     );
+}
+
+/// B7（#214 §三-7）：PUT ip_filter——热键语义（applied）+ 快照配置面/运行态
+/// 回读 + 落盘；非法 url / interval → 400 零副作用。
+#[tokio::test]
+async fn put_ip_filter_url_and_interval_roundtrip() {
+    let (_dir, base, cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+
+    // 默认态：url 空（禁用）+ interval 每日 + 零条目
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["ip_filter"]["url"], "");
+    assert_eq!(s["ip_filter"]["refresh_interval_secs"], 86_400);
+    assert_eq!(s["ip_filter"]["entry_count"], 0);
+    assert_eq!(s["ip_filter"]["last_ok_unix"], 0);
+    assert_eq!(s["ip_filter"]["last_error"], serde_json::Value::Null);
+
+    // PUT：url + interval（热键——订阅循环 15s 粒度跟随）
+    let resp = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({
+            "ip_filter": { "url": "  https://filter.example/level1.p2p  ", "refresh_interval_secs": 3600 }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let report: serde_json::Value = resp.json().await.unwrap();
+    for key in ["ip_filter.url", "ip_filter.refresh_interval_secs"] {
+        assert!(
+            report["applied"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!(key)),
+            "缺 {key}: {report}"
+        );
+    }
+
+    // 快照回读：trim 后的 url + interval（运行态零条目——无 BT 引擎未拉取）
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        s["ip_filter"]["url"], "https://filter.example/level1.p2p",
+        "存储前 trim"
+    );
+    assert_eq!(s["ip_filter"]["refresh_interval_secs"], 3600);
+
+    // 落盘
+    let text = std::fs::read_to_string(&cfg_path).unwrap();
+    let on_disk: smart_dl_daemon::config::Config = toml::from_str(&text).unwrap();
+    assert_eq!(on_disk.ip_filter.url, "https://filter.example/level1.p2p");
+    assert_eq!(on_disk.ip_filter.refresh_interval_secs, 3600);
+
+    // 非法：scheme / 超长 / interval 越界 → 400 零副作用
+    let before = std::fs::read_to_string(&cfg_path).unwrap();
+    for bad in [
+        serde_json::json!({ "ip_filter": { "url": "ftp://x.example/l" } }),
+        serde_json::json!({ "ip_filter": { "url": format!("https://x/{}", "a".repeat(2100)) } }),
+        serde_json::json!({ "ip_filter": { "refresh_interval_secs": 2_592_001 } }),
+    ] {
+        let resp = client
+            .put(format!("{base}/settings"))
+            .json(&bad)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "非法 ip_filter 须拒绝: {bad}");
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("ip_filter"),
+            "错误须点名字段: {body}"
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&cfg_path).unwrap(),
+        before,
+        "零副作用"
+    );
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        s["ip_filter"]["refresh_interval_secs"], 3600,
+        "非法 PUT 不得改值"
+    );
+
+    // 禁用语义入口：url 清空合法（订阅循环将清除条目）
+    let resp = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({ "ip_filter": { "url": "" } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["ip_filter"]["url"], "");
 }

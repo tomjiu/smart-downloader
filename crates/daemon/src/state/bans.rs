@@ -300,3 +300,272 @@ mod ban_entry_tests {
         assert_eq!(truncate_len("abcdef", 5), "abcde…");
     }
 }
+
+// ==================== B7（#214 §三-7）：IP 过滤 URL 订阅 ====================
+
+/// 订阅文本解析（B7 纯函数）：DAT/P2P 区间行（与手动导入同解析器）+
+/// 单 IP 行；注释/空行跳过；无法解析的行记入错误（部分行损坏不阻断
+/// 整体——qB 对标）。条目上限 100 万（防病态内存）。
+pub(crate) fn parse_ip_filter_text(
+    text: &str,
+) -> (std::collections::BTreeSet<String>, Vec<String>) {
+    let mut entries = std::collections::BTreeSet::new();
+    let mut errors = Vec::new();
+    for (lineno, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if entries.len() >= 1_000_000 {
+            errors.push(format!("L{}: 条目超限（>100 万），余下行跳过", lineno + 1));
+            break;
+        }
+        if let Some((a, b)) = parse_ban_range_line(line) {
+            entries.insert(format!("{a}-{b}"));
+        } else if let Ok(c) = normalize_ban_entry(line) {
+            entries.insert(c);
+        } else if errors.len() < 50 {
+            // 错误列表封顶 50 条（防错误源把响应/日志撑爆；计数语义存疑时
+            // 用户应先看 last_error 的整体结论）
+            errors.push(format!("L{}: {}", lineno + 1, truncate_len(line, 48)));
+        }
+    }
+    (entries, errors)
+}
+
+impl DaemonState {
+    /// 订阅刷新（B7，#214 §三-7）：拉取 → 解析 → 与上次条目集 diff →
+    /// 引擎增量下发（新增 ban / 消失 unban）→ bt_bans 同步 → 双文件落盘。
+    ///
+    /// 语义要点：
+    /// - **分账**：手动封禁不在订阅集内，永不受刷新影响（增删只碰 diff 命中者）
+    /// - **失败保持**（#160 防假阳性）：拉取/解析失败 → last_error 记账，
+    ///   条目与引擎不动（保持上次生效集，绝不因瞬时故障清空防线）
+    /// - **部分生效收敛**：单条引擎失败 → 该条不入 entries（下次刷新
+    ///   diff 会重试），last_error 汇总部分失败
+    /// - **BT-only**：引擎不可用 → Err（无 BT 无意义，不静默入表制造
+    ///   「看似生效」的假阳性；条目不动）
+    /// - 成功 = 至少拉取+解析完成（部分引擎失败也算「有进度」：
+    ///   last_ok 更新 + last_error 记部分失败摘要）
+    pub async fn refresh_ip_filter(&self, url: &str) -> Result<usize, String> {
+        let _serial = self.ban_ops.lock().await; // 与手动 ban/unban/import 互斥
+        let now = super::now_unix();
+        // 失败记账（所有失败路径统一：last_error + last_attempt——退避基准
+        // 与状态面诚实回显都依赖它；条目/引擎不动 = 保持上次生效集）
+        let fail = |msg: String| -> Result<usize, String> {
+            self.ip_filter.lock().last_error = Some(msg.clone());
+            self.ip_filter.lock().last_attempt_unix = now;
+            Err(msg)
+        };
+
+        // ---- 1. 拉取（30s 总超时 + 64MB 上限；webhook_client 复用连接池）----
+        let resp = match self
+            .webhook_client
+            .get(url)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return fail(format!("订阅源请求失败: {e}")),
+        };
+        if !resp.status().is_success() {
+            return fail(format!("订阅源返回 {}", resp.status()));
+        }
+        if let Some(len) = resp.content_length() {
+            if len > 64 * 1024 * 1024 {
+                return fail(format!("订阅源过大（{len} 字节 > 64MB 上限）"));
+            }
+        }
+        let body = match resp.text().await {
+            Ok(b) => b,
+            Err(e) => return fail(format!("订阅源读取失败: {e}")),
+        };
+        if body.len() > 64 * 1024 * 1024 {
+            return fail(format!("订阅源过大（{} 字节 > 64MB 上限）", body.len()));
+        }
+
+        // ---- 2. 解析（部分行损坏不阻断；错误摘要入 last_error）----
+        let (new_entries, parse_errors) = parse_ip_filter_text(&body);
+        // 安全护栏：200 但零条目且全为无法解析的行 → 大概率指错了源
+        //（HTML 错误页等）——拒绝应用（防「空集清空全部订阅条目」的
+        // 误伤路径；真正的空列表文件 = 零条目零错误，仍合法清空）
+        if new_entries.is_empty() && !parse_errors.is_empty() {
+            return fail(format!(
+                "订阅源内容无法解析（{} 行全失败，疑似格式错误或 HTML 页），保持上次生效集",
+                parse_errors.len()
+            ));
+        }
+
+        // ---- 3. 引擎在线门槛（BT-only 功能）----
+        let engine = match self.engine_for(EngineKind::Bt) {
+            Ok(e) => e,
+            Err(e) => {
+                return fail(format!("BT 引擎不可用（{e}）：订阅刷新需要 BT 引擎在线"));
+            }
+        };
+        let Some(bt) = engine.bt() else {
+            return fail("BT 引擎无扩展面：订阅刷新需要 BT 引擎在线".to_string());
+        };
+
+        // ---- 4. diff + 引擎增量下发 ----
+        let old_entries = self.ip_filter.lock().entries.clone();
+        let to_add: Vec<_> = new_entries.difference(&old_entries).cloned().collect();
+        let to_remove: Vec<_> = old_entries.difference(&new_entries).cloned().collect();
+        let mut engine_errors: Vec<String> = Vec::new();
+        // 实际生效集 = 保留交集 ∪ 成功新增 ∪ 解禁失败者（仍生效）
+        let mut applied: std::collections::BTreeSet<String> =
+            new_entries.intersection(&old_entries).cloned().collect();
+        for entry in &to_add {
+            let res = match entry.split_once('-') {
+                Some((a, b)) => bt.ban_ip_range(a, b).await,
+                None => bt.ban_ip(entry).await,
+            };
+            match res {
+                Ok(()) => {
+                    applied.insert(entry.clone());
+                    let mut bans = self.bt_bans.lock();
+                    if !bans.contains(entry) {
+                        bans.push(entry.clone());
+                    }
+                }
+                Err(e) => engine_errors.push(format!("{entry}: {e}")),
+            }
+        }
+        for entry in &to_remove {
+            let res = bt.unban_ip(entry).await; // ffi 层原生支持区间串
+            match res {
+                Ok(()) => {
+                    self.bt_bans.lock().retain(|b| b != entry);
+                }
+                Err(e) => {
+                    // 解禁失败：条目仍生效 → 留在 applied（下次刷新再试摘除）
+                    applied.insert(entry.clone());
+                    engine_errors.push(format!("解禁 {entry}: {e}"));
+                }
+            }
+        }
+
+        // ---- 5. 记账 + 落盘（bans.json = 全量生效集；ip_filter.json =
+        //      订阅归属基准——重启后保有 diff 基线）----
+        let count = applied.len();
+        let mut partial = String::new();
+        if !parse_errors.is_empty() {
+            partial = format!("（{} 行无法解析）", parse_errors.len());
+        }
+        if !engine_errors.is_empty() {
+            if !partial.is_empty() {
+                partial.push_str(" + ");
+            }
+            partial.push_str(&format!("（{} 条引擎失败）", engine_errors.len()));
+        }
+        {
+            let mut st = self.ip_filter.lock();
+            st.entries = applied;
+            st.source_url = url.to_string();
+            st.last_ok_unix = now;
+            st.last_attempt_unix = now;
+            st.last_error = (!partial.is_empty()).then_some(partial.clone());
+        }
+        self.persist_bans();
+        self.persist_ip_filter_state();
+        tracing::info!(
+            "IP 过滤订阅刷新: +{} / -{} / 生效 {} 条{partial}",
+            to_add.len(),
+            to_remove.len(),
+            count
+        );
+        Ok(count)
+    }
+
+    /// 禁用订阅（B7）：url 改空时清除全部订阅条目（手动封禁保留）。
+    /// 引擎在线 → 逐条解禁；不在线 → 仅列表/落盘摘除（引擎侧规则随
+    /// 重启消失——本会话从未生效过，无残留）。幂等：entries 空 = 直过。
+    pub async fn clear_ip_filter_subscription(&self) {
+        let _serial = self.ban_ops.lock().await;
+        let old: Vec<String> = {
+            let mut st = self.ip_filter.lock();
+            std::mem::take(&mut st.entries).into_iter().collect()
+        };
+        if old.is_empty() {
+            return;
+        }
+        let engine = self.engine_for(EngineKind::Bt).ok();
+        let bt = engine.as_ref().and_then(|e| e.bt());
+        let mut unbanned = 0usize;
+        for entry in &old {
+            if let Some(bt) = bt {
+                if bt.unban_ip(entry).await.is_ok() {
+                    unbanned += 1;
+                }
+            }
+            self.bt_bans.lock().retain(|b| b != entry);
+        }
+        {
+            let mut st = self.ip_filter.lock();
+            st.entries.clear();
+            st.source_url.clear();
+            st.last_ok_unix = 0;
+            st.last_error = None;
+        }
+        self.persist_bans();
+        self.persist_ip_filter_state();
+        tracing::info!(
+            "IP 过滤订阅已禁用：解除 {} 条（引擎侧 {} 条）",
+            old.len(),
+            unbanned
+        );
+    }
+
+    /// ip_filter.json 落盘（best-effort：失败仅 warn）。
+    pub(crate) fn persist_ip_filter_state(&self) {
+        let Some(path) = self.ip_filter_persist_path.clone() else {
+            return;
+        };
+        let st = self.ip_filter.lock().clone();
+        if let Err(e) = super::persistence::write_ip_filter_state_atomic(&path, &st) {
+            tracing::warn!("ip_filter.json 落盘失败 {path:?}: {e}");
+        }
+    }
+
+    /// 订阅配置现值（B7 ticker 用）：live_config 现读（热改跟随）。
+    pub(crate) fn ip_filter_cfg_now(&self) -> (String, u64) {
+        let cfg = self.live_config.lock();
+        match cfg.as_ref() {
+            Some(c) => (c.ip_filter.url.clone(), c.ip_filter.refresh_interval_secs),
+            None => (String::new(), 0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod ip_filter_parse_tests {
+    use super::*;
+
+    /// B7：混合格式解析（DAT/P2P/单 IP/v4-mapped 去重/注释跳过/坏行记账）。
+    #[test]
+    fn parse_ip_filter_text_mixed_formats() {
+        let text = "# level1 header\n\
+                    1.2.3.4\n\
+                    range:5.6.7.0-5.6.7.255,bad isp\n\
+                    9.9.9.0 - 9.9.9.255 , 000 , some range\n\
+                    ::ffff:1.2.3.4\n\
+                    garbage\n\
+                    \n";
+        let (entries, errors) = parse_ip_filter_text(text);
+        assert_eq!(entries.len(), 3, "v4-mapped 与字面 v4 去重: {entries:?}");
+        assert!(entries.contains("1.2.3.4"));
+        assert!(entries.contains("5.6.7.0-5.6.7.255"));
+        assert!(entries.contains("9.9.9.0-9.9.9.255"));
+        assert_eq!(errors.len(), 1, "仅 garbage 行报错: {errors:?}");
+    }
+
+    /// 空内容 = 空集（合法——订阅源显式清空 = 全部解除，由调用方应用）。
+    #[test]
+    fn parse_ip_filter_text_empty() {
+        let (entries, errors) = parse_ip_filter_text("");
+        assert!(entries.is_empty() && errors.is_empty());
+        let (entries, errors) = parse_ip_filter_text("# only comment\n\n");
+        assert!(entries.is_empty() && errors.is_empty());
+    }
+}

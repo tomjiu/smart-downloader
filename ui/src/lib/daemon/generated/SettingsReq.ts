@@ -4,6 +4,7 @@ import type { BtSessionReq } from "./BtSessionReq";
 import type { CleanupReq } from "./CleanupReq";
 import type { ConnectionReq } from "./ConnectionReq";
 import type { DownloadReq } from "./DownloadReq";
+import type { IpFilterReq } from "./IpFilterReq";
 import type { LoggingReq } from "./LoggingReq";
 import type { PostDownloadReq } from "./PostDownloadReq";
 import type { QueueReq } from "./QueueReq";
@@ -19,6 +20,10 @@ export type SettingsReq = { bandwidth?: BandwidthReq, connection?: ConnectionReq
  * 日志级别域（B4，#214 §三-13）。
  */
 logging?: LoggingReq, 
+/**
+ * IP 过滤订阅域（B7，#214 §三-7）。
+ */
+ip_filter?: IpFilterReq, 
 /**
  * 持久化开关（默认 true）；与 query `?persist=` 等价（body 优先）。
  */

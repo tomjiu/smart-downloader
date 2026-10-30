@@ -67,6 +67,8 @@ pub struct SettingsReq {
     pub queue: Option<QueueReq>,
     /// 日志级别域（B4，#214 §三-13）。
     pub logging: Option<LoggingReq>,
+    /// IP 过滤订阅域（B7，#214 §三-7）。
+    pub ip_filter: Option<IpFilterReq>,
     /// 持久化开关（默认 true）；与 query `?persist=` 等价（body 优先）。
     pub persist: Option<bool>,
 }
@@ -235,6 +237,20 @@ pub struct LoggingReq {
     pub level: Option<String>,
 }
 
+/// IP 过滤订阅域（B7，#214 §三-7，qB「IP 过滤·URL 订阅」对标）。
+/// 热键：订阅循环 15s 粒度现读 live_config——PUT 后下一粒度内拉取；
+/// url 改空 = 禁用并清除已生效订阅条目（手动封禁保留）。
+#[derive(Debug, Clone, Default, serde::Deserialize, TS)]
+#[serde(default)]
+#[ts(export, optional_fields)]
+pub struct IpFilterReq {
+    /// 订阅源 URL；空 = 禁用。验证：http(s):// 且 ≤2048（与 config
+    /// validate 同口径）；存储前 trim（首尾空白纯误输入）。
+    pub url: Option<String>,
+    /// 刷新间隔（秒）；0 = 仅启动拉一次。0..=2592000。
+    pub refresh_interval_secs: Option<u64>,
+}
+
 /// `PUT /settings` 响应：应用结果分类 + 当前生效限速。
 #[derive(Debug, Clone, serde::Serialize, TS)]
 #[ts(export)]
@@ -401,6 +417,24 @@ pub struct SettingsQueueDto {
     pub max_active_total: u32,
 }
 
+/// IP 过滤订阅域快照（B7，#214 §三-7）：配置面（url/interval）+
+/// 运行态（生效条数/上次成功/上次错误）——qB「IP 过滤」对话框同级信息。
+#[derive(Debug, Clone, serde::Serialize, TS)]
+#[ts(export)]
+pub struct SettingsIpFilterDto {
+    /// 订阅源 URL（空 = 禁用）。设置面可写（与 proxy/webhook 同密级）。
+    pub url: String,
+    /// 刷新间隔（秒）；0 = 仅启动拉一次。
+    pub refresh_interval_secs: u64,
+    /// 当前生效订阅条数（手动封禁不计入）。
+    pub entry_count: usize,
+    /// 上次成功刷新时刻（unix 秒；0 = 尚未成功）。
+    pub last_ok_unix: u64,
+    /// 上次部分失败摘要（None = 最近一次拉取完全成功；拉取失败时为
+    /// 整体原因——条目保持上次生效集不动）。
+    pub last_error: Option<String>,
+}
+
 /// RSS 域（B1，#214）：全局刷新策略快照。max_processed 运行时可热改；
 /// auto_refresh / refresh_interval_secs 重启生效（ticker 固化）。
 #[derive(Debug, Clone, serde::Serialize, TS)]
@@ -525,6 +559,9 @@ pub struct SettingsSnapshot {
     pub meta: SettingsMetaDto,
     /// 日志域（B4，#214）。
     pub logging: SettingsLoggingDto,
+    /// IP 过滤订阅域（B7，#214 §三-7）：url/interval 为配置面，
+    /// entry_count/last_* 为运行态（订阅循环 15s 粒度维护）。
+    pub ip_filter: SettingsIpFilterDto,
 }
 
 impl DaemonState {
@@ -708,6 +745,17 @@ impl DaemonState {
             logging: SettingsLoggingDto {
                 level: cfg.logging.normalized_level(),
                 effective_level: crate::logging::current_level().to_string(),
+            },
+            // B7（#214 §三-7）：配置面取 live_config，运行态取订阅循环记账
+            ip_filter: {
+                let st = self.ip_filter_status();
+                SettingsIpFilterDto {
+                    url: cfg.ip_filter.url.clone(),
+                    refresh_interval_secs: cfg.ip_filter.refresh_interval_secs,
+                    entry_count: st.entry_count,
+                    last_ok_unix: st.last_ok_unix,
+                    last_error: st.last_error,
+                }
             },
         }
     }
@@ -1020,6 +1068,28 @@ impl DaemonState {
                 if t > 100_000 {
                     return Err(DaemonError::InvalidSource(format!(
                         "queue.max_active_total = {t} 无效：须在 0..=100000（0 = 不限）"
+                    )));
+                }
+            }
+        }
+        // B7（#214 §三-7）：IP 过滤订阅——与 config validate 同口径
+        //（http(s) + ≤2048 + interval ≤ 30 天），另 trim 后存。
+        if let Some(ipf) = &req.ip_filter {
+            if let Some(u) = ipf.url.as_deref() {
+                let u = u.trim();
+                if !u.is_empty()
+                    && (!(u.starts_with("http://") || u.starts_with("https://")) || u.len() > 2048)
+                {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "ip_filter.url = {} 无效：须 http(s):// 且 ≤2048 字符（空 = 禁用）",
+                        u.chars().take(64).collect::<String>()
+                    )));
+                }
+            }
+            if let Some(secs) = ipf.refresh_interval_secs {
+                if secs > 2_592_000 {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "ip_filter.refresh_interval_secs = {secs} 无效：须在 0..=2592000（0 = 仅启动拉一次）"
                     )));
                 }
             }
@@ -1485,6 +1555,31 @@ impl DaemonState {
                     applied.push("logging.level".into());
                 } else {
                     restart_required.push("logging.level".into());
+                }
+            }
+        }
+        // B7（#214 §三-7）：IP 过滤订阅——热键（订阅循环 15s 粒度现读
+        // live_config：换源/到期即拉取；url 改空 → 循环清除订阅条目）。
+        // live_config 未装配（库嵌入）→ restart_required（#160 防假阳性）。
+        if let Some(ipf) = &req.ip_filter {
+            let mut touched = false;
+            if let Some(cfg) = self.live_config.lock().as_mut() {
+                if let Some(u) = ipf.url.as_deref() {
+                    cfg.ip_filter.url = u.trim().to_string();
+                    touched = true;
+                }
+                if let Some(secs) = ipf.refresh_interval_secs {
+                    cfg.ip_filter.refresh_interval_secs = secs;
+                    touched = true;
+                }
+            }
+            if touched {
+                for k in ["url", "refresh_interval_secs"] {
+                    applied.push(format!("ip_filter.{k}"));
+                }
+            } else {
+                for k in ["url", "refresh_interval_secs"] {
+                    restart_required.push(format!("ip_filter.{k}"));
                 }
             }
         }
@@ -2025,6 +2120,8 @@ mod tests {
             "download.min_split_mb",
             "queue.max_active_http",
             "queue.max_active_total",
+            "ip_filter.url",
+            "ip_filter.refresh_interval_secs",
             "limits.alt_from",
             "webhook.url",
             "cleanup.auto_remove_completed_days",
