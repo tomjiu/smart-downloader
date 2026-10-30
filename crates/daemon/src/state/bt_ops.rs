@@ -640,6 +640,52 @@ impl DaemonState {
         Ok(())
     }
 
+    /// 任务级上传槽位（B3，qB「每任务上传槽位」）：`n > 0` = 同时 unchoke
+    /// 的 peer 数上限；`n == 0` = 复位 -1（per-torrent 默认无限，受会话
+    /// unchoke_slots_limit 约束）。仅 BT 任务（其余 409）；即时生效（句柄
+    /// 级参数，metadata 未就绪也可设）；持久化 + 恢复重放（同
+    /// set_task_max_connections 口径）。
+    pub async fn set_task_max_uploads(&self, id: &str, n: u32) -> Result<(), DaemonError> {
+        let (engine, tid, kind) = {
+            let rec = self
+                .tasks
+                .lock()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            // kind 预拒先于引擎解析（错误形态保真，同 set_task_max_connections）。
+            if rec.engine_kind != EngineKind::Bt {
+                return Err(DaemonError::UnsupportedOp(format!(
+                    "任务 {id} 非 BT 任务（{:?}），不支持上传槽位",
+                    rec.engine_kind
+                )));
+            }
+            let tid = rec
+                .engine_tid
+                .clone()
+                .ok_or_else(|| DaemonError::NotFound(id.to_string()))?;
+            (self.engine_for(rec.engine_kind)?, tid, rec.engine_kind)
+        };
+        let bt = engine.bt().ok_or_else(|| {
+            DaemonError::UnsupportedOp(format!("任务 {id} 非 BT 任务（{kind:?}），不支持上传槽位"))
+        })?;
+        bt.set_max_uploads(&tid, n).await.map_err(|e| match e {
+            smart_dl_core::types::EngineError::Unsupported => {
+                DaemonError::UnsupportedOp(format!("任务 {id} 的引擎不支持上传槽位"))
+            }
+            other => DaemonError::Engine(other.to_string()),
+        })?;
+        {
+            let mut tasks = self.tasks.lock();
+            if let Some(rec) = tasks.get_mut(id) {
+                rec.task.max_uploads = Some(n);
+                rec.push_event("max_uploads_changed", Some(n.to_string()));
+            }
+        }
+        self.autosave();
+        Ok(())
+    }
+
     /// 任务级代理热改（E8）：`Some(url)` = 切任务专用 client（覆盖全局，
     /// add 时 E5 语义的运行时版）；`None` = 清除回引擎共享 client。
     ///

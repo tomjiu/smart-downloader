@@ -1653,6 +1653,8 @@ impl DownloadEngine for HttpEngine {
             num_seeds: 0,
             error: t.error.clone(),
             name: t.resolved_name.clone(),
+            // B3：单向引擎无上行口径（序列化省略）
+            upload_idle_secs: None,
         })
     }
 

@@ -308,6 +308,12 @@ impl DaemonState {
                                 replay_details.push(format!("连接数上限重放失败: {e}"));
                             }
                         }
+                        // ③c 上传槽位重放（B3，同 ③b 口径）。
+                        if let Some(n) = t.max_uploads {
+                            if let Err(e) = bt.set_max_uploads(&tid, n).await {
+                                replay_details.push(format!("上传槽位重放失败: {e}"));
+                            }
+                        }
                     }
                     // ④ 暂停意图重放 + 运行态恢复（P4 G5）：
                     // - was_paused → engine.pause：BT（内核暂停 + 意图登记持续压制

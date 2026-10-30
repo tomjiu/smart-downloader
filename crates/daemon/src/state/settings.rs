@@ -22,6 +22,14 @@
 //! | `bittorrent.enabled` / `bittorrent.save_path` | 重启生效（引擎装配期读；PUT 仅持久化） |
 //! | `server` / `provider` / `provider_xunlei` / `provider_quark` / `xunlei` | **只读快照**（装配期生效，不提供 PUT——避免「设置了看似生效实则没有」的假阳性，#160 同族预防）；`server.http_token` 只出 set/unset 布尔，明文永不出设置面 |
 //!
+//! B3（#214 §三 6/11/12，BT 调谐三件）：
+//!
+//! | 域 | 生效语义 |
+//! |---|---|
+//! | `bittorrent.dht_bootstrap_nodes` | 快照立即（内核热改不保证即时生效——DHT 重启[daemon 重启或切换 enable_dht]后保证生效；启动装配期三明治注入见 apply_startup_tuning） |
+//! | `bittorrent.max_upload_slots` | 立即（内核 unchoke_slots_limit；-1 = 不限 / 0 = 复位默认 / >0 = 槽位） |
+//! | `bittorrent.seeding_idle_limit_min` | 立即（daemon 侧执法：距上次上行负载达阈值自动暂停；口径 = upload_idle_secs 与做种起始取小） |
+//!
 //! 持久化：`PUT /settings?persist=true`（默认）在权威配置（live_config）上打
 //! 补丁后原子回写 `--config` 文件（tmp+rename）。未指定 `--config` 时仅运行
 //! 时生效（report.persisted=false）。热重载循环按文本变更检测（文件为准），
@@ -108,6 +116,16 @@ pub struct BtSessionReq {
     pub max_share_ratio: Option<f64>,
     /// 做种时长上限（分钟，qbit「做种时间限制」对标）；0 = 不启用。
     pub max_seeding_time_min: Option<u32>,
+    /// DHT 引导节点（B3，qB「DHT 节点」对标）："host:port" 列表整表替换
+    /// （空表 = 清除自定义回落内核默认）。运行中热改为快照先行（DHT
+    /// 重启后生效，见 lt.h 契约注释）。
+    pub dht_bootstrap_nodes: Option<Vec<String>>,
+    /// 会话全局上传槽位（B3，qB「全局上传槽位」）：-1 = 不限；0 = 内核
+    /// 默认（8）；>0 = 槽位数。运行中即时生效。
+    pub max_upload_slots: Option<i32>,
+    /// 做种空闲上限（分钟，B3，qB「当做种空闲时间达到」对标）；0 = 不启用。
+    /// 运行中即时生效（daemon 侧执法）。
+    pub seeding_idle_limit_min: Option<u32>,
     /// 存储模式（batch5 对标 qB「预分配磁盘空间」）：true = 新任务预分配。
     /// 会话级开关，仅重启时注入引擎（PUT 仅持久化）。
     pub storage_allocate: Option<bool>,
@@ -262,6 +280,15 @@ pub struct SettingsBittorrentDto {
     pub extra_trackers: Vec<String>,
     pub max_share_ratio: f64,
     pub max_seeding_time_min: u32,
+    /// DHT 引导节点（B3，qB「DHT 节点」对标）：空表 = 内核内置默认表。
+    /// 热改后需 DHT 重启（重启 daemon 或切换 enable_dht）才保证生效。
+    pub dht_bootstrap_nodes: Vec<String>,
+    /// 会话全局上传槽位（B3，qB「全局上传槽位」）：-1 = 不限；0 = 内核
+    /// 默认（8）；>0 = 槽位数。运行中即时生效。
+    pub max_upload_slots: i32,
+    /// 做种空闲上限（分钟，B3，qB「当做种空闲时间达到」对标）；0 = 不启用。
+    /// 口径 = 距上次上行负载（从未上行自进入做种起算）。
+    pub seeding_idle_limit_min: u32,
     /// 存储模式：true = 新任务预分配（batch5，重启生效）。
     pub storage_allocate: bool,
     /// 当前构建是否装配 BT 引擎（feature bt）。
@@ -511,6 +538,9 @@ impl DaemonState {
                 extra_trackers: cfg.bt.extra_trackers,
                 max_share_ratio: cfg.bt.max_share_ratio,
                 max_seeding_time_min: cfg.bt.max_seeding_time_min,
+                dht_bootstrap_nodes: cfg.bt.dht_bootstrap_nodes,
+                max_upload_slots: cfg.bt.max_upload_slots,
+                seeding_idle_limit_min: cfg.bt.seeding_idle_limit_min,
                 storage_allocate: cfg.bt.storage_allocate,
                 bt_available: self.engines.contains_key(&EngineKind::Bt),
                 enabled: cfg.bt.enabled,
@@ -696,6 +726,72 @@ impl DaemonState {
                 if m > 999_999 {
                     return Err(DaemonError::InvalidSource(format!(
                         "bittorrent.max_seeding_time_min = {m} 无效：须在 0..=999999（0 = 不启用）"
+                    )));
+                }
+            }
+            // B3：DHT 引导节点——条目门（≤32 × "host[:port]"；端口 1..=65535；
+            // 拒 \r\n\t 与逗号[CSV 分隔符]防注入；host 非空 ≤253）。
+            if let Some(nodes) = &bt.dht_bootstrap_nodes {
+                if nodes.len() > 32 {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "bittorrent.dht_bootstrap_nodes 最多 32 条（实际 {}）",
+                        nodes.len()
+                    )));
+                }
+                for n in nodes {
+                    let n = n.trim();
+                    if n.is_empty() {
+                        return Err(DaemonError::InvalidSource(
+                            "bittorrent.dht_bootstrap_nodes 含空条目".into(),
+                        ));
+                    }
+                    if n.len() > 300
+                        || n.contains(',')
+                        || n.chars().any(|c| matches!(c, '\r' | '\n' | '\t' | '\0'))
+                    {
+                        return Err(DaemonError::InvalidSource(format!(
+                            "bittorrent.dht_bootstrap_nodes 条目非法: {n:.48}…"
+                        )));
+                    }
+                    // host[:port] 拆分：末段全数字视作端口（IPv6 含多冒号不拆）
+                    let (host, port) = match n.rsplit_once(':') {
+                        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+                            (h, Some(p))
+                        }
+                        _ => (n, None),
+                    };
+                    if host.is_empty() || host.len() > 253 {
+                        return Err(DaemonError::InvalidSource(format!(
+                            "bittorrent.dht_bootstrap_nodes host 非法: {n:.48}…"
+                        )));
+                    }
+                    if let Some(p) = port {
+                        let Ok(v) = p.parse::<u32>() else {
+                            return Err(DaemonError::InvalidSource(format!(
+                                "bittorrent.dht_bootstrap_nodes 端口非法: {n:.48}…"
+                            )));
+                        };
+                        if v == 0 || v > 65535 {
+                            return Err(DaemonError::InvalidSource(format!(
+                                "bittorrent.dht_bootstrap_nodes 端口越界（1..=65535）: {n:.48}…"
+                            )));
+                        }
+                    }
+                }
+            }
+            // B3：全局上传槽位——-1（不限）/ 0（内核默认）/ 1..=1000
+            if let Some(s) = bt.max_upload_slots {
+                if !(-1..=1000).contains(&s) {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "bittorrent.max_upload_slots = {s} 无效：-1（不限）/ 0（内核默认）/ 1..=1000"
+                    )));
+                }
+            }
+            // B3：做种空闲上限（0 = 关闭；上限同时长口径 999999 分钟）
+            if let Some(m) = bt.seeding_idle_limit_min {
+                if m > 999_999 {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "bittorrent.seeding_idle_limit_min = {m} 无效：须在 0..=999999（0 = 不启用）"
                     )));
                 }
             }
@@ -950,7 +1046,10 @@ impl DaemonState {
                 || bt.encrypt.is_some()
                 || bt.extra_trackers.is_some()
                 || bt.max_share_ratio.is_some()
-                || bt.max_seeding_time_min.is_some();
+                || bt.max_seeding_time_min.is_some()
+                || bt.dht_bootstrap_nodes.is_some()
+                || bt.max_upload_slots.is_some()
+                || bt.seeding_idle_limit_min.is_some();
             if any {
                 let patch = BtSessionPatch {
                     enable_dht: bt.enable_dht,
@@ -964,6 +1063,9 @@ impl DaemonState {
                     extra_trackers: bt.extra_trackers.clone(),
                     max_share_ratio: bt.max_share_ratio,
                     max_seeding_time_min: bt.max_seeding_time_min,
+                    dht_bootstrap_nodes: bt.dht_bootstrap_nodes.clone(),
+                    max_upload_slots: bt.max_upload_slots,
+                    seeding_idle_limit_min: bt.seeding_idle_limit_min,
                 };
                 self.dispatch_bt_patch(&patch).await;
                 if let Some(cfg) = self.live_config.lock().as_mut() {
@@ -998,6 +1100,19 @@ impl DaemonState {
                     if let Some(v) = bt.max_seeding_time_min {
                         cfg.bt.max_seeding_time_min = v;
                     }
+                    if let Some(v) = &bt.dht_bootstrap_nodes {
+                        cfg.bt.dht_bootstrap_nodes = v
+                            .iter()
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect();
+                    }
+                    if let Some(v) = bt.max_upload_slots {
+                        cfg.bt.max_upload_slots = v;
+                    }
+                    if let Some(v) = bt.seeding_idle_limit_min {
+                        cfg.bt.seeding_idle_limit_min = v;
+                    }
                 }
                 for k in [
                     "enable_dht",
@@ -1009,6 +1124,9 @@ impl DaemonState {
                     "extra_trackers",
                     "max_share_ratio",
                     "max_seeding_time_min",
+                    "dht_bootstrap_nodes",
+                    "max_upload_slots",
+                    "seeding_idle_limit_min",
                 ] {
                     applied.push(format!("bittorrent.{k}"));
                 }

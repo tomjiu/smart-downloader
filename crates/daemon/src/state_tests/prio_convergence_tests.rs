@@ -54,6 +54,7 @@ fn downloading_rec(id: &str, ih: &str) -> TaskRecord {
             },
             limits: None,
             max_connections: None,
+            max_uploads: None,
             queue_priority: 0,
         },
         engine_tid: Some(ih.to_string()),

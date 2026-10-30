@@ -16,6 +16,7 @@ import type {
   BansReq,
   BatchTaskReq,
   ConnectionsReq,
+  UploadSlotsReq,
   FilePriorityEntry,
   FilePrioritiesOut,
   FilePriorityReq,
@@ -234,6 +235,15 @@ export class DaemonClient {
   taskConnections(id: string, maxConnections: number) {
     const body: ConnectionsReq = { max_connections: maxConnections };
     return req(`/tasks/${id}/connections`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+  }
+  /// 任务级上传槽位（B3，qB「每任务上传槽位」）：>0 = 同时 unchoke
+  /// 的 peer 数上限；0 = 复位默认（无限，受全局槽位约束）。
+  taskUploadSlots(id: string, maxUploads: number) {
+    const body: UploadSlotsReq = { max_uploads: maxUploads };
+    return req(`/tasks/${id}/upload_slots`, {
       method: "POST",
       body: JSON.stringify(body),
     });

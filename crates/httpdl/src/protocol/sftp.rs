@@ -1052,6 +1052,8 @@ impl DownloadEngine for SftpEngine {
             error: t.error.clone(),
             // SFTP 不参与 E9 名字回填：daemon add 时已派生 URL 末段名
             name: None,
+            // B3：单向引擎无上行口径（序列化省略）
+            upload_idle_secs: None,
         })
     }
 
@@ -1399,6 +1401,7 @@ mod tests {
             },
             limits: None,
             max_connections: None,
+            max_uploads: None,
             queue_priority: 0,
         };
 
@@ -1472,6 +1475,7 @@ mod tests {
             },
             limits: None,
             max_connections: None,
+            max_uploads: None,
             queue_priority: 0,
         };
         let engine = SftpEngine::with_backoff(Backoff::default());
@@ -1526,6 +1530,7 @@ mod tests {
             },
             limits: None,
             max_connections: None,
+            max_uploads: None,
             queue_priority: 0,
         };
         let engine = SftpEngine::with_backoff(Backoff::default());

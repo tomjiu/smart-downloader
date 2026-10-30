@@ -71,6 +71,7 @@ fn task_of(id: &str) -> DownloadTask {
         },
         limits: None,
         max_connections: None,
+        max_uploads: None,
     }
 }
 

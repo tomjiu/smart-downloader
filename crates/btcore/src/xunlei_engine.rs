@@ -286,6 +286,8 @@ impl DownloadEngine for XunleiBtEngine {
             error,
             // E9：xunlei 引擎暂不参与名字回填（XLTaskInfo 未还原 name 字段）
             name: None,
+            // B3：单向引擎无上行口径（序列化省略）
+            upload_idle_secs: None,
         })
     }
 

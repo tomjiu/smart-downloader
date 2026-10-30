@@ -285,6 +285,23 @@ pub struct BtCfg {
     /// （u32 serde default = 0 = 不启用，无需具名缺省函数。）
     #[serde(default)]
     pub max_seeding_time_min: u32,
+    /// DHT 引导节点（B3，qB「DHT 节点」对标）："host:port" 列表（端口可省，
+    /// 内核补 6881）；空（默认）= 内核内置表（router.bittorrent.com 等）。
+    /// 启动时于 DHT 启动前注入（apply_startup_tuning 三明治保证）；
+    /// 运行中可经 `PUT /settings` 热改（DHT 重启后生效，快照先行）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dht_bootstrap_nodes: Vec<String>,
+    /// 会话全局上传槽位（B3，qB「全局上传槽位」对标）：内核
+    /// unchoke_slots_limit。-1 = 不限；0（默认）= 内核默认（8）；>0 = 槽位
+    /// 数。启动时生效；运行中可经 `PUT /settings` 即时热改。
+    #[serde(default)]
+    pub max_upload_slots: i32,
+    /// 做种空闲上限（分钟，B3，qB「当做种空闲时间达到」对标）：Seeding 态
+    /// 距上次上行负载（与进入做种态时刻取小）达到指定分钟即自动暂停。
+    /// 0（默认）= 不启用。口径 = 引擎 last_upload（内核 steady 时钟），
+    /// 从未上行自进入做种起算。运行中可热改（daemon 侧执法）。
+    #[serde(default)]
+    pub seeding_idle_limit_min: u32,
     /// 存储模式（batch5 对标 qB「预分配磁盘空间」）：true = 后续新增任务
     /// 预分配完整文件大小（allocate，磁盘占用即时到位、碎片更少）；
     /// false（默认）= 稀疏（sparse，按需增长）。fastresume 回灌任务保留
@@ -380,6 +397,9 @@ impl Default for BtCfg {
             extra_trackers: Vec::new(),
             max_share_ratio: default_bt_max_share_ratio(),
             max_seeding_time_min: 0,
+            dht_bootstrap_nodes: Vec::new(),
+            max_upload_slots: 0,
+            seeding_idle_limit_min: 0,
             storage_allocate: false,
         }
     }

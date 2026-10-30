@@ -9,6 +9,21 @@ export type SettingsBittorrentDto = { enable_dht: boolean, enable_lsd: boolean, 
  */
 encrypt: string, extra_trackers: Array<string>, max_share_ratio: number, max_seeding_time_min: number, 
 /**
+ * DHT 引导节点（B3，qB「DHT 节点」对标）：空表 = 内核内置默认表。
+ * 热改后需 DHT 重启（重启 daemon 或切换 enable_dht）才保证生效。
+ */
+dht_bootstrap_nodes: Array<string>, 
+/**
+ * 会话全局上传槽位（B3，qB「全局上传槽位」）：-1 = 不限；0 = 内核
+ * 默认（8）；>0 = 槽位数。运行中即时生效。
+ */
+max_upload_slots: number, 
+/**
+ * 做种空闲上限（分钟，B3，qB「当做种空闲时间达到」对标）；0 = 不启用。
+ * 口径 = 距上次上行负载（从未上行自进入做种起算）。
+ */
+seeding_idle_limit_min: number, 
+/**
  * 存储模式：true = 新任务预分配（batch5，重启生效）。
  */
 storage_allocate: boolean, 

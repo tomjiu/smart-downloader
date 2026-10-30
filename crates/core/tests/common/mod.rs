@@ -75,6 +75,7 @@ pub fn make_task(id: &str, name: &str) -> DownloadTask {
         },
         limits: None,
         max_connections: None,
+        max_uploads: None,
         queue_priority: 0,
     }
 }

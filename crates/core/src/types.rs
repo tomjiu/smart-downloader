@@ -265,6 +265,11 @@ pub struct EngineStatus {
     /// daemon 轮询据此回填 `metadata.name`（空缺时），使派生名进入列表/快照
     /// 透出链。None = 引擎未透出（BT/FTP/NAS/xunlei 暂不参与回填）。
     pub name: Option<String>,
+    /// 距上次上行负载的秒数（B3，#214 做种空闲数据源）：内核 steady 时钟
+    /// 口径，仅 BT 引擎填值（从未上行亦为 None = 自进入做种态起算）；
+    /// 供 `seeding_idle_limit_min` 执法（与做种态起始时刻取小）。None =
+    /// 引擎无口径（HTTP/FTP 等单向引擎恒缺省，序列化省略）。
+    pub upload_idle_secs: Option<u64>,
 }
 
 /// 引擎侧任务状态。
@@ -452,6 +457,14 @@ pub trait BtEngineExt: DownloadEngine {
         Err(EngineError::Unsupported)
     }
 
+    /// 任务级上传槽位（B3，qB「每任务上传槽位」）：`n > 0` = 同时 unchoke
+    /// 的 peer 数上限；`n == 0` = 复位 -1（per-torrent 默认无限，受会话
+    /// unchoke_slots_limit 约束——与 qB 复位到全局口径同构）。仅 BT 引擎
+    /// 实现（句柄级参数，即时生效，metadata 未就绪也可设）。
+    async fn set_max_uploads(&self, _id: &EngineTaskId, _n: u32) -> Result<(), EngineError> {
+        Err(EngineError::Unsupported)
+    }
+
     /// 超级种子开关（BitComet 首创，qbit 任务右键同名能力）：仅 BT 引擎
     /// 实现（seed_mode flag，做种态生效、下载中无效果）；其余引擎 →
     /// `Unsupported`。
@@ -539,6 +552,14 @@ pub trait BtEngineExt: DownloadEngine {
     /// 经过指定分钟即自动暂停；`None`/`Some(0)` = 未启用。仅 BT 引擎返回
     /// 非 None。同步只读。
     fn seeding_time_limit(&self) -> Option<u32> {
+        None
+    }
+
+    /// 做种空闲上限快照（分钟，B3 执法面，qB「当做种空闲时间达到」对标）：
+    /// `Some(>0)` = Seeding 态距上次上行负载（与进入做种态时刻取小）达到
+    /// 指定分钟即自动暂停；`None`/`Some(0)` = 未启用。仅 BT 引擎返回非
+    /// None。同步只读（读引擎会话快照）。
+    fn seeding_idle_limit(&self) -> Option<u32> {
         None
     }
 
@@ -667,6 +688,19 @@ pub struct BtSessionPatch {
     /// 做种时长上限（分钟，qbit「做种时间限制」对标）：Seeding 态经过
     /// 指定时长即自动暂停。`None` = 不调整；`Some(0)` = 关闭（>0 = 生效阈值）。
     pub max_seeding_time_min: Option<u32>,
+    /// DHT 引导节点（B3，qB「DHT 节点」对标）："host:port" 列表；`None` =
+    /// 不调整；`Some(v)` = 整表替换（空表 = 清除自定义回落内核默认）。
+    /// 生效时机 = DHT 启动前最佳；运行中热改内核不保证即时生效（重启或
+    /// 切换 enable_dht 后生效，见 lt.h 契约注释）。
+    pub dht_bootstrap_nodes: Option<Vec<String>>,
+    /// 会话全局上传槽位（B3，qB「全局上传槽位」）：-1 = 不限；0 = 不修改
+    /// （不下发，内核默认 8）；>0 = 槽位数。运行中即时生效。
+    pub max_upload_slots: Option<i32>,
+    /// 做种空闲上限（分钟，B3，qB「当做种空闲时间达到」对标）：Seeding 态
+    /// 距上次上行负载达到指定分钟即自动暂停。`None` = 不调整；`Some(0)` =
+    /// 关闭（>0 = 生效阈值）。口径 = 引擎 upload_idle_secs 与进入做种态
+    /// 时刻取小（从未上行 → 自进入做种起算，与 qB「无活动」同构）。
+    pub seeding_idle_limit_min: Option<u32>,
 }
 
 #[cfg(test)]

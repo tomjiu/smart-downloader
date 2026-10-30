@@ -1645,6 +1645,8 @@ impl DownloadEngine for FtpEngine {
             error: t.error.clone(),
             // FTP 不参与 E9 名字回填：daemon add 时已派生 URL 末段名
             name: None,
+            // B3：单向引擎无上行口径（序列化省略）
+            upload_idle_secs: None,
         })
     }
 

@@ -52,6 +52,7 @@ fn mock_task() -> smart_dl_core::task::DownloadTask {
         },
         limits: None,
         max_connections: None,
+        max_uploads: None,
         queue_priority: 0,
     }
 }

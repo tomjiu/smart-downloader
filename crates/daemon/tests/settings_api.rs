@@ -987,3 +987,170 @@ async fn bittorrent_extra_trackers_and_ratio_apply() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 }
+
+/// B3（#214 §三 6/11/12）：BT 调谐三件套 PUT → applied + 快照回显 + toml
+/// 落盘回读（非 bt 构建引擎缺失静默跳过下发，值仍持久化——B1 同口径）。
+#[tokio::test]
+async fn put_bittorrent_b3_tuning_applied_and_persisted() {
+    let (_dir, base, cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+    let report: serde_json::Value = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({
+            "bittorrent": {
+                "dht_bootstrap_nodes": ["router.bittorrent.com:6881", "dht.transmissionbt.com"],
+                "max_upload_slots": 16,
+                "seeding_idle_limit_min": 30
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let applied = report["applied"].as_array().unwrap();
+    for k in [
+        "bittorrent.dht_bootstrap_nodes",
+        "bittorrent.max_upload_slots",
+        "bittorrent.seeding_idle_limit_min",
+    ] {
+        assert!(applied.iter().any(|v| v == k), "缺 {k}：{applied:?}");
+    }
+    // 快照回显
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        s["bittorrent"]["dht_bootstrap_nodes"],
+        serde_json::json!(["router.bittorrent.com:6881", "dht.transmissionbt.com"])
+    );
+    assert_eq!(s["bittorrent"]["max_upload_slots"], 16);
+    assert_eq!(s["bittorrent"]["seeding_idle_limit_min"], 30);
+    // toml 落盘回读（解析断言防同名字段误判）
+    let reloaded = smart_dl_daemon::config::Config::load(Some(&cfg_path)).unwrap();
+    assert_eq!(
+        reloaded.bt.dht_bootstrap_nodes,
+        vec![
+            "router.bittorrent.com:6881".to_string(),
+            "dht.transmissionbt.com".to_string()
+        ]
+    );
+    assert_eq!(reloaded.bt.max_upload_slots, 16);
+    assert_eq!(reloaded.bt.seeding_idle_limit_min, 30);
+}
+
+/// B3 验证从严：节点条目非法 / 槽位越界 / 空闲上限越界 → 400 零副作用。
+#[tokio::test]
+async fn put_bittorrent_b3_invalid_values_rejected() {
+    let (_dir, base, _cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+    for (name, body) in [
+        (
+            "注入换行",
+            serde_json::json!({"bittorrent": {"dht_bootstrap_nodes": ["bad\nhost:6881"]}}),
+        ),
+        (
+            "端口 0",
+            serde_json::json!({"bittorrent": {"dht_bootstrap_nodes": ["router.example:0"]}}),
+        ),
+        (
+            "端口越界",
+            serde_json::json!({"bittorrent": {"dht_bootstrap_nodes": ["router.example:70000"]}}),
+        ),
+        (
+            "空条目",
+            serde_json::json!({"bittorrent": {"dht_bootstrap_nodes": ["router.example:6881", "  "]}}),
+        ),
+        (
+            "逗号注入",
+            serde_json::json!({"bittorrent": {"dht_bootstrap_nodes": ["a:1,b:2"]}}),
+        ),
+        (
+            "槽位 -2",
+            serde_json::json!({"bittorrent": {"max_upload_slots": -2}}),
+        ),
+        (
+            "槽位 1001",
+            serde_json::json!({"bittorrent": {"max_upload_slots": 1001}}),
+        ),
+        (
+            "空闲上限越界",
+            serde_json::json!({"bittorrent": {"seeding_idle_limit_min": 1_000_000}}),
+        ),
+    ] {
+        let resp = client
+            .put(format!("{base}/settings"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            reqwest::StatusCode::BAD_REQUEST,
+            "{name} 必须 400"
+        );
+    }
+    // 零副作用：快照仍为默认
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        s["bittorrent"]["dht_bootstrap_nodes"],
+        serde_json::json!([])
+    );
+    assert_eq!(s["bittorrent"]["max_upload_slots"], 0);
+    assert_eq!(s["bittorrent"]["seeding_idle_limit_min"], 0);
+}
+
+/// B3：槽位 -1（不限）合法 + 空表节点 = 清除自定义（回落内核默认）。
+#[tokio::test]
+async fn put_bittorrent_b3_unlimited_slots_and_clear_nodes() {
+    let (_dir, base, _cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+    let report: serde_json::Value = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({
+            "bittorrent": {
+                "dht_bootstrap_nodes": [],
+                "max_upload_slots": -1
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        report["applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v == "bittorrent.max_upload_slots"),
+        "-1（不限）必须合法"
+    );
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        s["bittorrent"]["dht_bootstrap_nodes"],
+        serde_json::json!([])
+    );
+    assert_eq!(s["bittorrent"]["max_upload_slots"], -1);
+}

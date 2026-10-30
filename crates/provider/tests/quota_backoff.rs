@@ -209,6 +209,7 @@ async fn busy_slot_paired_across_fallback_lifecycle() {
         },
         limits: None,
         max_connections: None,
+        max_uploads: None,
         queue_priority: 0,
     };
 

@@ -51,6 +51,7 @@ fn insert_completed(state: &DaemonState, id: &str, finished_at_unix: u64) {
             },
             limits: None,
             max_connections: None,
+            max_uploads: None,
             queue_priority: 0,
         },
         engine_tid: Some(id.to_string()),

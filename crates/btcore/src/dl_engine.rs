@@ -58,6 +58,8 @@ fn map_status(st: &TorrentStatus) -> EngineStatus {
         // E28：BT 任务名回填接入 —— torrent metadata name 经 FFI status 透出，
         // daemon E9 轮询幂等回填（同 CD 链口径：一次成功后 name 非 None 自然停）
         name: st.name.clone(),
+        // B3：距上次上行负载秒数（从未上行 -1 → None = 自进入做种起算）
+        upload_idle_secs: (st.upload_idle_secs >= 0).then_some(st.upload_idle_secs as u64),
     };
     if total > 0 {
         es.files.push(FileProgress {
@@ -132,6 +134,14 @@ struct BtSessionCfg {
     max_share_ratio: f64,
     /// 做种时长上限（分钟，qbit「做种时间限制」对标）；0 = 不启用。
     max_seeding_time_min: u32,
+    /// DHT 引导节点（B3，qB「DHT 节点」对标）："host:port" 列表；空 =
+    /// 内核默认（router.bittorrent.com 等内置表）。
+    dht_bootstrap_nodes: Vec<String>,
+    /// 会话全局上传槽位（B3，qB「全局上传槽位」）：-1 = 不限；0 = 内核
+    /// 默认（sp.clear，2.x 默认 8）；>0 = 槽位数。
+    max_upload_slots: i32,
+    /// 做种空闲上限（分钟，B3，qB「当做种空闲时间达到」对标）；0 = 不启用。
+    seeding_idle_limit_min: u32,
 }
 
 impl BtEngine {
@@ -207,6 +217,11 @@ impl BtEngine {
                 extra_trackers: extra_trackers.to_vec(),
                 max_share_ratio,
                 max_seeding_time_min,
+                // B3 三项默认未管理（内核默认/关闭）：serve 装配期经
+                // apply_startup_tuning 注入（DHT 节点需先于 DHT 启动注入）。
+                dht_bootstrap_nodes: Vec::new(),
+                max_upload_slots: 0,
+                seeding_idle_limit_min: 0,
             }),
         })
     }
@@ -229,6 +244,56 @@ impl BtEngine {
         self.core
             .apply_conn(listen_port, max_connections)
             .map_err(|e| format!("bt apply_conn: {e:?}"))
+    }
+
+    /// 启动期 BT 调谐注入（B3，#214 §三 6/11/12）：serve 装配从
+    /// `[bt] dht_bootstrap_nodes / max_upload_slots / seeding_idle_limit_min`
+    /// 调用，构造后、首个任务前。DHT 引导节点须在 DHT 读取引导表前注入——
+    /// 若会话已以 enable_dht=true 装配，先关 DHT 再注入后重开（DHT 重启读
+    /// 新表；毫秒级窗口且无任务，无副作用）。`max_upload_slots != 0` 或
+    /// 节点表非空才下发；idle 仅入会话快照（daemon 侧执法）。运行中变更
+    /// 走 apply_bt_session。
+    pub fn apply_startup_tuning(
+        &self,
+        dht_nodes: &[String],
+        max_upload_slots: i32,
+        seeding_idle_limit_min: u32,
+    ) -> Result<(), String> {
+        if dht_nodes.is_empty() && max_upload_slots == 0 && seeding_idle_limit_min == 0 {
+            return Ok(()); // 全默认：不下发（内核默认 8 槽位/内置引导表）
+        }
+        let dht_was_on = self.session.lock().enable_dht;
+        if !dht_nodes.is_empty() && dht_was_on {
+            // 三明治：关 DHT → 注入引导表 → 重开（见方法注释）
+            self.core
+                .apply_discovery(false, false, false, false)
+                .map_err(|e| format!("bt dht restart(off): {e:?}"))?;
+        }
+        if !dht_nodes.is_empty() {
+            self.core
+                .apply_dht_nodes(dht_nodes)
+                .map_err(|e| format!("bt apply_dht_nodes: {e:?}"))?;
+            if dht_was_on {
+                let s = self.session.lock();
+                self.core
+                    .apply_discovery(s.enable_dht, s.enable_lsd, s.enable_upnp, s.enable_pex)
+                    .map_err(|e| format!("bt dht restart(on): {e:?}"))?;
+            }
+        }
+        if max_upload_slots != 0 {
+            self.core
+                .apply_upload_slots(max_upload_slots)
+                .map_err(|e| format!("bt apply_upload_slots: {e:?}"))?;
+        }
+        {
+            let mut s = self.session.lock();
+            s.dht_bootstrap_nodes = dht_nodes.to_vec();
+            if max_upload_slots != 0 {
+                s.max_upload_slots = max_upload_slots;
+            }
+            s.seeding_idle_limit_min = seeding_idle_limit_min;
+        }
+        Ok(())
     }
 
     pub fn core(&self) -> Arc<BtCore> {
@@ -950,6 +1015,19 @@ impl BtEngineExt for BtEngine {
         merged.max_seeding_time_min = patch
             .max_seeding_time_min
             .unwrap_or(snap.max_seeding_time_min);
+        // B3 三项：dht 节点 None = 不调整；Some = 整表替换（空表 = 清除
+        // 自定义回落内核默认）。upload_slots / idle 同语义合并。
+        if let Some(v) = &patch.dht_bootstrap_nodes {
+            merged.dht_bootstrap_nodes = v
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        merged.max_upload_slots = patch.max_upload_slots.unwrap_or(snap.max_upload_slots);
+        merged.seeding_idle_limit_min = patch
+            .seeding_idle_limit_min
+            .unwrap_or(snap.seeding_idle_limit_min);
 
         // 1) 发现层（DHT/LSD/UPnP/PEX）
         let discovery_changed = merged.enable_dht != snap.enable_dht
@@ -989,6 +1067,22 @@ impl BtEngineExt for BtEngine {
                 .apply_conn(merged.listen_port, merged.max_connections)
                 .map_err(|e| EngineError::Other(format!("bt apply_conn: {e:?}")))?;
         }
+        // 4) B3：DHT 引导节点（变更即整表重放；空表 = 清除自定义）。
+        //    生效时机 = DHT（重）启动读取引导表；运行中热改内核不保证
+        //    即时生效（见 lt.h 契约注释），快照先行保证重启后正确。
+        if merged.dht_bootstrap_nodes != snap.dht_bootstrap_nodes {
+            self.core
+                .apply_dht_nodes(&merged.dht_bootstrap_nodes)
+                .map_err(|e| EngineError::Other(format!("bt apply_dht_nodes: {e:?}")))?;
+        }
+        // 5) B3：全局上传槽位（-1 = 不限；0 = 复位内核默认；>0 = 槽位）。
+        //    不等即下发——含「设置→复位默认」路径（FFI 0 = sp.clear）。
+        if merged.max_upload_slots != snap.max_upload_slots {
+            self.core
+                .apply_upload_slots(merged.max_upload_slots)
+                .map_err(|e| EngineError::Other(format!("bt apply_upload_slots: {e:?}")))?;
+        }
+        // seeding_idle_limit_min：仅快照（daemon 侧执法，无内核面）
         // 全部成功才提交快照（失败组保持旧值，重试幂等）
         *self.session.lock() = merged;
         Ok(())
@@ -1021,6 +1115,13 @@ impl BtEngineExt for BtEngine {
     /// metadata 未就绪也可设（handle 级参数，随任务存续生效）。
     async fn set_max_connections(&self, id: &EngineTaskId, n: u32) -> Result<(), EngineError> {
         self.core.set_max_connections(id, n).map_err(bt_engine_err)
+    }
+
+    /// 任务级上传槽位（B3，qB「每任务上传槽位」）：>0 = 上限；0 = 复位 -1
+    /// （per-torrent 默认无限，受会话 unchoke_slots_limit 约束——与 qB
+    /// 复位到全局口径同构）。metadata 未就绪也可设（handle 级参数）。
+    async fn set_max_uploads(&self, id: &EngineTaskId, n: u32) -> Result<(), EngineError> {
+        self.core.set_max_uploads(id, n).map_err(bt_engine_err)
     }
 
     async fn set_super_seeding(&self, id: &EngineTaskId, on: bool) -> Result<(), EngineError> {
@@ -1108,6 +1209,11 @@ impl BtEngineExt for BtEngine {
 
     fn seeding_time_limit(&self) -> Option<u32> {
         let m = self.session.lock().max_seeding_time_min;
+        (m > 0).then_some(m)
+    }
+
+    fn seeding_idle_limit(&self) -> Option<u32> {
+        let m = self.session.lock().seeding_idle_limit_min;
         (m > 0).then_some(m)
     }
 

@@ -195,6 +195,15 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
                                   // S1：启动期会话连接参数（监听端口/全局连接数上限；0 = 不下发）
             bt.apply_startup_conn(cfg.bt.listen_port, cfg.bt.max_connections)
                 .map_err(ServeError::Engine)?;
+            // B3（#214 §三 6/11/12）：启动期 BT 调谐——DHT 引导节点（先于
+            // DHT 启动注入，见 apply_startup_tuning 三明治）+ 全局上传槽位 +
+            // 做种空闲执法阈值（快照；daemon 侧执法）。
+            bt.apply_startup_tuning(
+                &cfg.bt.dht_bootstrap_nodes,
+                cfg.bt.max_upload_slots,
+                cfg.bt.seeding_idle_limit_min,
+            )
+            .map_err(ServeError::Engine)?;
             // batch5（存储模式）：会话级预分配开关，任务装配前注入（后续
             // 全部新增生效；fastresume 回灌保留原模式）。
             bt.set_session_storage_allocate(cfg.bt.storage_allocate)

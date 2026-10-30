@@ -49,6 +49,7 @@ fn insert_bt_rec(state: &DaemonState, id: &str, ih: &str) {
             },
             limits: None,
             max_connections: None,
+            max_uploads: None,
             queue_priority: 0,
         },
         engine_tid: Some(ih.to_string()),

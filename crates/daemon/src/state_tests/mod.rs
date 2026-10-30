@@ -66,6 +66,12 @@ pub struct FakeEngine {
     seeding_ratio_limit: parking_lot::Mutex<Option<f64>>,
     /// seeding_time_limit() 回显（分钟；None = 未启用）。
     seeding_time_limit: parking_lot::Mutex<Option<u32>>,
+    /// seeding_idle_limit() 回显（分钟，B3 做种空闲执法测试用；None = 未启用）。
+    seeding_idle_limit: parking_lot::Mutex<Option<u32>>,
+    /// status().upload_idle_secs 回显（B3 做种空闲执法测试用；None = 无口径/从未上行）。
+    status_upload_idle: parking_lot::Mutex<Option<u64>>,
+    /// 已下发的上传槽位调用（(engine_tid, n)，B3 断言用）。
+    max_uploads_calls: parking_lot::Mutex<Vec<(String, u32)>>,
     /// add() 人为延迟（batch7 并发超卖测试用；0 = 旧行为即时返回）。
     add_delay_ms: std::sync::atomic::AtomicU64,
     /// 已下发的 session 级封禁（ban_ip/ban_ip_range 记录，batch7 重试测试用）。
@@ -103,6 +109,9 @@ impl FakeEngine {
             max_conn: parking_lot::Mutex::new(Vec::new()),
             seeding_ratio_limit: parking_lot::Mutex::new(None),
             seeding_time_limit: parking_lot::Mutex::new(None),
+            seeding_idle_limit: parking_lot::Mutex::new(None),
+            status_upload_idle: parking_lot::Mutex::new(None),
+            max_uploads_calls: parking_lot::Mutex::new(Vec::new()),
             add_delay_ms: std::sync::atomic::AtomicU64::new(0),
             bans: parking_lot::Mutex::new(Vec::new()),
             fail_bans: parking_lot::Mutex::new(std::collections::HashSet::new()),
@@ -338,6 +347,9 @@ impl DownloadEngine for FakeEngine {
         if let Some(s) = *self.status_state.lock() {
             st.state = s;
         }
+        if let Some(gap) = *self.status_upload_idle.lock() {
+            st.upload_idle_secs = Some(gap);
+        }
         Ok(st)
     }
     async fn remove(
@@ -445,11 +457,23 @@ impl BtEngineExt for FakeEngine {
         self.max_conn.lock().push((id.to_string(), n));
         Ok(())
     }
+    /// 上传槽位（B3）：记录 (engine_tid, n) 供断言；恒成功。
+    async fn set_max_uploads(
+        &self,
+        id: &EngineTaskId,
+        n: u32,
+    ) -> Result<(), smart_dl_core::types::EngineError> {
+        self.max_uploads_calls.lock().push((id.to_string(), n));
+        Ok(())
+    }
     fn seeding_ratio_limit(&self) -> Option<f64> {
         *self.seeding_ratio_limit.lock()
     }
     fn seeding_time_limit(&self) -> Option<u32> {
         *self.seeding_time_limit.lock()
+    }
+    fn seeding_idle_limit(&self) -> Option<u32> {
+        *self.seeding_idle_limit.lock()
     }
     async fn ban_ip(&self, ip: &str) -> Result<(), smart_dl_core::types::EngineError> {
         self.do_ban(ip).await

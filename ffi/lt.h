@@ -66,6 +66,19 @@ lt_err lt_apply_transport(lt_session* s, int enable_utp, int enc_policy);
    max_connections: 0 = 不修改（内核默认 200）；>0 时 connections_limit。 */
 lt_err lt_apply_conn(lt_session* s, int port, int max_connections);
 
+/* —— B3 会话级 BT 调谐（#214 §三 6/11 对标）—— */
+/* DHT 引导节点（qB「DHT 节点」对标）：nodes_csv = 逗号分隔 "host:port" 列表
+   （libtorrent settings_pack::dht_bootstrap_nodes 口径，host 可省端口由内核
+   补 6881）。NULL / 空串 = 清除自定义回落内核默认列表（settings_pack::clear）。
+   生效时机：DHT 启动前设置最佳；DHT 已启动时内核文档明示「重启 DHT 后才
+   可能生效」——调用方重启或切换 enable_dht 可触发重读。 */
+lt_err lt_apply_dht_nodes(lt_session* s, const char* nodes_csv);
+
+/* 会话全局上传槽位（qB「全局上传槽位」对标）：内核 unchoke_slots_limit。
+   slots: -1 = 不限（全部 peer 恒 unchoke）；0 = 复位内核默认
+   （settings_pack::clear，2.x 默认 8）；>0 = 槽位数。运行中即时生效。 */
+lt_err lt_apply_upload_slots(lt_session* s, int slots);
+
 /* —— 添加/移除（5）—— */
 lt_err lt_add_magnet(lt_session* s, const char* magnet, const char** web_seeds, char* ih_out /*41 字节*/);
 lt_err lt_add_torrent_file(lt_session* s, const uint8_t* meta, size_t len, const char** web_seeds, char* ih_out);
@@ -89,6 +102,8 @@ typedef struct {
     int64_t all_time_download, /* E33: 全生命周期累计下行（含历史，随 resume data
                                   持久；>= 本次 done——hashfail/断点重复收字节计入） */
             all_time_upload;   /* E33: 全生命周期累计上行（做种贡献；暂停不清零） */
+    int64_t upload_idle_secs;  /* B3: 距上次上行负载的秒数（qB「做种空闲」数据源，
+                                  内核 steady 时钟）；-1 = 本次会话从未上行。 */
 } lt_torrent_status;
 
 lt_err lt_status(lt_session* s, const char* ih, lt_torrent_status* out);
@@ -206,6 +221,11 @@ lt_err lt_force_recheck(lt_session* s, const char* ih);
 /* 任务级连接数上限（S1-c）：>0 = torrent_handle::set_max_connections；
    0 = 复位为会话级 connections_limit 当前值（qbit「无限制」回到全局口径）。 */
 lt_err lt_torrent_set_max_connections(lt_session* s, const char* ih, int max_connections);
+
+/* 任务级上传槽位（B3，qB「每任务上传槽位」）：>0 = torrent_handle::
+   set_max_uploads；0 = 复位 -1（内核文档：per-torrent 默认无限，实际受
+   会话 unchoke_slots_limit 约束——与 qB 复位到全局口径同构）。 */
+lt_err lt_torrent_set_max_uploads(lt_session* s, const char* ih, int max_uploads);
 
 /* —— 块读取（v2；async read_piece → 轮询取数）—— */
 lt_err lt_read_piece(lt_session* s, const char* ih, int idx, uint8_t* buf, size_t buflen, size_t* out_len);

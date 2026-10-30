@@ -14,6 +14,22 @@ max_share_ratio?: number,
  */
 max_seeding_time_min?: number, 
 /**
+ * DHT 引导节点（B3，qB「DHT 节点」对标）："host:port" 列表整表替换
+ * （空表 = 清除自定义回落内核默认）。运行中热改为快照先行（DHT
+ * 重启后生效，见 lt.h 契约注释）。
+ */
+dht_bootstrap_nodes?: Array<string>, 
+/**
+ * 会话全局上传槽位（B3，qB「全局上传槽位」）：-1 = 不限；0 = 内核
+ * 默认（8）；>0 = 槽位数。运行中即时生效。
+ */
+max_upload_slots?: number, 
+/**
+ * 做种空闲上限（分钟，B3，qB「当做种空闲时间达到」对标）；0 = 不启用。
+ * 运行中即时生效（daemon 侧执法）。
+ */
+seeding_idle_limit_min?: number, 
+/**
  * 存储模式（batch5 对标 qB「预分配磁盘空间」）：true = 新任务预分配。
  * 会话级开关，仅重启时注入引擎（PUT 仅持久化）。
  */
