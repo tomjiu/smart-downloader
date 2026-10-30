@@ -78,6 +78,18 @@ jobs:
       - name: test daemon (sftp)
         run: cargo test -p smart-dl-daemon --features sftp
 
+      # #212：桌面壳纯逻辑子 crate（crates 拆分——无 tauri/native 链接依赖，
+      # 常规 rust 环境可跑）：daemon 身份验证探针 + 启动失败文案的单测与
+      # fmt/clippy 门禁。桌面壳主 crate 需 webkit2gtk 等系统库，由
+      # desktop.yml 的打包 job 覆盖（那里只编译不测试——正因如此纯逻辑
+      # 必须拆出来才能进常规 CI）。
+      - name: test desktop shell-probe (fmt + clippy + test)
+        if: runner.os == 'Linux'
+        run: |
+          cargo fmt --manifest-path desktop/src-tauri/Cargo.toml --all --check
+          cargo clippy --manifest-path desktop/src-tauri/Cargo.toml -p smart-dl-shell-probe --all-targets -- -D warnings
+          cargo test --manifest-path desktop/src-tauri/Cargo.toml -p smart-dl-shell-probe
+
       # ts-rs 生成类型漂移检查（PR #149/#150；本 PR 补强）：
       # ① .cargo/config.toml 此前遗漏提交——export 导出到 <crate>/bindings/
       #   默认目录，此处 diff 恒净（检查空转）。现配置 [env] 统一导出路径，
