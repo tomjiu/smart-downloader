@@ -350,4 +350,57 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
       timeout: 10_000,
     });
   });
+
+  test('HC-9 设置覆盖度 B1（rss/fsync/bt 新分区渲染 + 保存回环 + 只读区）', async ({ page, request }) => {
+    await page.goto(BASE!);
+    await page.getByRole('button', { name: '设置' }).click();
+    // —— 新分区渲染断言（B1，#214）——
+    // RSS 节三字段
+    await expect(page.locator('.dl-field-label:has-text("已处理条目保留上限")')).toBeVisible();
+    await expect(page.locator('.dl-field-label:has-text("自动刷新")').first()).toBeVisible();
+    await expect(page.locator('.dl-field-label:has-text("刷新间隔（秒）")')).toBeVisible();
+    // 下载节 fsync 三件套
+    await expect(page.locator('.dl-field-label:has-text("段数据逐段 fsync")')).toBeVisible();
+    await expect(page.locator('.dl-field-label:has-text("批量阈值：累计段数")')).toBeVisible();
+    await expect(page.locator('.dl-field-label:has-text("批量阈值：时间间隔（毫秒）")')).toBeVisible();
+    // BT 节新增两字段
+    await expect(page.locator('.dl-field-label:has-text("BT 引擎总开关")')).toBeVisible();
+    await expect(page.locator('.dl-field-label:has-text("BT 独立落盘目录")')).toBeVisible();
+    // 只读装配区
+    await expect(page.locator('.dl-field-label:has-text("监听地址")').first()).toBeVisible();
+    await expect(page.locator('.dl-field-label:has-text("API 鉴权令牌")')).toBeVisible();
+
+    // —— 保存回环：rss.max_processed（立即生效键）——
+    const input = page.locator('#set-a11y-30');
+    await expect(input).toBeVisible();
+    await input.fill('333');
+    await page.getByLabel('保存设置').click();
+    await expect(page.getByText(/已应用 1 项/).first()).toBeVisible({ timeout: 10_000 });
+    const after = (await (await request.get(`${BASE}/settings`)).json()) as {
+      rss: { max_processed_items_per_feed: number };
+    };
+    expect(after.rss.max_processed_items_per_feed).toBe(333);
+
+    // —— 重启语义键（fsync 批量段数）：保存后 toast 报「重启生效」+ API 回读 ——
+    const seg = page.locator('#set-a11y-27');
+    await seg.fill('16');
+    await page.getByLabel('保存设置').click();
+    await expect(page.getByText(/重启生效 1 项/).first()).toBeVisible({ timeout: 10_000 });
+    const after2 = (await (await request.get(`${BASE}/settings`)).json()) as {
+      download: { fsync_batch_segments: number };
+    };
+    expect(after2.download.fsync_batch_segments).toBe(16);
+
+    // —— 复原（保住套件干净起点：两项均回出厂默认）——
+    await input.fill('200');
+    await seg.fill('8');
+    await page.getByLabel('保存设置').click();
+    await expect(page.getByText(/已应用 1 项/).first()).toBeVisible({ timeout: 10_000 });
+    const restored = (await (await request.get(`${BASE}/settings`)).json()) as {
+      rss: { max_processed_items_per_feed: number };
+      download: { fsync_batch_segments: number };
+    };
+    expect(restored.rss.max_processed_items_per_feed).toBe(200);
+    expect(restored.download.fsync_batch_segments).toBe(8);
+  });
 });
