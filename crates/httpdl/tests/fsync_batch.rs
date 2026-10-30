@@ -98,6 +98,7 @@ async fn run_download(
         None,
         progress,
         policy,
+        0,
     )
     .await
 }
@@ -337,6 +338,7 @@ async fn batch_mode_pause_flushes_and_resume_completes() {
         Some(pause),
         Some(progress),
         batch_policy(100, 3_600_000), // 全程无中途冲刷 → 只能靠收尾冲刷
+        0,
     )
     .await;
     assert_eq!(r, Ok(DynamicOutcome::Paused), "应暂停退出: {r:?}");
@@ -377,6 +379,7 @@ async fn batch_mode_pause_flushes_and_resume_completes() {
         None,
         None,
         batch_policy(100, 3_600_000),
+        0,
     )
     .await;
     assert_eq!(r2, Ok(DynamicOutcome::Completed), "恢复应完成: {r2:?}");

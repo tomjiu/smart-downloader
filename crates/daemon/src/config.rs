@@ -113,6 +113,36 @@ pub struct DownloadCfg {
     /// 默认 2000。合法域 100..=600000（越界钳到边界）。
     #[serde(default = "default_fsync_batch_interval_ms")]
     pub fsync_batch_interval_ms: u64,
+    /// 自定义 User-Agent（B2，#214，aria2 `--user-agent` 对标）：空 = 产品
+    /// 默认 `smart-dl/<version>`。逐任务 client 与探针请求同源（新任务
+    /// 生效）；serve 启动时烘入全局 client。合法域：非空时长度 1..=512。
+    #[serde(default)]
+    pub user_agent: String,
+    /// 代理例外列表（B2，#214，aria2 `--no-proxy` 对标）：任务 host 后缀
+    /// 命中任一条目 → 绕过代理直连。合法域：≤64 条，单条 1..=256。
+    #[serde(default)]
+    pub no_proxy: Vec<String>,
+    /// TCP 连接超时秒（B2，#214）：1..=300（越界钳到边界）；默认 10。
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+    /// 空闲读超时秒（B2，#214）：1..=3600；不设总超时（护长下载，H-9）；
+    /// 默认 30。
+    #[serde(default = "default_read_timeout_secs")]
+    pub read_timeout_secs: u64,
+    /// 单任务最大并发连接（B2，#214，aria2 `--max-connection-per-server`
+    /// 对标）：0 = 自动公式 clamp(total/64MB, 2, 8)；1 = 强制单连接。
+    /// 合法域 0..=64（越界钳到边界）。
+    #[serde(default)]
+    pub max_connections_per_task: u32,
+    /// 分段粒度 MB（B2，#214，aria2 `--min-split-size` 对标）：1..=1024；
+    /// 默认 16。仅无账本新下载采用（账本恢复沿用原粒度，WAL 对齐优先）。
+    #[serde(default = "default_min_split_mb")]
+    pub min_split_mb: u64,
+    /// 全局自动重试默认次数（B2，#214，qB「重试次数」对标）：任务未显式
+    /// 指定 auto_retry 时的兜底值。合法域 0..=10（与任务级同门）；0 =
+    /// 默认不重试（现状）。运行时生效（add 时现读）。
+    #[serde(default)]
+    pub retry_max_attempts: u32,
 }
 
 /// 安全修复（P1-b）：与 Config::default() 单源——修复前 derive Default 令
@@ -128,8 +158,27 @@ impl Default for DownloadCfg {
             fsync_per_segment: default_true(),
             fsync_batch_segments: default_fsync_batch_segments(),
             fsync_batch_interval_ms: default_fsync_batch_interval_ms(),
+            user_agent: String::new(),
+            no_proxy: Vec::new(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            read_timeout_secs: default_read_timeout_secs(),
+            max_connections_per_task: 0,
+            min_split_mb: default_min_split_mb(),
+            retry_max_attempts: 0,
         }
     }
+}
+
+fn default_connect_timeout_secs() -> u64 {
+    10
+}
+
+fn default_read_timeout_secs() -> u64 {
+    30
+}
+
+fn default_min_split_mb() -> u64 {
+    16
 }
 
 fn default_max_redirects() -> u32 {
@@ -158,6 +207,26 @@ impl DownloadCfg {
             batch_interval: std::time::Duration::from_millis(
                 self.fsync_batch_interval_ms.clamp(100, 600_000),
             ),
+        }
+    }
+
+    /// `[download]` 配置段 → HTTP 引擎调谐参数（B2，#214；含越界钳制，
+    /// 与 segment_sync_policy 同口径——加载期宽容、PUT /settings 从严）。
+    /// daemon 启动时烘入引擎 + 全局 client。
+    pub fn http_tuning(&self) -> smart_dl_core::types::HttpTuning {
+        smart_dl_core::types::HttpTuning {
+            user_agent: self.user_agent.trim().chars().take(512).collect(),
+            no_proxy: self
+                .no_proxy
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .take(64)
+                .collect(),
+            connect_timeout_secs: self.connect_timeout_secs.clamp(1, 300),
+            read_timeout_secs: self.read_timeout_secs.clamp(1, 3600),
+            max_connections_per_task: self.max_connections_per_task.min(64),
+            min_split_mb: self.min_split_mb.clamp(1, 1024),
         }
     }
 }

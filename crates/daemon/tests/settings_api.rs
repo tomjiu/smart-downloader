@@ -325,6 +325,248 @@ async fn put_bt_save_path_empty_clears_to_dest_root() {
     assert!(reloaded.bt.save_path.is_none(), "toml 应已清除 save_path");
 }
 
+/// B2（#214）：HTTP 调谐域——applied（新任务生效语义）+ 快照回读 + 落盘。
+#[tokio::test]
+async fn put_http_tuning_applies_and_persists() {
+    let (_dir, base, cfg_path) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+
+    let report: serde_json::Value = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({
+            "download": {
+                "user_agent": "my-agent/1.0",
+                "no_proxy": ["lan", ".corp.example"],
+                "connect_timeout_secs": 20,
+                "read_timeout_secs": 60,
+                "max_connections_per_task": 4,
+                "min_split_mb": 8,
+                "retry_max_attempts": 3
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let applied = report["applied"].as_array().unwrap();
+    for k in [
+        "download.user_agent",
+        "download.no_proxy",
+        "download.connect_timeout_secs",
+        "download.read_timeout_secs",
+        "download.max_connections_per_task",
+        "download.min_split_mb",
+        "download.retry_max_attempts",
+    ] {
+        assert!(applied.iter().any(|v| v == k), "缺 {k}：{applied:?}");
+    }
+    assert!(
+        report["restart_required"].as_array().unwrap().is_empty(),
+        "调谐域应即时生效（新任务语义）：{:?}",
+        report["restart_required"]
+    );
+
+    // 快照回读
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["download"]["user_agent"], "my-agent/1.0");
+    assert_eq!(s["download"]["no_proxy"][0], "lan");
+    assert_eq!(s["download"]["connect_timeout_secs"], 20);
+    assert_eq!(s["download"]["read_timeout_secs"], 60);
+    assert_eq!(s["download"]["max_connections_per_task"], 4);
+    assert_eq!(s["download"]["min_split_mb"], 8);
+    assert_eq!(s["download"]["retry_max_attempts"], 3);
+
+    // 落盘断言（回读解析）
+    let reloaded = smart_dl_daemon::config::Config::load(Some(&cfg_path)).unwrap();
+    assert_eq!(reloaded.download.user_agent, "my-agent/1.0");
+    assert_eq!(reloaded.download.connect_timeout_secs, 20);
+    assert_eq!(reloaded.download.max_connections_per_task, 4);
+    assert_eq!(reloaded.download.min_split_mb, 8);
+    assert_eq!(reloaded.download.retry_max_attempts, 3);
+}
+
+/// B2（#214）：调谐域越界/非法 400 零副作用——UA 换行（头注入）、
+/// no_proxy 空条目、超时/并发/分段/重试越界。
+#[tokio::test]
+async fn put_http_tuning_invalid_rejected_zero_side_effect() {
+    let (_dir, base, _p) = spawn_daemon(base_cfg()).await;
+    let client = reqwest::Client::new();
+    for (body, key) in [
+        (
+            serde_json::json!({ "download": { "user_agent": "bad\r\nua" } }),
+            "UA 头注入",
+        ),
+        (
+            serde_json::json!({ "download": { "no_proxy": ["ok", "  "] } }),
+            "no_proxy 空条目",
+        ),
+        (
+            serde_json::json!({ "download": { "connect_timeout_secs": 0 } }),
+            "connect 下限",
+        ),
+        (
+            serde_json::json!({ "download": { "read_timeout_secs": 99999 } }),
+            "read 上限",
+        ),
+        (
+            serde_json::json!({ "download": { "max_connections_per_task": 65 } }),
+            "并发上限",
+        ),
+        (
+            serde_json::json!({ "download": { "min_split_mb": 0 } }),
+            "分段下限",
+        ),
+        (
+            serde_json::json!({ "download": { "retry_max_attempts": 11 } }),
+            "重试上限",
+        ),
+    ] {
+        let resp = client
+            .put(format!("{base}/settings"))
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400, "{key} 应 400");
+    }
+    // 零副作用：快照保持默认
+    let s: serde_json::Value = client
+        .get(format!("{base}/settings"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(s["download"]["user_agent"], "");
+    assert_eq!(s["download"]["connect_timeout_secs"], 10);
+    assert_eq!(s["download"]["retry_max_attempts"], 0);
+}
+
+/// B2（#214）：重试默认端到端——PUT retry_max_attempts 后，add 任务
+/// （不带 auto_retry）经「探测过、下载失败」源时按全局默认安排 auto_retry
+/// （事件历史证据）。需要轮询/调度循环（retry_api 同款 100ms 加速口径），
+/// settings_api 的 spawn_daemon 不带循环 → 本测试自装配带循环实例。
+#[tokio::test]
+async fn put_retry_default_applies_to_new_task_failures() {
+    // flaky 源：首请求（探测）200 + 16KB；此后恒 404（下载失败）
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        "/flaky",
+        axum::routing::get(move || async move {
+            let n = hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::OK)
+                    .header(axum::http::header::CONTENT_LENGTH, "16384")
+                    .body(axum::body::Body::from(vec![7u8; 16 * 1024]))
+                    .unwrap()
+            } else {
+                axum::response::Response::builder()
+                    .status(axum::http::StatusCode::NOT_FOUND)
+                    .body(axum::body::Body::empty())
+                    .unwrap()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let flaky_addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // 自装配：live_config + 持久化路径（PUT /settings 需要）+ 调度循环
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("daemon.toml");
+    let cfg = base_cfg();
+    std::fs::write(&cfg_path, cfg.to_toml_string().unwrap()).unwrap();
+    let engine = HttpEngine::new(reqwest::Client::new());
+    let dest = dir.path().join("downloads");
+    std::fs::create_dir_all(&dest).unwrap();
+    let state = Arc::new(
+        DaemonState::new(Arc::new(engine), vec![])
+            .with_dest_root(dest)
+            .with_config_path(Some(cfg_path.clone()))
+            .with_live_config(cfg),
+    );
+    let app = http::router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let base = format!("http://{addr}");
+    // 轮询 + 调度循环（retry_api serve_with_scheduler 同款）
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                let _ = st.poll_engine_states().await;
+                let _ = st.activate_due_tasks().await;
+            }
+        });
+    }
+
+    let client = reqwest::Client::new();
+    // 全局默认重试 2 次
+    let r: serde_json::Value = client
+        .put(format!("{base}/settings"))
+        .json(&serde_json::json!({ "download": { "retry_max_attempts": 2 } }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(r["applied"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|v| v == "download.retry_max_attempts"));
+
+    // 不带 auto_retry 的任务（探测 200 → 建成；下载 404 → 引擎 Error）
+    let resp = client
+        .post(format!("{base}/tasks"))
+        .json(&serde_json::json!({ "url": format!("http://{flaky_addr}/flaky") }))
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "add 应通过（探测 200）");
+    let created: serde_json::Value = resp.json().await.unwrap();
+    let id = created["task_id"].as_str().unwrap().to_string();
+
+    // 轮询事件历史：auto_retry 出现（全局默认生效的证据）
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut ok = false;
+    while std::time::Instant::now() < deadline {
+        let logs: serde_json::Value = client
+            .get(format!("{base}/tasks/{id}/logs"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let events = logs["events"].as_array().cloned().unwrap_or_default();
+        if events.iter().any(|e| e["op"] == "auto_retry") {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+    assert!(ok, "全局重试默认应令任务失败时安排 auto_retry");
+}
+
 /// B1（#214）：越界值 400 零副作用（fsync/rss 合法域从严拒绝）。
 #[tokio::test]
 async fn put_b1_out_of_range_rejected_zero_side_effect() {

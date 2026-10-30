@@ -12,7 +12,6 @@ use crate::hls;
 use crate::ledger;
 use crate::range::{multi_source_ok, probe_range, Probe};
 use crate::rate::{RateLimiter, RateSample};
-use crate::segment_manager::DEFAULT_MIN_SPLIT;
 use crate::verify::{verify_file, verify_file_md5, verify_file_sha1, verify_nonempty_blocks};
 use parking_lot::{Mutex, RwLock};
 use smart_dl_core::identity::ContentIdentity;
@@ -20,14 +19,13 @@ use smart_dl_core::identity::ContentIdentity;
 use smart_dl_core::task::DownloadTask;
 use smart_dl_core::types::{
     Capability, DownloadEngine, DownloadSource, EngineError, EngineKind, EngineState, EngineStatus,
-    EngineTaskId, FileProgress, HttpEngineExt,
+    EngineTaskId, FileProgress, HttpEngineExt, HttpTuning,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-
 /// 换源竞态窗口：段失败后等待 update_sources 到达（mirrors 变化则重试）。
 const SOURCE_WINDOW: Duration = Duration::from_millis(500);
 
@@ -129,6 +127,14 @@ pub struct HttpEngine {
     /// 或批量（机械盘吞吐救星）。启动时烘入，不参与热重载（fsync 语义
     /// 变更无运行中切换需求）。见 download::SegmentSyncPolicy。
     sync_policy: SegmentSyncPolicy,
+    /// HTTP 调谐参数（B2，#214）：UA/超时/并发上限/分段粒度/no_proxy。
+    /// `set_tuning` 热改（新任务生效）；共享 client 不重建（immutable），
+    /// 偏离 base 时逐任务构建调谐 client。
+    tuning: Arc<RwLock<HttpTuning>>,
+    /// 共享 client 构建时的调谐基准（serve 启动注入）：与当前 tuning
+    /// 一致且无代理 → 共享 client；偏离 → 逐任务调谐构建。判定基准而非
+    /// 快照真源（真源恒为 tuning）。
+    base_tuning: HttpTuning,
 }
 
 /// 从代理 URL 提取 `user:pass@`（E5：任务级代理 reqwest basic_auth 用；
@@ -150,23 +156,63 @@ pub const USER_AGENT: &str = concat!("smart-dl/", env!("CARGO_PKG_VERSION"));
 /// connect 10s + read 30s（H-9：不设总超时护长下载）；proxy URL 非法返回 Err
 /// （daemon add 时调用本函数校验，spawn 时重建失败则任务标 Error）。
 pub fn build_proxied_client(proxy_url: &str) -> Result<reqwest::Client, String> {
-    let proxy = reqwest::Proxy::all(proxy_url).map_err(|e| e.to_string())?;
-    // 凭据与代理体合成同一个 Proxy（ClientBuilder.proxy() 为追加语义：
-    // 先 push 无凭据再 push 带凭据会由前者先命中，凭据丢失 → 条件单次）
-    let proxy = match proxy_auth_of(proxy_url) {
-        Some((u, p)) => proxy.basic_auth(&u, &p),
-        None => proxy,
-    };
-    reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .read_timeout(std::time::Duration::from_secs(30))
+    build_tuned_client(Some(proxy_url), None, &HttpTuning::default())
+}
+
+/// no_proxy 命中判定（B2，#214，aria2 `--no-proxy` 对标）：host 与任一条目
+/// 后缀匹配（大小写不敏感；条目剥前导 `.` 后比对，尾部不匹配中段）。
+/// `"lan"` 命中 `host.lan` 不命中 `host.lan.example.com`；`""` 不匹配任何。
+pub fn no_proxy_hit(host: &str, no_proxy: &[String]) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    no_proxy.iter().any(|raw| {
+        let entry = raw.trim().trim_start_matches('.').to_ascii_lowercase();
+        !entry.is_empty()
+            && (host == entry || host.strip_suffix(&entry).is_some_and(|h| h.ends_with('.')))
+    })
+}
+
+/// 调谐 client 构建（B2，#214）：UA / 超时 / 代理 / 代理例外全口径。
+/// `proxy = None` 或 no_proxy 命中任务 host → 直连；凭据代理体合成语义
+/// 与 build_proxied_client 一致。`task_host` = 任务主源 host（no_proxy 判定）。
+pub fn build_tuned_client(
+    proxy: Option<&str>,
+    task_host: Option<&str>,
+    tuning: &HttpTuning,
+) -> Result<reqwest::Client, String> {
+    let ua = tuning.user_agent.trim();
+    let ua = if ua.is_empty() { USER_AGENT } else { ua };
+    let mut builder = reqwest::Client::builder()
+        .user_agent(ua)
+        .connect_timeout(Duration::from_secs(tuning.connect_timeout_secs.max(1)))
+        .read_timeout(Duration::from_secs(tuning.read_timeout_secs.max(1)))
         // A5（cookie jar）：任务级 client 各自独立 jar（与全局 client 隔离），
         // 探测/段请求/重定向自动携带与更新；Cookie 任务头仍可显式覆盖。
-        .cookie_store(true)
-        .proxy(proxy)
-        .build()
-        .map_err(|e| e.to_string())
+        .cookie_store(true);
+    let effective_proxy = match proxy {
+        Some(p) if p.trim().is_empty() => None,
+        Some(p) => {
+            // no_proxy 命中任务 host → 绕过代理直连（aria2 同语义）
+            match task_host {
+                Some(h) if no_proxy_hit(h, &tuning.no_proxy) => None,
+                _ => Some(p),
+            }
+        }
+        None => None,
+    };
+    if let Some(p) = effective_proxy {
+        let proxy = reqwest::Proxy::all(p).map_err(|e| e.to_string())?;
+        // 凭据与代理体合成同一个 Proxy（ClientBuilder.proxy() 为追加语义：
+        // 先 push 无凭据再 push 带凭据会由前者先命中，凭据丢失 → 条件单次）
+        let proxy = match proxy_auth_of(p) {
+            Some((u, pass)) => proxy.basic_auth(&u, &pass),
+            None => proxy,
+        };
+        builder = builder.proxy(proxy);
+    }
+    builder.build().map_err(|e| e.to_string())
 }
 
 impl HttpEngine {
@@ -194,7 +240,24 @@ impl HttpEngine {
             }),
             global_proxy: Arc::new(RwLock::new(None)),
             sync_policy: SegmentSyncPolicy::default(),
+            tuning: Arc::new(RwLock::new(HttpTuning::default())),
+            base_tuning: HttpTuning::default(),
         }
+    }
+
+    /// HTTP 调谐注入（B2，#214）：serve 启动时由 `[download]` 配置段构建
+    /// （UA/超时/并发/分段/no_proxy）。同步更新 base（共享 client 由 serve
+    /// 侧按同一 tuning 预构建，见 serve.rs）。运行中热改走
+    /// `HttpEngineExt::set_tuning`（不重烘共享 client）。
+    pub fn with_tuning(mut self, tuning: HttpTuning) -> Self {
+        *self.tuning.write() = tuning.clone();
+        self.base_tuning = tuning;
+        self
+    }
+
+    /// 当前调谐快照（B2）：daemon 设置面 GET /settings 回显用。
+    pub fn tuning_snapshot(&self) -> HttpTuning {
+        self.tuning.read().clone()
     }
 
     /// 段落盘策略注入（fsync 性能开关）：默认每段 fsync（P0-4 语义），
@@ -214,24 +277,37 @@ impl HttpEngine {
         // 全局）；None → 引擎共享 client（可能含全局 [download] proxy）。
         // S1 补充：任务无代理且运行时全局代理已设置 → 合并运行时全局代理
         // （新任务生效语义；启动时代理已烘入共享 client，此处仅运行中变更）。
+        // B2 补充：调谐偏离基准（UA/超时/no_proxy/…运行中热改过）→ 同样逐任务
+        // 构建调谐 client（新任务生效；共享 client immutable 不重建）。
         // 构建失败（add 时已校验过，此处兜底）→ 任务标 Error 不 spawn。
-        let (client, spawn_err) = {
+        let (client, tuning, spawn_err) = {
             let runtime_global = self.global_proxy.read().clone().filter(|s| !s.is_empty());
+            let tuning = self.tuning.read().clone();
             let tasks = self.inner.tasks.lock();
-            match tasks
-                .get(&tid)
-                .and_then(|t| t.proxy.as_deref())
-                .map(|s| s.to_string())
-                .or(runtime_global)
-            {
-                Some(p) => match build_proxied_client(&p) {
-                    Ok(c) => (c, None),
+            let (task_proxy, task_host) = match tasks.get(&tid) {
+                Some(t) => (
+                    t.proxy.as_deref().map(|s| s.to_string()),
+                    t.mirrors
+                        .first()
+                        .and_then(|u| reqwest::Url::parse(u).ok())
+                        .and_then(|u| u.host_str().map(|h| h.to_string())),
+                ),
+                None => (None, None),
+            };
+            drop(tasks);
+            let proxy = task_proxy.or(runtime_global);
+            let tuned = proxy.is_some() || tuning != self.base_tuning;
+            if tuned {
+                match build_tuned_client(proxy.as_deref(), task_host.as_deref(), &tuning) {
+                    Ok(c) => (c, tuning, None),
                     Err(e) => (
                         self.client.clone(),
-                        Some(format!("任务级 proxy client 构建失败: {e}")),
+                        tuning,
+                        Some(format!("任务级 client 构建失败: {e}")),
                     ),
-                },
-                None => (self.client.clone(), None),
+                }
+            } else {
+                (self.client.clone(), tuning, None)
             }
         };
         if let Some(msg) = spawn_err {
@@ -279,7 +355,17 @@ impl HttpEngine {
             })
         } else {
             tokio::spawn(async move {
-                download_loop(&client, limiter, inner, tid, gen, epoch, sync_policy).await;
+                download_loop(
+                    &client,
+                    limiter,
+                    inner,
+                    tid,
+                    gen,
+                    epoch,
+                    sync_policy,
+                    tuning,
+                )
+                .await;
             })
         };
         // 收尸监控：panic → 任务标 Error（V11 锁治理后 parking_lot 无中毒，
@@ -309,17 +395,34 @@ impl HttpEngine {
     /// pause()/remove() 管理）；resume() epoch+1 → 旧循环在下一 abort 检查点
     /// 自杀，新循环凭段账本续传。
     fn spawn_stream_loop(&self, tid: EngineTaskId, epoch: u64) {
+        // B2（#214）：与 spawn_download 同口径——任务代理/全局代理/调谐偏离
+        // 任一命中 → 逐任务调谐 client；否则引擎共享 client。
         let (client, spawn_err) = {
+            let runtime_global = self.global_proxy.read().clone().filter(|s| !s.is_empty());
+            let tuning = self.tuning.read().clone();
             let tasks = self.inner.tasks.lock();
-            match tasks.get(&tid).and_then(|t| t.proxy.as_deref()) {
-                Some(p) => match build_proxied_client(p) {
+            let (task_proxy, task_host) = match tasks.get(&tid) {
+                Some(t) => (
+                    t.proxy.as_deref().map(|s| s.to_string()),
+                    t.mirrors
+                        .first()
+                        .and_then(|u| reqwest::Url::parse(u).ok())
+                        .and_then(|u| u.host_str().map(|h| h.to_string())),
+                ),
+                None => (None, None),
+            };
+            drop(tasks);
+            let proxy = task_proxy.or(runtime_global);
+            if proxy.is_some() || tuning != self.base_tuning {
+                match build_tuned_client(proxy.as_deref(), task_host.as_deref(), &tuning) {
                     Ok(c) => (c, None),
                     Err(e) => (
                         self.client.clone(),
-                        Some(format!("任务级 proxy client 构建失败: {e}")),
+                        Some(format!("任务级 client 构建失败: {e}")),
                     ),
-                },
-                None => (self.client.clone(), None),
+                }
+            } else {
+                (self.client.clone(), None)
             }
         };
         if let Some(msg) = spawn_err {
@@ -646,6 +749,8 @@ async fn download_loop_unknown(
     }
 }
 
+// 参数为同层语义字段（download_dynamic 同口径允许超参）。
+#[allow(clippy::too_many_arguments)]
 async fn download_loop(
     client: &reqwest::Client,
     limiter: Arc<RateLimiter>,
@@ -654,6 +759,7 @@ async fn download_loop(
     gen: u64,
     epoch: u64,
     sync_policy: SegmentSyncPolicy,
+    tuning: HttpTuning,
 ) {
     loop {
         // 快照任务参数（不跨 await 持锁）；gen/epoch 失配 → 本循环作废
@@ -703,6 +809,10 @@ async fn download_loop(
         let ledger_path = ledger::ledger_path(&part);
         let loaded =
             ledger::load(&ledger_path).filter(|l| l.total == total && l.validate_segments());
+        // B2（#214）：无账本的新下载采用调谐分段粒度（[download] min_split_mb，
+        // 默认 16 与旧常量一致）；账本恢复沿用原粒度——WAL 段对齐不变量
+        // 优先于设置热改（粒度变更会导致账本段与新计划错位）。
+        let tuned_min_split = (tuning.min_split_mb.max(1)) * 1024 * 1024;
         let ledger_handle = DynamicLedger {
             path: ledger_path,
             etag: etag.clone(),
@@ -710,7 +820,7 @@ async fn download_loop(
             min_split: loaded
                 .as_ref()
                 .map(|l| l.min_split)
-                .unwrap_or(DEFAULT_MIN_SPLIT),
+                .unwrap_or(tuned_min_split),
             done: loaded.map(|l| l.done).unwrap_or_default(),
         };
         let min_split = ledger_handle.min_split;
@@ -743,6 +853,7 @@ async fn download_loop(
             Some(pause_flag),
             Some(progress),
             sync_policy,
+            tuning.max_connections_per_task as usize,
         )
         .await
         {
@@ -1160,10 +1271,23 @@ impl DownloadEngine for HttpEngine {
         // 任务级代理的意义正是「只有代理可达源」——探测若用共享 client 直连，
         // 代理专属源会在 add 时误判死亡。client 构建失败 → 任务拒绝（daemon
         // 层已校验，此处同一函数再拦，双保险）。
-        let client = match &proxy {
-            Some(p) => build_proxied_client(p)
-                .map_err(|e| EngineError::Other(format!("任务级 proxy client 构建失败: {e}")))?,
-            None => self.client.clone(),
+        // B2（#214）：探测 client 与段下载 client 同口径——任务级代理 /
+        // 运行时全局代理 / 调谐偏离基准任一命中 → 调谐构建（探测与段请求
+        // UA/超时同源，防「探测裸 UA、下载带 UA」的半吊子生效）。构建失败
+        // → 任务拒绝（daemon 层已校验，此处同一函数再拦，双保险）。
+        let client = {
+            let runtime_global = self.global_proxy.read().clone().filter(|s| !s.is_empty());
+            let tuning = self.tuning.read().clone();
+            let task_host = reqwest::Url::parse(&url)
+                .ok()
+                .and_then(|u| u.host_str().map(|h| h.to_string()));
+            let effective = proxy.clone().or(runtime_global);
+            if effective.is_some() || tuning != self.base_tuning {
+                build_tuned_client(effective.as_deref(), task_host.as_deref(), &tuning)
+                    .map_err(|e| EngineError::Other(format!("任务级 client 构建失败: {e}")))?
+            } else {
+                self.client.clone()
+            }
         };
         // C-HLS 分流：.m3u8 URL → HLS VOD 下载（不走 Range 探测/分段链——
         // 清单是文本，total/Range 语义无意义）。备用源对 HLS 无意义（清单
@@ -1831,6 +1955,15 @@ impl HttpEngineExt for HttpEngine {
             };
             self.spawn_download(id.clone(), gen, epoch);
         }
+        Ok(())
+    }
+
+    /// 引擎级调谐热改（B2，#214）：整体置换 tuning（新任务生效；存量任务
+    /// 自下一次重下轮起跟随）。共享 client 不重建——偏离 base 后 spawn
+    /// 路径自然走逐任务调谐构建（见 spawn_download）。无资源可失败点
+    /// （纯内存置换），恒 Ok。
+    async fn set_tuning(&self, tuning: HttpTuning) -> Result<(), EngineError> {
+        *self.tuning.write() = tuning;
         Ok(())
     }
 }

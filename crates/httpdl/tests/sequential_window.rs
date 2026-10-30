@@ -171,6 +171,7 @@ async fn sequential_caps_inflight_segments() {
         None,
         None,
         smart_dl_httpdl::download::SegmentSyncPolicy::default(),
+        0,
     )
     .await;
     assert!(r.is_ok(), "顺序下载应成功: {r:?}");
@@ -208,6 +209,7 @@ async fn parallel_runs_full_workers() {
         None,
         None,
         smart_dl_httpdl::download::SegmentSyncPolicy::default(),
+        0,
     )
     .await;
     assert!(r.is_ok(), "并行下载应成功: {r:?}");

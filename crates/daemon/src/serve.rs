@@ -65,12 +65,20 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     // 安全修复（H-9）：connect/read 超时兜底——connect_timeout 防黑洞地址挂死，
     // read_timeout 防对端断流挂死（idle 语义，单次读超时即断）；刻意不设总超时，
     // 避免误杀正常的长耗时大文件下载。
+    // B2（#214）：UA/超时改由 [download] 调谐段驱动（cfg.http_tuning()，
+    // 默认与旧硬编码同值：UA=smart-dl/version、connect 10s、read 30s）。
+    let tuning = cfg.download.http_tuning();
+    let global_ua = if tuning.user_agent.trim().is_empty() {
+        smart_dl_httpdl::engine::USER_AGENT.to_string()
+    } else {
+        tuning.user_agent.trim().to_string()
+    };
     let mut client_builder = reqwest::Client::builder()
         // soak #168：默认 UA（httpdl 单源常量；thinkbroadband 等公网源 403 无 UA
         // 请求，任务级 headers 显式 UA 仍可覆盖）
-        .user_agent(smart_dl_httpdl::engine::USER_AGENT)
-        .connect_timeout(Duration::from_secs(10))
-        .read_timeout(Duration::from_secs(30))
+        .user_agent(global_ua)
+        .connect_timeout(Duration::from_secs(tuning.connect_timeout_secs))
+        .read_timeout(Duration::from_secs(tuning.read_timeout_secs))
         // batch5（重定向深度可配，qB 对标）：全局 client 策略 limited(n)，
         // 合法域 1..=100（越界钳到边界，0 视作 1）。任务级代理 client
         // （httpdl build_proxied_client）保持 reqwest 默认 10 跳。
@@ -101,7 +109,10 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
         // fsync 性能开关（PR #114 审查 §3.3）：[download] 配置段烘入引擎
         // （每段 fsync 默认；机械盘用户可配批量模式换吞吐，WAL 语义不变）。
         smart_dl_httpdl::HttpEngine::new_limited(client.clone(), cfg.download.max_download_kb_s)
-            .with_sync_policy(cfg.download.segment_sync_policy()),
+            .with_sync_policy(cfg.download.segment_sync_policy())
+            // B2（#214）：调谐基准烘入（运行中热改走 set_tuning：共享 client
+            // 不重建，逐任务调谐构建生效）。
+            .with_tuning(tuning),
     );
     // 3b. 云兜底 provider 列表装配（UNWIRED #3 重构：抽出可单测的
     // assemble_providers——mock / xunlei / quark 三源汇入）

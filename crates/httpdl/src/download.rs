@@ -182,7 +182,7 @@ fn rotate_mirrors(mirrors: &[String], worker_no: usize) -> Vec<String> {
 /// `headers` = 任务级自定义头（H-8 修复）：随每个段请求下发（与探测一致语义），
 /// 否则鉴权型源（Cookie/Token）段请求 403 不可用。任务头中的 `range`（大小写
 /// 不敏感）跳过——段区间由段参数生成，任务头不得劫持/制造重复 Range。
-/// 参数均为同层语义字段，聚合结构体反而增加调用方样板 → 允许 13 参。
+/// 参数均为同层语义字段，聚合结构体反而增加调用方样板 → 允许 14 参。
 #[allow(clippy::too_many_arguments)]
 pub async fn download_dynamic(
     client: &reqwest::Client,
@@ -198,6 +198,7 @@ pub async fn download_dynamic(
     pause: Option<Arc<AtomicBool>>,
     progress: Option<Arc<dyn Fn(u64) + Send + Sync>>,
     sync: SegmentSyncPolicy,
+    max_workers: usize,
 ) -> Result<DynamicOutcome, String> {
     // 预分配 .part（续传场景：旧 .part 保留，只写缺失段；不截断）
     let f = std::fs::OpenOptions::new()
@@ -227,7 +228,13 @@ pub async fn download_dynamic(
     } else {
         None
     };
-    let n_workers = segment_count(total);
+    // B2（#214）：单任务并发上限——0 = 自动公式；>0 = clamp(公式, cap)
+    // （1 = 强制单连接；上限不放大公式值，防小文件打满连接）。
+    let n_workers = if max_workers == 0 {
+        segment_count(total)
+    } else {
+        segment_count(total).min(max_workers).max(1)
+    };
     // 批量落盘状态（fsync 性能开关）：仅在 !sync.per_segment 时使用；
     // 锁序恒为 manager → batch（只在 manager 锁内的完成块/收尾冲刷中访问）。
     let batch_state = Arc::new(Mutex::new(BatchSyncState {
