@@ -4,6 +4,7 @@ import type { BtSessionReq } from "./BtSessionReq";
 import type { CleanupReq } from "./CleanupReq";
 import type { ConnectionReq } from "./ConnectionReq";
 import type { DownloadReq } from "./DownloadReq";
+import type { LoggingReq } from "./LoggingReq";
 import type { PostDownloadReq } from "./PostDownloadReq";
 import type { QueueReq } from "./QueueReq";
 import type { RssReq } from "./RssReq";
@@ -14,6 +15,10 @@ import type { WebhookReq } from "./WebhookReq";
  * `PUT /settings` 请求体：各域可选，域内字段可选（None = 不调整）。
  */
 export type SettingsReq = { bandwidth?: BandwidthReq, connection?: ConnectionReq, bittorrent?: BtSessionReq, download?: DownloadReq, rss?: RssReq, cleanup?: CleanupReq, post_download?: PostDownloadReq, webhook?: WebhookReq, scheduler?: SchedulerReq, queue?: QueueReq, 
+/**
+ * 日志级别域（B4，#214 §三-13）。
+ */
+logging?: LoggingReq, 
 /**
  * 持久化开关（默认 true）；与 query `?persist=` 等价（body 优先）。
  */

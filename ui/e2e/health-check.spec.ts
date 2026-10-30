@@ -442,4 +442,57 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
     expect(restoredB3.bittorrent.max_upload_slots).toBe(0);
     expect(restoredB3.bittorrent.dht_bootstrap_nodes).toEqual([]);
   });
+
+  // B4+B5（#214 §三-13 + §五-4）：日志级别热改 + 配置导出/导入往返。
+  test('HC-10 日志级别与配置导入导出（B4/B5）', async ({ page, request }) => {
+    await page.goto(BASE!);
+    await page.getByRole('button', { name: '设置' }).click();
+
+    // —— B4：日志分区渲染 + 下拉保存回环（真实 daemon 装配了 reload 句柄
+    //    → applied「立即生效」路径）——
+    await expect(page.locator('.dl-field-label:has-text("日志级别")')).toBeVisible();
+    const select = page.locator('[data-testid="log-level-select"]');
+    await expect(select).toBeVisible();
+    await select.selectOption('debug');
+    await page.getByLabel('保存设置').click();
+    await expect(page.getByText(/已应用 1 项/).first()).toBeVisible({ timeout: 10_000 });
+    const afterLog = (await (await request.get(`${BASE}/settings`)).json()) as {
+      logging: { level: string; effective_level: string };
+    };
+    expect(afterLog.logging.level).toBe('debug');
+    // 真实二进制：reload 即时生效（记账与配置一致）
+    expect(afterLog.logging.effective_level).toBe('debug');
+
+    // —— B5：导出 → 改配置 → 导入（API 面；UI 文件选择器无法脚本化
+    //    file input 的 hidden 点击路径，导入对话框交互由 ConfirmDialog
+    //    组件单测与 API 集成测试覆盖，e2e 锁定导出内容 + 导入生效）——
+    const exported = await (await request.get(`${BASE}/settings/export`)).text();
+    expect(exported).toContain('[logging]');
+    expect(exported).toContain('level = "debug"');
+    // 导入：改回 warn + 队列配额（热键）
+    const imported = exported.replace('level = "debug"', 'level = "warn"');
+    const impResp = await request.post(`${BASE}/settings/import`, {
+      headers: { 'Content-Type': 'application/toml' },
+      data: imported,
+    });
+    expect(impResp.ok()).toBeTruthy();
+    const report = (await impResp.json()) as { applied: string[]; persisted: boolean };
+    expect(report.persisted).toBe(true);
+    expect(report.applied).toContain('logging.level');
+    const afterImp = (await (await request.get(`${BASE}/settings`)).json()) as {
+      logging: { level: string; effective_level: string };
+    };
+    expect(afterImp.logging.level).toBe('warn');
+    expect(afterImp.logging.effective_level).toBe('warn');
+
+    // —— 复原：导出文件已含 warn → PUT logging.level 回 info ——
+    const restore = await request.put(`${BASE}/settings?persist=true`, {
+      data: { logging: { level: 'info' } },
+    });
+    expect(restore.ok()).toBeTruthy();
+    const restoredLog = (await (await request.get(`${BASE}/settings`)).json()) as {
+      logging: { level: string };
+    };
+    expect(restoredLog.logging.level).toBe('info');
+  });
 });

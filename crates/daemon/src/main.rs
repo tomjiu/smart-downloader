@@ -6,13 +6,9 @@
 use smart_dl_daemon::serve;
 
 fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
+    // B4（#214 §三-13）：日志初始化依赖配置（[logging].level），故先加载
+    // 配置再装配订阅者——配置加载失败路径用 eprintln（不依赖 tracing），
+    // 语义不变。优先级：RUST_LOG > config > info。
     let args: Vec<String> = std::env::args().collect();
 
     // —— serve 子命令 ——
@@ -32,6 +28,7 @@ fn main() {
                 std::process::exit(2);
             }
         };
+        smart_dl_daemon::logging::init(&cfg.logging.normalized_level());
         // CLI `--addr` 覆盖配置文件监听地址（桌面壳 sidecar 契约：壳与 daemon
         // 同端口约定）。非回环 + 无 token 的 fail-closed 校验在 serve::run 内。
         let cfg = match &serve_args.addr {
@@ -51,6 +48,10 @@ fn main() {
     }
 
     // —— 客户端模式：过滤 --server / --token，其余交给 Cli 解析 ——
+    // 客户端不加载配置文件（连接远端 daemon，本地配置无意义）；订阅者
+    // 仍装配（RUST_LOG 排障杠杆保留，缺省 info——与旧行为一致，日志走
+    // stderr 不污染 stdout 管道输出）。
+    smart_dl_daemon::logging::init("info");
     let mut server = "http://127.0.0.1:8787".to_string();
     // 安全修复（V1 配套）：token 优先级 CLI --token > 环境变量 SMART_DL_HTTP_TOKEN
     //（与 serve 同 env，用户配置一次两边生效）；均无 = None（回环未配置模式）。

@@ -4,6 +4,7 @@ import type { SettingsBittorrentDto } from "./SettingsBittorrentDto";
 import type { SettingsCleanupDto } from "./SettingsCleanupDto";
 import type { SettingsConnectionDto } from "./SettingsConnectionDto";
 import type { SettingsDownloadDto } from "./SettingsDownloadDto";
+import type { SettingsLoggingDto } from "./SettingsLoggingDto";
 import type { SettingsMetaDto } from "./SettingsMetaDto";
 import type { SettingsPostDownloadDto } from "./SettingsPostDownloadDto";
 import type { SettingsProviderDto } from "./SettingsProviderDto";
@@ -19,4 +20,8 @@ import type { SettingsXunleiDto } from "./SettingsXunleiDto";
 /**
  * `GET /settings` 全量快照。
  */
-export type SettingsSnapshot = { bandwidth: SettingsBandwidthDto, connection: SettingsConnectionDto, bittorrent: SettingsBittorrentDto, download: SettingsDownloadDto, rss: SettingsRssDto, cleanup: SettingsCleanupDto, post_download: SettingsPostDownloadDto, webhook: SettingsWebhookDto, scheduler: SettingsSchedulerDto, queue: SettingsQueueDto, server: SettingsServerDto, provider: SettingsProviderDto, provider_xunlei: SettingsProviderXunleiDto, provider_quark: SettingsProviderQuarkDto, xunlei: SettingsXunleiDto, meta: SettingsMetaDto, };
+export type SettingsSnapshot = { bandwidth: SettingsBandwidthDto, connection: SettingsConnectionDto, bittorrent: SettingsBittorrentDto, download: SettingsDownloadDto, rss: SettingsRssDto, cleanup: SettingsCleanupDto, post_download: SettingsPostDownloadDto, webhook: SettingsWebhookDto, scheduler: SettingsSchedulerDto, queue: SettingsQueueDto, server: SettingsServerDto, provider: SettingsProviderDto, provider_xunlei: SettingsProviderXunleiDto, provider_quark: SettingsProviderQuarkDto, xunlei: SettingsXunleiDto, meta: SettingsMetaDto, 
+/**
+ * 日志域（B4，#214）。
+ */
+logging: SettingsLoggingDto, };

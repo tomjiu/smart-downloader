@@ -32,6 +32,10 @@ pub struct Config {
     pub scheduler: SchedulerCfg,
     pub lock: LockCfg,
     pub storage: StorageCfg,
+    /// 日志级别（B4，#214 §三-13）：qB「行为→日志」对标。启动期优先级 =
+    /// `RUST_LOG` 环境变量（开发者排障杠杆）> 本配置 > `info` 兜底；
+    /// 运行中可经 `PUT /settings` 热改（tracing reload，立即生效）。
+    pub logging: LoggingCfg,
 }
 
 /// 安全修复（第三轮审查 P1-b）：子表手写 Default（与 Config::default() 单源）。
@@ -195,6 +199,42 @@ fn default_fsync_batch_segments() -> u32 {
 
 fn default_fsync_batch_interval_ms() -> u64 {
     2000
+}
+
+/// 日志级别配置（B4，#214 §三-13）：`[logging] level = "info"`。
+/// 合法值 = off/error/warn/info/debug/trace（tracing EnvFilter 同名级别，
+/// 大小写不敏感）。加载期未知值宽容回落 `info`（与 http_tuning 钳制同
+/// 口径——启动不被日志级别卡死）；`PUT /settings` 侧从严拒绝。
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct LoggingCfg {
+    /// 日志级别（tracing 级别名，小写归一存储）。
+    pub level: String,
+}
+
+impl Default for LoggingCfg {
+    fn default() -> Self {
+        Self {
+            level: "info".into(),
+        }
+    }
+}
+
+impl LoggingCfg {
+    /// 归一化级别（加载期宽容口径）：trim + 小写；未知值回落 `info`。
+    /// 合法性白名单与 daemon::logging::normalize_level 单源（config 不依赖
+    /// daemon 模块，本地同步实现）。
+    pub fn normalized_level(&self) -> String {
+        let t = self.level.trim().to_ascii_lowercase();
+        if matches!(
+            t.as_str(),
+            "off" | "error" | "warn" | "info" | "debug" | "trace"
+        ) {
+            t
+        } else {
+            "info".to_string()
+        }
+    }
 }
 
 impl DownloadCfg {
