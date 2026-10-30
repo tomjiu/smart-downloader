@@ -437,6 +437,7 @@ async fn added_at_ms_persisted_fifo_order_survives_restart() {
                 max_active_bt: 0,
                 max_active_http: 1,
                 max_active_ftp: 0,
+                max_active_total: 0,
             }),
     );
 
@@ -483,6 +484,7 @@ async fn added_at_ms_persisted_fifo_order_survives_restart() {
             max_active_bt: 0,
             max_active_http: 1,
             max_active_ftp: 0,
+            max_active_total: 0,
         });
     let n = state2.restore_from(&store).await.unwrap();
     assert_eq!(n, 2, "两个定时任务必须恢复");

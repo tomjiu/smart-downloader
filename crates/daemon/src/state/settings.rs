@@ -219,6 +219,9 @@ pub struct QueueReq {
     pub max_active_bt: Option<u32>,
     pub max_active_http: Option<u32>,
     pub max_active_ftp: Option<u32>,
+    /// 跨引擎全局在传总量上限（#214 §三-10）；0 = 不限。
+    /// 热键：门控读 live queue_cfg，PUT 即生效（后续 add/递补立即受闸）。
+    pub max_active_total: Option<u32>,
 }
 
 /// 日志级别域（B4，#214 §三-13，qB「行为→日志」对标）：tracing 级别名
@@ -387,12 +390,15 @@ pub struct SettingsSchedulerDto {
 }
 
 /// 队列域（S1）：各引擎同时在传任务上限；0 = 不限。
+/// `max_active_total`（#214 §三-10）= 跨引擎全局总量闸，叠加在分引擎
+/// 配额之上（取小生效）；同为热键（live queue_cfg 现读）。
 #[derive(Debug, Clone, serde::Serialize, TS)]
 #[ts(export)]
 pub struct SettingsQueueDto {
     pub max_active_bt: u32,
     pub max_active_http: u32,
     pub max_active_ftp: u32,
+    pub max_active_total: u32,
 }
 
 /// RSS 域（B1，#214）：全局刷新策略快照。max_processed 运行时可热改；
@@ -628,6 +634,7 @@ impl DaemonState {
                 max_active_bt: queue.max_active_bt,
                 max_active_http: queue.max_active_http,
                 max_active_ftp: queue.max_active_ftp,
+                max_active_total: queue.max_active_total,
             },
             // —— B1 只读装配快照（#214）：装配期生效，PUT 不可写 ——
             server: SettingsServerDto {
@@ -1002,6 +1009,17 @@ impl DaemonState {
                 if crate::logging::normalize_level(v).is_none() {
                     return Err(DaemonError::InvalidSource(format!(
                         "logging.level = {v:?} 无效：仅支持 off / error / warn / info / debug / trace"
+                    )));
+                }
+            }
+        }
+        // B6（#214 §三-10）：全局并发总量——0 = 不限；上限 100000（防误输
+        // 巨值反而等同不限的困惑；分引擎三项历史无界保持不动，新键从严）。
+        if let Some(q) = &req.queue {
+            if let Some(t) = q.max_active_total {
+                if t > 100_000 {
+                    return Err(DaemonError::InvalidSource(format!(
+                        "queue.max_active_total = {t} 无效：须在 0..=100000（0 = 不限）"
                     )));
                 }
             }
@@ -1434,11 +1452,22 @@ impl DaemonState {
             if let Some(v) = q.max_active_ftp {
                 cur.max_active_ftp = v;
             }
+            // B6（#214 §三-10）：总量闸热更——门控/递补均现读 live
+            // queue_cfg，PUT 后下一个 add/tick 即受新闸约束；已在传
+            // 任务不回退（收紧闸门只影响新激活，与分引擎配额同口径）。
+            if let Some(v) = q.max_active_total {
+                cur.max_active_total = v;
+            }
             *self.queue_cfg.lock() = cur.clone();
             if let Some(cfg) = self.live_config.lock().as_mut() {
                 cfg.queue = cur;
             }
-            for k in ["max_active_bt", "max_active_http", "max_active_ftp"] {
+            for k in [
+                "max_active_bt",
+                "max_active_http",
+                "max_active_ftp",
+                "max_active_total",
+            ] {
                 applied.push(format!("queue.{k}"));
             }
         }
@@ -1995,6 +2024,7 @@ mod tests {
             "download.user_agent",
             "download.min_split_mb",
             "queue.max_active_http",
+            "queue.max_active_total",
             "limits.alt_from",
             "webhook.url",
             "cleanup.auto_remove_completed_days",

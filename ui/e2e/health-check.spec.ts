@@ -377,6 +377,8 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
     await expect(page.locator('.dl-field-label:has-text("做种空闲上限（分钟）")')).toBeVisible();
     await expect(page.locator('.dl-field-label:has-text("全局上传槽位")')).toBeVisible();
     await expect(page.locator('.dl-field-label:has-text("DHT 引导节点")')).toBeVisible();
+    // B6（#214 §三-10）：跨引擎全局总量闸
+    await expect(page.locator('.dl-field-label:has-text("全局同时传输总量上限")')).toBeVisible();
     // 只读装配区
     await expect(page.locator('.dl-field-label:has-text("监听地址")').first()).toBeVisible();
     await expect(page.locator('.dl-field-label:has-text("API 鉴权令牌")')).toBeVisible();
@@ -420,6 +422,17 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
       'dht.transmissionbt.com:6881',
     ]);
 
+    // —— B6（#214 §三-10）：全局总量闸保存回环（立即生效键）——
+    const total = page.locator('#set-a11y-43');
+    await expect(total).toBeVisible();
+    await total.fill('6');
+    await page.getByLabel('保存设置').click();
+    await expect(page.getByText(/已应用/).first()).toBeVisible({ timeout: 10_000 });
+    const afterB6 = (await (await request.get(`${BASE}/settings`)).json()) as {
+      queue: { max_active_total: number };
+    };
+    expect(afterB6.queue.max_active_total).toBe(6);
+
     // —— 复原（保住套件干净起点：两项均回出厂默认）——
     await input.fill('200');
     await seg.fill('8');
@@ -441,6 +454,14 @@ test.describe.serial('全路径体检 e2e（真实 daemon + 真实下载 + 全�
     };
     expect(restoredB3.bittorrent.max_upload_slots).toBe(0);
     expect(restoredB3.bittorrent.dht_bootstrap_nodes).toEqual([]);
+    // B6 复原：总量回 0（不限）
+    await total.fill('0');
+    await page.getByLabel('保存设置').click();
+    await expect(page.getByText(/已应用/).first()).toBeVisible({ timeout: 10_000 });
+    const restoredB6 = (await (await request.get(`${BASE}/settings`)).json()) as {
+      queue: { max_active_total: number };
+    };
+    expect(restoredB6.queue.max_active_total).toBe(0);
   });
 
   // B4+B5（#214 §三-13 + §五-4）：日志级别热改 + 配置导出/导入往返。

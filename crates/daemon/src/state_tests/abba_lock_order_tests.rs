@@ -148,6 +148,7 @@ async fn abba_concurrent_gate_never_oversells_quota() {
         max_active_bt: 0,
         max_active_http: 3,
         max_active_ftp: 0,
+        max_active_total: 0,
     });
     let state = Arc::new(state);
 
