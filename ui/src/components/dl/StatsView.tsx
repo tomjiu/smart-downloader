@@ -107,10 +107,12 @@ export default function StatsView({
   // Provider」，与真实状态不符——侧栏红点之外唯一线索是限速卡错误串）。
   if (!stats && !connected) {
     return (
-      <div className="dl-card" data-testid="stats-waiting" style={{ color: "var(--fg-3)", padding: 24 }}>
-        daemon 未连接——统计暂不可用，等待自动重连…
-        <div style={{ fontSize: 12, marginTop: 6 }}>
-          连接恢复后本页自动加载（每秒重试，无需刷新）
+      <div className="dl-page dl-page--narrow">
+        <div className="dl-card" data-testid="stats-waiting" style={{ color: "var(--fg-3)", padding: 24 }}>
+          daemon 未连接——统计暂不可用，等待自动重连…
+          <div style={{ fontSize: 12, marginTop: 6 }}>
+            连接恢复后本页自动加载（每秒重试，无需刷新）
+          </div>
         </div>
       </div>
     );
@@ -138,7 +140,7 @@ export default function StatsView({
   const stateEntries = Object.entries(st.by_state).filter(([, n]) => n > 0);
 
   return (
-    <div style={{ display: "grid", gap: 16 }}>
+    <div className="dl-page">
       <div className="dl-grid dl-grid--stats">
         <StatCard icon="cloud-download" tone="var(--accent)" label="总下载速度" value={fmtSpeed(st.down_bytes_s)} sub={`会话累计 ${fmtBytes(st.session_down_bytes)}`} />
         <StatCard icon="arrow-up" tone="var(--info)" label="总上传速度" value={fmtSpeed(st.up_bytes_s)} sub={`会话累计 ${fmtBytes(st.session_up_bytes)}`} />

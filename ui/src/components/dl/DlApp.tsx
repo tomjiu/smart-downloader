@@ -35,6 +35,8 @@ import TasksTable, {
 } from "./TasksTable";
 import StatsView from "./StatsView";
 import LogsView from "./LogsView";
+import TitleBar from "./TitleBar";
+import ProvidersView from "./ProvidersView";
 import RssView from "./RssView";
 import SettingsView from "./SettingsView";
 import SecurityView from "./SecurityView";
@@ -72,7 +74,7 @@ const RATE_TTL_MS = 5000;
 /// 手改的键值 → 回落默认），typeof window 守卫防 SSG 预渲染崩溃；
 /// 恢复走挂载后 useEffect 而非 lazy initializer——避免服务端渲染
 /// 默认态与客户端恢复态的 hydration 不匹配（与 dl.side 同模式）。
-const VIEW_KEYS: ViewKey[] = ["tasks", "stats", "rss", "logs", "security", "settings"];
+const VIEW_KEYS: ViewKey[] = ["tasks", "stats", "rss", "logs", "plugins", "security", "settings"];
 const SORT_KEYS = ["name", "state", "progress", "speed", "size", "eta"] as const;
 
 function restoreView(): ViewKey {
@@ -240,7 +242,7 @@ export default function DlApp() {
   /// 全局快捷键（Slack/GitHub 惯例）：Ctrl/Cmd+1..6 切视图、/ 聚焦搜索。
   /// 输入控件内不拦截（除 Ctrl 组合——数字组合在输入框内无编辑语义冲突）。
   useEffect(() => {
-    const ORDER: ViewKey[] = ["tasks", "stats", "rss", "logs", "security", "settings"];
+    const ORDER: ViewKey[] = ["tasks", "stats", "rss", "logs", "plugins", "security", "settings"];
     const isTyping = (t: EventTarget | null) =>
       t instanceof HTMLElement &&
       (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
@@ -687,6 +689,10 @@ export default function DlApp() {
 
   return (
     <div className="dl-root">
+      {/* #213-1 桌面壳自绘标题栏：仅 data-shell="frameless"（Windows/Linux
+          壳）渲染；浏览器/macOS 恒返回 null 零影响。fixed 悬浮，dl-root
+          由 CSS 按同旗标 padding-top 让位（见 globals.css）。 */}
+      <TitleBar />
       <Sidebar
         view={view}
         onView={setView}
@@ -757,6 +763,7 @@ export default function DlApp() {
           {view === "stats" && <StatsView stats={stats} history={history} connected={connected} />}
           {view === "rss" && <RssView onToast={toast} />}
           {view === "logs" && <LogsView events={events} />}
+          {view === "plugins" && <ProvidersView onToast={toast} />}
           {view === "settings" && <SettingsView onToast={toast} />}
           {view === "security" && <SecurityView onToast={toast} />}
           </main>

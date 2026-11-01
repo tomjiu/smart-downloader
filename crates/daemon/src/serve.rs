@@ -121,6 +121,7 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     let mut state = DaemonState::new(http_engine, providers)
         .with_dest_root(cfg.download.dest_root.clone())
         .with_http_token(http_token.clone())
+        .with_instance_token(args.instance_token.clone())
         .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
         .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s)
         .with_bootstrap_client(client.clone())
@@ -142,6 +143,7 @@ pub async fn run(cfg: Config, args: ServeArgs) -> Result<(), ServeError> {
     let mut state = DaemonState::new(http_engine, providers)
         .with_dest_root(cfg.download.dest_root.clone())
         .with_http_token(http_token.clone())
+        .with_instance_token(args.instance_token.clone())
         .with_disk_precheck_strict(cfg.download.disk_precheck_strict)
         .with_global_limits(cfg.download.max_download_kb_s, cfg.bt.max_upload_kb_s)
         .with_bootstrap_client(client)
@@ -695,7 +697,8 @@ fn resolve_http_token(env_val: Option<String>, cfg_val: Option<String>) -> (Opti
     }
 }
 
-/// 进程参数：`serve [--config <path>] [--ui-dir <dir>] [--addr <addr>]`。
+/// 进程参数：`serve [--config <path>] [--ui-dir <dir>] [--addr <addr>]
+/// [--instance-token <hex>]`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ServeArgs {
     pub config: Option<std::path::PathBuf>,
@@ -706,6 +709,10 @@ pub struct ServeArgs {
     /// 桌面壳用它与 sidecar 约定同一端口（壳轮询就绪 + 开窗同址）。
     /// 非回环地址仍走 serve::run 的 fail-closed 校验（无 token 拒绝启动）。
     pub addr: Option<String>,
+    /// 一次性启动 nonce（#212 桌面壳身份验证）：壳生成随机值经 CLI 注入，
+    /// daemon 经 `GET /instance-token/:nonce` 回 200/404 供壳确认「监听端口的
+    /// 正是本次拉起的子进程」。非凭据（不授予任何 API 权限）；空串视作未设置。
+    pub instance_token: Option<String>,
 }
 
 pub fn parse_args(args: &[String]) -> Result<ServeArgs, String> {
@@ -734,6 +741,13 @@ pub fn parse_args(args: &[String]) -> Result<ServeArgs, String> {
                 out.addr = Some(v.to_string());
                 i += 2;
             }
+            "--instance-token" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| "--instance-token 缺少值".to_string())?;
+                out.instance_token = Some(v.to_string());
+                i += 2;
+            }
             a if a.starts_with('-') => return Err(format!("未知参数: {a}")),
             _ => i += 1,
         }
@@ -744,6 +758,39 @@ pub fn parse_args(args: &[String]) -> Result<ServeArgs, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_args_instance_token() {
+        // #212：--instance-token 注入一次性 nonce
+        let args: Vec<String> = ["--instance-token", "abc123def"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let p = parse_args(&args).unwrap();
+        assert_eq!(p.instance_token.as_deref(), Some("abc123def"));
+        // 与既有参数组合
+        let args: Vec<String> = [
+            "--addr",
+            "127.0.0.1:8788",
+            "--instance-token",
+            "xyz",
+            "--ui-dir",
+            "/tmp/ui",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let p = parse_args(&args).unwrap();
+        assert_eq!(p.addr.as_deref(), Some("127.0.0.1:8788"));
+        assert_eq!(p.instance_token.as_deref(), Some("xyz"));
+        assert_eq!(p.ui_dir, Some(std::path::PathBuf::from("/tmp/ui")));
+        // 缺值报错
+        let args: Vec<String> = ["--instance-token"].iter().map(|s| s.to_string()).collect();
+        assert!(parse_args(&args).is_err());
+        // 缺省 None
+        let args: Vec<String> = vec![];
+        assert_eq!(parse_args(&args).unwrap().instance_token, None);
+    }
 
     #[test]
     fn resolve_http_token_env_priority_and_auto() {

@@ -98,6 +98,116 @@ body {
   }
 }
 
+/* ── #213-1 桌面壳自绘标题栏（Windows/Linux 无装饰窗口）──
+   开关：html[data-shell="frameless"]（layout.tsx 启动脚本首帧同步注入——
+   __TAURI__ 存在且非 macOS；三处消费：dl-root 让位 / 抽屉下移 / TitleBar
+   组件渲染）。fixed 悬浮于一切内容之上（z 130 > 抽屉 91 / 确认框 95 /
+   toast 120）：壳级 chrome 恒可见恒可点——抽屉/弹层打开时不锁死窗口
+   控制按钮（VS Code 同款层级语义）。视觉：--bg-2 下沉层 + 1px --line
+   分界（与侧栏/状态栏同层），无图标无标题（#213 用户要求去除左上角
+   标识）；关闭钮 hover 走 Windows 惯例红。浏览器模式零成本：无旗标
+   → 无 padding、无节点。 */
+html[data-shell="frameless"] .dl-root {
+  padding-top: var(--titlebar-h);
+}
+/* 抽屉原 top:0 会被标题栏盖住头部——壳模式下移到标题栏下沿 */
+html[data-shell="frameless"] .dl-drawer {
+  top: var(--titlebar-h);
+}
+.dl-titlebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--titlebar-h);
+  z-index: 130;
+  display: flex;
+  align-items: stretch;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--line);
+  user-select: none;
+}
+.dl-titlebar-drag {
+  flex: 1;
+}
+.dl-titlebar-btn {
+  width: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  padding: 0;
+  background: transparent;
+  color: var(--fg-2);
+  cursor: default; /* 窗口控制惯例：不显示手型（系统标题栏同款） */
+}
+.dl-titlebar-btn:hover {
+  background: var(--bg-3);
+  color: var(--fg);
+}
+.dl-titlebar-btn:active {
+  background: var(--hover);
+}
+.dl-titlebar-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.dl-titlebar-btn--close:hover {
+  background: #e81123; /* Windows 系统标题栏关闭钮惯例红 */
+  color: #fff;
+}
+.dl-titlebar-btn--close:active {
+  background: #c50f1f;
+  color: #fff;
+}
+
+/* ── 页面级容器（#213-2 布局统一）──
+   此前各视图根容器各自内联（gap 14/16 混用、maxWidth 有无不一、
+   SecurityView 直接拿 dl-card 当根），观感突兀。统一为两层结构：
+   .dl-page          所有视图共用：纵向堆叠 + 统一节奏（gap/--space-4）
+   .dl-page--narrow  表单类视图（设置/RSS/安全/插件）：860 阅读宽度 + 居中
+   （任务/日志/统计为全宽数据视图，只用基类）*/
+.dl-page {
+  display: grid;
+  gap: var(--space-4);
+  align-content: start;
+  width: 100%;
+}
+.dl-page--narrow {
+  max-width: 860px;
+  margin-inline: auto;
+}
+
+/* 行内代码 / 命令块（#213-4 插件页登录引导）：与 dl-input 同底色系 */
+.dl-code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 3px 8px;
+  color: var(--fg-2);
+}
+
+/* ── 视图切换入场（#213-3）──
+   dl-main 直接子级 = 当前视图的根分块；条件渲染（view === "x" && …）
+   切视图即重挂载 → 入场动画自然触发，纯 CSS 零标记改动。时长走 --dur
+   token，动作语言与 dl-fade / dl-slide 同族（淡入 + 4px 上浮）。 */
+.dl-main > * {
+  animation: dl-view-in var(--dur) ease-out both;
+}
+@keyframes dl-view-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .dl-main > * {
+    animation: none;
+  }
+}
+
 /* ── 通用控件（旧 UI 库移除后的基础件）── */
 .dl-btn {
   display: inline-flex;

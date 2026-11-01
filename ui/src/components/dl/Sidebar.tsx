@@ -29,6 +29,7 @@ const DATA_VIEWS: { key: Exclude<ViewKey, "tasks" | "settings">; label: string; 
   { key: "stats", label: "统计", icon: "graph" },
   { key: "rss", label: "RSS", icon: "radio-tower" },
   { key: "logs", label: "日志", icon: "output" },
+  { key: "plugins", label: "插件", icon: "zap" },
   { key: "security", label: "安全", icon: "shield" },
 ];
 

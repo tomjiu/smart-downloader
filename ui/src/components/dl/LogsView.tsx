@@ -44,7 +44,7 @@ export default function LogsView({ events }: { events: SchedulerEventEnvelope[] 
   const types = useMemo(() => Array.from(new Set(events.map((e) => e.event.type))), [events]);
 
   return (
-    <div>
+    <div className="dl-page">
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12, alignItems: "center" }}>
         <button
           className={`dl-tab ${!type ? "dl-tab--active" : ""}`}

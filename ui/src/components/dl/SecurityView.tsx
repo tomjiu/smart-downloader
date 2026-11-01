@@ -170,7 +170,7 @@ export default function SecurityView({
   };
 
   return (
-    <>
+    <div className="dl-page dl-page--narrow">
     <div className="dl-card" style={{ display: "grid", gap: 14 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
         <Icon name="shield" size={15} className="dl-drawer-ico" />
@@ -403,6 +403,6 @@ export default function SecurityView({
         需 BT 引擎在线（拉取/解禁均下发 ip_filter）；订阅条目与手动封禁分账——刷新只增删订阅条目；拉取失败保持上次生效集不动
       </div>
     </div>
-    </>
+    </div>
   );
 }

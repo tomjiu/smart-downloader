@@ -23,6 +23,8 @@
   --side-rail-w: 56px;
   --toolbar-h: 48px;
   --status-h: 28px;
+  /* #213-1 桌面壳自绘标题栏（Windows/Linux 无装饰窗口；浏览器/macOS 不渲染） */
+  --titlebar-h: 36px;
 
   --space-1: 4px;
   --space-2: 8px;
