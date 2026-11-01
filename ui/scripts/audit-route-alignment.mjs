@@ -59,7 +59,8 @@ const storeSrc = fs.readFileSync(
 
 /// by-design 盲区登记簿：daemon-only / 运维端点（无 UI 消费者是刻意的）。
 const BY_DESIGN = new Set([
-  'GET /config',
+  // #213-4 插件页起 UI 消费 /config（启停态/档位快照）——从 by-design 移出，
+  // 转为对齐通道（store.configSnapshot）。
   'GET /health',
   'GET /metrics',
   'GET /version',
@@ -74,6 +75,9 @@ const BY_DESIGN = new Set([
   // POST /security/bans/unban（#187 规范通道）；DELETE 路由保留兼容既有
   // CLI/脚本调用方（同 handler，见 http.rs 路由注释）——daemon-only 兼容面。
   'DELETE /security/bans',
+  // #212 桌面壳身份验证探针：消费者是 Tauri 壳的 wait_daemon（Rust 裸
+  // TCP，非前端 fetch）——按 UI 源码统计消费者恒为零，by-design。
+  'GET /instance-token/:x',
 ]);
 
 // ---- 1. daemon 路由（.route( 切段：段首路径 + 段身 handler 链）----

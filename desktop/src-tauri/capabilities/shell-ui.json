@@ -1,0 +1,16 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "shell-ui",
+  "description": "#213-1 自绘标题栏：主窗加载 daemon 源（http://127.0.0.1:<port>，端口可被 SMART_DL_DESKTOP_PORT 覆盖）——remote URL 上的页面需要窗口控制 IPC。端口通配 `:*` 实证于 urlpattern 0.3.0（tauri RemoteUrlPattern 的 constructor-string 语义，仅匹配 127.0.0.1 回环，不覆盖 localhost/外部域）。",
+  "windows": ["main"],
+  "remote": {
+    "urls": ["http://127.0.0.1:*"]
+  },
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close"
+  ]
+}

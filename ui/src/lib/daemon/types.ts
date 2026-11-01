@@ -19,6 +19,16 @@ export type { FileProgress as TaskFile } from "./generated/FileProgress";
 export type { DaemonStats as Stats } from "./generated/DaemonStats";
 export type { GlobalLimits } from "./generated/GlobalLimits";
 export type { ProviderStatusDto } from "./generated/ProviderStatusDto";
+/// `GET /config` 精简快照的**子集视图**（#213-4 插件页消费）。后端为
+/// serde_json::json! 动态构造（非 ts-rs 派生 DTO，无法生成 TS 类型）；
+/// 此处仅声明消费字段——字段名与 config.rs snapshot_json 对齐，漂移由
+/// e2e（providers-view）与后端快照测试双面把着。
+export type ConfigSnapshot = {
+  provider_enabled: boolean;
+  provider_xunlei_enabled: boolean;
+  provider_quark_enabled: boolean;
+  provider_xunlei_tier: string;
+};
 export type { SchedulerEvent } from "./generated/SchedulerEvent";
 export type { Envelope as SchedulerEventEnvelope } from "./generated/Envelope";
 export type { SettingsApplyReport } from "./generated/SettingsApplyReport";
